@@ -1,0 +1,10 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_server_host": "127.0.0.1",
+  "dolt_server_port": 3307,
+  "dolt_server_user": "root",
+  "dolt_database": "flow",
+  "project_id": "d8eb5e47-ca52-4134-a71b-d709922ec1ba"
+}

@@ -1,0 +1,15 @@
+.venv/
+.local/
+__pycache__/
+.pytest_cache/
+*.pyc
+data/uploads/*
+data/downloads/*
+data/state.json
+!data/uploads/.gitkeep
+!data/downloads/.gitkeep
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
