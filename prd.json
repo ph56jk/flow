@@ -1,0 +1,244 @@
+{
+  "name": "flow",
+  "description": "`Flow Web UI` là một ứng dụng web cục bộ bọc `flow-py` để giúp người dùng điều khiển Google Flow bằng giao diện trực quan, tiếng Việt, ít thao tác kỹ thuật. Bản hiện tại đã hỗ trợ đăng nhập, kết nối project, tạo ảnh/video, chỉnh sửa media, xem workflow, theo dõi job và tải kết quả về máy. Tuy nhiên trải nghiệm thực tế vẫn còn các điểm nghẽn: người mới dễ vướng ở bước project/login, lỗi từ browser automation còn gây bối rối, job bị ngắt sau restart chưa có đường quay lại rõ ràng, và việc tái sử dụng kết quả cũ để chỉnh sửa vẫn cần nhiều thao tác tay. PRD này định nghĩa vòng nâng cấp tiếp theo của sản phẩm với trọng tâm: rút ngắn thời gian tới tác vụ thành công đầu tiên, giảm ngõ cụt khi lỗi, tăng khả năng tái sử dụng artifact và giữ ứng dụng đơn giản, local-first, dễ tiếp cận. Vòng này không ưu tiên mở rộng sang hệ thống preset/skill mới, không thêm frontend framework, và không biến sản phẩm thành nền tảng cộng tác nhiều người dùng. ### Người dùng mục tiêu",
+  "branchName": "ralph/flow-next-upgrade",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Chuẩn hóa project và readiness snapshot",
+      "description": "As a người dùng mới hoặc quay lại, I want app chuẩn hóa project input và tính readiness snapshot thống nhất, so that tôi biết ngay workspace hiện có thể chạy hay đang thiếu bước nào.",
+      "acceptanceCriteria": [
+        "Backend lưu `project_id` đã normalize và `project_url` nhất quán khi người dùng nhập ID hoặc URL project.",
+        "`/api/state` vẫn giữ shape hiện tại nhưng cung cấp đủ dữ liệu để frontend suy ra readiness snapshot mà không làm gãy UI cũ.",
+        "Khi project, auth hoặc workflow thay đổi, readiness snapshot và copy trạng thái được cập nhật đồng bộ bằng tiếng Việt có dấu.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-002",
+      "title": "Chế độ Golden Path cho lần chạy đầu tiên",
+      "description": "As a người mới dùng app, I want một luồng Golden Path chỉ hiển thị các bước cốt lõi, so that tôi có thể đi từ project tới login rồi tới tác vụ đầu tiên mà không lạc trong giao diện.",
+      "acceptanceCriteria": [
+        "Khi người dùng chưa hoàn tất project hoặc auth, app hiển thị rõ bước hiện tại trong luồng Golden Path và CTA chính phù hợp.",
+        "Khi từng bước được hoàn tất, giao diện phản ánh ngay bước kế tiếp mà không bắt người dùng tự suy đoán trạng thái.",
+        "Người dùng có thể hoàn tất luồng phổ biến mà không cần mở `Cài đặt nâng cao`, và app không yêu cầu tài khoản riêng ngoài phiên Google Flow.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-001"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-003",
+      "title": "Mặc định theo ý định và preflight gate cho form tạo nội dung",
+      "description": "As a người sáng tạo nội dung, I want form tạo ảnh và video có mặc định phù hợp theo ý định và chặn submit sai điều kiện, so that tôi tạo tác vụ nhanh hơn và giảm lỗi có thể đoán trước.",
+      "acceptanceCriteria": [
+        "Khi người dùng chọn intent tạo ảnh hoặc video, app điền sẵn các giá trị mặc định hợp lý như aspect, count hoặc timeout nhưng vẫn cho phép chỉnh tay.",
+        "Khi thiếu điều kiện tối thiểu để chạy job, app không enqueue job và hiển thị rõ điều kiện còn thiếu cùng cách xử lý.",
+        "Khi input hợp lệ, luồng submit vẫn dùng backend hiện tại và không phá các khả năng create image/video đã có.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-001"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-004",
+      "title": "Phân loại lỗi và action recovery theo ngữ cảnh",
+      "description": "As a người dùng vừa gặp lỗi, I want mỗi job lỗi hiển thị loại lỗi và hành động recovery liên quan, so that tôi biết nên làm gì tiếp theo thay vì tự đoán.",
+      "acceptanceCriteria": [
+        "Khi backend nhận lỗi từ Flow hoặc browser automation, lỗi được map vào nhóm rõ ràng như auth, project, timeout, browser lock, workflow và hiển thị bằng tiếng Việt dễ hiểu.",
+        "Khi job có nhóm lỗi đã biết, job card hiển thị các action recovery phù hợp như đăng nhập lại, kiểm tra project, tăng timeout hoặc mở lại browser.",
+        "Khi lỗi không map được, app vẫn hiển thị fallback message an toàn và cung cấp ít nhất một hành động tiếp theo hợp lệ.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-005",
+      "title": "Retry từ job lỗi hoặc bị ngắt với payload clone",
+      "description": "As a người dùng muốn chạy lại nhanh, I want clone payload từ job lỗi hoặc bị ngắt sang một retry flow, so that tôi có thể chạy lại tác vụ mà không phải nhập lại từ đầu.",
+      "acceptanceCriteria": [
+        "Khi người dùng bấm `Chạy lại` trên job `failed` hoặc `interrupted`, app tạo một retry flow mới dựa trên input cũ mà không sửa đổi job gốc.",
+        "Khi retry flow được mở, người dùng có thể điều chỉnh các trường được phép như prompt, timeout hoặc workflow và các thay đổi chỉ áp dụng cho lần retry mới.",
+        "Khi enqueue retry, job mới vẫn được phân biệt với job gốc trong history và không làm mất trace của lần chạy trước.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-004"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-006",
+      "title": "Crash replay pack và tóm tắt interrupted work",
+      "description": "As a người dùng quay lại sau khi app restart, I want interrupted work được gom thành một replay pack rõ ràng, so that tôi có thể khôi phục đà làm việc thay vì đọc log rời rạc.",
+      "acceptanceCriteria": [
+        "Khi server restart trong lúc còn job `queued`, `running` hoặc `polling`, các job đó được chuyển sang `interrupted` và giữ lại log cuối cùng cùng input cần cho recovery.",
+        "Khi có interrupted jobs, app hiển thị danh sách interrupted work theo cụm rõ ràng và cho phép mở nhanh retry từ từng item.",
+        "Khi người dùng không cần giữ interrupted jobs nữa, metadata recovery có thể được làm sạch an toàn mà không xóa nhầm artifact local.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-004",
+        "US-005"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-007",
+      "title": "Output shelf cho artifact gần đây",
+      "description": "As a người sáng tạo quay vòng nhiều lần, I want một output shelf nhỏ hiển thị artifact gần đây với action rõ ràng, so that tôi có thể mở, tải, chép mã hoặc tái sử dụng output nhanh hơn.",
+      "acceptanceCriteria": [
+        "Khi có artifact từ các job hoàn tất gần đây, output shelf hiển thị preview phù hợp và không bắt người dùng cuộn toàn bộ lịch sử job để tìm.",
+        "Khi artifact có URL gốc hoặc file local, người dùng có thể mở đúng liên kết hoặc file local và nhận lỗi rõ ràng nếu tệp không còn.",
+        "Khi người dùng muốn tái sử dụng artifact, output shelf cung cấp action `Chép media id`, `Chép workflow id`, `Dùng để sửa`, `Lưu về máy` ngay cạnh artifact liên quan.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-008",
+      "title": "Chuỗi hành động artifact-to-edit và prefill sâu cho form sửa",
+      "description": "As a người dùng đã có output tốt, I want đi từ artifact hoặc workflow sang form sửa với prefill sâu, so that tôi có thể tiếp tục chỉnh sửa trong tối đa hai thao tác.",
+      "acceptanceCriteria": [
+        "Khi người dùng bấm `Dùng để sửa` từ artifact hoặc workflow, app mở đúng form chỉnh sửa và điền sẵn `media id`, `workflow id` cùng các field liên quan.",
+        "Khi loại chỉnh sửa được suy ra từ action chọn, app chọn đúng `edit type` mặc định và chỉ hiển thị các trường phù hợp.",
+        "Khi submit chỉnh sửa, các luồng backend hiện có cho extend, upscale, camera, insert và remove tiếp tục hoạt động mà không cần nhập lại dữ liệu đã có trong artifact context.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-007"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-009",
+      "title": "Workflow memory cho continuation work",
+      "description": "As a người dùng hay lặp lại kiểu continuation giống nhau, I want app nhớ workflow và context edit gần đây, so that các lần chỉnh tiếp theo bắt đầu nhanh hơn từ các gợi ý có căn cứ.",
+      "acceptanceCriteria": [
+        "Khi có các job chỉnh sửa hoặc generate thành công gần đây, app đề xuất workflow hoặc context gần nhất có liên quan khi người dùng vào form sửa.",
+        "Khi người dùng chọn một gợi ý workflow memory, các field liên quan được điền sẵn nhưng người dùng vẫn có thể thay đổi hoặc bỏ qua.",
+        "Khi workflow memory không còn hợp lệ, app không submit mù và hiển thị hướng dẫn chọn lại workflow khả dụng.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-008"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-010",
+      "title": "Storyboard tiến trình cho job dài",
+      "description": "As a người dùng đang chờ Flow phản hồi, I want xem storyboard tiến trình của job, so that tôi biết app còn đang làm việc hay đã mắc ở bước nào.",
+      "acceptanceCriteria": [
+        "Khi job đang chạy hoặc polling, app hiển thị các mốc tiến trình có ý nghĩa như gửi yêu cầu, chờ phản hồi, polling, lưu artifact và hoàn tất thay vì chỉ một trạng thái chung.",
+        "Khi backend có log hoặc progress hint mới, storyboard phản ánh mốc mới nhất và giúp người dùng phân biệt tiến triển với đứng yên.",
+        "Khi người dùng dùng bộ lọc trạng thái, danh sách tác vụ vẫn phản ánh đúng bộ lọc và progress storyboard hiển thị đúng cho các job còn lại.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-011",
+      "title": "Trust signals layer và project health timeline",
+      "description": "As a người dùng quay lại app sau một thời gian, I want thấy trust signals và health timeline của project, so that tôi quyết định nhanh có nên chạy tiếp hay cần sửa môi trường trước.",
+      "acceptanceCriteria": [
+        "Khi app có dữ liệu về auth, project, workflow và artifact local, dashboard hiển thị trust signals ngắn gọn như `Project hợp lệ`, `Đăng nhập còn hiệu lực`, `Workflow có sẵn`, `Artifact local còn tồn tại`.",
+        "Khi project có lịch sử hoạt động đủ gần, app tóm tắt được health timeline với các dấu hiệu như login ổn, timeout tăng, workflow rỗng hoặc interrupted jobs mà không trở thành màn hình quá kỹ thuật.",
+        "Khi người dùng quay lại app sau refresh hoặc lần mở sau, trust signals và health timeline vẫn có dữ liệu nền phù hợp và không buộc thiết lập lại từ đầu.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-001",
+        "US-010"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-012",
+      "title": "Cleanup assistant cho uploads, downloads và history",
+      "description": "As a người vận hành app local lâu dài, I want một cleanup assistant an toàn cho file và history, so that workspace luôn gọn mà không làm mất output quan trọng.",
+      "acceptanceCriteria": [
+        "Khi uploads, downloads và job history tăng dần, cleanup assistant phân loại được file tạm, file đã tải, metadata cũ và mục có thể dọn, đồng thời hiển thị rõ mục nào an toàn để xóa.",
+        "Khi người dùng xác nhận dọn một nhóm dữ liệu, app chỉ xóa những mục thuộc phạm vi cho phép và không vi phạm các rào chắn path an toàn hiện có.",
+        "Khi artifact local vẫn đang được tham chiếu là quan trọng hoặc gần đây, cleanup assistant giữ lại mặc định hoặc yêu cầu xác nhận rõ ràng hơn trước khi xóa.",
+        "`python3 -m py_compile flow_web/*.py` passes",
+        "`node --check flow_web/static/app.js` passes",
+        "Luồng giao diện liên quan được kiểm tra nhanh trên app local ở viewport khoảng 390px."
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "Hoan tat bang tay sau khi iteration Codex bi fail do model capacity; cleanup assistant snapshot, /api/cleanup va UI panel da hien dien va syntax checks da pass.",
+      "dependsOn": [
+        "US-007",
+        "US-011"
+      ]
+    }
+  ],
+  "metadata": {
+    "updatedAt": "2026-04-07T06:20:11.689Z"
+  }
+}

@@ -1,8 +1,11 @@
 .venv/
 .local/
+.env.local
+.codex/
 __pycache__/
 .pytest_cache/
 *.pyc
+flow_web_ui.egg-info/
 data/uploads/*
 data/downloads/*
 data/state.json
@@ -13,3 +16,8 @@ data/state.json
 .dolt/
 *.db
 .beads-credential-key
+.beads-server/
+
+# Ralph runtime files
+.ralph-output/
+.ralph-tui/

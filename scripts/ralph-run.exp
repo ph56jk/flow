@@ -1,0 +1,23 @@
+#!/usr/bin/expect -f
+
+set timeout -1
+
+set script_dir [file dirname [file normalize [info script]]]
+set project_dir [file dirname $script_dir]
+set prd_path [file join $project_dir "prd.json"]
+
+cd $project_dir
+
+spawn ralph-tui run --prd $prd_path
+
+expect {
+  -re {q:Quit[[:space:]]+s:Start} {
+    send -- "s"
+  }
+  -re {Ready - Press Enter or s to start} {
+    send -- "s"
+  }
+  timeout {}
+}
+
+interact
