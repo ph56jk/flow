@@ -33,6 +33,53 @@ Script này sẽ tự:
 - cài Chromium cho Playwright nếu chưa có
 - mở app ở `http://127.0.0.1:8000`
 
+### Windows portable: giải nén là chạy
+
+Nếu không muốn mỗi máy lại tải Python, dependency và Chromium từ đầu, có thể build sẵn một bản portable ngay trên Windows:
+
+```powershell
+cd flow
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_portable.ps1
+```
+
+Script này sẽ tạo thư mục:
+
+```text
+dist\flow-windows-portable
+```
+
+Trong đó đã có sẵn:
+- Python portable
+- dependency Python
+- Chromium cho Playwright
+- launcher `Flow Web UI.cmd`
+
+Người dùng cuối chỉ cần:
+1. copy hoặc giải nén thư mục đó sang máy Windows khác
+2. double click `Flow Web UI.cmd`
+
+Không cần clone repo, không cần cài Python, không cần chờ tải Chromium lại.
+
+### Windows release zip: đóng gói để gửi cho người khác
+
+Nếu muốn đóng thành một file zip để share:
+
+```powershell
+cd flow
+powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1
+```
+
+Script này sẽ tạo:
+
+```text
+dist\flow-windows-release.zip
+```
+
+Người nhận chỉ cần:
+1. tải file zip
+2. giải nén
+3. double click `Flow Web UI.cmd`
+
 ### macOS / Linux
 
 ```bash
@@ -221,3 +268,4 @@ Hiện có 34 smoke tests cho `flow_web`.
 - App state lưu tại `data/state.json`
 - Trên Windows, tránh tự tay tắt cửa sổ Chromium giữa chừng — để app tự quản lý
 - Headless mode không khuyến khích vì reCAPTCHA sẽ luôn fail
+- Bản portable/release dành cho Windows dùng `scripts/run_flow_web_portable.ps1`, nên không phụ thuộc `.venv` của máy đích
