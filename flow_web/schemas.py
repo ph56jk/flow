@@ -247,6 +247,7 @@ class CreateJobRequest(BaseModel):
     title: str = ""
     timeout_s: int = 0
     source_job_id: str = ""
+    model: str = ""
     aspect: str = "landscape"
     count: int = 1
     start_image_path: str = ""

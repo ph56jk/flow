@@ -1,5 +1,15 @@
 const ACTIVE_STATUSES = new Set(["queued", "running", "polling"]);
 const EDIT_JOB_TYPES = new Set(["extend", "upscale", "camera_motion", "camera_position", "insert", "remove"]);
+const FALLBACK_VIDEO_MODELS = [
+  { value: "Veo 3.1 - Fast", label: "Veo 3.1 - Fast" },
+  { value: "Veo 3.1 - Quality", label: "Veo 3.1 - Quality" },
+  { value: "Veo 2 - Fast", label: "Veo 2 - Fast" },
+  { value: "Veo 2 - Quality", label: "Veo 2 - Quality" },
+];
+const FALLBACK_IMAGE_MODELS = [
+  { value: "NARWHAL", label: "Nano Banana 2" },
+  { value: "IMAGEN_3", label: "Imagen 3" },
+];
 
 const MODE_CONFIG = {
   video: {
@@ -142,6 +152,12 @@ const state = {
   jobs: [],
   outputShelf: { items: [] },
   skillLibraryCount: 0,
+  modelOptions: {
+    video: [...FALLBACK_VIDEO_MODELS],
+    image: [...FALLBACK_IMAGE_MODELS],
+  },
+  modelOptionsLoaded: false,
+  modelOptionsLoading: false,
   startImagePath: "",
   startImageName: "",
   startImagePublicUrl: "",
@@ -160,9 +176,9 @@ const state = {
     image: null,
   },
   drafts: {
-    video: { prompt: "", aspect: "landscape", count: 1 },
-    image: { prompt: "", aspect: "square", count: 2 },
-    edit: { prompt: "", aspect: "landscape", count: 1 },
+    video: { prompt: "", model: "Veo 3.1 - Fast", aspect: "landscape", count: 1 },
+    image: { prompt: "", model: "NARWHAL", aspect: "square", count: 2 },
+    edit: { prompt: "", model: "", aspect: "landscape", count: 1 },
   },
   promptAiDrafts: {
     video: { brief: "", style: "", mustInclude: "", avoid: "", audience: "" },
@@ -225,6 +241,7 @@ const elements = {
   imageReferenceList: document.querySelector("#imageReferenceList"),
   imageReferenceStatus: document.querySelector("#imageReferenceStatus"),
   generationOptionsWrap: document.querySelector("#generationOptionsWrap"),
+  modelSelect: document.querySelector("#modelSelect"),
   editOptionsWrap: document.querySelector("#editOptionsWrap"),
   motionField: document.querySelector("#motionField"),
   motionSelect: document.querySelector("#motionSelect"),
@@ -435,9 +452,41 @@ function currentPromptAiResult() {
   return state.promptAiResults[state.mode];
 }
 
+function modelOptionsForMode(mode) {
+  if (mode === "image") {
+    return state.modelOptions.image?.length ? state.modelOptions.image : FALLBACK_IMAGE_MODELS;
+  }
+  if (mode === "video") {
+    return state.modelOptions.video?.length ? state.modelOptions.video : FALLBACK_VIDEO_MODELS;
+  }
+  return [];
+}
+
+function defaultModelForMode(mode) {
+  return modelOptionsForMode(mode)[0]?.value || "";
+}
+
+function modelLabelForMode(mode, value) {
+  const raw = String(value || "").trim();
+  const matched = modelOptionsForMode(mode).find((item) => item.value === raw);
+  if (matched) {
+    return matched.label;
+  }
+  if (mode === "image") {
+    if (raw === "NARWHAL") {
+      return "Nano Banana 2";
+    }
+    if (raw === "IMAGEN_3") {
+      return "Imagen 3";
+    }
+  }
+  return raw;
+}
+
 function syncDraftFromForm() {
   const draft = currentDraft();
   draft.prompt = elements.promptInput.value;
+  draft.model = elements.modelSelect.value || draft.model || defaultModelForMode(state.mode);
   draft.aspect = elements.aspectSelect.value;
   draft.count = Math.max(1, Math.min(4, Number(elements.countInput.value || draft.count || 1)));
 }
@@ -466,7 +515,15 @@ function syncPromptAiDraftFromForm() {
 function applyDraftToForm() {
   const draft = currentDraft();
   const config = currentModeConfig();
+  const options = modelOptionsForMode(state.mode);
+  const fallbackModel = defaultModelForMode(state.mode);
+  const nextModel = options.some((item) => item.value === draft.model) ? draft.model : fallbackModel;
+  draft.model = nextModel;
   elements.promptInput.value = draft.prompt || "";
+  elements.modelSelect.innerHTML = options
+    .map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`)
+    .join("");
+  elements.modelSelect.value = nextModel;
   elements.aspectSelect.value = draft.aspect || config.defaultAspect;
   elements.countInput.value = String(draft.count || config.defaultCount);
 }
@@ -580,24 +637,26 @@ function renderComposerSummary() {
   }
 
   if (state.mode === "image") {
+    const modelLabel = modelLabelForMode("image", currentDraft().model);
     if (state.imageReferenceItems.length) {
       elements.composerSummaryMode.textContent = "Chỉnh ảnh từ ảnh tham chiếu";
-      elements.composerSummaryText.textContent = `Đang dùng ${fileKindLabel(state.imageReferenceItems.length)} để ghép hoặc chỉnh theo prompt vừa nhập.`;
+      elements.composerSummaryText.textContent = `Đang dùng ${fileKindLabel(state.imageReferenceItems.length)} để ghép hoặc chỉnh theo prompt vừa nhập bằng model ${modelLabel}.`;
       return;
     }
     elements.composerSummaryMode.textContent = "Ảnh từ prompt";
-    elements.composerSummaryText.textContent = "App sẽ tạo ảnh trực tiếp từ mô tả vừa nhập.";
+    elements.composerSummaryText.textContent = `App sẽ tạo ảnh trực tiếp từ mô tả vừa nhập bằng model ${modelLabel}.`;
     return;
   }
 
+  const videoModelLabel = modelLabelForMode("video", currentDraft().model);
   if (state.startImagePath) {
     elements.composerSummaryMode.textContent = "Video từ ảnh";
-    elements.composerSummaryText.textContent = `Đang dùng ${state.startImageName || "ảnh đầu vào"} làm khung đầu tiên cho video này.`;
+    elements.composerSummaryText.textContent = `Đang dùng ${state.startImageName || "ảnh đầu vào"} làm khung đầu tiên bằng model ${videoModelLabel}.`;
     return;
   }
 
   elements.composerSummaryMode.textContent = "Video từ prompt";
-  elements.composerSummaryText.textContent = "Không có ảnh đầu vào. App sẽ tạo video trực tiếp từ mô tả vừa nhập.";
+  elements.composerSummaryText.textContent = `Không có ảnh đầu vào. App sẽ tạo video trực tiếp từ mô tả vừa nhập bằng model ${videoModelLabel}.`;
 }
 
 function renderUploadStatus() {
@@ -807,6 +866,7 @@ function fillComposerFromSource(mode, payload = {}) {
   state.mode = resolvedMode;
   state.drafts[resolvedMode] = {
     prompt: String(payload.prompt || "").trim(),
+    model: String(payload.model || defaultModelForMode(resolvedMode)).trim() || defaultModelForMode(resolvedMode),
     aspect: String(payload.aspect || MODE_CONFIG[resolvedMode].defaultAspect).trim() || MODE_CONFIG[resolvedMode].defaultAspect,
     count: Math.max(1, Math.min(4, Number(payload.count || MODE_CONFIG[resolvedMode].defaultCount))),
   };
@@ -975,6 +1035,9 @@ async function loadState({ silent = false } = {}) {
     }
 
     renderAll();
+    if (isReady() && !state.modelOptionsLoaded) {
+      void loadModelOptions();
+    }
     if (!silent) {
       showMessage("");
     }
@@ -1168,6 +1231,7 @@ async function submitCreate(event) {
   const payload = {
     type: state.mode,
     prompt: draft.prompt.trim(),
+    model: draft.model || defaultModelForMode(state.mode),
     aspect: draft.aspect || currentModeConfig().defaultAspect,
     count: Math.max(1, Math.min(4, Number(draft.count || currentModeConfig().defaultCount))),
     timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
@@ -1298,6 +1362,7 @@ function buildRetryPayload(job) {
     title: "",
     timeout_s: Math.max(30, Number(input.timeout_s || state.config?.generation_timeout_s || 300)),
     source_job_id: job.id,
+    model: String(input.model || defaultModelForMode(modeForJobType(job.type))).trim(),
     aspect: String(input.aspect || MODE_CONFIG[job.type]?.defaultAspect || "landscape").trim(),
     count: Math.max(1, Math.min(4, Number(input.count || MODE_CONFIG[job.type]?.defaultCount || 1))),
     start_image_path: String(input.start_image_path || "").trim(),
@@ -1353,6 +1418,56 @@ function changeMode(mode) {
   syncPromptAiDraftFromForm();
   state.mode = mode;
   renderAll();
+}
+
+function parseVideoModelOptions(payload) {
+  const items = Array.isArray(payload?.result?.videoModels) ? payload.result.videoModels : [];
+  const seen = new Set();
+  const options = [];
+  for (const item of items) {
+    const label = String(item?.displayName || "").trim();
+    const caps = Array.isArray(item?.capabilities) ? item.capabilities : [];
+    const deprecated = String(item?.modelStatus || "").toUpperCase().includes("DEPRECATED");
+    if (!label || deprecated || label.includes("[Lower Priority]")) {
+      continue;
+    }
+    const supportsCreate =
+      caps.includes("VIDEO_MODEL_CAPABILITY_TEXT") ||
+      caps.includes("VIDEO_MODEL_CAPABILITY_START_IMAGE");
+    if (!supportsCreate || seen.has(label)) {
+      continue;
+    }
+    seen.add(label);
+    options.push({ value: label, label });
+  }
+  return options.length ? options : [...FALLBACK_VIDEO_MODELS];
+}
+
+async function loadModelOptions() {
+  if (state.modelOptionsLoading || !isReady()) {
+    return;
+  }
+  state.modelOptionsLoading = true;
+  try {
+    const payload = await api("/api/models");
+    state.modelOptions.video = parseVideoModelOptions(payload);
+    state.modelOptions.image = [...FALLBACK_IMAGE_MODELS];
+    state.modelOptionsLoaded = true;
+    state.drafts.video.model = state.modelOptions.video.some((item) => item.value === state.drafts.video.model)
+      ? state.drafts.video.model
+      : defaultModelForMode("video");
+    state.drafts.image.model = state.modelOptions.image.some((item) => item.value === state.drafts.image.model)
+      ? state.drafts.image.model
+      : defaultModelForMode("image");
+    if (state.mode !== "edit") {
+      renderComposer();
+    }
+  } catch (error) {
+    state.modelOptions.video = [...FALLBACK_VIDEO_MODELS];
+    state.modelOptions.image = [...FALLBACK_IMAGE_MODELS];
+  } finally {
+    state.modelOptionsLoading = false;
+  }
 }
 
 function setupPolling() {
@@ -1411,6 +1526,10 @@ elements.promptAiMustInclude.addEventListener("input", syncPromptAiDraftFromForm
 elements.promptAiAvoid.addEventListener("input", syncPromptAiDraftFromForm);
 elements.promptAiAudience.addEventListener("input", syncPromptAiDraftFromForm);
 elements.promptInput.addEventListener("input", syncDraftFromForm);
+elements.modelSelect.addEventListener("change", () => {
+  syncDraftFromForm();
+  renderComposerSummary();
+});
 elements.aspectSelect.addEventListener("change", syncDraftFromForm);
 elements.countInput.addEventListener("input", syncDraftFromForm);
 elements.latestStatusCard.addEventListener("click", (event) => {

@@ -95,6 +95,36 @@ class FlowWebService:
     GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
     GEMINI_TIMEOUT_S = 30
+    DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
+    DEFAULT_IMAGE_MODEL = "NARWHAL"
+    IMAGE_MODEL_LABELS = {
+        "NARWHAL": "Nano Banana 2",
+        "IMAGEN_3": "Imagen 3",
+    }
+    IMAGE_MODEL_EDIT_VALUES = {
+        "NARWHAL": "GEM_PIX_2",
+        "IMAGEN_3": "IMAGEN_3",
+    }
+    VIDEO_MODEL_DISPLAY_ALIASES = {
+        "veo 3.1 - fast": "Veo 3.1 - Fast",
+        "veo 3.1 fast": "Veo 3.1 - Fast",
+        "veo 3.1 - quality": "Veo 3.1 - Quality",
+        "veo 3.1 quality": "Veo 3.1 - Quality",
+        "veo 2 - fast": "Veo 2 - Fast",
+        "veo 2 fast": "Veo 2 - Fast",
+        "veo 2 - quality": "Veo 2 - Quality",
+        "veo 2 quality": "Veo 2 - Quality",
+        "veo 3.1 - fast [lower priority]": "Veo 3.1 - Fast [Lower Priority]",
+    }
+    IMAGE_MODEL_ALIASES = {
+        "narwhal": "NARWHAL",
+        "gem_pix_2": "NARWHAL",
+        "nano banana": "NARWHAL",
+        "nano banana 2": "NARWHAL",
+        "imagen 3": "IMAGEN_3",
+        "imagen3": "IMAGEN_3",
+        "imagen_3": "IMAGEN_3",
+    }
     PROMPT_SKILL_PREFIXES = (
         "guides/design/",
         "guides/photo/",
@@ -2058,6 +2088,7 @@ class FlowWebService:
                     jobs = await asyncio.wait_for(
                         client.generate_video(
                             request.prompt,
+                            model=self._normalize_video_model(request.model),
                             aspect=request.aspect,
                             count=request.count,
                             start_image=request.start_image_path or None,
@@ -2976,6 +3007,44 @@ class FlowWebService:
                 return True
             return False
 
+        async def _compat_get_image_model_selector(_self: Any, page: Any) -> str:
+            await _compat_open_settings_panel(_self, page)
+            menu = await _compat_get_tabbed_menu(page)
+            if menu is None:
+                return ""
+            button = menu.locator('button[aria-haspopup="menu"]').first
+            if await button.count() > 0:
+                return str((await button.text_content()) or "").replace("arrow_drop_down", "").strip()
+            for label in ["Nano Banana", "Imagen"]:
+                locator = menu.locator("button").filter(has_text=label).first
+                if await locator.count() > 0:
+                    return str((await locator.text_content()) or "").replace("arrow_drop_down", "").strip()
+            return ""
+
+        async def _compat_select_image_model(_self: Any, page: Any, model_display_name: str) -> bool:
+            await _compat_open_settings_panel(_self, page)
+            menu = await _compat_get_tabbed_menu(page)
+            if menu is None:
+                return False
+            current = await _compat_get_image_model_selector(_self, page)
+            wanted = str(model_display_name or "").strip()
+            if wanted and wanted.lower() in current.lower():
+                return True
+
+            model_button = menu.locator('button[aria-haspopup="menu"]').first
+            if await model_button.count() > 0:
+                await model_button.click(force=True)
+                await asyncio.sleep(0.5)
+
+            if not wanted:
+                return bool(await _compat_get_image_model_selector(_self, page))
+
+            matched = await _compat_click_visible_menu_item(page, wanted)
+            if matched:
+                await asyncio.sleep(0.5)
+                return True
+            return False
+
         async def _compat_upload_via_file_input(page: Any, image_path: str) -> bool:
             selectors = [
                 'input[type="file"][accept*="image"]',
@@ -3218,6 +3287,7 @@ class FlowWebService:
             client_self: Any,
             prompt: str,
             *,
+            model: str = "Nano Banana 2",
             aspect: str = "landscape",
             count: int = 1,
             reference_images: Optional[list[str]] = None,
@@ -3249,6 +3319,7 @@ class FlowWebService:
                 switched = await client_self._ui.switch_mode(page, GenerationMode.IMAGE)
                 if not switched:
                     raise RuntimeError("Google Flow chưa chuyển sang chế độ tạo ảnh.")
+                await client_self._ui.select_image_model(page, model)
                 await client_self._ui.set_aspect_ratio(page, ratio)
                 await client_self._ui.set_count(page, batch_target)
                 await client_self._ui.fill_prompt(page, prompt)
@@ -3493,6 +3564,8 @@ class FlowWebService:
         FlowUI.set_count = _compat_set_count
         FlowUI.get_video_model_selector = _compat_get_video_model_selector
         FlowUI.select_video_model = _compat_select_video_model
+        FlowUI.get_image_model_selector = _compat_get_image_model_selector
+        FlowUI.select_image_model = _compat_select_image_model
         FlowClient.generate_video = _compat_generate_video
         FlowClient.generate_image = _compat_generate_image
         self.__class__._FLOW_RUNTIME_PATCHED = True
@@ -4437,6 +4510,7 @@ class FlowWebService:
         payload["type"] = str(payload.get("type", "")).strip()
         payload["prompt"] = str(payload.get("prompt", "")).strip()
         payload["title"] = str(payload.get("title", "")).strip()
+        payload["model"] = self._normalize_job_model(payload["type"], str(payload.get("model", "")).strip())
         payload["aspect"] = str(payload.get("aspect", "landscape")).strip() or "landscape"
         payload["start_image_path"] = str(payload.get("start_image_path", "")).strip()
         payload["reference_image_paths"] = [
@@ -5245,6 +5319,9 @@ class FlowWebService:
         if request.type in {"video", "image"} and not 1 <= int(request.count) <= 4:
             raise HTTPException(status_code=400, detail="Số lượng cho tác vụ tạo nội dung phải nằm trong khoảng 1 đến 4.")
 
+        if request.type == "image" and self._normalize_image_model(request.model) not in self.IMAGE_MODEL_LABELS:
+            raise HTTPException(status_code=400, detail="Model ảnh này hiện chưa được hỗ trợ trong app.")
+
         if request.type in {"extend", "upscale", "camera_motion", "camera_position", "insert", "remove"}:
             if not request.media_id.strip():
                 raise HTTPException(status_code=400, detail="Vui lòng nhập Media ID cho tác vụ chỉnh sửa.")
@@ -5265,6 +5342,42 @@ class FlowWebService:
         if normalized == "square":
             return "IMAGE_ASPECT_RATIO_SQUARE"
         return "IMAGE_ASPECT_RATIO_LANDSCAPE"
+
+    def _normalize_video_model(self, model: str) -> str:
+        raw = str(model or "").strip()
+        if not raw:
+            return self.DEFAULT_VIDEO_MODEL
+        compact = re.sub(r"\s+", " ", raw).strip().lower()
+        return self.VIDEO_MODEL_DISPLAY_ALIASES.get(compact, raw)
+
+    def _normalize_image_model(self, model: str) -> str:
+        raw = str(model or "").strip()
+        if not raw:
+            return self.DEFAULT_IMAGE_MODEL
+        compact = re.sub(r"\s+", " ", raw).strip().lower()
+        normalized = self.IMAGE_MODEL_ALIASES.get(compact, raw.upper())
+        if normalized not in self.IMAGE_MODEL_LABELS:
+            return self.DEFAULT_IMAGE_MODEL
+        return normalized
+
+    def _normalize_job_model(self, request_type: str, model: str) -> str:
+        kind = str(request_type or "").strip()
+        if kind == "video":
+            return self._normalize_video_model(model)
+        if kind == "image":
+            return self._normalize_image_model(model)
+        return str(model or "").strip()
+
+    def _image_api_model_name(self, model: str) -> str:
+        return self._normalize_image_model(model)
+
+    def _image_edit_model_name(self, model: str) -> str:
+        normalized = self._normalize_image_model(model)
+        return self.IMAGE_MODEL_EDIT_VALUES.get(normalized, self.IMAGE_MODEL_EDIT_VALUES[self.DEFAULT_IMAGE_MODEL])
+
+    def _image_ui_model_label(self, model: str) -> str:
+        normalized = self._normalize_image_model(model)
+        return self.IMAGE_MODEL_LABELS.get(normalized, self.IMAGE_MODEL_LABELS[self.DEFAULT_IMAGE_MODEL])
 
     def _normalize_local_upload_paths(self, values: List[str]) -> List[str]:
         roots = [UPLOADS_DIR.resolve()]
@@ -5411,6 +5524,7 @@ class FlowWebService:
         client: Any,
         prompt: str,
         *,
+        model: str,
         aspect: str,
         count: int,
         reference_media_names: List[str],
@@ -5452,7 +5566,7 @@ class FlowWebService:
             "requests": [
                 {
                     "clientContext": dict(client_context),
-                    "imageModelName": "GEM_PIX_2",
+                    "imageModelName": self._image_edit_model_name(model),
                     "imageAspectRatio": self._image_api_aspect_ratio(aspect),
                     "structuredPrompt": {"parts": [{"text": prompt}]},
                     "seed": random.randint(0, 2**31 - 1),
@@ -5512,6 +5626,7 @@ class FlowWebService:
             return await self._generate_image_edit_result(
                 client,
                 request.prompt,
+                model=request.model,
                 aspect=request.aspect,
                 count=target_count,
                 reference_media_names=reference_media_names,
@@ -5519,6 +5634,7 @@ class FlowWebService:
             )
         return await client._api.generate_image(
             request.prompt,
+            model=self._image_api_model_name(request.model),
             aspect_ratio=self._image_api_aspect_ratio(request.aspect),
             count=target_count,
         )
@@ -5537,6 +5653,7 @@ class FlowWebService:
             return await self._generate_single_reference_image_via_ui(
                 client,
                 request.prompt,
+                model=request.model,
                 workflow_id=request.workflow_id or "",
                 reference_media_name=reference_media_names[0],
                 count=max(1, min(4, int(request.count or 1))),
@@ -5544,6 +5661,7 @@ class FlowWebService:
             )
         return await client.generate_image(
             request.prompt,
+            model=self._image_ui_model_label(request.model),
             aspect=request.aspect,
             count=max(1, min(4, int(request.count or 1))),
             timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
@@ -5554,6 +5672,7 @@ class FlowWebService:
         client: Any,
         prompt: str,
         *,
+        model: str,
         reference_media_name: str,
         workflow_id: str = "",
         count: int = 1,
@@ -5579,6 +5698,7 @@ class FlowWebService:
 
         try:
             await client._ui.open_settings_panel(page)
+            await client._ui.select_image_model(page, self._image_ui_model_label(model))
             await client._ui.set_count(page, max(1, min(4, int(count or 1))))
         except Exception:
             pass

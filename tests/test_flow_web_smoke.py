@@ -93,7 +93,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual(420, resolved.timeout_s)
         self.assertEqual("wf-default", resolved.workflow_id)
+        self.assertEqual("Veo 3.1 - Fast", resolved.model)
         self.assertEqual("landscape", resolved.aspect)
+
+    def test_resolve_job_request_normalizes_image_model(self) -> None:
+        config = AppConfig(project_id="pid", generation_timeout_s=420)
+        request = CreateJobRequest(type="image", prompt="run", model="Nano Banana 2")
+
+        resolved = self.service._resolve_job_request(request, config)
+
+        self.assertEqual("NARWHAL", resolved.model)
 
     def test_canonical_project_url_uses_vi_locale_route(self) -> None:
         self.assertEqual(
@@ -510,6 +519,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ):
             await self.service._run_flow_job(job.id, request)
 
+        fake_client.generate_video.assert_awaited_once()
+        self.assertEqual("Veo 3.1 - Fast", fake_client.generate_video.await_args.kwargs["model"])
         saved = self.store.get_job(job.id)
         self.assertIsNotNone(saved)
         self.assertEqual("completed", saved.status)
@@ -731,6 +742,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         images = await self.service._generate_image_edit_result(
             fake_client,
             "ghép logo lên áo",
+            model="IMAGEN_3",
             aspect="portrait",
             count=2,
             reference_media_names=["base-media", "logo-media"],
@@ -741,7 +753,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("projects/pid/flowMedia:batchGenerateImages", captured_body["url"])
         self.assertEqual(2, len(captured_body["body"]["requests"]))
         for request_payload in captured_body["body"]["requests"]:
-            self.assertEqual("GEM_PIX_2", request_payload["imageModelName"])
+            self.assertEqual("IMAGEN_3", request_payload["imageModelName"])
             self.assertEqual("IMAGE_ASPECT_RATIO_PORTRAIT", request_payload["imageAspectRatio"])
             self.assertEqual("wf-base", request_payload["clientContext"]["workflowId"])
             self.assertEqual(
@@ -754,7 +766,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
     async def test_run_flow_job_uses_direct_image_api_for_exact_count(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        request = CreateJobRequest(type="image", prompt="meo de thuong", count=2, aspect="square")
+        request = CreateJobRequest(type="image", prompt="meo de thuong", count=2, aspect="square", model="IMAGEN_3")
         job = JobRecord(
             type="image",
             status="queued",
@@ -793,6 +805,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         fake_client._api.generate_image.assert_awaited_once()
         kwargs = fake_client._api.generate_image.await_args.kwargs
         self.assertEqual(2, kwargs["count"])
+        self.assertEqual("IMAGEN_3", kwargs["model"])
         self.assertEqual("IMAGE_ASPECT_RATIO_SQUARE", kwargs["aspect_ratio"])
 
         saved = self.store.get_job(job.id)
