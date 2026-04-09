@@ -12,7 +12,7 @@ dependencies = [
     "fastapi>=0.115.0,<1.0.0",
     "uvicorn[standard]>=0.30.0,<1.0.0",
     "python-multipart>=0.0.9,<1.0.0",
-    "flow-py @ git+https://github.com/eddie-fqh/flow-py.git",
+    "flow-py @ https://github.com/eddie-fqh/flow-py/archive/bd01679304d6fccc4c96fea3b33151c2e9e836f4.zip",
 ]
 
 [project.optional-dependencies]

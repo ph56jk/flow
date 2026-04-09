@@ -9,7 +9,7 @@ Web app local điều khiển [flow-py](https://github.com/eddie-fqh/flow-py) qu
 | Mục | Yêu cầu |
 |---|---|
 | OS | Windows 10/11 hoặc macOS / Linux |
-| Python | **3.11+** (bắt buộc, không chạy được trên 3.9/3.10) |
+| Python | **3.11+**. Trên Windows, script one-click có thể tự kéo Python portable nếu máy chưa có |
 | Git | Cần để clone repo |
 | Chromium | Sẽ do Playwright tự tải |
 | Tài khoản Google | Đã được cấp quyền truy cập Google Flow (labs.google/fx) |
@@ -26,6 +26,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\run_flow_web.ps1
 ```
 
 Script này sẽ tự:
+- chọn ổ còn nhiều chỗ trống hơn để đặt runtime nếu `C:` gần đầy
+- tự kéo Python portable nếu máy chưa có Python 3.11 chuẩn
 - tạo `.venv` nếu chưa có
 - cài dependencies nếu thiếu hoặc vừa pull code mới
 - cài Chromium cho Playwright nếu chưa có
@@ -45,9 +47,10 @@ Nếu dùng macOS và thích double-click:
 
 ### ⚠️ Windows lưu ý đặc biệt
 
-- **Path cài Chromium KHÔNG được có khoảng trắng.** Thư mục `C:\Users\HAVI GROUP\...` sẽ gây lỗi `side-by-side configuration is incorrect` / `spawn UNKNOWN`. Script `run_flow_web.ps1` sẽ tự dùng `C:\pw-flow` nếu chủ nhân chưa set `PLAYWRIGHT_BROWSERS_PATH`.
+- **Path cài Chromium KHÔNG được có khoảng trắng.** Thư mục `C:\Users\HAVI GROUP\...` sẽ gây lỗi `side-by-side configuration is incorrect` / `spawn UNKNOWN`. Script `run_flow_web.ps1` sẽ tự chọn path kiểu `D:\pw-flow` hoặc `C:\pw-flow` theo ổ còn trống.
 - Cần **Microsoft Visual C++ Redistributable (x64)** mới nhất — Chromium yêu cầu.
 - Biến môi trường `Path` **không được có entry rỗng** (dấu `;` thừa cuối chuỗi) vì sẽ gây Node.js `spawn UNKNOWN` khi Playwright launch browser.
+- `flow-py` đã được đổi sang tải từ file zip GitHub trực tiếp, nên **không còn bắt buộc phải có Git** chỉ để `pip install` chạy được.
 - Các script `.sh` trong repo chỉ dùng cho macOS/Linux. Trên Windows dùng PowerShell hoặc các script `scripts/setup_windows.ps1`, `scripts/run_flow_web.ps1`.
 - Google Flow dùng browser automation + reCAPTCHA → **chạy ở chế độ hiện cửa sổ (không headless)** ổn định hơn nhiều so với headless.
 

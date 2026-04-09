@@ -5629,21 +5629,6 @@ class FlowWebService:
         request: CreateJobRequest,
         reference_media_names: List[str],
     ) -> List[Any]:
-        # Đi thẳng UI path để tránh reCAPTCHA của API path lặp lại mỗi lần
-        if not reference_media_names:
-            await self.store.append_log(
-                job_id,
-                "Đang tạo ảnh qua giao diện Flow. Nếu Chromium hiện reCAPTCHA, hãy bấm giải bằng tay.",
-            )
-            try:
-                return await self._generate_images_via_ui(client, request, reference_media_names)
-            except Exception as exc:
-                if self._is_recaptcha_error(exc):
-                    await self.store.append_log(
-                        job_id,
-                        "Google Flow vẫn đang chặn bằng reCAPTCHA. Vui lòng mở cửa sổ Chromium và giải captcha rồi thử lại.",
-                    )
-                raise
         try:
             return await self._generate_images_once(client, request, reference_media_names)
         except Exception as exc:
