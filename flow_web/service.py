@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import shlex
 import shutil
 import time
 import unicodedata
+import uuid
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
@@ -116,6 +118,12 @@ class FlowWebService:
         ensure_app_dirs()
         self.store = store
         self._tasks: Dict[str, asyncio.Task] = {}
+        self._browser_session_lock = asyncio.Lock()
+        self._shared_browser: Any | None = None
+
+    async def close(self) -> None:
+        async with self._browser_session_lock:
+            await self._close_shared_browser()
 
     def get_state(self) -> Dict[str, Any]:
         snapshot = self.store.snapshot()
@@ -183,6 +191,46 @@ class FlowWebService:
     def get_auth_status(self) -> AuthStatus:
         _, is_authenticated, _, _, _ = self._flow_modules()
         return AuthStatus(authenticated=is_authenticated())
+
+    async def logout_flow(self) -> Dict[str, Any]:
+        snapshot = self.store.snapshot()
+        config = self._normalized_config(snapshot.config)
+        active_jobs = [job for job in snapshot.jobs if job.status in {"queued", "running", "polling"}]
+
+        if active_jobs:
+            raise HTTPException(
+                status_code=409,
+                detail="Đang có tác vụ chạy. Hãy chờ xong rồi đăng xuất Google Flow để tránh ngắt phiên giữa chừng.",
+            )
+
+        if config.cdp_url:
+            raise HTTPException(
+                status_code=400,
+                detail="Phiên này đang dùng Chrome ngoài qua CDP. Hãy đăng xuất trực tiếp trong trình duyệt Chrome đó.",
+            )
+
+        from flow._storage import PROFILE_DIR, ensure_dirs
+
+        profile_dir = Path(PROFILE_DIR)
+        cookies_path = profile_dir / "Default" / "Cookies"
+        had_session = cookies_path.exists() and cookies_path.stat().st_size > 0
+
+        try:
+            await self.close()
+            if profile_dir.exists():
+                shutil.rmtree(profile_dir)
+            ensure_dirs()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail="Không thể xóa phiên Google Flow hiện tại. Nếu còn cửa sổ Chromium của Flow đang mở, hãy đóng nó rồi thử lại.",
+            ) from exc
+
+        return {
+            "ok": True,
+            "had_session": had_session,
+            "auth": _model_dump(self.get_auth_status()),
+        }
 
     def list_projects(self) -> List[ProjectEntry]:
         _, _, load_projects, get_active_project, _ = self._flow_modules()
@@ -1916,10 +1964,9 @@ class FlowWebService:
             await self.store.patch_job(job_id, status="running")
             await self._set_job_progress(job_id, "launching_browser", "Em đang mở Chromium để đi tới Google Flow.")
             await self.store.append_log(job_id, "Đang mở Chromium để đăng nhập Google Flow")
-            BrowserManager, _, _, _, _ = self._flow_modules()
-            browser = BrowserManager(headless=False)
-            await browser.start()
-            try:
+            config = self._normalized_config(self.store.snapshot().config)
+            async with self._browser_session_lock:
+                browser = await self._ensure_shared_browser()
                 page = await browser.page()
                 await page.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded")
                 await self._set_job_progress(
@@ -1941,10 +1988,12 @@ class FlowWebService:
                     await asyncio.sleep(2)
                 if not email:
                     raise RuntimeError("Hết thời gian chờ đăng nhập Google Flow.")
+                if config.project_id:
+                    await page.goto(self._project_url(config.project_id), wait_until="domcontentloaded")
+                    await asyncio.sleep(1.5)
+                await self.store.append_log(job_id, "Em sẽ giữ nguyên tab Google Flow này để dùng tiếp cho các lượt chạy sau.")
                 await self.store.append_log(job_id, f"Đã đăng nhập với tài khoản {email}")
                 await self.store.patch_job(job_id, status="completed", result={"email": email})
-            finally:
-                await browser.stop()
         except Exception as exc:
             detail = self._flow_error_detail(exc)
             await self.store.patch_job(job_id, status="failed", error=detail)
@@ -1963,7 +2012,8 @@ class FlowWebService:
             timeout_s = max(30, int(request.timeout_s or config.generation_timeout_s))
 
             if request.type == "video":
-                send_timeout_s = max(30, min(timeout_s, 90))
+                requested_count = max(1, int(request.count or 1))
+                send_timeout_s = max(30, min(timeout_s, 90 * requested_count))
                 if request.start_image_path:
                     await self.store.append_log(job_id, "Đang chuẩn bị tải ảnh đầu vào và gắn vào ô Start.")
                     await self._set_job_progress(
@@ -1992,6 +2042,11 @@ class FlowWebService:
                     ) from exc
                 if not jobs:
                     raise RuntimeError("Google Flow chưa khởi tạo được clip video nào từ yêu cầu này.")
+                if len(jobs) < requested_count:
+                    raise RuntimeError(
+                        f"Google Flow chỉ khởi tạo {len(jobs)}/{requested_count} clip trong lượt gửi này. "
+                        "Em không tự bấm gửi thêm để tránh tạo dư clip ngoài ý muốn. Hãy thử chạy lại."
+                    )
                 await self.store.append_log(job_id, f"Đã gửi {len(jobs)} tác vụ tạo video")
                 await self._set_job_progress(
                     job_id,
@@ -2017,13 +2072,22 @@ class FlowWebService:
                 }
 
             if request.type == "image":
-                await self._set_job_progress(job_id, "sending_request", "Em đang gửi yêu cầu tạo ảnh tới Flow.")
-                images = await client.generate_image(
-                    request.prompt,
-                    aspect=request.aspect,
-                    count=request.count,
-                    reference_images=request.reference_media_names or None,
-                    timeout_s=timeout_s,
+                reference_media_names = await self._resolve_image_reference_media(client, job_id, request)
+                all_reference_media_names = reference_media_names or list(request.reference_media_names or [])
+                if all_reference_media_names:
+                    await self._set_job_progress(
+                        job_id,
+                        "sending_request",
+                        f"Em đang gửi yêu cầu chỉnh ảnh với {len(all_reference_media_names)} ảnh tham chiếu tới Flow.",
+                    )
+                else:
+                    await self._set_job_progress(job_id, "sending_request", "Em đang gửi yêu cầu tạo ảnh tới Flow.")
+
+                images = await self._generate_images_with_retry(
+                    client,
+                    job_id,
+                    request,
+                    all_reference_media_names,
                 )
                 await self.store.append_log(job_id, f"Đã tạo {len(images)} ảnh")
                 await self._set_job_progress(
@@ -2332,10 +2396,33 @@ class FlowWebService:
         if not config.project_id:
             raise HTTPException(status_code=400, detail="Mã project là bắt buộc.")
         effective_timeout_s = max(30, int(timeout_s or config.generation_timeout_s))
+        resolved_workflow_id = workflow_id or config.active_workflow_id or None
+
+        if self._should_keep_flow_browser_open(config):
+            async with self._browser_session_lock:
+                try:
+                    browser = await self._ensure_shared_browser()
+                    client = await self._build_client_from_shared_browser(
+                        browser,
+                        project_id=config.project_id,
+                        workflow_id=resolved_workflow_id,
+                        timeout_s=effective_timeout_s,
+                    )
+                    return await fn(client)
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    if self._is_browser_closed_error(exc):
+                        await self._close_shared_browser()
+                    raise HTTPException(
+                        status_code=self._flow_error_status(exc),
+                        detail=self._flow_error_detail(exc),
+                    ) from exc
+
         try:
             client = await FlowClient.create(
                 project_id=config.project_id,
-                workflow_id=workflow_id or config.active_workflow_id or None,
+                workflow_id=resolved_workflow_id,
                 headless=config.headless,
                 cdp_url=config.cdp_url or None,
                 timeout_s=effective_timeout_s,
@@ -2356,6 +2443,76 @@ class FlowWebService:
             ) from exc
         finally:
             await client.close()
+
+    def _should_keep_flow_browser_open(self, config: AppConfig) -> bool:
+        return not config.headless and not config.cdp_url
+
+    async def _close_shared_browser(self) -> None:
+        browser = self._shared_browser
+        self._shared_browser = None
+        if browser is None:
+            return
+        try:
+            await browser.stop()
+        except Exception:
+            pass
+
+    async def _shared_browser_is_usable(self) -> bool:
+        browser = self._shared_browser
+        if browser is None or getattr(browser, "_ctx", None) is None:
+            return False
+        try:
+            page = await browser.page()
+            if page.is_closed():
+                return False
+            await page.evaluate("() => document.readyState")
+            return True
+        except Exception:
+            return False
+
+    async def _ensure_shared_browser(self) -> Any:
+        if await self._shared_browser_is_usable():
+            return self._shared_browser
+        await self._close_shared_browser()
+        BrowserManager, _, _, _, _ = self._flow_modules()
+        browser = BrowserManager(headless=False)
+        await browser.start()
+        self._shared_browser = browser
+        return browser
+
+    async def _build_client_from_shared_browser(
+        self,
+        browser: Any,
+        *,
+        project_id: str,
+        workflow_id: str | None,
+        timeout_s: int,
+    ) -> Any:
+        self._patch_flow_runtime_compat()
+        from flow._api import FlowAPI
+        from flow._client import FlowClient
+
+        api = FlowAPI(browser, project_id=project_id, default_timeout_s=timeout_s)
+        client = FlowClient(api, browser, project_id, workflow_id)
+        client.workflow_id = workflow_id
+        client._project_url = self._project_url(project_id)
+
+        page = await browser.page()
+        target_url = client._project_url
+        if not page.url.startswith(target_url):
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=20_000)
+            await asyncio.sleep(2)
+        return client
+
+    def _is_browser_closed_error(self, exc: Exception) -> bool:
+        detail = str(exc or "").lower()
+        needles = (
+            "target page, context or browser has been closed",
+            "browser has been closed",
+            "context closed",
+            "page closed",
+        )
+        return any(needle in detail for needle in needles)
 
     def _sync_project_to_flow_storage(self, config: AppConfig) -> None:
         project_id = self._normalize_project_id(config.project_id or config.project_url)
@@ -2387,7 +2544,7 @@ class FlowWebService:
         if self.__class__._FLOW_RUNTIME_PATCHED:
             return
 
-        from flow._api import VideoJob
+        from flow._api import FlowAPI, GeneratedImage, VideoJob, RECAPTCHA_SITE_KEY
         from flow._client import FlowClient
         from flow._flow_ui import FlowUI
         from flow._models import AspectRatio, GenerationMode
@@ -2411,8 +2568,8 @@ class FlowWebService:
                 """
             ))
 
-        async def _compat_click_menu_trigger(page: Any) -> bool:
-            clicked = await page.evaluate(
+        async def _compat_find_create_options_trigger_index(page: Any) -> int:
+            index = await page.evaluate(
                 """
                 () => {
                   const buttons = [...document.querySelectorAll('button[aria-haspopup="menu"]')];
@@ -2431,20 +2588,130 @@ class FlowWebService:
                           && style.visibility !== 'hidden',
                       };
                     })
-                    .filter(item => item.visible && /(x[1-4]|Nano Banana|Veo|Imagen|🍌)/.test(item.text))
+                    .filter(item => item.visible && /(x[1-4]|Nano Banana|Veo|Imagen|Video|Image|🍌)/i.test(item.text))
                     .sort((a, b) => a.top - b.top);
-                  if (!candidates.length) {
-                    return false;
-                  }
-                  buttons[candidates[candidates.length - 1].index].click();
-                  return true;
+                  return candidates.length ? candidates[candidates.length - 1].index : -1;
                 }
                 """
             )
-            if clicked:
-                await asyncio.sleep(0.5)
-                return True
-            return False
+            try:
+                return int(index)
+            except Exception:
+                return -1
+
+        async def _compat_find_tabbed_menu_index(page: Any) -> int:
+            index = await page.evaluate(
+                """
+                () => {
+                  const menus = [...document.querySelectorAll('[role="menu"]')];
+                  const candidates = menus
+                    .map((menu, index) => {
+                      const style = window.getComputedStyle(menu);
+                      const rect = menu.getBoundingClientRect();
+                      const tabs = [...menu.querySelectorAll('[role="tab"]')].filter((tab) => {
+                        const tabStyle = window.getComputedStyle(tab);
+                        const tabRect = tab.getBoundingClientRect();
+                        return tabRect.width > 0
+                          && tabRect.height > 0
+                          && tabStyle.display !== 'none'
+                          && tabStyle.visibility !== 'hidden';
+                      });
+                      return {
+                        index,
+                        top: rect.top,
+                        visible: rect.width > 0
+                          && rect.height > 0
+                          && style.display !== 'none'
+                          && style.visibility !== 'hidden',
+                        tabCount: tabs.length,
+                      };
+                    })
+                    .filter((item) => item.visible && item.tabCount > 0)
+                    .sort((a, b) => a.top - b.top);
+                  return candidates.length ? candidates[candidates.length - 1].index : -1;
+                }
+                """
+            )
+            try:
+                return int(index)
+            except Exception:
+                return -1
+
+        async def _compat_get_tabbed_menu(page: Any) -> Any | None:
+            index = await _compat_find_tabbed_menu_index(page)
+            if index < 0:
+                return None
+            return page.locator('[role="menu"]').nth(index)
+
+        async def _compat_wait_for_new_call(
+            interceptor: Any,
+            start_index: int,
+            endpoint_tail: str,
+            *,
+            timeout_s: float,
+            fail_on_tails: Optional[List[str]] = None,
+        ) -> Any:
+            deadline = time.monotonic() + timeout_s
+            seen_tails: List[str] = []
+            fail_on = [str(item or "") for item in (fail_on_tails or []) if str(item or "")]
+            best_match = None
+            settle_deadline = 0.0
+
+            def _response_weight(call: Any) -> int:
+                if not isinstance(getattr(call, "resp", None), dict):
+                    return 0
+                resp = call.resp or {}
+                return (
+                    len(resp.get("jobs", []) or [])
+                    + len(resp.get("media", []) or [])
+                    + len(resp.get("workflows", []) or [])
+                )
+
+            while time.monotonic() < deadline:
+                completed = [
+                    call
+                    for call in getattr(interceptor, "_calls", [])[start_index:]
+                    if call.resp is not None
+                ]
+                if completed:
+                    seen_tails = [str(call.tail or "") for call in completed]
+                for call in reversed(completed):
+                    tail = str(call.tail or "")
+                    if any(fragment in tail for fragment in fail_on):
+                        raise RuntimeError(
+                            "Google Flow đã gửi nhầm endpoint cho thao tác hiện tại. "
+                            f"Captured: {tail}"
+                        )
+                    if endpoint_tail not in tail:
+                        continue
+                    if call.status not in (200, 201):
+                        message = ""
+                        if isinstance(call.resp, dict):
+                            message = str(((call.resp.get("error") or {}).get("message")) or "").strip()
+                        raise RuntimeError(
+                            f"{endpoint_tail} failed [{call.status}]: {message or tail}"
+                        )
+                    if best_match is None or _response_weight(call) >= _response_weight(best_match):
+                        best_match = call
+                        settle_deadline = time.monotonic() + 1.0
+                if best_match is not None and time.monotonic() >= settle_deadline:
+                    return best_match
+                await asyncio.sleep(0.25)
+            raise RuntimeError(
+                f"Timed out ({timeout_s}s) waiting for {endpoint_tail}. Captured so far: {seen_tails}"
+            )
+
+        async def _compat_click_menu_trigger(page: Any) -> bool:
+            index = await _compat_find_create_options_trigger_index(page)
+            if index < 0:
+                return False
+            trigger = page.locator('button[aria-haspopup="menu"]').nth(index)
+            try:
+                await trigger.click(force=True)
+            except Exception:
+                return False
+            await asyncio.sleep(0.5)
+            return True
 
         async def _compat_open_settings_panel(_self: Any, page: Any) -> bool:
             try:
@@ -2464,13 +2731,157 @@ class FlowWebService:
             return False
 
         async def _compat_click_menu_tab(page: Any, labels: List[str]) -> bool:
+            menu = await _compat_get_tabbed_menu(page)
+            if menu is None:
+                return False
             for label in labels:
-                locator = page.locator('[role="menu"] [role="tab"]').filter(has_text=label).first
-                if await locator.count() > 0:
-                    await locator.click(force=True)
-                    await asyncio.sleep(0.5)
-                    return True
+                wanted = str(label or "").strip().lower()
+                tabs = menu.locator('[role="tab"]')
+                count = await tabs.count()
+                matched = False
+                for index in range(count):
+                    tab = tabs.nth(index)
+                    try:
+                        box = await tab.bounding_box()
+                    except Exception:
+                        box = None
+                    if not box:
+                        continue
+                    text = str(await tab.text_content() or "").replace("\n", " ").strip().lower()
+                    if wanted not in text:
+                        continue
+                    try:
+                        await tab.click(force=True)
+                    except Exception:
+                        continue
+                    matched = True
+                    break
+                if not matched:
+                    continue
+                await asyncio.sleep(0.45)
+                selected_tabs = menu.locator('[role="tab"][aria-selected="true"]')
+                selected_count = await selected_tabs.count()
+                for selected_index in range(selected_count):
+                    text = str(await selected_tabs.nth(selected_index).text_content() or "").replace("\n", " ").strip().lower()
+                    if wanted in text:
+                        return True
             return False
+
+        async def _compat_click_visible_menu_item(page: Any, wanted: str) -> bool:
+            wanted = str(wanted or "").strip().lower()
+            items = page.locator('[role="menuitem"]')
+            count = await items.count()
+            for index in range(count):
+                item = items.nth(index)
+                try:
+                    box = await item.bounding_box()
+                except Exception:
+                    box = None
+                if not box:
+                    continue
+                text = str(await item.text_content() or "").replace("\n", " ").strip().lower()
+                if wanted not in text:
+                    continue
+                try:
+                    await item.click(force=True)
+                    return True
+                except Exception:
+                    continue
+            return False
+
+        async def _compat_fill_prompt(_self: Any, page: Any, prompt: str) -> bool:
+            prompt = str(prompt or "").strip()
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.2)
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.2)
+            except Exception:
+                pass
+
+            best = None
+            best_is_input = False
+            best_y = -1.0
+            for selector, is_input in (
+                ('div[role="textbox"][contenteditable="true"]', False),
+                ('div[data-slate-editor="true"][contenteditable="true"]', False),
+                ('div[contenteditable="true"]', False),
+                ('textarea', True),
+                ('input[type="text"]', True),
+            ):
+                locator = page.locator(selector)
+                count = await locator.count()
+                for index in range(count):
+                    candidate = locator.nth(index)
+                    try:
+                        box = await candidate.bounding_box()
+                    except Exception:
+                        box = None
+                    if not box:
+                        continue
+                    if box["width"] < 240 or box["height"] < 18 or box["y"] < 300:
+                        continue
+                    if box["y"] >= best_y:
+                        best = candidate
+                        best_is_input = is_input
+                        best_y = float(box["y"])
+
+            if best is None:
+                return False
+
+            await best.scroll_into_view_if_needed()
+            await asyncio.sleep(0.1)
+            await best.click(force=True)
+            await asyncio.sleep(0.2)
+
+            if best_is_input:
+                try:
+                    await best.fill(prompt)
+                except Exception:
+                    return False
+                try:
+                    value = await best.input_value()
+                except Exception:
+                    value = await best.text_content()
+                return prompt[:20] in str(value or "")
+
+            try:
+                await page.keyboard.press("Meta+a")
+                await page.keyboard.press("Control+a")
+                await asyncio.sleep(0.05)
+                await page.keyboard.press("Backspace")
+                await asyncio.sleep(0.05)
+                await page.keyboard.insert_text(prompt)
+                await asyncio.sleep(0.2)
+                content = await best.text_content()
+                if prompt[:20] in str(content or ""):
+                    return True
+            except Exception:
+                pass
+
+            try:
+                injected = await best.evaluate(
+                    """
+                    (el, value) => {
+                      el.focus();
+                      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
+                        el.value = value;
+                      } else {
+                        const paragraph = el.querySelector('[data-slate-node="element"]') || el.firstElementChild || el;
+                        if (paragraph) {
+                          paragraph.textContent = value;
+                        }
+                      }
+                      el.dispatchEvent(new Event('input', { bubbles: true }));
+                      el.dispatchEvent(new Event('change', { bubbles: true }));
+                      return (el.textContent || el.value || '').trim();
+                    }
+                    """,
+                    prompt,
+                )
+            except Exception:
+                return False
+            return prompt[:20] in str(injected or "")
 
         async def _compat_switch_mode(_self: Any, page: Any, mode: Any) -> bool:
             await _compat_open_settings_panel(_self, page)
@@ -2496,20 +2907,29 @@ class FlowWebService:
 
         async def _compat_get_video_model_selector(_self: Any, page: Any) -> str:
             await _compat_open_settings_panel(_self, page)
+            menu = await _compat_get_tabbed_menu(page)
+            if menu is None:
+                return ""
+            button = menu.locator('button[aria-haspopup="menu"]').first
+            if await button.count() > 0:
+                return str((await button.text_content()) or "").replace("arrow_drop_down", "").strip()
             for label in ["Veo", "Nano Banana", "Imagen"]:
-                locator = page.locator('[role="menu"] button').filter(has_text=label).first
+                locator = menu.locator("button").filter(has_text=label).first
                 if await locator.count() > 0:
                     return str((await locator.text_content()) or "").replace("arrow_drop_down", "").strip()
             return ""
 
         async def _compat_select_video_model(_self: Any, page: Any, model_display_name: str) -> bool:
             await _compat_open_settings_panel(_self, page)
+            menu = await _compat_get_tabbed_menu(page)
+            if menu is None:
+                return False
             current = await _compat_get_video_model_selector(_self, page)
             wanted = str(model_display_name or "").strip()
             if wanted and wanted.lower() in current.lower():
                 return True
 
-            model_button = page.locator('[role="menu"] button').filter(has_text="arrow_drop_down").first
+            model_button = menu.locator('button[aria-haspopup="menu"]').first
             if await model_button.count() > 0:
                 await model_button.click(force=True)
                 await asyncio.sleep(0.5)
@@ -2517,9 +2937,8 @@ class FlowWebService:
             if not wanted:
                 return bool(await _compat_get_video_model_selector(_self, page))
 
-            option = page.locator("button").filter(has_text=wanted).first
-            if await option.count() > 0:
-                await option.click(force=True)
+            matched = await _compat_click_visible_menu_item(page, wanted)
+            if matched:
                 await asyncio.sleep(0.5)
                 return True
             return False
@@ -2577,10 +2996,12 @@ class FlowWebService:
                 await asyncio.sleep(0.5)
 
             candidates = [
-                dialog.locator('[data-index]').filter(has_text=image_name).first,
-                dialog.locator('[role="button"]').filter(has_text=image_name).first,
-                dialog.locator("button").filter(has_text=image_name).first,
-                dialog.get_by_text(image_name, exact=True).first,
+                dialog.locator('[data-index]').filter(has_text=image_name).last,
+                dialog.locator('[data-item-index]').filter(has_text=image_name).last,
+                dialog.locator('img[alt]').filter(has_text=image_name).last,
+                dialog.locator('[role="button"]').filter(has_text=image_name).last,
+                dialog.locator("button").filter(has_text=image_name).last,
+                dialog.get_by_text(image_name, exact=True).last,
             ]
             for candidate in candidates:
                 try:
@@ -2660,19 +3081,31 @@ class FlowWebService:
                 await _compat_close_dialog(page)
                 return False
 
+            click_attempts = [
+                ("row", lambda: row.click(force=True)),
+                ("image", lambda: row.locator("img").first.click(force=True)),
+                ("first-child", lambda: row.evaluate("(el) => (el.firstElementChild || el).click()")),
+            ]
+            for _, action in click_attempts:
+                try:
+                    await action()
+                except Exception:
+                    continue
+                try:
+                    await page.wait_for_function(
+                        "() => !document.querySelector('[role=\"dialog\"]')",
+                        timeout=5000,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+                if await page.locator('[role="dialog"]').count() == 0:
+                    return True
             try:
-                await row.evaluate("(el) => (el.firstElementChild || el).click()")
-            except Exception:
-                await row.click(force=True)
-            try:
-                await page.wait_for_function(
-                    "() => !document.querySelector('[role=\"dialog\"]')",
-                    timeout=5000,
-                )
+                await _compat_close_dialog(page)
             except Exception:
                 pass
-            await asyncio.sleep(0.5)
-            return await page.locator('[role="dialog"]').count() == 0
+            return False
 
         async def _compat_generate_video(
             client_self: Any,
@@ -2690,30 +3123,165 @@ class FlowWebService:
 
             interceptor = UIInterceptor()
             interceptor.attach(page)
+            target_count = max(1, min(4, int(count or 1)))
 
             uploaded_image_name = ""
             if start_image:
                 uploaded_image_name = await _compat_upload_project_image(client_self, page, start_image)
 
-            await client_self._ui.open_settings_panel(page)
             mode = GenerationMode.FRAME_TO_VIDEO if start_image else GenerationMode.VIDEO
+            submit_endpoint = "video:batchAsyncGenerateVideoStartImage" if start_image else "batchAsyncGenerateVideoText"
+            ratio = AspectRatio.PORTRAIT if aspect == "portrait" else AspectRatio.LANDSCAPE
+
+            await client_self._ui.open_settings_panel(page)
             await client_self._ui.switch_mode(page, mode)
             await client_self._ui.select_video_model(page, model)
-            ratio = AspectRatio.PORTRAIT if aspect == "portrait" else AspectRatio.LANDSCAPE
             await client_self._ui.set_aspect_ratio(page, ratio)
-            await client_self._ui.set_count(page, count)
+            await client_self._ui.set_count(page, target_count)
             await client_self._ui.fill_prompt(page, prompt)
             if uploaded_image_name:
                 attached = await _compat_attach_start_frame(page, uploaded_image_name)
                 if not attached:
                     raise RuntimeError("Google Flow chưa gắn được ảnh đầu vào vào ô Start.")
 
+            call_start = len(getattr(interceptor, "_calls", []))
             await client_self._ui.click_submit(page)
-            submit_endpoint = "video:batchAsyncGenerateVideoStartImage" if start_image else "batchAsyncGenerateVideoText"
-            entry = await interceptor.wait_for(
-                submit_endpoint, timeout=timeout_s, require_success=True
+            entry = await _compat_wait_for_new_call(
+                interceptor,
+                call_start,
+                submit_endpoint,
+                timeout_s=timeout_s,
             )
-            return _compat_parse_video_jobs(client_self, entry.resp)
+            jobs = _compat_parse_video_jobs(client_self, entry.resp)
+            if not jobs:
+                raise RuntimeError("Google Flow chưa khởi tạo được clip video nào từ yêu cầu này.")
+            if len(jobs) < target_count:
+                raise RuntimeError(
+                    f"Google Flow chỉ khởi tạo {len(jobs)}/{target_count} clip trong một lượt gửi. "
+                    "Em dừng tại đây để tránh bấm thêm và tạo dư clip ngoài ý muốn. Hãy thử chạy lại."
+                )
+            return jobs[:target_count]
+
+        async def _compat_ensure_project_page(client_self: Any, page: Any = None) -> None:
+            if page is None:
+                page = await client_self._bm.page()
+            if client_self.project_id in str(page.url or ""):
+                return
+            try:
+                await page.goto(
+                    client_self._project_url,
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+            except Exception:
+                await page.goto(
+                    client_self._project_url,
+                    wait_until="commit",
+                    timeout=60_000,
+                )
+            await asyncio.sleep(2.5)
+
+        async def _compat_generate_image(
+            client_self: Any,
+            prompt: str,
+            *,
+            aspect: str = "landscape",
+            count: int = 1,
+            reference_images: Optional[list[str]] = None,
+            timeout_s: int = 120,
+        ) -> list[Any]:
+            page = await client_self._bm.page()
+            await client_self._ensure_project_page(page)
+
+            interceptor = UIInterceptor()
+            interceptor.attach(page)
+            target_count = max(1, min(4, int(count or 1)))
+
+            ratio = (
+                AspectRatio.PORTRAIT
+                if "port" in str(aspect or "").lower()
+                else AspectRatio.SQUARE
+                if "square" in str(aspect or "").lower()
+                else AspectRatio.LANDSCAPE
+            )
+            images: List[Any] = []
+            attempts = 0
+            max_attempts = max(target_count, 1) + 1
+            while len(images) < target_count and attempts < max_attempts:
+                remaining = target_count - len(images)
+                batch_target = max(1, min(4, remaining))
+                attempts += 1
+
+                await client_self._ui.open_settings_panel(page)
+                switched = await client_self._ui.switch_mode(page, GenerationMode.IMAGE)
+                if not switched:
+                    raise RuntimeError("Google Flow chưa chuyển sang chế độ tạo ảnh.")
+                await client_self._ui.set_aspect_ratio(page, ratio)
+                await client_self._ui.set_count(page, batch_target)
+                await client_self._ui.fill_prompt(page, prompt)
+                call_start = len(getattr(interceptor, "_calls", []))
+                await client_self._ui.click_submit(page)
+                entry = await _compat_wait_for_new_call(
+                    interceptor,
+                    call_start,
+                    "batchGenerateImages",
+                    timeout_s=max(30, timeout_s),
+                    fail_on_tails=["batchAsyncGenerateVideo"],
+                )
+                batch_images = _compat_parse_images(entry.resp)
+                if not batch_images:
+                    raise RuntimeError("Google Flow không trả ảnh nào về từ yêu cầu hiện tại.")
+                images.extend(batch_images)
+
+            return images[:target_count]
+
+        def _compat_parse_images(payload: Any) -> list[Any]:
+            response = payload if isinstance(payload, dict) else {}
+            images: List[Any] = []
+
+            media_items = response.get("media", []) or []
+            if media_items:
+                for media_item in media_items:
+                    if not isinstance(media_item, dict):
+                        continue
+                    image = GeneratedImage.__new__(GeneratedImage)
+                    image._raw = media_item
+                    image.media_name = str(media_item.get("name") or media_item.get("mediaName") or "").strip()
+                    image.project_id = str(media_item.get("projectId") or "").strip()
+                    image.workflow_id = str(media_item.get("workflowId") or "").strip()
+                    generated = ((media_item.get("image") or {}).get("generatedImage") or {})
+                    image.fife_url = str(
+                        generated.get("fifeUrl")
+                        or generated.get("url")
+                        or media_item.get("fifeUrl")
+                        or ""
+                    ).strip()
+                    image.seed = generated.get("seed", 0)
+                    image.model = str(generated.get("modelNameType") or generated.get("model") or "").strip()
+                    image.prompt = str(generated.get("prompt") or "").strip()
+                    image.dimensions = media_item.get("dimensions", {}) or {}
+                    image.file_path = None
+                    images.append(image)
+                if images:
+                    return images
+
+            generated_items = response.get("generatedImages", []) or []
+            for item in generated_items:
+                if not isinstance(item, dict):
+                    continue
+                image = GeneratedImage.__new__(GeneratedImage)
+                image._raw = item
+                image.media_name = str(item.get("mediaName") or item.get("name") or "").strip()
+                image.project_id = ""
+                image.workflow_id = ""
+                image.fife_url = str(item.get("fifeUrl") or item.get("url") or "").strip()
+                image.seed = int(item.get("seed", 0) or 0)
+                image.model = str(item.get("modelNameType") or item.get("model") or "").strip()
+                image.prompt = str(item.get("prompt") or "").strip()
+                image.dimensions = item.get("dimensions", {}) or {}
+                image.file_path = None
+                images.append(image)
+            return images
 
         def _compat_parse_video_jobs(client_self: Any, payload: Any) -> list[Any]:
             response = payload if isinstance(payload, dict) else {}
@@ -2761,6 +3329,108 @@ class FlowWebService:
                 jobs.append(job)
             return jobs
 
+        async def _compat_get_recaptcha_token(api_self: Any) -> str:
+            page = await api_self._bm.page()
+
+            is_on_flow = "labs.google" in str(page.url or "")
+            if not is_on_flow:
+                await api_self._ensure_project_page()
+                page = await api_self._bm.page()
+            elif getattr(api_self, "project_id", "") and getattr(api_self, "_project_page_url", "") not in str(page.url or ""):
+                await api_self._ensure_project_page()
+                page = await api_self._bm.page()
+
+            async def _token_once() -> str:
+                try:
+                    ready = await page.wait_for_function(
+                        "() => !!window.grecaptcha?.enterprise?.execute",
+                        timeout=12_000,
+                    )
+                    await ready.dispose()
+                except Exception:
+                    return ""
+                try:
+                    token = await page.evaluate(
+                        f"""
+                        async () => {{
+                            try {{
+                                return await window.grecaptcha.enterprise.execute(
+                                    '{RECAPTCHA_SITE_KEY}',
+                                    {{ action: 'GENERATE' }}
+                                );
+                            }} catch (error) {{
+                                return '';
+                            }}
+                        }}
+                        """
+                    )
+                except Exception:
+                    return ""
+                return str(token or "").strip()
+
+            for attempt in range(3):
+                token = await _token_once()
+                if token:
+                    return token
+                if attempt == 0:
+                    try:
+                        await page.reload(wait_until="domcontentloaded", timeout=20_000)
+                    except Exception:
+                        pass
+                await asyncio.sleep(1.5)
+            return ""
+
+        async def _compat_api_fetch(api_self: Any, method: str, url: str, body: Optional[dict] = None) -> dict:
+            if not str(url).startswith("http"):
+                url = f"{api_self.API_BASE if hasattr(api_self, 'API_BASE') else 'https://aisandbox-pa.googleapis.com/v1'}/{str(url).lstrip('/')}"
+
+            hdrs = await api_self._get_auth_headers()
+            api_key = str(getattr(api_self, "FLOW_API_KEY", "") or "").strip()
+            if api_key:
+                hdrs["x-goog-api-key"] = api_key
+            data = json.dumps(body) if body is not None else None
+            ctx = api_self._bm.context.request
+            timeout_ms = int(max(30, int(getattr(api_self, "_timeout_s", 300) or 300)) * 1000)
+
+            if method.upper() == "GET":
+                resp = await ctx.get(url, headers=hdrs, timeout=timeout_ms)
+            elif method.upper() == "PATCH":
+                resp = await ctx.patch(url, headers=hdrs, data=data, timeout=timeout_ms)
+            else:
+                resp = await ctx.post(url, headers=hdrs, data=data, timeout=timeout_ms)
+
+            if resp.status >= 400:
+                text = await resp.text()
+                endpoint = str(url).split("/")[-1].split(":")[-1]
+                if resp.status == 404:
+                    raise RuntimeError(
+                        f"Endpoint not found (HTTP 404): {endpoint}\n"
+                        f"This feature may be deprecated or unavailable via direct API.\n"
+                        f"Response: {text[:200]}"
+                    )
+                if resp.status == 400:
+                    try:
+                        err_body = json.loads(text)
+                        msg = err_body.get("error", {}).get("message", text[:200])
+                    except Exception:
+                        msg = text[:200]
+                    raise RuntimeError(f"HTTP 400 INVALID_ARGUMENT on {endpoint}: {msg}")
+                if resp.status in (401, 403):
+                    try:
+                        err_body = json.loads(text)
+                        msg = err_body.get("error", {}).get("message", text[:200])
+                    except Exception:
+                        msg = text[:200]
+                    raise RuntimeError(
+                        f"HTTP {resp.status} on {endpoint}: {msg or 'authentication failed. Session cookies may be expired.'}"
+                    )
+                raise RuntimeError(f"HTTP {resp.status} on {endpoint}: {text[:200]}")
+
+            try:
+                return await resp.json()
+            except Exception:
+                return {}
+
         def _compat_interceptor_attach(self: Any, page: Any) -> None:
             if getattr(self, "_attached", False):
                 return
@@ -2778,8 +3448,12 @@ class FlowWebService:
                 except Exception:
                     continue
 
+        FlowAPI._fetch = _compat_api_fetch
+        FlowAPI.get_recaptcha_token = _compat_get_recaptcha_token
         UIInterceptor.attach = _compat_interceptor_attach
+        FlowClient._ensure_project_page = _compat_ensure_project_page
         FlowUI._settings_visible = _compat_settings_visible
+        FlowUI.fill_prompt = _compat_fill_prompt
         FlowUI.open_settings_panel = _compat_open_settings_panel
         FlowUI.switch_mode = _compat_switch_mode
         FlowUI.set_aspect_ratio = _compat_set_aspect_ratio
@@ -2787,6 +3461,7 @@ class FlowWebService:
         FlowUI.get_video_model_selector = _compat_get_video_model_selector
         FlowUI.select_video_model = _compat_select_video_model
         FlowClient.generate_video = _compat_generate_video
+        FlowClient.generate_image = _compat_generate_image
         self.__class__._FLOW_RUNTIME_PATCHED = True
 
     def _project_url(self, project_id: str) -> str:
@@ -3610,6 +4285,11 @@ class FlowWebService:
         payload["title"] = str(payload.get("title", "")).strip()
         payload["aspect"] = str(payload.get("aspect", "landscape")).strip() or "landscape"
         payload["start_image_path"] = str(payload.get("start_image_path", "")).strip()
+        payload["reference_image_paths"] = [
+            str(item).strip()
+            for item in payload.get("reference_image_paths", [])
+            if str(item).strip()
+        ]
         payload["reference_media_names"] = [
             str(item).strip()
             for item in payload.get("reference_media_names", [])
@@ -3658,6 +4338,8 @@ class FlowWebService:
                 return "Tạo video từ ảnh"
             return "Tạo video từ prompt"
         if request.type == "image":
+            if request.reference_image_paths or request.reference_media_names:
+                return "Chỉnh ảnh từ ảnh tham chiếu"
             return "Tạo ảnh từ prompt"
         titles = {
             "extend": "Kéo dài video",
@@ -3899,23 +4581,29 @@ class FlowWebService:
 
         for job in jobs:
             job_input = job.input if isinstance(job.input, dict) else {}
-            raw_path = str(job_input.get("start_image_path", "") or "").strip()
-            if not raw_path:
-                continue
-            try:
-                path = Path(raw_path).expanduser().resolve()
-            except OSError:
-                continue
-            if not self._path_within_roots(path, [root]):
-                continue
+            raw_paths = [str(job_input.get("start_image_path", "") or "").strip()]
+            raw_paths.extend(
+                str(item or "").strip()
+                for item in job_input.get("reference_image_paths", [])
+                if str(item or "").strip()
+            )
+            for raw_path in raw_paths:
+                if not raw_path:
+                    continue
+                try:
+                    path = Path(raw_path).expanduser().resolve()
+                except OSError:
+                    continue
+                if not self._path_within_roots(path, [root]):
+                    continue
 
-            key = str(path)
-            ref = references.setdefault(key, {"active": 0, "terminal": 0, "total": 0})
-            ref["total"] += 1
-            if job.status in {"queued", "running", "polling"}:
-                ref["active"] += 1
-            else:
-                ref["terminal"] += 1
+                key = str(path)
+                ref = references.setdefault(key, {"active": 0, "terminal": 0, "total": 0})
+                ref["total"] += 1
+                if job.status in {"queued", "running", "polling"}:
+                    ref["active"] += 1
+                else:
+                    ref["terminal"] += 1
 
         safe_entries: List[Dict[str, Any]] = []
         protected_entries: List[Dict[str, Any]] = []
@@ -4397,6 +5085,9 @@ class FlowWebService:
         if request.type == "image" and not request.prompt.strip():
             raise HTTPException(status_code=400, detail="Hãy nhập mô tả ảnh trước khi chạy.")
 
+        if request.type == "image" and len(request.reference_image_paths) > 4:
+            raise HTTPException(status_code=400, detail="Tối đa 4 ảnh tham chiếu cho một lượt chỉnh ảnh.")
+
         if request.type in {"video", "image"} and not 1 <= int(request.count) <= 4:
             raise HTTPException(status_code=400, detail="Số lượng cho tác vụ tạo nội dung phải nằm trong khoảng 1 đến 4.")
 
@@ -4412,6 +5103,230 @@ class FlowWebService:
 
         if request.type == "insert" and not request.prompt.strip():
             raise HTTPException(status_code=400, detail="Vui lòng nhập prompt để chèn vật thể.")
+
+    def _image_api_aspect_ratio(self, aspect: str) -> str:
+        normalized = self._parse_aspect(aspect or "landscape")
+        if normalized == "portrait":
+            return "IMAGE_ASPECT_RATIO_PORTRAIT"
+        if normalized == "square":
+            return "IMAGE_ASPECT_RATIO_SQUARE"
+        return "IMAGE_ASPECT_RATIO_LANDSCAPE"
+
+    def _normalize_local_upload_paths(self, values: List[str]) -> List[str]:
+        roots = [UPLOADS_DIR.resolve()]
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for value in values:
+            raw = str(value or "").strip()
+            if not raw:
+                continue
+            try:
+                resolved = Path(raw).expanduser().resolve()
+            except OSError:
+                continue
+            if not resolved.exists() or not resolved.is_file():
+                continue
+            if not self._path_within_roots(resolved, roots):
+                continue
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(key)
+        return normalized
+
+    async def _resolve_image_reference_media(self, client: Any, job_id: str, request: CreateJobRequest) -> List[str]:
+        reference_media_names = self._normalize_reference_media_names(request.reference_media_names or [])
+        reference_image_paths = self._normalize_local_upload_paths(request.reference_image_paths or [])
+        if not reference_image_paths:
+            return reference_media_names
+
+        total = len(reference_image_paths)
+        await self.store.append_log(job_id, f"Đang chuẩn bị {total} ảnh tham chiếu để ghép/chỉnh ảnh.")
+        for index, image_path in enumerate(reference_image_paths):
+            await self._set_job_progress(
+                job_id,
+                "sending_request",
+                f"Em đang tải ảnh tham chiếu {index + 1}/{total} lên Flow trước khi chỉnh ảnh.",
+            )
+            await self.store.append_log(job_id, f"Đang tải ảnh tham chiếu {index + 1}/{total}: {Path(image_path).name}")
+            media_name = await client._api.upload_image(image_path)
+            if media_name:
+                reference_media_names.append(media_name)
+
+        return self._normalize_reference_media_names(reference_media_names)
+
+    async def _generate_image_edit_result(
+        self,
+        client: Any,
+        prompt: str,
+        *,
+        aspect: str,
+        count: int,
+        reference_media_names: List[str],
+        workflow_id: str = "",
+    ) -> List[Any]:
+        normalized_media_names = self._normalize_reference_media_names(reference_media_names)
+        if not normalized_media_names:
+            raise RuntimeError("Chưa có ảnh nào để dùng làm đầu vào chỉnh sửa.")
+
+        base_media_name = normalized_media_names[0]
+        extra_reference_media_names = normalized_media_names[1:]
+        resolved_workflow_id = str(workflow_id or "").strip() or await self._find_workflow_id_for_media(client, base_media_name)
+        if not resolved_workflow_id:
+            raise RuntimeError(
+                "Google Flow chưa tìm thấy workflow gắn với ảnh gốc. Hãy thử tải lại ảnh rồi chạy lại giúp em."
+            )
+
+        client_context = dict(await client._api._client_context())
+        client_context["workflowId"] = resolved_workflow_id
+
+        image_inputs = [
+            {
+                "imageInputType": "IMAGE_INPUT_TYPE_BASE_IMAGE",
+                "name": base_media_name,
+            }
+        ]
+        image_inputs.extend(
+            {
+                "imageInputType": "IMAGE_INPUT_TYPE_REFERENCE",
+                "name": media_name,
+            }
+            for media_name in extra_reference_media_names
+        )
+
+        body = {
+            "clientContext": client_context,
+            "mediaGenerationContext": {"batchId": str(uuid.uuid4())},
+            "useNewMedia": True,
+            "requests": [
+                {
+                    "clientContext": dict(client_context),
+                    "imageModelName": "GEM_PIX_2",
+                    "imageAspectRatio": self._image_api_aspect_ratio(aspect),
+                    "structuredPrompt": {"parts": [{"text": prompt}]},
+                    "seed": random.randint(0, 2**31 - 1),
+                    "imageInputs": list(image_inputs),
+                }
+                for _ in range(max(1, min(4, int(count or 1))))
+            ],
+        }
+        data = await client._api._fetch(
+            "POST",
+            f"projects/{client._api.project_id}/flowMedia:batchGenerateImages",
+            body,
+        )
+
+        from flow._api import GeneratedImage
+
+        images = [GeneratedImage(item) for item in data.get("media", [])]
+        for image in images:
+            image.prompt = prompt
+        if not images:
+            raise RuntimeError("Google Flow không trả ảnh nào về từ yêu cầu chỉnh sửa hiện tại.")
+        return images
+
+    async def _generate_images_with_retry(
+        self,
+        client: Any,
+        job_id: str,
+        request: CreateJobRequest,
+        reference_media_names: List[str],
+    ) -> List[Any]:
+        try:
+            return await self._generate_images_once(client, request, reference_media_names)
+        except Exception as exc:
+            if not self._is_recaptcha_error(exc):
+                raise
+
+            await self.store.append_log(
+                job_id,
+                "Flow vua bat reCAPTCHA khi tao anh. Em dang tai lai project va thu gui lai 1 lan nua.",
+            )
+            await self._set_job_progress(
+                job_id,
+                "sending_request",
+                "Flow dang yeu cau xac nhan reCAPTCHA. Em dang tai lai trang project roi thu gui lai 1 lan nua.",
+            )
+            await self._reload_flow_project_page(client)
+            return await self._generate_images_once(client, request, reference_media_names)
+
+    async def _generate_images_once(
+        self,
+        client: Any,
+        request: CreateJobRequest,
+        reference_media_names: List[str],
+    ) -> List[Any]:
+        target_count = max(1, min(4, int(request.count or 1)))
+        if reference_media_names:
+            return await self._generate_image_edit_result(
+                client,
+                request.prompt,
+                aspect=request.aspect,
+                count=target_count,
+                reference_media_names=reference_media_names,
+                workflow_id=request.workflow_id or "",
+            )
+        return await client._api.generate_image(
+            request.prompt,
+            aspect_ratio=self._image_api_aspect_ratio(request.aspect),
+            count=target_count,
+        )
+
+    async def _find_workflow_id_for_media(self, client: Any, media_name: str) -> str:
+        safe_media_name = str(media_name or "").strip()
+        if not safe_media_name:
+            return ""
+
+        for attempt in range(3):
+            project_data = await client._api.get_project_data()
+            workflows = project_data.get("projectContents", {}).get("workflows", [])
+            for workflow in workflows:
+                workflow_id = str(workflow.get("name") or "").strip()
+                if not workflow_id:
+                    continue
+                metadata = workflow.get("metadata", {}) or {}
+                if str(metadata.get("primaryMediaId") or "").strip() == safe_media_name:
+                    return workflow_id
+                for media in workflow.get("medias", []) or []:
+                    if str(media.get("name") or "").strip() == safe_media_name:
+                        return workflow_id
+            if attempt < 2:
+                await asyncio.sleep(1)
+
+        return ""
+
+    async def _reload_flow_project_page(self, client: Any) -> None:
+        page = await client._bm.page()
+        project_url = str(
+            getattr(client, "_project_url", "")
+            or getattr(getattr(client, "_api", None), "_project_page_url", "")
+            or self._project_url(getattr(client, "project_id", ""))
+        ).strip()
+        if not project_url:
+            return
+
+        try:
+            await page.goto(project_url, wait_until="networkidle", timeout=60_000)
+        except Exception:
+            try:
+                await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
+            except Exception:
+                await page.reload(wait_until="domcontentloaded", timeout=60_000)
+
+        try:
+            ready = await page.wait_for_function(
+                "() => !!window.grecaptcha?.enterprise?.execute",
+                timeout=15_000,
+            )
+            await ready.dispose()
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+
+    def _is_recaptcha_error(self, exc: Exception) -> bool:
+        detail = str(exc or "").lower()
+        return "recaptcha" in detail and "failed" in detail
 
     async def _wait_for_video_with_progress(
         self,

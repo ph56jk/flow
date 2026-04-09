@@ -482,6 +482,53 @@ textarea:focus {
   line-height: 1.5;
 }
 
+.action-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 18px 0 0;
+}
+
+.task-chip {
+  min-height: 52px;
+  padding: 10px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02);
+  color: var(--muted);
+  text-align: left;
+  font-weight: 600;
+}
+
+.task-chip.active {
+  color: var(--text);
+  border-color: var(--line-strong);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.source-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border-radius: calc(var(--radius-md) + 4px);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.source-panel-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.source-panel-head h3 {
+  margin: 0;
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 1.1rem;
+  letter-spacing: -0.03em;
+}
+
 .prompt-ai-card {
   display: grid;
   gap: 16px;
@@ -587,6 +634,17 @@ textarea:focus {
   background: rgba(255, 255, 255, 0.025);
 }
 
+.upload-box-head {
+  display: grid;
+  gap: 6px;
+}
+
+.upload-box-head p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
 .upload-preview {
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr) auto;
@@ -629,6 +687,15 @@ textarea:focus {
   gap: 8px;
 }
 
+.reference-list {
+  display: grid;
+  gap: 10px;
+}
+
+.reference-card {
+  grid-template-columns: 72px minmax(0, 1fr) auto;
+}
+
 .ready-hint {
   margin: 0;
   max-width: 48ch;
@@ -637,6 +704,35 @@ textarea:focus {
 .submit-row button:disabled {
   opacity: 0.5;
   cursor: wait;
+}
+
+.status-card {
+  margin-top: 18px;
+}
+
+.latest-status {
+  min-height: 0;
+}
+
+.status-summary-card {
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.03), rgba(255, 255, 255, 0.015)),
+    var(--panel-soft);
+  padding: 18px;
+  display: grid;
+  gap: 12px;
+}
+
+.status-summary-card strong {
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 1.02rem;
+}
+
+.flow-open-note {
+  margin: 0;
+  color: var(--muted);
 }
 
 .lower-grid {

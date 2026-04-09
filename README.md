@@ -18,6 +18,27 @@ Web app local de dieu khien [flow-py](https://github.com/eddie-fqh/flow-py) bang
 - Playwright Chromium
 - Tai khoan Google da duoc cap quyen truy cap Google Flow
 
+## Chay tren Windows duoc khong?
+
+Co. Phan web app chinh (`FastAPI` + `Pathlib` + `Playwright`) chay duoc tren Windows 10/11 neu co:
+
+- Python 3.11+
+- Git
+- Chromium cho Playwright
+
+Luu y:
+
+- Cac script `.sh` trong repo la cho macOS/Linux.
+- Tren Windows, nen dung PowerShell va cac script `scripts/setup_windows.ps1`, `scripts/run_flow_web.ps1`.
+- Vi Google Flow dung browser automation + reCAPTCHA, nen che do mo browser that (khong headless) on dinh hon tren Windows.
+
+## Tai repo tu GitHub
+
+```powershell
+git clone https://github.com/ph56jk/flow.git
+cd flow
+```
+
 ## Cai dat
 
 ```bash
@@ -29,6 +50,23 @@ playwright install chromium
 
 Neu may chu nhan chua co `python3.11`, can cai Python 3.11 truoc. `flow-py` khong chay duoc tren Python 3.9.
 
+### Cai dat tren Windows (PowerShell)
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+.\scripts\setup_windows.ps1
+```
+
+Neu khong muon dung script, co the chay tay:
+
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m playwright install chromium
+```
+
 ## Chay app
 
 ```bash
@@ -37,6 +75,19 @@ uvicorn flow_web.main:app --reload
 ```
 
 Mo `http://127.0.0.1:8000`.
+
+### Chay app tren Windows
+
+```powershell
+.\scripts\run_flow_web.ps1
+```
+
+Hoac chay tay:
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python -m uvicorn flow_web.main:app --host 127.0.0.1 --port 8000 --reload
+```
 
 ## Bat Gemini cho Prompt AI
 
@@ -64,4 +115,4 @@ Hoac luu vao file `.env.local` o root du an, app se tu nap file nay luc khoi don
 - `flow-py` la browser automation, khong phai official API.
 - Google co the doi giao dien bat cu luc nao.
 - Headless co the fail vi reCAPTCHA; `Open Browser` la tuy chon an toan hon.
-- Session va project luu trong `~/.flow-py`, con app state luu trong [`data/state.json`](/Users/admin/VibeCoding/flow/data/state.json).
+- Session va project luu trong `~/.flow-py`, con app state luu trong `data/state.json`.

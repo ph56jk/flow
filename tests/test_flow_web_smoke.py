@@ -131,6 +131,17 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("Tạo video từ ảnh", title)
 
+    def test_default_title_marks_image_with_references_as_edit(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="ghép logo lên áo",
+            reference_image_paths=["/tmp/model.jpg", "/tmp/logo.png"],
+        )
+
+        title = self.service._default_title(request)
+
+        self.assertEqual("Chỉnh ảnh từ ảnh tham chiếu", title)
+
     def test_prompt_assistant_snapshot_reports_gemini_when_key_exists(self) -> None:
         skills = [
             SkillRecord(
@@ -199,6 +210,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("layered foreground midground and background depth", expanded)
         self.assertGreater(len(expanded), len(short_prompt))
 
+    def test_logout_flow_clears_local_profile_session(self) -> None:
+        profile_dir = self.temp_root / "flow-profile"
+        cookies_path = profile_dir / "Default" / "Cookies"
+        cookies_path.parent.mkdir(parents=True, exist_ok=True)
+        cookies_path.write_bytes(b"cookie-data")
+
+        with patch("flow._storage.PROFILE_DIR", profile_dir), patch("flow._storage.ensure_dirs") as ensure_dirs:
+            result = asyncio.run(self.service.logout_flow())
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["had_session"])
+        self.assertFalse(result["auth"]["authenticated"])
+        self.assertFalse(cookies_path.exists())
+        ensure_dirs.assert_called_once()
+
+    def test_logout_flow_blocks_when_jobs_are_running(self) -> None:
+        asyncio.run(self.store.add_job(JobRecord(type="video", status="running", title="Đang chạy")))
+
+        with self.assertRaises(HTTPException) as ctx:
+            asyncio.run(self.service.logout_flow())
+
+        self.assertEqual(409, ctx.exception.status_code)
+        self.assertIn("đang có tác vụ chạy", str(ctx.exception.detail).lower())
+
 
 class StateStoreRegressionTests(TempAppPathsMixin, unittest.TestCase):
     def setUp(self) -> None:
@@ -229,6 +264,31 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.start_temp_paths()
         self.store = StateStore()
         self.service = FlowWebService(self.store)
+
+    async def test_with_client_keeps_shared_flow_browser_open_in_visible_mode(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        fake_browser = SimpleNamespace()
+        fake_client = SimpleNamespace(name="shared-client")
+
+        with patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(return_value=fake_browser),
+        ) as ensure_shared_browser, patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=fake_client),
+        ) as build_client, patch.object(
+            self.service,
+            "_close_shared_browser",
+            AsyncMock(),
+        ) as close_shared_browser:
+            result = await self.service._with_client(lambda client: asyncio.sleep(0, result=client.name))
+
+        self.assertEqual("shared-client", result)
+        ensure_shared_browser.assert_awaited_once()
+        build_client.assert_awaited_once()
+        close_shared_browser.assert_not_called()
 
     async def test_run_flow_job_saves_video_artifact_from_nested_status_url(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
@@ -280,6 +340,31 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("https://example.com/video.mp4", saved.artifacts[0].url)
         self.assertEqual("video/mp4", saved.artifacts[0].mime_type)
 
+    async def test_run_flow_job_fails_when_video_submit_returns_too_few_jobs(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(type="video", prompt="cat", count=2)
+        job = JobRecord(
+            type="video",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        only_one_job = SimpleNamespace(media_name="media-123", workflow_id="wf-123")
+        fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[only_one_job]))
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(fake_client)
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client):
+            await self.service._run_flow_job(job.id, request)
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("failed", saved.status)
+        self.assertIn("1/2 clip", saved.error)
+
     async def test_run_flow_job_marks_send_stage_timeout_clearly(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(type="video", prompt="samurai fight", count=1, start_image_path="/tmp/demo.jpg")
@@ -316,6 +401,259 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIsNotNone(saved)
         self.assertEqual("failed", saved.status)
         self.assertIn("chưa gửi được yêu cầu tạo video", saved.error.lower())
+
+    async def test_run_flow_job_uploads_reference_images_for_image_edit(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        reference_a = self.uploads_dir / "model.jpg"
+        reference_b = self.uploads_dir / "logo.png"
+        reference_a.write_bytes(b"model")
+        reference_b.write_bytes(b"logo")
+
+        request = CreateJobRequest(
+            type="image",
+            prompt="ghép logo này lên áo của người mẫu",
+            count=1,
+            reference_image_paths=[str(reference_a), str(reference_b)],
+        )
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        fake_image = SimpleNamespace(
+            media_name="img-123",
+            workflow_id="wf-123",
+            fife_url="https://example.com/result.jpg",
+            prompt=request.prompt,
+            dimensions={"width": 1280, "height": 720},
+        )
+        captured_body = {}
+
+        async def fake_fetch(method: str, url: str, body: dict):
+            captured_body["method"] = method
+            captured_body["url"] = url
+            captured_body["body"] = body
+            return {
+                "media": [
+                    {
+                        "name": fake_image.media_name,
+                        "workflowId": fake_image.workflow_id,
+                        "image": {"generatedImage": {"fifeUrl": fake_image.fife_url}},
+                    }
+                ]
+            }
+
+        fake_client = SimpleNamespace(
+            _api=SimpleNamespace(
+                project_id="pid",
+                upload_image=AsyncMock(side_effect=["ref-model", "ref-logo"]),
+                _client_context=AsyncMock(
+                    return_value={
+                        "projectId": "pid",
+                        "tool": "PINHOLE",
+                        "sessionId": ";123",
+                        "recaptchaContext": {"token": "abc", "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB"},
+                    }
+                ),
+                get_project_data=AsyncMock(
+                    return_value={
+                        "projectContents": {
+                            "workflows": [
+                                {"name": "wf-base", "metadata": {"primaryMediaId": "ref-model"}},
+                                {"name": "wf-ref", "metadata": {"primaryMediaId": "ref-logo"}},
+                            ]
+                        }
+                    }
+                ),
+                _fetch=AsyncMock(side_effect=fake_fetch),
+                generate_image=AsyncMock(side_effect=AssertionError("Legacy reference_images payload should not be used")),
+            ),
+            generate_image=AsyncMock(return_value=[fake_image]),
+        )
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(fake_client)
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client):
+            await self.service._run_flow_job(job.id, request)
+
+        fake_client._api.upload_image.assert_any_await(str(reference_a.resolve()))
+        fake_client._api.upload_image.assert_any_await(str(reference_b.resolve()))
+        fake_client._api._fetch.assert_awaited_once()
+        self.assertEqual("POST", captured_body["method"])
+        self.assertEqual("projects/pid/flowMedia:batchGenerateImages", captured_body["url"])
+        request_body = captured_body["body"]["requests"][0]
+        self.assertEqual("wf-base", request_body["clientContext"]["workflowId"])
+        self.assertEqual(
+            [
+                {"imageInputType": "IMAGE_INPUT_TYPE_BASE_IMAGE", "name": "ref-model"},
+                {"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": "ref-logo"},
+            ],
+            request_body["imageInputs"],
+        )
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(1, len(saved.artifacts))
+        self.assertEqual("https://example.com/result.jpg", saved.artifacts[0].url)
+
+    async def test_generate_image_edit_result_uses_first_image_as_base_and_rest_as_reference(self) -> None:
+        captured_body = {}
+
+        async def fake_fetch(method: str, url: str, body: dict):
+            captured_body["method"] = method
+            captured_body["url"] = url
+            captured_body["body"] = body
+            return {
+                "media": [
+                    {
+                        "name": "img-1",
+                        "workflowId": "wf-base",
+                        "image": {"generatedImage": {"fifeUrl": "https://example.com/edited.jpg"}},
+                    },
+                    {
+                        "name": "img-2",
+                        "workflowId": "wf-base",
+                        "image": {"generatedImage": {"fifeUrl": "https://example.com/edited-2.jpg"}},
+                    },
+                ]
+            }
+
+        fake_client = SimpleNamespace(
+            _api=SimpleNamespace(
+                project_id="pid",
+                _client_context=AsyncMock(
+                    return_value={
+                        "projectId": "pid",
+                        "tool": "PINHOLE",
+                        "sessionId": ";123",
+                        "recaptchaContext": {"token": "abc", "applicationType": "RECAPTCHA_APPLICATION_TYPE_WEB"},
+                    }
+                ),
+                _fetch=AsyncMock(side_effect=fake_fetch),
+                get_project_data=AsyncMock(
+                    return_value={
+                        "projectContents": {
+                            "workflows": [
+                                {"name": "wf-base", "metadata": {"primaryMediaId": "base-media"}},
+                                {"name": "wf-ref", "metadata": {"primaryMediaId": "logo-media"}},
+                            ]
+                        }
+                    }
+                ),
+            )
+        )
+
+        images = await self.service._generate_image_edit_result(
+            fake_client,
+            "ghép logo lên áo",
+            aspect="portrait",
+            count=2,
+            reference_media_names=["base-media", "logo-media"],
+        )
+
+        self.assertEqual(2, len(images))
+        self.assertEqual("POST", captured_body["method"])
+        self.assertEqual("projects/pid/flowMedia:batchGenerateImages", captured_body["url"])
+        self.assertEqual(2, len(captured_body["body"]["requests"]))
+        for request_payload in captured_body["body"]["requests"]:
+            self.assertEqual("GEM_PIX_2", request_payload["imageModelName"])
+            self.assertEqual("IMAGE_ASPECT_RATIO_PORTRAIT", request_payload["imageAspectRatio"])
+            self.assertEqual("wf-base", request_payload["clientContext"]["workflowId"])
+            self.assertEqual(
+                [
+                    {"imageInputType": "IMAGE_INPUT_TYPE_BASE_IMAGE", "name": "base-media"},
+                    {"imageInputType": "IMAGE_INPUT_TYPE_REFERENCE", "name": "logo-media"},
+                ],
+                request_payload["imageInputs"],
+            )
+
+    async def test_run_flow_job_uses_direct_image_api_for_exact_count(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(type="image", prompt="meo de thuong", count=2, aspect="square")
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        fake_images = [
+            SimpleNamespace(
+                media_name="img-1",
+                workflow_id="wf-1",
+                fife_url="https://example.com/img-1.jpg",
+                prompt=request.prompt,
+                dimensions={"width": 1024, "height": 1024},
+            ),
+            SimpleNamespace(
+                media_name="img-2",
+                workflow_id="wf-1",
+                fife_url="https://example.com/img-2.jpg",
+                prompt=request.prompt,
+                dimensions={"width": 1024, "height": 1024},
+            ),
+        ]
+        fake_client = SimpleNamespace(
+            _api=SimpleNamespace(generate_image=AsyncMock(return_value=fake_images)),
+            generate_image=AsyncMock(side_effect=AssertionError("UI image generation should not be used")),
+        )
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(fake_client)
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client):
+            await self.service._run_flow_job(job.id, request)
+
+        fake_client._api.generate_image.assert_awaited_once()
+        kwargs = fake_client._api.generate_image.await_args.kwargs
+        self.assertEqual(2, kwargs["count"])
+        self.assertEqual("IMAGE_ASPECT_RATIO_SQUARE", kwargs["aspect_ratio"])
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual(2, len(saved.artifacts))
+
+    async def test_generate_images_with_retry_reloads_project_after_recaptcha_error(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(type="image", prompt="meo de thuong", count=1, aspect="square")
+        job = JobRecord(
+            type="image",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        fake_image = SimpleNamespace(
+            media_name="img-1",
+            workflow_id="wf-1",
+            fife_url="https://example.com/img-1.jpg",
+            prompt=request.prompt,
+            dimensions={"width": 1024, "height": 1024},
+        )
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_generate_images_once",
+            AsyncMock(side_effect=[RuntimeError("HTTP 403 on batchGenerateImages: reCAPTCHA evaluation failed"), [fake_image]]),
+        ) as generate_once, patch.object(
+            self.service,
+            "_reload_flow_project_page",
+            AsyncMock(),
+        ) as reload_project:
+            result = await self.service._generate_images_with_retry(fake_client, job.id, request, [])
+
+        self.assertEqual([fake_image], result)
+        self.assertEqual(2, generate_once.await_count)
+        reload_project.assert_awaited_once_with(fake_client)
 
 
 if __name__ == "__main__":

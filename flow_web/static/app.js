@@ -1,4 +1,5 @@
 const ACTIVE_STATUSES = new Set(["queued", "running", "polling"]);
+const EDIT_JOB_TYPES = new Set(["extend", "upscale", "camera_motion", "camera_position", "insert", "remove"]);
 
 const MODE_CONFIG = {
   video: {
@@ -17,14 +18,16 @@ const MODE_CONFIG = {
     defaultAspect: "landscape",
     defaultCount: 1,
     showStartImage: true,
+    showPromptAi: true,
+    promptRequired: true,
   },
   image: {
     title: "Bạn muốn tạo ảnh gì?",
-    hint: "Nhập mô tả ngắn gọn rồi bấm chạy.",
+    hint: "Nhập mô tả ngắn gọn hoặc ghép ảnh tham chiếu rồi bấm chạy.",
     promptLabel: "Mô tả ảnh",
-    placeholder: "Ví dụ: Ảnh sản phẩm chuối tối giản trên nền đen, ánh sáng studio mềm",
+    placeholder: "Ví dụ: ghép logo này lên áo của người mẫu, giữ nếp vải thật và ánh sáng đồng nhất",
     promptAiLabel: "Bạn muốn ảnh như thế nào?",
-    promptAiPlaceholder: "Ví dụ: ảnh poster đàn piano sang trọng trên nền đen, ánh sáng studio mềm",
+    promptAiPlaceholder: "Ví dụ: ghép logo áo vào ảnh người mẫu, nhìn như ảnh chụp thật trong studio",
     submitLabel: "Tạo ảnh",
     resultsTitle: "Kết quả ảnh gần đây",
     runsTitle: "Lượt chạy ảnh gần đây",
@@ -34,11 +37,106 @@ const MODE_CONFIG = {
     defaultAspect: "square",
     defaultCount: 2,
     showStartImage: false,
+    showPromptAi: true,
+    promptRequired: true,
+  },
+  edit: {
+    title: "Bạn muốn chỉnh video như thế nào?",
+    hint: "Chọn một video đã có sẵn, chọn thao tác cần sửa, rồi bấm chạy.",
+    promptLabel: "Mô tả chỉnh sửa",
+    placeholder: "Ví dụ: kéo dài thêm 5 giây với chuyển động tự nhiên",
+    submitLabel: "Chạy thao tác",
+    resultsTitle: "Kết quả chỉnh video gần đây",
+    runsTitle: "Lượt chỉnh video gần đây",
+    readyText: "Sẵn sàng chỉnh video.",
+    emptyResult: "Chưa có kết quả chỉnh video nào.",
+    emptyRun: "Chưa có lượt chỉnh video nào.",
+    defaultAspect: "landscape",
+    defaultCount: 1,
+    showStartImage: false,
+    showPromptAi: false,
+    promptRequired: false,
+  },
+};
+
+const EDIT_ACTION_CONFIG = {
+  extend: {
+    title: "Kéo dài video",
+    hint: "Dùng khi muốn nối thêm phần cuối video hiện có.",
+    promptLabel: "Mô tả đoạn nối thêm",
+    placeholder: "Ví dụ: tiếp tục cảnh này thêm vài giây, chuyển động mượt và giữ đúng nhân vật",
+    submitLabel: "Kéo dài video",
+    promptRequired: false,
+    showPrompt: true,
+    showMotion: false,
+    showPosition: false,
+    showResolution: false,
+  },
+  upscale: {
+    title: "Nâng chất lượng video",
+    hint: "Dùng khi muốn tăng chất lượng video đã có.",
+    promptLabel: "Không cần mô tả thêm",
+    placeholder: "",
+    submitLabel: "Nâng chất lượng",
+    promptRequired: false,
+    showPrompt: false,
+    showMotion: false,
+    showPosition: false,
+    showResolution: true,
+  },
+  camera_motion: {
+    title: "Chỉnh chuyển động camera",
+    hint: "Dùng khi muốn đổi cách máy quay di chuyển.",
+    promptLabel: "Không cần mô tả thêm",
+    placeholder: "",
+    submitLabel: "Đổi chuyển động camera",
+    promptRequired: false,
+    showPrompt: false,
+    showMotion: true,
+    showPosition: false,
+    showResolution: false,
+  },
+  camera_position: {
+    title: "Chỉnh vị trí camera",
+    hint: "Dùng khi muốn đổi góc hoặc khoảng cách camera.",
+    promptLabel: "Không cần mô tả thêm",
+    placeholder: "",
+    submitLabel: "Đổi vị trí camera",
+    promptRequired: false,
+    showPrompt: false,
+    showMotion: false,
+    showPosition: true,
+    showResolution: false,
+  },
+  insert: {
+    title: "Chèn vật thể",
+    hint: "Dùng khi muốn thêm vật thể hoặc chi tiết mới vào video.",
+    promptLabel: "Mô tả vật thể cần chèn",
+    placeholder: "Ví dụ: thêm thanh kiếm phát sáng vào tay nhân vật",
+    submitLabel: "Chèn vật thể",
+    promptRequired: true,
+    showPrompt: true,
+    showMotion: false,
+    showPosition: false,
+    showResolution: false,
+  },
+  remove: {
+    title: "Xóa vật thể",
+    hint: "Dùng khi muốn gỡ một vật thể không cần thiết khỏi video.",
+    promptLabel: "Không cần mô tả thêm",
+    placeholder: "",
+    submitLabel: "Xóa vật thể",
+    promptRequired: false,
+    showPrompt: false,
+    showMotion: false,
+    showPosition: false,
+    showResolution: false,
   },
 };
 
 const state = {
   mode: "video",
+  editAction: "extend",
   config: null,
   auth: { authenticated: false },
   jobs: [],
@@ -47,8 +145,15 @@ const state = {
   startImagePath: "",
   startImageName: "",
   startImagePublicUrl: "",
+  imageReferenceItems: [],
   uploading: false,
   setupOpen: null,
+  selectedEditSourceKey: "",
+  manualMediaId: "",
+  manualWorkflowId: "",
+  motion: "truck_left",
+  position: "center",
+  resolution: "1080p",
   promptAssistant: null,
   promptAiResults: {
     video: null,
@@ -57,6 +162,7 @@ const state = {
   drafts: {
     video: { prompt: "", aspect: "landscape", count: 1 },
     image: { prompt: "", aspect: "square", count: 2 },
+    edit: { prompt: "", aspect: "landscape", count: 1 },
   },
   promptAiDrafts: {
     video: { brief: "", style: "", mustInclude: "", avoid: "", audience: "" },
@@ -68,6 +174,7 @@ const elements = {
   projectStatus: document.querySelector("#projectStatus"),
   authStatus: document.querySelector("#authStatus"),
   topbarHint: document.querySelector("#topbarHint"),
+  logoutButton: document.querySelector("#logoutButton"),
   setupToggle: document.querySelector("#setupToggle"),
   setupPanel: document.querySelector("#setupPanel"),
   configForm: document.querySelector("#configForm"),
@@ -94,10 +201,17 @@ const elements = {
   promptAiSkillChips: document.querySelector("#promptAiSkillChips"),
   promptAiResultText: document.querySelector("#promptAiResultText"),
   usePromptAiResultButton: document.querySelector("#usePromptAiResultButton"),
+  promptAiCard: document.querySelector("#promptAiCard"),
   promptLabel: document.querySelector("#promptLabel"),
   promptInput: document.querySelector("#promptInput"),
   composerSummaryMode: document.querySelector("#composerSummaryMode"),
   composerSummaryText: document.querySelector("#composerSummaryText"),
+  editActionStrip: document.querySelector("#editActionStrip"),
+  editActionButtons: Array.from(document.querySelectorAll("[data-edit-action]")),
+  editSourceWrap: document.querySelector("#editSourceWrap"),
+  editSourceSelect: document.querySelector("#editSourceSelect"),
+  manualMediaId: document.querySelector("#manualMediaId"),
+  manualWorkflowId: document.querySelector("#manualWorkflowId"),
   startImageWrap: document.querySelector("#startImageWrap"),
   startImageFile: document.querySelector("#startImageFile"),
   startImageStatus: document.querySelector("#startImageStatus"),
@@ -106,16 +220,25 @@ const elements = {
   startImagePreviewName: document.querySelector("#startImagePreviewName"),
   startImagePreviewHint: document.querySelector("#startImagePreviewHint"),
   clearStartImageButton: document.querySelector("#clearStartImageButton"),
+  imageReferenceWrap: document.querySelector("#imageReferenceWrap"),
+  imageReferenceFiles: document.querySelector("#imageReferenceFiles"),
+  imageReferenceList: document.querySelector("#imageReferenceList"),
+  imageReferenceStatus: document.querySelector("#imageReferenceStatus"),
+  generationOptionsWrap: document.querySelector("#generationOptionsWrap"),
+  editOptionsWrap: document.querySelector("#editOptionsWrap"),
+  motionField: document.querySelector("#motionField"),
+  motionSelect: document.querySelector("#motionSelect"),
+  positionField: document.querySelector("#positionField"),
+  positionSelect: document.querySelector("#positionSelect"),
+  resolutionField: document.querySelector("#resolutionField"),
+  resolutionSelect: document.querySelector("#resolutionSelect"),
   aspectSelect: document.querySelector("#aspectSelect"),
   countInput: document.querySelector("#countInput"),
   readyHint: document.querySelector("#readyHint"),
   submitButton: document.querySelector("#submitButton"),
   composerForm: document.querySelector("#composerForm"),
   refreshButton: document.querySelector("#refreshButton"),
-  resultsTitle: document.querySelector("#resultsTitle"),
-  runsTitle: document.querySelector("#runsTitle"),
-  outputShelfList: document.querySelector("#outputShelfList"),
-  jobList: document.querySelector("#jobList"),
+  latestStatusCard: document.querySelector("#latestStatusCard"),
   modeButtons: Array.from(document.querySelectorAll(".mode-button")),
 };
 
@@ -190,6 +313,10 @@ function basename(value) {
     return "";
   }
   return text.split("/").pop() || text;
+}
+
+function fileKindLabel(count) {
+  return count > 1 ? `${count} ảnh` : "1 ảnh";
 }
 
 function uploadPublicUrlFromPath(value) {
@@ -270,12 +397,38 @@ function currentModeConfig() {
   return MODE_CONFIG[state.mode];
 }
 
+function currentEditConfig() {
+  return EDIT_ACTION_CONFIG[state.editAction] || EDIT_ACTION_CONFIG.extend;
+}
+
+function currentOperationConfig() {
+  if (state.mode === "edit") {
+    const modeConfig = currentModeConfig();
+    const editConfig = currentEditConfig();
+    return {
+      ...modeConfig,
+      ...editConfig,
+    };
+  }
+  return currentModeConfig();
+}
+
+function modeForJobType(jobType) {
+  if (jobType === "image") {
+    return "image";
+  }
+  if (EDIT_JOB_TYPES.has(jobType)) {
+    return "edit";
+  }
+  return "video";
+}
+
 function currentDraft() {
   return state.drafts[state.mode];
 }
 
 function currentPromptAiDraft() {
-  return state.promptAiDrafts[state.mode];
+  return state.promptAiDrafts[state.mode] || null;
 }
 
 function currentPromptAiResult() {
@@ -289,8 +442,20 @@ function syncDraftFromForm() {
   draft.count = Math.max(1, Math.min(4, Number(elements.countInput.value || draft.count || 1)));
 }
 
+function syncEditInputsFromForm() {
+  state.selectedEditSourceKey = elements.editSourceSelect.value || "";
+  state.manualMediaId = elements.manualMediaId.value.trim();
+  state.manualWorkflowId = elements.manualWorkflowId.value.trim();
+  state.motion = elements.motionSelect.value || "truck_left";
+  state.position = elements.positionSelect.value || "center";
+  state.resolution = elements.resolutionSelect.value || "1080p";
+}
+
 function syncPromptAiDraftFromForm() {
   const draft = currentPromptAiDraft();
+  if (!draft) {
+    return;
+  }
   draft.brief = elements.promptAiBrief.value;
   draft.style = elements.promptAiStyle.value;
   draft.mustInclude = elements.promptAiMustInclude.value;
@@ -306,8 +471,25 @@ function applyDraftToForm() {
   elements.countInput.value = String(draft.count || config.defaultCount);
 }
 
+function applyEditInputsToForm() {
+  elements.editSourceSelect.value = state.selectedEditSourceKey || "";
+  elements.manualMediaId.value = state.manualMediaId || "";
+  elements.manualWorkflowId.value = state.manualWorkflowId || "";
+  elements.motionSelect.value = state.motion || "truck_left";
+  elements.positionSelect.value = state.position || "center";
+  elements.resolutionSelect.value = state.resolution || "1080p";
+}
+
 function applyPromptAiDraftToForm() {
   const draft = currentPromptAiDraft();
+  if (!draft) {
+    elements.promptAiBrief.value = "";
+    elements.promptAiStyle.value = "";
+    elements.promptAiMustInclude.value = "";
+    elements.promptAiAvoid.value = "";
+    elements.promptAiAudience.value = "";
+    return;
+  }
   elements.promptAiBrief.value = draft.brief || "";
   elements.promptAiStyle.value = draft.style || "";
   elements.promptAiMustInclude.value = draft.mustInclude || "";
@@ -327,6 +509,9 @@ function renderTopbar() {
   elements.projectStatus.dataset.state = projectId ? "ready" : "pending";
   elements.authStatus.textContent = state.auth?.authenticated ? "Đã đăng nhập" : "Chưa đăng nhập";
   elements.authStatus.dataset.state = state.auth?.authenticated ? "ready" : "pending";
+  elements.logoutButton.hidden = !state.auth?.authenticated;
+  elements.logoutButton.disabled = activeJobs > 0;
+  elements.logoutButton.title = activeJobs > 0 ? "Hãy chờ các tác vụ đang chạy hoàn tất rồi đăng xuất." : "";
   elements.setupToggle.textContent = state.setupOpen ? "Ẩn thiết lập" : "Thiết lập";
   elements.setupPanel.hidden = !state.setupOpen;
 
@@ -335,9 +520,9 @@ function renderTopbar() {
   } else if (!state.auth?.authenticated) {
     elements.topbarHint.textContent = "Project đã có. Chỉ còn đăng nhập Google Flow là chạy được.";
   } else if (activeJobs) {
-    elements.topbarHint.textContent = `Đang có ${activeJobs} lượt chạy. Bạn vẫn có thể gửi thêm yêu cầu mới.`;
+    elements.topbarHint.textContent = `Đang có ${activeJobs} lượt chạy. Tab Google Flow vẫn được giữ mở để bạn theo dõi trực tiếp.`;
   } else {
-    elements.topbarHint.textContent = "Mọi thứ đã sẵn sàng. Chỉ cần nhập prompt rồi bấm chạy.";
+    elements.topbarHint.textContent = "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
   }
 
   if (document.activeElement !== elements.projectId) {
@@ -352,31 +537,54 @@ function renderTopbar() {
 }
 
 function renderComposer() {
-  const config = currentModeConfig();
+  const config = currentOperationConfig();
   elements.composerTitle.textContent = config.title;
   elements.composerHint.textContent = config.hint;
   elements.promptLabel.textContent = config.promptLabel;
-  elements.promptInput.placeholder = config.placeholder;
+  elements.promptInput.placeholder = config.placeholder || "";
   elements.submitButton.textContent = config.submitLabel;
-  elements.resultsTitle.textContent = config.resultsTitle;
-  elements.runsTitle.textContent = config.runsTitle;
-  elements.startImageWrap.hidden = !config.showStartImage;
+  elements.startImageWrap.hidden = !(state.mode === "video" && config.showStartImage);
+  elements.imageReferenceWrap.hidden = state.mode !== "image";
   elements.readyHint.textContent = isReady()
-    ? config.readyText
+    ? `${config.readyText} Tab Google Flow sẽ được giữ mở sau khi gửi.`
     : "Lưu project và đăng nhập một lần rồi bấm chạy.";
+  elements.promptLabel.parentElement.hidden = Boolean(state.mode === "edit" && !config.showPrompt);
 
   for (const button of elements.modeButtons) {
     button.classList.toggle("active", button.dataset.mode === state.mode);
   }
 
   applyDraftToForm();
+  renderEditControls();
   renderComposerSummary();
   renderUploadStatus();
-  renderPromptAssistant();
+  renderImageReferenceStatus();
+  if (currentModeConfig().showPromptAi) {
+    renderPromptAssistant();
+  }
 }
 
 function renderComposerSummary() {
+  if (state.mode === "edit") {
+    const source = selectedEditSource();
+    const action = currentEditConfig();
+    elements.composerSummaryMode.textContent = action.title;
+    if (source) {
+      elements.composerSummaryText.textContent = `Đang dùng ${source.title} làm nguồn để ${action.title.toLowerCase()}.`;
+    } else if (state.manualMediaId && state.manualWorkflowId) {
+      elements.composerSummaryText.textContent = "Đang dùng Media ID và Workflow ID nhập tay cho thao tác chỉnh video này.";
+    } else {
+      elements.composerSummaryText.textContent = "Chọn video cần chỉnh rồi bấm chạy.";
+    }
+    return;
+  }
+
   if (state.mode === "image") {
+    if (state.imageReferenceItems.length) {
+      elements.composerSummaryMode.textContent = "Chỉnh ảnh từ ảnh tham chiếu";
+      elements.composerSummaryText.textContent = `Đang dùng ${fileKindLabel(state.imageReferenceItems.length)} để ghép hoặc chỉnh theo prompt vừa nhập.`;
+      return;
+    }
     elements.composerSummaryMode.textContent = "Ảnh từ prompt";
     elements.composerSummaryText.textContent = "App sẽ tạo ảnh trực tiếp từ mô tả vừa nhập.";
     return;
@@ -416,6 +624,118 @@ function renderUploadStatus() {
     return;
   }
   elements.startImageStatus.textContent = "Không có ảnh đầu vào. Nếu bỏ trống, app sẽ tạo video từ prompt.";
+}
+
+function availableVideoSources() {
+  const shelfItems = (state.outputShelf?.items || []).filter((item) => {
+    const mimeType = String(item.mime_type || "");
+    return mimeType.startsWith("video/") || item.job_type === "video" || EDIT_JOB_TYPES.has(item.job_type);
+  });
+
+  const deduped = [];
+  const seen = new Set();
+  for (const item of shelfItems) {
+    const mediaId = String(item.media_id || "").trim();
+    const workflowId = String(item.workflow_id || "").trim();
+    if (!mediaId || !workflowId) {
+      continue;
+    }
+    const key = `${mediaId}::${workflowId}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push({
+      key,
+      mediaId,
+      workflowId,
+      label: `${item.job_title || item.title || "Video"} · ${formatTime(item.created_at)}`,
+      title: item.title || item.job_title || "Video gần đây",
+    });
+  }
+  return deduped;
+}
+
+function selectedEditSource() {
+  const items = availableVideoSources();
+  return items.find((item) => item.key === state.selectedEditSourceKey) || null;
+}
+
+function renderEditControls() {
+  const isEdit = state.mode === "edit";
+  elements.editActionStrip.hidden = !isEdit;
+  elements.editSourceWrap.hidden = !isEdit;
+  elements.generationOptionsWrap.hidden = isEdit;
+  elements.promptAiCard.hidden = !currentModeConfig().showPromptAi;
+
+  if (!isEdit) {
+    elements.editOptionsWrap.hidden = true;
+    return;
+  }
+
+  for (const button of elements.editActionButtons) {
+    button.classList.toggle("active", button.dataset.editAction === state.editAction);
+  }
+
+  const sources = availableVideoSources();
+  const options = ['<option value="">Chọn một video</option>']
+    .concat(
+      sources.map(
+        (item) => `<option value="${escapeHtml(item.key)}">${escapeHtml(item.label)}</option>`
+      )
+    )
+    .join("");
+  elements.editSourceSelect.innerHTML = options;
+  if (!sources.some((item) => item.key === state.selectedEditSourceKey)) {
+    state.selectedEditSourceKey = "";
+  }
+
+  applyEditInputsToForm();
+
+  const config = currentEditConfig();
+  const hasOptions = config.showMotion || config.showPosition || config.showResolution;
+  elements.editOptionsWrap.hidden = !hasOptions;
+  elements.motionField.hidden = !config.showMotion;
+  elements.positionField.hidden = !config.showPosition;
+  elements.resolutionField.hidden = !config.showResolution;
+}
+
+function renderImageReferenceStatus() {
+  if (state.mode !== "image") {
+    return;
+  }
+
+  const items = state.imageReferenceItems || [];
+  if (state.uploading && !items.length) {
+    elements.imageReferenceList.hidden = true;
+    elements.imageReferenceList.innerHTML = "";
+    elements.imageReferenceStatus.textContent = "Đang tải ảnh tham chiếu...";
+    return;
+  }
+  if (!items.length) {
+    elements.imageReferenceList.hidden = true;
+    elements.imageReferenceList.innerHTML = "";
+    elements.imageReferenceStatus.textContent = "Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ dùng chúng để ghép/chỉnh ảnh.";
+    return;
+  }
+
+  elements.imageReferenceList.hidden = false;
+  elements.imageReferenceList.innerHTML = items
+    .map((item, index) => {
+      const source = item.publicUrl || uploadPublicUrlFromPath(item.path);
+      return `
+        <article class="upload-preview reference-card">
+          <img class="upload-preview-image" src="${escapeHtml(source)}" alt="${escapeHtml(item.name || "Ảnh tham chiếu")}" />
+          <div class="upload-preview-copy">
+            <strong>${escapeHtml(item.name || "Ảnh tham chiếu")}</strong>
+            <p>${escapeHtml(index === 0 ? "Ảnh chính hoặc ảnh người mẫu." : "Ảnh phụ để ghép logo, họa tiết hoặc chi tiết cần chèn.")}</p>
+          </div>
+          <button type="button" class="ghost-button card-button" data-action="remove-reference-image" data-index="${index}">Bỏ ảnh</button>
+        </article>
+      `;
+    })
+    .join("");
+  elements.imageReferenceStatus.textContent = `Đã gắn ${fileKindLabel(items.length)}. App sẽ dùng chúng làm ảnh tham chiếu khi tạo ảnh.`;
 }
 
 function renderPromptAiResult() {
@@ -470,102 +790,68 @@ function renderPromptAssistant() {
   renderPromptAiResult();
 }
 
-function outputItemsForMode() {
-  const items = state.outputShelf?.items || [];
-  return items.filter((item) => item.job_type === state.mode);
+function jobsForCurrentMode() {
+  return (state.jobs || [])
+    .filter((job) => (state.mode === "edit" ? EDIT_JOB_TYPES.has(job.type) : job.type === state.mode))
+    .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime());
 }
 
 function fillComposerFromSource(mode, payload = {}) {
-  if (!MODE_CONFIG[mode]) {
+  const resolvedMode = MODE_CONFIG[mode] ? mode : modeForJobType(payload.type || mode);
+  if (!MODE_CONFIG[resolvedMode]) {
     return;
   }
   syncDraftFromForm();
   syncPromptAiDraftFromForm();
-  state.mode = mode;
-  state.drafts[mode] = {
+  syncEditInputsFromForm();
+  state.mode = resolvedMode;
+  state.drafts[resolvedMode] = {
     prompt: String(payload.prompt || "").trim(),
-    aspect: String(payload.aspect || MODE_CONFIG[mode].defaultAspect).trim() || MODE_CONFIG[mode].defaultAspect,
-    count: Math.max(1, Math.min(4, Number(payload.count || MODE_CONFIG[mode].defaultCount))),
+    aspect: String(payload.aspect || MODE_CONFIG[resolvedMode].defaultAspect).trim() || MODE_CONFIG[resolvedMode].defaultAspect,
+    count: Math.max(1, Math.min(4, Number(payload.count || MODE_CONFIG[resolvedMode].defaultCount))),
   };
-  state.promptAiDrafts[mode] = {
-    ...state.promptAiDrafts[mode],
+  state.promptAiDrafts[resolvedMode] = {
+    ...state.promptAiDrafts[resolvedMode],
     brief: String(payload.prompt || "").trim(),
   };
 
-  if (mode === "video") {
+  if (resolvedMode === "video") {
     state.startImagePath = String(payload.start_image_path || "").trim();
     state.startImageName = basename(state.startImagePath);
     state.startImagePublicUrl = uploadPublicUrlFromPath(state.startImagePath);
+    state.imageReferenceItems = [];
+  } else if (resolvedMode === "image") {
+    state.startImagePath = "";
+    state.startImageName = "";
+    state.startImagePublicUrl = "";
+    state.imageReferenceItems = (payload.reference_image_paths || [])
+      .map((path) => String(path || "").trim())
+      .filter(Boolean)
+      .map((path) => ({
+        path,
+        name: basename(path),
+        publicUrl: uploadPublicUrlFromPath(path),
+      }));
   } else {
     state.startImagePath = "";
     state.startImageName = "";
     state.startImagePublicUrl = "";
+    state.imageReferenceItems = [];
+    state.editAction = EDIT_JOB_TYPES.has(payload.type) ? payload.type : state.editAction;
+    state.manualMediaId = String(payload.media_id || "").trim();
+    state.manualWorkflowId = String(payload.workflow_id || "").trim();
+    state.motion = String(payload.motion || state.motion || "truck_left").trim() || "truck_left";
+    state.position = String(payload.position || state.position || "center").trim() || "center";
+    state.resolution = String(payload.resolution || state.resolution || "1080p").trim() || "1080p";
+    const matchedKey = availableVideoSources().find(
+      (item) => item.mediaId === state.manualMediaId && item.workflowId === state.manualWorkflowId
+    )?.key;
+    state.selectedEditSourceKey = matchedKey || "";
   }
 
   renderAll();
   window.scrollTo({ top: 0, behavior: "smooth" });
   elements.promptInput.focus();
-}
-
-function previewMarkup(item) {
-  const source = item.local_file_url || item.preview_url || item.source_url || "";
-  if (!source) {
-    return '<div class="result-placeholder">Chưa có preview</div>';
-  }
-
-  if ((item.mime_type || "").startsWith("video/") || item.job_type === "video") {
-    return `<video class="result-media" src="${escapeHtml(source)}" controls playsinline preload="metadata"></video>`;
-  }
-  return `<img class="result-media" src="${escapeHtml(source)}" alt="${escapeHtml(item.title || item.job_title || "Kết quả")}" />`;
-}
-
-function renderOutputs() {
-  const config = currentModeConfig();
-  const items = outputItemsForMode().slice(0, 8);
-  if (!items.length) {
-    elements.outputShelfList.className = "results-grid empty-state";
-    elements.outputShelfList.textContent = config.emptyResult;
-    return;
-  }
-
-  elements.outputShelfList.className = "results-grid";
-  elements.outputShelfList.innerHTML = items
-    .map((item, index) => {
-      const source = item.local_file_url || item.preview_url || item.source_url || "";
-      const actionText = item.local_file_url ? "Mở bản tải về" : "Mở kết quả";
-      const sourceJob = (state.jobs || []).find((job) => job.id === item.job_id);
-      const sourceImagePath = String(sourceJob?.input?.start_image_path || "").trim();
-      const sourceBadge = sourceImagePath ? `Từ ảnh ${basename(sourceImagePath)}` : item.job_type_label || "";
-      return `
-        <article class="result-card${index === 0 ? " featured" : ""}${sourceImagePath ? " from-image" : ""}">
-          ${previewMarkup(item)}
-          <div class="result-copy">
-            <div class="result-meta">
-              <span class="mini-pill">${escapeHtml(sourceBadge)}</span>
-              <span>${escapeHtml(formatTime(item.created_at))}</span>
-            </div>
-            <strong>${escapeHtml(item.title || item.job_title || "Kết quả")}</strong>
-            <p>${escapeHtml(truncate(item.prompt || "", 120) || "Không có mô tả được lưu.")}</p>
-            <div class="card-actions">
-              ${
-                source
-                  ? `<a class="inline-link action-link" href="${escapeHtml(source)}" target="_blank" rel="noreferrer">${actionText}</a>`
-                  : ""
-              }
-              <button
-                type="button"
-                class="ghost-button card-button"
-                data-action="reuse-output"
-                data-output-index="${index}"
-              >
-                Dùng lại prompt
-              </button>
-            </div>
-          </div>
-        </article>
-      `;
-    })
-    .join("");
 }
 
 function describeJob(job) {
@@ -612,93 +898,66 @@ function jobDuration(job) {
   return formatDuration(Math.max(0, end - start));
 }
 
-function renderMilestones(job) {
-  const source = job.progress_snapshot?.milestones || [];
-  const selected = source.filter((item) =>
-    ["connecting", "sending_request", "awaiting_response", "saving_artifacts", "completed"].includes(item.key)
-  );
-  if (!selected.length) {
-    return "";
-  }
-
-  const shortLabels = {
-    connecting: "Kết nối",
-    sending_request: "Gửi",
-    awaiting_response: "Chờ",
-    saving_artifacts: "Lưu",
-    completed: "Xong",
-  };
-
-  return `
-    <div class="milestone-strip">
-      ${selected
-        .map((item) => {
-          const status = item.status || "pending";
-          return `<span class="milestone-chip" data-status="${escapeHtml(status)}">${escapeHtml(shortLabels[item.key] || item.label || item.key)}</span>`;
-        })
-        .join("")}
-    </div>
-  `;
-}
-
-function renderJobs() {
-  const config = currentModeConfig();
-  const jobs = (state.jobs || []).filter((job) => job.type === state.mode).slice(0, 6);
-  if (!jobs.length) {
-    elements.jobList.className = "run-list empty-state";
-    elements.jobList.textContent = config.emptyRun;
+function renderLatestStatus() {
+  const latestJob = jobsForCurrentMode()[0];
+  if (!latestJob) {
+    elements.latestStatusCard.className = "latest-status empty-state";
+    elements.latestStatusCard.textContent = "Chưa có lượt chạy nào. Sau khi bấm chạy, tab Google Flow sẽ được giữ mở.";
     return;
   }
 
-  elements.jobList.className = "run-list";
-  elements.jobList.innerHTML = jobs
-    .map((job) => {
-      const prompt = truncate(job.input?.prompt || "", 120) || "Không có mô tả.";
-      const note = describeJob(job);
-      const duration = jobDuration(job);
-      const sourceImagePath = String(job.input?.start_image_path || "").trim();
-      const sourceLabel = sourceImagePath ? `Ảnh gốc: ${basename(sourceImagePath)}` : "";
-      const canRetry =
-        job.status === "failed" ||
-        job.status === "interrupted" ||
-        (job.type === "video" && job.status === "completed" && !(job.artifacts || []).length);
-      const canReuse = Boolean(String(job.input?.prompt || "").trim());
-      return `
-        <article class="run-card">
-          <div class="run-head">
-            <div>
-              <strong>${escapeHtml(job.title || config.submitLabel)}</strong>
-              <small>${escapeHtml(formatTime(job.created_at))}${duration ? ` · ${escapeHtml(duration)}` : ""}</small>
-            </div>
-            <span class="status-chip" data-status="${escapeHtml(jobProgressTone(job))}">${escapeHtml(jobProgressLabel(job))}</span>
-          </div>
-          ${renderMilestones(job)}
-          ${sourceLabel ? `<p class="run-source">${escapeHtml(sourceLabel)}</p>` : ""}
-          <p class="run-prompt">${escapeHtml(prompt)}</p>
-          <p class="run-note">${escapeHtml(note)}</p>
-          <div class="card-actions">
-            ${
-              canReuse
-                ? `<button type="button" class="ghost-button card-button" data-action="reuse-job" data-job-id="${escapeHtml(job.id)}">Dùng lại prompt</button>`
-                : ""
-            }
-            ${
-              canRetry
-                ? `<button type="button" class="ghost-button card-button" data-action="retry-job" data-job-id="${escapeHtml(job.id)}">Chạy lại</button>`
-                : ""
-            }
-          </div>
-        </article>
-      `;
-    })
-    .join("");
+  const prompt = truncate(latestJob.input?.prompt || "", 180) || "Không có mô tả.";
+  const note = describeJob(latestJob);
+  const duration = jobDuration(latestJob);
+  const sourceImagePath = String(latestJob.input?.start_image_path || "").trim();
+  const referenceImageCount = Array.isArray(latestJob.input?.reference_image_paths)
+    ? latestJob.input.reference_image_paths.length
+    : 0;
+  const sourceLabel = sourceImagePath
+    ? `Ảnh gốc: ${basename(sourceImagePath)}`
+    : referenceImageCount
+    ? `Ảnh tham chiếu: ${referenceImageCount}`
+    : "";
+  const canRetry =
+    latestJob.status === "failed" ||
+    latestJob.status === "interrupted" ||
+    (latestJob.type === "video" && latestJob.status === "completed" && !(latestJob.artifacts || []).length);
+  const canReuse = Boolean(String(latestJob.input?.prompt || "").trim());
+
+  elements.latestStatusCard.className = "latest-status";
+  elements.latestStatusCard.innerHTML = `
+    <article class="status-summary-card">
+      <div class="run-head">
+        <div>
+          <strong>${escapeHtml(latestJob.title || currentOperationConfig().submitLabel)}</strong>
+          <small>${escapeHtml(formatTime(latestJob.created_at))}${duration ? ` · ${escapeHtml(duration)}` : ""}</small>
+        </div>
+        <span class="status-chip" data-status="${escapeHtml(jobProgressTone(latestJob))}">${escapeHtml(jobProgressLabel(latestJob))}</span>
+      </div>
+      ${sourceLabel ? `<p class="run-source">${escapeHtml(sourceLabel)}</p>` : ""}
+      <p class="run-prompt">${escapeHtml(prompt)}</p>
+      <p class="run-note">${escapeHtml(note)}</p>
+      <p class="run-note flow-open-note">Tab Google Flow vẫn được giữ mở để bạn xem trực tiếp trên đó.</p>
+      <div class="card-actions">
+        ${
+          canReuse
+            ? `<button type="button" class="ghost-button card-button" data-action="reuse-job" data-job-id="${escapeHtml(latestJob.id)}">Dùng lại prompt</button>`
+            : ""
+        }
+        ${
+          canRetry
+            ? `<button type="button" class="ghost-button card-button" data-action="retry-job" data-job-id="${escapeHtml(latestJob.id)}">Chạy lại</button>`
+            : ""
+        }
+      </div>
+    </article>
+  `;
 }
 
 function renderAll() {
   renderTopbar();
   renderComposer();
-  renderOutputs();
-  renderJobs();
+  renderLatestStatus();
 }
 
 async function loadState({ silent = false } = {}) {
@@ -706,7 +965,7 @@ async function loadState({ silent = false } = {}) {
     const payload = await api("/api/state");
     state.config = payload.config || {};
     state.auth = payload.auth || { authenticated: false };
-    state.jobs = (payload.jobs || []).filter((job) => job.type === "video" || job.type === "image");
+    state.jobs = (payload.jobs || []).filter((job) => job.type !== "login");
     state.outputShelf = payload.output_shelf || { items: [] };
     state.promptAssistant = payload.prompt_assistant || null;
     state.skillLibraryCount = Array.isArray(payload.skills) ? payload.skills.length : 0;
@@ -758,11 +1017,35 @@ async function saveConfig(event) {
 async function loginFlow() {
   try {
     await api("/api/auth/login", { method: "POST" });
-    showMessage("Đang mở cửa sổ đăng nhập Google Flow.", "success");
+    showMessage("Đang mở cửa sổ đăng nhập Google Flow. Em sẽ để nguyên tab này để dùng tiếp.", "success");
     state.setupOpen = true;
     renderTopbar();
   } catch (error) {
     showMessage(error.message, "error");
+  }
+}
+
+async function logoutFlow() {
+  if (!state.auth?.authenticated) {
+    showMessage("Phiên Google Flow hiện đã ở trạng thái đăng xuất.", "success");
+    return;
+  }
+
+  elements.logoutButton.disabled = true;
+  try {
+    const payload = await api("/api/auth/logout", { method: "POST" });
+    state.setupOpen = true;
+    await loadState({ silent: true });
+    showMessage(
+      payload.had_session
+        ? "Đã đăng xuất Google Flow. Khi cần chạy tiếp, chỉ việc đăng nhập lại."
+        : "Phiên Google Flow đã ở trạng thái đăng xuất.",
+      "success"
+    );
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    renderTopbar();
   }
 }
 
@@ -798,6 +1081,42 @@ async function uploadStartImage(event) {
   }
 }
 
+async function uploadImageReferences(event) {
+  const files = Array.from(event.target.files || []);
+  if (!files.length) {
+    return;
+  }
+
+  if (state.imageReferenceItems.length + files.length > 4) {
+    event.target.value = "";
+    showMessage("Tối đa 4 ảnh tham chiếu cho một lượt ghép/chỉnh ảnh.", "error");
+    return;
+  }
+
+  state.uploading = true;
+  renderImageReferenceStatus();
+  try {
+    for (const file of files) {
+      const data = new FormData();
+      data.append("file", file);
+      const payload = await api("/api/uploads", { method: "POST", body: data });
+      state.imageReferenceItems.push({
+        path: payload.saved_path || "",
+        name: payload.file_name || file.name,
+        publicUrl: payload.public_url || uploadPublicUrlFromPath(payload.saved_path || file.name),
+      });
+    }
+    showMessage("Đã tải ảnh tham chiếu để ghép/chỉnh ảnh.", "success");
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    state.uploading = false;
+    event.target.value = "";
+    renderComposerSummary();
+    renderImageReferenceStatus();
+  }
+}
+
 function clearStartImage() {
   state.startImagePath = "";
   state.startImageName = "";
@@ -808,9 +1127,21 @@ function clearStartImage() {
   showMessage("Đã bỏ ảnh đầu vào.", "success");
 }
 
+function removeReferenceImage(indexValue) {
+  const index = Number(indexValue);
+  if (!Number.isInteger(index) || index < 0 || index >= state.imageReferenceItems.length) {
+    return;
+  }
+  state.imageReferenceItems.splice(index, 1);
+  renderComposerSummary();
+  renderImageReferenceStatus();
+  showMessage("Đã bỏ một ảnh tham chiếu.", "success");
+}
+
 async function submitCreate(event) {
   event.preventDefault();
   syncDraftFromForm();
+  syncEditInputsFromForm();
 
   if (!state.config?.project_id) {
     state.setupOpen = true;
@@ -827,7 +1158,8 @@ async function submitCreate(event) {
   }
 
   const draft = currentDraft();
-  if (!draft.prompt.trim()) {
+  const operationConfig = currentOperationConfig();
+  if (operationConfig.promptRequired && !draft.prompt.trim()) {
     showMessage("Hãy nhập mô tả trước khi chạy.", "error");
     elements.promptInput.focus();
     return;
@@ -841,8 +1173,36 @@ async function submitCreate(event) {
     timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
   };
 
-  if (state.mode === "video" && state.startImagePath) {
-    payload.start_image_path = state.startImagePath;
+  if (state.mode === "video") {
+    payload.type = "video";
+    if (state.startImagePath) {
+      payload.start_image_path = state.startImagePath;
+    }
+  }
+
+  if (state.mode === "image") {
+    payload.type = "image";
+    if (state.imageReferenceItems.length) {
+      payload.reference_image_paths = state.imageReferenceItems.map((item) => item.path).filter(Boolean);
+    }
+  }
+
+  if (state.mode === "edit") {
+    const source = selectedEditSource();
+    payload.type = state.editAction;
+    payload.prompt = draft.prompt.trim();
+    payload.aspect = "landscape";
+    payload.count = 1;
+    payload.motion = state.motion;
+    payload.position = state.position;
+    payload.resolution = state.resolution;
+    payload.media_id = source?.mediaId || state.manualMediaId.trim();
+    payload.workflow_id = source?.workflowId || state.manualWorkflowId.trim();
+
+    if (!payload.media_id || !payload.workflow_id) {
+      showMessage("Hãy chọn video cần chỉnh hoặc nhập Media ID và Workflow ID.", "error");
+      return;
+    }
   }
 
   elements.submitButton.disabled = true;
@@ -851,12 +1211,15 @@ async function submitCreate(event) {
       method: "POST",
       body: JSON.stringify(payload),
     });
-    showMessage(
+    const submitMessage =
       state.mode === "video" && state.startImagePath
-        ? "Đã gửi yêu cầu tạo video từ ảnh."
-        : `Đã gửi yêu cầu ${state.mode === "video" ? "tạo video" : "tạo ảnh"}.`,
-      "success"
-    );
+        ? "Đã gửi yêu cầu tạo video từ ảnh. Tab Google Flow sẽ được giữ mở."
+        : state.mode === "image" && state.imageReferenceItems.length
+        ? "Đã gửi yêu cầu chỉnh ảnh từ ảnh tham chiếu. Tab Google Flow sẽ được giữ mở."
+        : state.mode === "edit"
+        ? `Đã gửi yêu cầu ${currentEditConfig().title.toLowerCase()}. Tab Google Flow sẽ được giữ mở.`
+        : `Đã gửi yêu cầu ${state.mode === "video" ? "tạo video" : "tạo ảnh"}. Tab Google Flow sẽ được giữ mở.`;
+    showMessage(submitMessage, "success");
     state.setupOpen = false;
     await loadState({ silent: true });
   } catch (error) {
@@ -938,6 +1301,7 @@ function buildRetryPayload(job) {
     aspect: String(input.aspect || MODE_CONFIG[job.type]?.defaultAspect || "landscape").trim(),
     count: Math.max(1, Math.min(4, Number(input.count || MODE_CONFIG[job.type]?.defaultCount || 1))),
     start_image_path: String(input.start_image_path || "").trim(),
+    reference_image_paths: Array.isArray(input.reference_image_paths) ? input.reference_image_paths : [],
     reference_media_names: Array.isArray(input.reference_media_names) ? input.reference_media_names : [],
     media_id: String(input.media_id || "").trim(),
     workflow_id: String(input.workflow_id || "").trim(),
@@ -962,7 +1326,7 @@ async function retryJob(jobId) {
       method: "POST",
       body: JSON.stringify(buildRetryPayload(job)),
     });
-    showMessage("Đã gửi lại lượt chạy với đúng cấu hình cũ.", "success");
+    showMessage("Đã gửi lại lượt chạy với đúng cấu hình cũ. Tab Google Flow sẽ được giữ mở.", "success");
     state.setupOpen = false;
     await loadState({ silent: true });
   } catch (error) {
@@ -979,22 +1343,6 @@ function reuseJob(jobId) {
 
   fillComposerFromSource(job.type, job.input || {});
   showMessage("Đã đổ lại prompt và thông số lên form.", "success");
-}
-
-function reuseOutput(indexValue) {
-  const index = Number(indexValue);
-  const item = outputItemsForMode().slice(0, 8)[index];
-  if (!item) {
-    showMessage("Không tìm thấy kết quả để dùng lại.", "error");
-    return;
-  }
-
-  const sourceJob = (state.jobs || []).find((job) => job.id === item.job_id);
-  fillComposerFromSource(item.job_type, {
-    prompt: item.prompt || "",
-    start_image_path: String(sourceJob?.input?.start_image_path || "").trim(),
-  });
-  showMessage("Đã chép prompt từ kết quả lên form.", "success");
 }
 
 function changeMode(mode) {
@@ -1020,6 +1368,13 @@ elements.modeButtons.forEach((button) => {
   button.addEventListener("click", () => changeMode(button.dataset.mode));
 });
 
+elements.editActionButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    state.editAction = button.dataset.editAction || "extend";
+    renderAll();
+  });
+});
+
 elements.setupToggle.addEventListener("click", () => {
   state.setupOpen = !state.setupOpen;
   renderTopbar();
@@ -1027,8 +1382,25 @@ elements.setupToggle.addEventListener("click", () => {
 
 elements.configForm.addEventListener("submit", saveConfig);
 elements.loginButton.addEventListener("click", loginFlow);
+elements.logoutButton.addEventListener("click", logoutFlow);
 elements.startImageFile.addEventListener("change", uploadStartImage);
+elements.imageReferenceFiles.addEventListener("change", uploadImageReferences);
 elements.clearStartImageButton.addEventListener("click", clearStartImage);
+elements.editSourceSelect.addEventListener("change", () => {
+  syncEditInputsFromForm();
+  renderComposerSummary();
+});
+elements.manualMediaId.addEventListener("input", () => {
+  syncEditInputsFromForm();
+  renderComposerSummary();
+});
+elements.manualWorkflowId.addEventListener("input", () => {
+  syncEditInputsFromForm();
+  renderComposerSummary();
+});
+elements.motionSelect.addEventListener("change", syncEditInputsFromForm);
+elements.positionSelect.addEventListener("change", syncEditInputsFromForm);
+elements.resolutionSelect.addEventListener("change", syncEditInputsFromForm);
 elements.composerForm.addEventListener("submit", submitCreate);
 elements.refreshButton.addEventListener("click", () => loadState());
 elements.promptAiSubmit.addEventListener("click", submitPromptAi);
@@ -1041,16 +1413,7 @@ elements.promptAiAudience.addEventListener("input", syncPromptAiDraftFromForm);
 elements.promptInput.addEventListener("input", syncDraftFromForm);
 elements.aspectSelect.addEventListener("change", syncDraftFromForm);
 elements.countInput.addEventListener("input", syncDraftFromForm);
-elements.outputShelfList.addEventListener("click", (event) => {
-  const actionTarget = event.target.closest("[data-action]");
-  if (!actionTarget) {
-    return;
-  }
-  if (actionTarget.dataset.action === "reuse-output") {
-    reuseOutput(actionTarget.dataset.outputIndex);
-  }
-});
-elements.jobList.addEventListener("click", (event) => {
+elements.latestStatusCard.addEventListener("click", (event) => {
   const actionTarget = event.target.closest("[data-action]");
   if (!actionTarget) {
     return;
@@ -1062,6 +1425,13 @@ elements.jobList.addEventListener("click", (event) => {
   if (actionTarget.dataset.action === "reuse-job") {
     reuseJob(actionTarget.dataset.jobId);
   }
+});
+elements.imageReferenceList.addEventListener("click", (event) => {
+  const actionTarget = event.target.closest("[data-action='remove-reference-image']");
+  if (!actionTarget) {
+    return;
+  }
+  removeReferenceImage(actionTarget.dataset.index);
 });
 
 loadState();

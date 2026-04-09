@@ -65,6 +65,7 @@ async def lifespan(app: FastAPI):
         sync_task.cancel()
         with suppress(asyncio.CancelledError):
             await sync_task
+        await app.state.flow_service.close()
 
 
 app = FastAPI(
@@ -109,6 +110,11 @@ async def login(request: Request) -> Dict[str, Any]:
     flow_service = service(request)
     job = await flow_service.enqueue_login()
     return {"job": job}
+
+
+@app.post("/api/auth/logout")
+async def logout(request: Request) -> Dict[str, Any]:
+    return await service(request).logout_flow()
 
 
 @app.get("/api/credits")

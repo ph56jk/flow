@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260407m" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260408g" />
   </head>
   <body>
     <div class="app-shell">
@@ -24,7 +24,7 @@
           </div>
           <div class="brand-copy">
             <p class="eyebrow">Flow Studio</p>
-            <h1>Tạo ảnh và video</h1>
+            <h1>Tạo và chỉnh với Flow</h1>
             <p class="subcopy" id="topbarHint">Lưu project một lần rồi chỉ việc nhập prompt.</p>
           </div>
         </div>
@@ -32,6 +32,7 @@
         <div class="topbar-actions">
           <span class="status-pill" id="projectStatus">Chưa có project</span>
           <span class="status-pill" id="authStatus">Chưa đăng nhập</span>
+          <button type="button" class="ghost-button" id="logoutButton" hidden>Đăng xuất</button>
           <button type="button" class="ghost-button" id="setupToggle">Thiết lập</button>
         </div>
       </header>
@@ -94,6 +95,7 @@
             <div class="mode-switch" role="tablist" aria-label="Chọn chế độ tạo">
               <button type="button" class="mode-button active" data-mode="video">Video</button>
               <button type="button" class="mode-button" data-mode="image">Ảnh</button>
+              <button type="button" class="mode-button" data-mode="edit">Chỉnh video</button>
             </div>
 
             <div class="composer-summary">
@@ -102,7 +104,16 @@
             </div>
 
             <form id="composerForm" class="composer-form">
-              <section class="prompt-ai-card">
+              <div id="editActionStrip" class="action-strip" hidden>
+                <button type="button" class="task-chip active" data-edit-action="extend">Kéo dài</button>
+                <button type="button" class="task-chip" data-edit-action="upscale">Nâng chất lượng</button>
+                <button type="button" class="task-chip" data-edit-action="camera_motion">Chuyển động camera</button>
+                <button type="button" class="task-chip" data-edit-action="camera_position">Vị trí camera</button>
+                <button type="button" class="task-chip" data-edit-action="insert">Chèn vật thể</button>
+                <button type="button" class="task-chip" data-edit-action="remove">Xóa vật thể</button>
+              </div>
+
+              <section class="prompt-ai-card" id="promptAiCard">
                 <div class="prompt-ai-head">
                   <div>
                     <p class="eyebrow">AI viết prompt</p>
@@ -159,6 +170,35 @@
                 </div>
               </section>
 
+              <section id="editSourceWrap" class="source-panel" hidden>
+                <div class="source-panel-head">
+                  <div>
+                    <p class="eyebrow">Nguồn để chỉnh</p>
+                    <h3>Chọn video cần sửa</h3>
+                    <p class="section-copy">Ưu tiên chọn từ kết quả gần đây. Nếu chưa thấy, có thể nhập tay ở phần dưới.</p>
+                  </div>
+                </div>
+                <label class="field wide">
+                  <span>Video gần đây</span>
+                  <select id="editSourceSelect">
+                    <option value="">Chọn một video</option>
+                  </select>
+                </label>
+                <details class="compact-details">
+                  <summary>Nhập tay nếu cần</summary>
+                  <div class="detail-grid">
+                    <label class="field">
+                      <span>Media ID</span>
+                      <input type="text" id="manualMediaId" placeholder="Ví dụ: 34dc0544-..." />
+                    </label>
+                    <label class="field">
+                      <span>Workflow ID</span>
+                      <input type="text" id="manualWorkflowId" placeholder="Ví dụ: a230f3de-..." />
+                    </label>
+                  </div>
+                </details>
+              </section>
+
               <label class="field wide prompt-field">
                 <span id="promptLabel">Mô tả video</span>
                 <textarea
@@ -184,7 +224,20 @@
                 <small id="startImageStatus">Không có ảnh đầu vào. Có thể bỏ qua.</small>
               </div>
 
-              <details class="compact-details">
+              <div id="imageReferenceWrap" class="upload-box" hidden>
+                <div class="upload-box-head">
+                  <strong>Ảnh tham chiếu để ghép hoặc chỉnh</strong>
+                  <p>Ví dụ: một ảnh người mẫu và một ảnh logo áo. Sau đó viết yêu cầu như “ghép logo này lên áo của người mẫu”.</p>
+                </div>
+                <div id="imageReferenceList" class="reference-list" hidden></div>
+                <label class="upload-field">
+                  <span>Chọn 1 đến 4 ảnh tham chiếu</span>
+                  <input type="file" id="imageReferenceFiles" accept="image/*" multiple />
+                </label>
+                <small id="imageReferenceStatus">Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ dùng chúng để ghép/chỉnh ảnh.</small>
+              </div>
+
+              <details class="compact-details" id="generationOptionsWrap">
                 <summary>Tùy chọn thêm</summary>
                 <div class="detail-grid">
                   <label class="field">
@@ -202,6 +255,44 @@
                 </div>
               </details>
 
+              <details class="compact-details" id="editOptionsWrap" hidden>
+                <summary>Tùy chọn cho thao tác này</summary>
+                <div class="detail-grid">
+                  <label class="field" id="motionField" hidden>
+                    <span>Chuyển động camera</span>
+                    <select id="motionSelect">
+                      <option value="truck_left">Trượt trái</option>
+                      <option value="truck_right">Trượt phải</option>
+                      <option value="tilt_up">Ngẩng lên</option>
+                      <option value="tilt_down">Chúc xuống</option>
+                      <option value="pan_left">Pan trái</option>
+                      <option value="pan_right">Pan phải</option>
+                      <option value="zoom_in">Tiến gần</option>
+                      <option value="zoom_out">Lùi ra</option>
+                    </select>
+                  </label>
+                  <label class="field" id="positionField" hidden>
+                    <span>Vị trí camera</span>
+                    <select id="positionSelect">
+                      <option value="center">Giữa khung hình</option>
+                      <option value="left">Lệch trái</option>
+                      <option value="right">Lệch phải</option>
+                      <option value="high">Góc cao hơn</option>
+                      <option value="low">Góc thấp hơn</option>
+                      <option value="closer">Gần hơn</option>
+                      <option value="further">Xa hơn</option>
+                    </select>
+                  </label>
+                  <label class="field" id="resolutionField" hidden>
+                    <span>Độ phân giải</span>
+                    <select id="resolutionSelect">
+                      <option value="1080p">1080p</option>
+                      <option value="720p">720p</option>
+                    </select>
+                  </label>
+                </div>
+              </details>
+
               <div class="submit-row">
                 <p id="readyHint" class="ready-hint">Lưu project và đăng nhập một lần rồi bấm chạy.</p>
                 <button type="submit" id="submitButton">Tạo video</button>
@@ -210,32 +301,21 @@
           </div>
         </section>
 
-        <div class="lower-grid">
-          <section class="surface-card surface-card-results">
-            <div class="section-head">
-              <div>
-                <p class="eyebrow">Kết quả</p>
-                <h2 id="resultsTitle">Kết quả video gần đây</h2>
-                <p class="section-copy">Mở lại nhanh những thứ vừa tạo ngay ở đây.</p>
-              </div>
-              <button type="button" class="ghost-button" id="refreshButton">Làm mới</button>
+        <section class="surface-card status-card">
+          <div class="section-head">
+            <div>
+              <p class="eyebrow">Trạng thái</p>
+              <h2>Luồng gần nhất</h2>
+              <p class="section-copy">App chỉ giữ một trạng thái ngắn gọn. Tab Google Flow sẽ được để nguyên để theo dõi trực tiếp.</p>
             </div>
-            <div id="outputShelfList" class="results-grid empty-state">Chưa có kết quả nào.</div>
-          </section>
-
-          <section class="surface-card surface-card-runs">
-            <div class="section-head">
-              <div>
-                <p class="eyebrow">Tiến độ</p>
-                <h2 id="runsTitle">Lượt chạy video gần đây</h2>
-                <p class="section-copy">Theo dõi nhanh để biết lượt nào đã xong, lượt nào còn chờ.</p>
-              </div>
-            </div>
-            <div id="jobList" class="run-list empty-state">Chưa có lượt chạy nào.</div>
-          </section>
-        </div>
+            <button type="button" class="ghost-button" id="refreshButton">Làm mới</button>
+          </div>
+          <div id="latestStatusCard" class="latest-status empty-state">
+            Chưa có lượt chạy nào. Sau khi bấm chạy, tab Google Flow sẽ được giữ mở.
+          </div>
+        </section>
       </main>
     </div>
-    <script type="module" src="/static/app.js?v=20260408b"></script>
+    <script type="module" src="/static/app.js?v=20260408g"></script>
   </body>
 </html>

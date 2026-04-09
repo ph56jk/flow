@@ -250,6 +250,7 @@ class CreateJobRequest(BaseModel):
     aspect: str = "landscape"
     count: int = 1
     start_image_path: str = ""
+    reference_image_paths: List[str] = Field(default_factory=list)
     reference_media_names: List[str] = Field(default_factory=list)
     media_id: str = ""
     workflow_id: str = ""
