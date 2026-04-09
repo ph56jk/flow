@@ -331,7 +331,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         context = SimpleNamespace(new_page=AsyncMock(return_value=page))
         browser = SimpleNamespace(context=context, _page=None, page=AsyncMock(return_value=page))
 
-        result = await self.service._open_login_flow_page(browser)
+        with patch.object(
+            self.service,
+            "_foreground_native_flow_window",
+            AsyncMock(),
+        ) as foreground_native_window:
+            result = await self.service._open_login_flow_page(browser)
 
         self.assertIs(result, page)
         context.new_page.assert_awaited_once()
@@ -342,6 +347,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             page.goto.await_args.args[0],
         )
         page.evaluate.assert_awaited()
+        foreground_native_window.assert_awaited_once()
 
     async def test_enqueue_login_fails_immediately_when_browser_cannot_open(self) -> None:
         with patch.object(

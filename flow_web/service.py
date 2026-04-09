@@ -8,6 +8,7 @@ import random
 import re
 import shlex
 import shutil
+import subprocess
 import time
 import unicodedata
 import uuid
@@ -2016,7 +2017,9 @@ class FlowWebService:
         )
         await self.store.append_log(
             job_id,
-            "Nếu chưa thấy tab hiện ra, hãy kiểm tra cửa sổ Chromium/Chrome for Testing vừa được mở trên màn hình.",
+            "Nếu chưa thấy tab hiện ra, hãy kiểm tra cửa sổ Chromium/Chrome for Testing vừa được mở trên màn hình."
+            if os.name != "nt"
+            else "Nếu chưa thấy tab hiện ra, hãy tìm cửa sổ 'Flow - Google Chrome for Testing' trên taskbar hoặc màn hình Windows.",
         )
         return page
 
@@ -2088,8 +2091,60 @@ class FlowWebService:
             )
         except Exception:
             pass
+        await self._foreground_native_flow_window()
         await asyncio.sleep(1.5)
         return page
+
+    async def _foreground_native_flow_window(self) -> None:
+        if os.name != "nt":
+            return
+        await asyncio.to_thread(self._foreground_native_flow_window_sync)
+
+    def _foreground_native_flow_window_sync(self) -> None:
+        if os.name != "nt":
+            return
+        script = r"""
+Add-Type -AssemblyName Microsoft.VisualBasic
+$deadline = (Get-Date).AddSeconds(10)
+while ((Get-Date) -lt $deadline) {
+  $window = Get-Process chrome -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne 0 } |
+    Sort-Object StartTime -Descending |
+    Select-Object -First 1
+  if ($window) {
+    try {
+      [Microsoft.VisualBasic.Interaction]::AppActivate($window.Id) | Out-Null
+      exit 0
+    } catch {
+    }
+  }
+  foreach ($title in @('Flow - Google Chrome for Testing', 'Google Chrome for Testing', 'Flow')) {
+    try {
+      [Microsoft.VisualBasic.Interaction]::AppActivate($title) | Out-Null
+      exit 0
+    } catch {
+    }
+  }
+  Start-Sleep -Milliseconds 350
+}
+exit 1
+"""
+        kwargs: Dict[str, Any] = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "timeout": 15,
+            "check": False,
+        }
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if creationflags:
+            kwargs["creationflags"] = creationflags
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                **kwargs,
+            )
+        except Exception:
+            return
 
     async def _run_flow_job(self, job_id: str, request: CreateJobRequest) -> None:
         await self.store.patch_job(job_id, status="running")
