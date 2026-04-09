@@ -326,6 +326,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         page = SimpleNamespace(
             bring_to_front=AsyncMock(),
             goto=AsyncMock(),
+            evaluate=AsyncMock(return_value=True),
         )
         context = SimpleNamespace(new_page=AsyncMock(return_value=page))
         browser = SimpleNamespace(context=context, _page=None, page=AsyncMock(return_value=page))
@@ -340,6 +341,22 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             "https://labs.google/fx/vi/tools/flow",
             page.goto.await_args.args[0],
         )
+        page.evaluate.assert_awaited()
+
+    async def test_enqueue_login_fails_immediately_when_browser_cannot_open(self) -> None:
+        with patch.object(
+            self.service,
+            "_launch_login_browser",
+            AsyncMock(side_effect=RuntimeError("Khong mo duoc cua so Chromium")),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service.enqueue_login()
+
+        self.assertEqual(500, ctx.exception.status_code)
+        self.assertIn("khong mo duoc cua so chromium", str(ctx.exception.detail).lower())
+        jobs = self.store.snapshot().jobs
+        self.assertEqual(1, len(jobs))
+        self.assertEqual("failed", jobs[0].status)
 
     async def test_ensure_valid_flow_project_page_redirects_placeholder_route(self) -> None:
         page = SimpleNamespace(

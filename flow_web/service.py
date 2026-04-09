@@ -946,7 +946,19 @@ class FlowWebService:
     async def enqueue_login(self) -> JobRecord:
         job = JobRecord(type="login", status="queued", title="Đăng nhập Google Flow")
         await self.store.add_job(job)
-        self._tasks[job.id] = asyncio.create_task(self._run_login(job.id))
+        try:
+            page = await self._launch_login_browser(job.id)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            detail = self._flow_error_detail(exc)
+            await self.store.patch_job(job.id, status="failed", error=detail)
+            await self.store.append_log(job.id, f"Đăng nhập thất bại: {detail}")
+            raise HTTPException(
+                status_code=self._flow_error_status(exc),
+                detail=detail,
+            ) from exc
+        self._tasks[job.id] = asyncio.create_task(self._wait_for_login_completion(job.id, page))
         return job
 
     async def enqueue_job(self, request: CreateJobRequest) -> JobRecord:
@@ -1990,40 +2002,49 @@ class FlowWebService:
             remote_status=remote_status,
         )
 
-    async def _run_login(self, job_id: str) -> None:
+    async def _launch_login_browser(self, job_id: str) -> Any:
+        await self.store.patch_job(job_id, status="running")
+        await self._set_job_progress(job_id, "launching_browser", "Em đang mở Chromium để đi tới Google Flow.")
+        await self.store.append_log(job_id, "Đang mở Chromium để đăng nhập Google Flow")
+        async with self._browser_session_lock:
+            browser = await self._ensure_shared_browser()
+            page = await self._open_login_flow_page(browser)
+        await self._set_job_progress(
+            job_id,
+            "awaiting_login",
+            "Chromium đã mở. Đang chờ hoàn tất đăng nhập Google Flow.",
+        )
+        await self.store.append_log(
+            job_id,
+            "Nếu chưa thấy tab hiện ra, hãy kiểm tra cửa sổ Chromium/Chrome for Testing vừa được mở trên màn hình.",
+        )
+        return page
+
+    async def _wait_for_login_completion(self, job_id: str, page: Any) -> None:
         try:
-            await self.store.patch_job(job_id, status="running")
-            await self._set_job_progress(job_id, "launching_browser", "Em đang mở Chromium để đi tới Google Flow.")
-            await self.store.append_log(job_id, "Đang mở Chromium để đăng nhập Google Flow")
             config = self._normalized_config(self.store.snapshot().config)
-            async with self._browser_session_lock:
-                browser = await self._ensure_shared_browser()
-                page = await self._open_login_flow_page(browser)
-                await self._set_job_progress(
-                    job_id,
-                    "awaiting_login",
-                    "Chromium đã mở. Đang chờ hoàn tất đăng nhập Google Flow.",
-                )
-                email = None
-                deadline = time.monotonic() + 900
-                while time.monotonic() < deadline:
-                    if "accounts.google.com" not in page.url:
-                        email = await page.evaluate(
-                            """
-                            () => window.__NEXT_DATA__?.props?.pageProps?.session?.user?.email || null
-                            """
-                        )
-                        if email:
-                            break
-                    await asyncio.sleep(2)
-                if not email:
-                    raise RuntimeError("Hết thời gian chờ đăng nhập Google Flow.")
-                if config.project_id:
-                    await page.goto(self._project_url(config.project_id), wait_until="domcontentloaded")
-                    await asyncio.sleep(1.5)
-                await self.store.append_log(job_id, "Em sẽ giữ nguyên tab Google Flow này để dùng tiếp cho các lượt chạy sau.")
-                await self.store.append_log(job_id, f"Đã đăng nhập với tài khoản {email}")
-                await self.store.patch_job(job_id, status="completed", result={"email": email})
+            email = None
+            deadline = time.monotonic() + 900
+            while time.monotonic() < deadline:
+                if getattr(page, "is_closed", lambda: False)():
+                    raise RuntimeError("Cửa sổ đăng nhập đã bị đóng trước khi hoàn tất.")
+                if "accounts.google.com" not in page.url:
+                    email = await page.evaluate(
+                        """
+                        () => window.__NEXT_DATA__?.props?.pageProps?.session?.user?.email || null
+                        """
+                    )
+                    if email:
+                        break
+                await asyncio.sleep(2)
+            if not email:
+                raise RuntimeError("Hết thời gian chờ đăng nhập Google Flow.")
+            if config.project_id:
+                await page.goto(self._project_url(config.project_id), wait_until="domcontentloaded")
+                await asyncio.sleep(1.5)
+            await self.store.append_log(job_id, "Em sẽ giữ nguyên tab Google Flow này để dùng tiếp cho các lượt chạy sau.")
+            await self.store.append_log(job_id, f"Đã đăng nhập với tài khoản {email}")
+            await self.store.patch_job(job_id, status="completed", result={"email": email})
         except Exception as exc:
             detail = self._flow_error_detail(exc)
             await self.store.patch_job(job_id, status="failed", error=detail)
@@ -2054,6 +2075,17 @@ class FlowWebService:
             await page.goto(target_url, wait_until="commit", timeout=60_000)
         try:
             await page.bring_to_front()
+        except Exception:
+            pass
+        try:
+            await page.evaluate(
+                """
+                () => {
+                  try { window.focus(); } catch (error) {}
+                  return true;
+                }
+                """
+            )
         except Exception:
             pass
         await asyncio.sleep(1.5)
