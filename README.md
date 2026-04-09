@@ -15,9 +15,37 @@ Web app local điều khiển [flow-py](https://github.com/eddie-fqh/flow-py) qu
 | Tài khoản Google | Đã được cấp quyền truy cập Google Flow (labs.google/fx) |
 | Gemini API key | Tuỳ chọn — chỉ cần nếu muốn dùng Prompt AI dùng Gemini thật |
 
+## 2. Chạy nhanh kiểu một phát
+
+### Windows
+
+```powershell
+git clone https://github.com/ph56jk/flow.git
+cd flow
+powershell -ExecutionPolicy Bypass -File .\scripts\run_flow_web.ps1
+```
+
+Script này sẽ tự:
+- tạo `.venv` nếu chưa có
+- cài dependencies nếu thiếu hoặc vừa pull code mới
+- cài Chromium cho Playwright nếu chưa có
+- mở app ở `http://127.0.0.1:8000`
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/ph56jk/flow.git
+cd flow
+chmod +x ./scripts/run_flow_web.sh ./scripts/run_flow_web.command
+./scripts/run_flow_web.sh
+```
+
+Nếu dùng macOS và thích double-click:
+- mở [run_flow_web.command](./scripts/run_flow_web.command)
+
 ### ⚠️ Windows lưu ý đặc biệt
 
-- **Path cài Chromium KHÔNG được có khoảng trắng.** Thư mục `C:\Users\HAVI GROUP\...` sẽ gây lỗi `side-by-side configuration is incorrect` / `spawn UNKNOWN`. Giải pháp: set biến môi trường `PLAYWRIGHT_BROWSERS_PATH=C:\pw` trước khi chạy `playwright install`.
+- **Path cài Chromium KHÔNG được có khoảng trắng.** Thư mục `C:\Users\HAVI GROUP\...` sẽ gây lỗi `side-by-side configuration is incorrect` / `spawn UNKNOWN`. Script `run_flow_web.ps1` sẽ tự dùng `C:\pw-flow` nếu chủ nhân chưa set `PLAYWRIGHT_BROWSERS_PATH`.
 - Cần **Microsoft Visual C++ Redistributable (x64)** mới nhất — Chromium yêu cầu.
 - Biến môi trường `Path` **không được có entry rỗng** (dấu `;` thừa cuối chuỗi) vì sẽ gây Node.js `spawn UNKNOWN` khi Playwright launch browser.
 - Các script `.sh` trong repo chỉ dùng cho macOS/Linux. Trên Windows dùng PowerShell hoặc các script `scripts/setup_windows.ps1`, `scripts/run_flow_web.ps1`.
@@ -25,16 +53,16 @@ Web app local điều khiển [flow-py](https://github.com/eddie-fqh/flow-py) qu
 
 ---
 
-## 2. Cài đặt
+## 3. Cài đặt thủ công
 
-### 2.1. Clone repo
+### 3.1. Clone repo
 
 ```bash
 git clone https://github.com/ph56jk/flow.git
 cd flow
 ```
 
-### 2.2. Cài Python 3.11 (nếu chưa có)
+### 3.2. Cài Python 3.11 (nếu chưa có)
 
 **Windows (winget):**
 ```powershell
@@ -46,13 +74,13 @@ winget install --id Python.Python.3.11 -e
 brew install python@3.11
 ```
 
-### 2.3. Cài Microsoft Visual C++ Redistributable (chỉ Windows)
+### 3.3. Cài Microsoft Visual C++ Redistributable (chỉ Windows)
 
 ```powershell
 winget install --id Microsoft.VCRedist.2015+.x64 -e
 ```
 
-### 2.4. Tạo venv và cài dependencies
+### 3.4. Tạo venv và cài dependencies
 
 **Windows PowerShell:**
 ```powershell
@@ -71,7 +99,7 @@ pip install --upgrade pip
 pip install -e .
 ```
 
-### 2.5. Cài Chromium cho Playwright
+### 3.5. Cài Chromium cho Playwright
 
 **Windows (BẮT BUỘC dùng path không có khoảng trắng):**
 ```powershell
@@ -86,15 +114,15 @@ python -m playwright install chromium
 
 ---
 
-## 3. Cấu hình
+## 4. Cấu hình
 
-### 3.1. File `.env.local` (ở root repo)
+### 4.1. File `.env.local` (ở root repo)
 
 Tạo file `.env.local` với nội dung:
 
 ```env
-# Bắt buộc trên Windows nếu đường dẫn user có khoảng trắng
-PLAYWRIGHT_BROWSERS_PATH=C:\pw
+# Tuỳ chọn trên Windows — mặc định script đã tự dùng C:\pw-flow
+PLAYWRIGHT_BROWSERS_PATH=C:\pw-flow
 
 # Tuỳ chọn — để dùng Gemini thật cho Prompt AI
 GEMINI_API_KEY=AIza...
@@ -103,7 +131,7 @@ GEMINI_MODEL=gemini-2.5-flash
 
 App sẽ tự nạp file này khi khởi động. Nếu không tạo Prompt AI sẽ dùng kho skill nội bộ.
 
-### 3.2. File `~/.flow-py/config.json` (tự sinh sau lần đăng nhập đầu)
+### 4.2. File `~/.flow-py/config.json` (tự sinh sau lần đăng nhập đầu)
 
 Đảm bảo `"headless": false` để cửa sổ Chromium hiện ra và giải reCAPTCHA khi cần:
 
@@ -116,18 +144,18 @@ App sẽ tự nạp file này khi khởi động. Nếu không tạo Prompt AI s
 
 ---
 
-## 4. Chạy app
+## 5. Chạy app thủ công
 
 **Windows PowerShell:**
 ```powershell
-$env:PLAYWRIGHT_BROWSERS_PATH = "C:\pw"
+$env:PLAYWRIGHT_BROWSERS_PATH = "C:\pw-flow"
 .\.venv\Scripts\Activate.ps1
 python -m uvicorn flow_web.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
 **Windows bash:**
 ```bash
-PLAYWRIGHT_BROWSERS_PATH="C:\\pw" .venv/Scripts/python.exe -m uvicorn flow_web.main:app --host 127.0.0.1 --port 8000
+PLAYWRIGHT_BROWSERS_PATH="C:\\pw-flow" .venv/Scripts/python.exe -m uvicorn flow_web.main:app --host 127.0.0.1 --port 8000
 ```
 
 **macOS / Linux:**
@@ -140,7 +168,7 @@ Mở trình duyệt: http://127.0.0.1:8000
 
 ---
 
-## 5. Cách dùng lần đầu
+## 6. Cách dùng lần đầu
 
 1. Mở http://127.0.0.1:8000
 2. Dán **Project ID** của Google Flow vào ô Config → bấm **Save Config**
@@ -159,7 +187,7 @@ Google Flow có thể bật reCAPTCHA bất chợt. Khi đó:
 
 ---
 
-## 6. Chạy test
+## 7. Chạy test
 
 ```bash
 pip install pytest pytest-asyncio
@@ -170,12 +198,12 @@ Hiện có 34 smoke tests cho `flow_web`.
 
 ---
 
-## 7. Troubleshooting
+## 8. Troubleshooting
 
 | Triệu chứng | Nguyên nhân | Cách fix |
 |---|---|---|
-| `spawn UNKNOWN` khi launch Chromium | PATH có entry rỗng, hoặc path cài Chromium có khoảng trắng | Xoá `;` thừa cuối `Path`, đặt `PLAYWRIGHT_BROWSERS_PATH=C:\pw` và cài lại Chromium |
-| `side-by-side configuration is incorrect` | Thiếu VC++ Redist hoặc path có khoảng trắng | `winget install Microsoft.VCRedist.2015+.x64` + cài Chromium vào `C:\pw` |
+| `spawn UNKNOWN` khi launch Chromium | PATH có entry rỗng, hoặc path cài Chromium có khoảng trắng | Xoá `;` thừa cuối `Path`, dùng `scripts/run_flow_web.ps1` hoặc đặt `PLAYWRIGHT_BROWSERS_PATH=C:\pw-flow` rồi cài lại Chromium |
+| `side-by-side configuration is incorrect` | Thiếu VC++ Redist hoặc path có khoảng trắng | `winget install Microsoft.VCRedist.2015+.x64` + cài Chromium vào `C:\pw-flow` |
 | UI hiện "Chưa đăng nhập" dù đã đăng nhập | `flow-py` check cookies ở vị trí cũ | Patch `_storage.py` để check cả `Default/Network/Cookies` (Chromium mới) |
 | "Google Flow chưa chuyển sang chế độ tạo ảnh" | UI tiếng Việt, selector không match "Image" | Đã fix trong `service.py` — nhận cả "Hình ảnh" |
 | Tạo ảnh bị treo mãi ở "Kết nối Flow" | Browser cũ còn lock profile hoặc reCAPTCHA chưa giải | `taskkill /F /IM chrome.exe /T`, restart app, giải captcha khi hiện |
@@ -183,7 +211,7 @@ Hiện có 34 smoke tests cho `flow_web`.
 
 ---
 
-## 8. Ghi chú kỹ thuật
+## 9. Ghi chú kỹ thuật
 
 - `flow-py` là **browser automation**, không phải official API → Google có thể đổi UI bất cứ lúc nào
 - Session và project lưu tại `~/.flow-py/`
