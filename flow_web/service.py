@@ -2653,11 +2653,11 @@ class FlowWebService:
                   const menus = [...document.querySelectorAll('[role="menu"]')];
                   return menus.some(el => {
                     const style = window.getComputedStyle(el);
-                    const text = (el.textContent || '').trim();
+                    const text = (el.textContent || '').trim().toLowerCase();
                     return style.display !== 'none'
                       && style.visibility !== 'hidden'
-                      && text.includes('Image')
-                      && text.includes('Video')
+                      && (text.includes('image') || text.includes('hình ảnh') || text.includes('hinh anh'))
+                      && text.includes('video')
                       && /x[1-4]/.test(text);
                   });
                 }
@@ -2982,7 +2982,7 @@ class FlowWebService:
         async def _compat_switch_mode(_self: Any, page: Any, mode: Any) -> bool:
             await _compat_open_settings_panel(_self, page)
             label_map = {
-                GenerationMode.IMAGE: ["Image"],
+                GenerationMode.IMAGE: ["Image", "Hình ảnh", "Hinh anh"],
                 GenerationMode.VIDEO: ["Video"],
                 GenerationMode.FRAME_TO_VIDEO: ["Video"],
             }
@@ -5629,6 +5629,21 @@ class FlowWebService:
         request: CreateJobRequest,
         reference_media_names: List[str],
     ) -> List[Any]:
+        # Đi thẳng UI path để tránh reCAPTCHA của API path lặp lại mỗi lần
+        if not reference_media_names:
+            await self.store.append_log(
+                job_id,
+                "Đang tạo ảnh qua giao diện Flow. Nếu Chromium hiện reCAPTCHA, hãy bấm giải bằng tay.",
+            )
+            try:
+                return await self._generate_images_via_ui(client, request, reference_media_names)
+            except Exception as exc:
+                if self._is_recaptcha_error(exc):
+                    await self.store.append_log(
+                        job_id,
+                        "Google Flow vẫn đang chặn bằng reCAPTCHA. Vui lòng mở cửa sổ Chromium và giải captcha rồi thử lại.",
+                    )
+                raise
         try:
             return await self._generate_images_once(client, request, reference_media_names)
         except Exception as exc:

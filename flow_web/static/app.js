@@ -852,6 +852,7 @@ function renderPromptAssistant() {
 function jobsForCurrentMode() {
   return (state.jobs || [])
     .filter((job) => (state.mode === "edit" ? EDIT_JOB_TYPES.has(job.type) : job.type === state.mode))
+    .filter((job) => ACTIVE_STATUSES.has(job.status))
     .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime());
 }
 
