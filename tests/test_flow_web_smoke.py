@@ -95,6 +95,29 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("wf-default", resolved.workflow_id)
         self.assertEqual("landscape", resolved.aspect)
 
+    def test_canonical_project_url_uses_vi_locale_route(self) -> None:
+        self.assertEqual(
+            "https://labs.google/fx/vi/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+            self.service._project_url("f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"),
+        )
+
+    def test_detects_placeholder_project_route(self) -> None:
+        self.assertTrue(
+            self.service._looks_like_placeholder_project_url(
+                "https://labs.google/fx/vi/tools/flow/project/[projectId]"
+            )
+        )
+        self.assertTrue(
+            self.service._looks_like_placeholder_project_url(
+                "https://labs.google/fx/tools/flow/project/%5BprojectId%5D/edit/demo"
+            )
+        )
+        self.assertFalse(
+            self.service._looks_like_placeholder_project_url(
+                "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403"
+            )
+        )
+
     def test_video_status_url_supports_nested_generated_video_payload(self) -> None:
         status = SimpleNamespace(
             fife_url="",
@@ -290,6 +313,160 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         build_client.assert_awaited_once()
         close_shared_browser.assert_not_called()
 
+    async def test_open_login_flow_page_opens_new_tab_and_brings_it_to_front(self) -> None:
+        page = SimpleNamespace(
+            bring_to_front=AsyncMock(),
+            goto=AsyncMock(),
+        )
+        context = SimpleNamespace(new_page=AsyncMock(return_value=page))
+        browser = SimpleNamespace(context=context, _page=None, page=AsyncMock(return_value=page))
+
+        result = await self.service._open_login_flow_page(browser)
+
+        self.assertIs(result, page)
+        context.new_page.assert_awaited_once()
+        page.bring_to_front.assert_awaited()
+        page.goto.assert_awaited()
+        self.assertEqual(
+            "https://labs.google/fx/vi/tools/flow",
+            page.goto.await_args.args[0],
+        )
+
+    async def test_ensure_valid_flow_project_page_redirects_placeholder_route(self) -> None:
+        page = SimpleNamespace(
+            url="https://labs.google/fx/vi/tools/flow/project/[projectId]",
+            goto=AsyncMock(),
+        )
+
+        await self.service._ensure_valid_flow_project_page(
+            page,
+            "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+        )
+
+        page.goto.assert_awaited()
+        args = page.goto.await_args.args
+        self.assertEqual(
+            "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+            args[0],
+        )
+
+    async def test_repair_placeholder_flow_tabs_redirects_all_stale_tabs(self) -> None:
+        stale_page = SimpleNamespace(
+            url="https://labs.google/fx/vi/tools/flow/project/[projectId]",
+            goto=AsyncMock(),
+        )
+        good_page = SimpleNamespace(
+            url="https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+            goto=AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            context=SimpleNamespace(
+                pages=[stale_page, good_page],
+            )
+        )
+
+        await self.service._repair_placeholder_flow_tabs(
+            browser,
+            "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+        )
+
+        stale_page.goto.assert_awaited()
+        good_page.goto.assert_not_awaited()
+
+    async def test_close_placeholder_flow_tabs_closes_stale_tabs_and_keeps_valid_page(self) -> None:
+        stale_page = SimpleNamespace(
+            url="https://labs.google/fx/vi/tools/flow/project/[projectId]",
+            close=AsyncMock(),
+        )
+        good_page = SimpleNamespace(
+            url="https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+            close=AsyncMock(),
+        )
+        browser = SimpleNamespace(
+            context=SimpleNamespace(
+                pages=[stale_page, good_page],
+            ),
+            _page=None,
+        )
+
+        await self.service._close_placeholder_flow_tabs(
+            browser,
+            "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+        )
+
+        stale_page.close.assert_awaited_once()
+        good_page.close.assert_not_awaited()
+
+    async def test_close_placeholder_flow_tabs_opens_fresh_page_when_only_stale_tab_exists(self) -> None:
+        stale_page = SimpleNamespace(
+            url="https://labs.google/fx/vi/tools/flow/project/[projectId]",
+            close=AsyncMock(),
+        )
+        fresh_page = SimpleNamespace(
+            url="about:blank",
+            goto=AsyncMock(),
+        )
+        context = SimpleNamespace(
+            pages=[stale_page],
+            new_page=AsyncMock(return_value=fresh_page),
+        )
+        browser = SimpleNamespace(
+            context=context,
+            _page=None,
+        )
+
+        async def pages_after_close() -> list[object]:
+            return [fresh_page]
+
+        stale_page.close.side_effect = lambda: context.pages.clear()
+
+        await self.service._close_placeholder_flow_tabs(
+            browser,
+            "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+        )
+
+        stale_page.close.assert_awaited_once()
+        context.new_page.assert_awaited_once()
+        fresh_page.goto.assert_awaited()
+
+    async def test_acquire_fresh_flow_page_prefers_matching_project_tab(self) -> None:
+        matching_page = SimpleNamespace(
+            url="https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+        )
+        other_page = SimpleNamespace(
+            url="https://labs.google/fx/tools/flow",
+        )
+        context = SimpleNamespace(
+            pages=[other_page, matching_page],
+            new_page=AsyncMock(),
+        )
+        browser = SimpleNamespace(context=context, _page=None)
+
+        page = await self.service._acquire_fresh_flow_page(
+            browser,
+            "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+        )
+
+        self.assertIs(page, matching_page)
+        context.new_page.assert_not_awaited()
+
+    async def test_acquire_fresh_flow_page_creates_new_tab_when_no_matching_tab_exists(self) -> None:
+        old_page = SimpleNamespace(url="https://labs.google/fx/tools/flow")
+        fresh_page = SimpleNamespace(url="about:blank")
+        context = SimpleNamespace(
+            pages=[old_page],
+            new_page=AsyncMock(return_value=fresh_page),
+        )
+        browser = SimpleNamespace(context=context, _page=None, page=AsyncMock(return_value=old_page))
+
+        page = await self.service._acquire_fresh_flow_page(
+            browser,
+            "https://labs.google/fx/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
+        )
+
+        self.assertIs(page, fresh_page)
+        context.new_page.assert_awaited_once()
+
     async def test_run_flow_job_saves_video_artifact_from_nested_status_url(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(type="video", prompt="samurai fight", count=1)
@@ -449,7 +626,6 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         fake_client = SimpleNamespace(
             _api=SimpleNamespace(
                 project_id="pid",
-                upload_image=AsyncMock(side_effect=["ref-model", "ref-logo"]),
                 _client_context=AsyncMock(
                     return_value={
                         "projectId": "pid",
@@ -477,11 +653,15 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         async def fake_with_client(fn, workflow_id="", timeout_s=0):
             return await fn(fake_client)
 
-        with patch.object(self.service, "_with_client", side_effect=fake_with_client):
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
+            self.service,
+            "_upload_project_image_robust",
+            AsyncMock(side_effect=["ref-model", "ref-logo"]),
+        ) as upload_project_image:
             await self.service._run_flow_job(job.id, request)
 
-        fake_client._api.upload_image.assert_any_await(str(reference_a.resolve()))
-        fake_client._api.upload_image.assert_any_await(str(reference_b.resolve()))
+        upload_project_image.assert_any_await(fake_client, str(reference_a.resolve()))
+        upload_project_image.assert_any_await(fake_client, str(reference_b.resolve()))
         fake_client._api._fetch.assert_awaited_once()
         self.assertEqual("POST", captured_body["method"])
         self.assertEqual("projects/pid/flowMedia:batchGenerateImages", captured_body["url"])
@@ -643,17 +823,66 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         with patch.object(
             self.service,
             "_generate_images_once",
-            AsyncMock(side_effect=[RuntimeError("HTTP 403 on batchGenerateImages: reCAPTCHA evaluation failed"), [fake_image]]),
+            AsyncMock(side_effect=RuntimeError("HTTP 403 on batchGenerateImages: reCAPTCHA evaluation failed")),
         ) as generate_once, patch.object(
             self.service,
             "_reload_flow_project_page",
             AsyncMock(),
         ) as reload_project:
-            result = await self.service._generate_images_with_retry(fake_client, job.id, request, [])
+            with patch.object(
+                self.service,
+                "_generate_images_via_ui",
+                AsyncMock(return_value=[fake_image]),
+            ) as generate_via_ui:
+                result = await self.service._generate_images_with_retry(fake_client, job.id, request, [])
 
         self.assertEqual([fake_image], result)
-        self.assertEqual(2, generate_once.await_count)
+        self.assertEqual(1, generate_once.await_count)
         reload_project.assert_awaited_once_with(fake_client)
+        generate_via_ui.assert_awaited_once_with(fake_client, request, [])
+
+    async def test_generate_images_via_ui_uses_single_reference_fallback(self) -> None:
+        request = CreateJobRequest(type="image", prompt="them kinh", count=1, aspect="portrait")
+        fake_image = SimpleNamespace(media_name="img-1")
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_generate_single_reference_image_via_ui",
+            AsyncMock(return_value=[fake_image]),
+        ) as single_ref:
+            result = await self.service._generate_images_via_ui(fake_client, request, ["base-media"])
+
+        self.assertEqual([fake_image], result)
+        single_ref.assert_awaited_once()
+
+    async def test_resolve_image_reference_media_uses_robust_upload_helper(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        reference_a = self.uploads_dir / "model.jpg"
+        reference_b = self.uploads_dir / "logo.png"
+        reference_a.write_bytes(b"model")
+        reference_b.write_bytes(b"logo")
+        job = JobRecord(type="image", status="queued", title="test")
+        await self.store.add_job(job)
+
+        request = CreateJobRequest(
+            type="image",
+            prompt="ghép logo này lên áo của người mẫu",
+            count=1,
+            reference_image_paths=[str(reference_a), str(reference_b)],
+        )
+        fake_client = SimpleNamespace()
+
+        with patch.object(
+            self.service,
+            "_upload_project_image_robust",
+            AsyncMock(side_effect=["ref-model", "ref-logo"]),
+        ) as upload_project_image:
+            result = await self.service._resolve_image_reference_media(fake_client, job.id, request)
+
+        self.assertEqual(["ref-model", "ref-logo"], result)
+        upload_project_image.assert_any_await(fake_client, str(reference_a.resolve()))
+        upload_project_image.assert_any_await(fake_client, str(reference_b.resolve()))
 
 
 if __name__ == "__main__":

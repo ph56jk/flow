@@ -89,6 +89,14 @@ Hoac chay tay:
 python -m uvicorn flow_web.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
+### Dang nhap Google Flow tren Windows
+
+- Bam `Dang nhap Google Flow` tren web app.
+- App se mo mot tab `Chromium` moi, tro thang vao `https://labs.google/fx/vi/tools/flow`.
+- Neu khong thay cua so/tab nao bat len, hay dong het `Chrome for Testing` cu roi bam lai nut dang nhap.
+- Neu Windows chan popup hoac cua so bi nam sau cac app khac, chuyen ve desktop va tim cua so `Chromium` / `Google Chrome for Testing`.
+- Khong nen chay app bang Task Scheduler, service nen, hoac terminal khong co desktop session, vi login can browser that de hien ra man hinh.
+
 ## Bat Gemini cho Prompt AI
 
 Prompt AI mac dinh van chay bang kho skill noi bo. Neu muon no dung Gemini that de viet prompt, dat them bien moi truong truoc khi chay app:

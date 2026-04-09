@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import random
 import re
@@ -1967,8 +1968,7 @@ class FlowWebService:
             config = self._normalized_config(self.store.snapshot().config)
             async with self._browser_session_lock:
                 browser = await self._ensure_shared_browser()
-                page = await browser.page()
-                await page.goto("https://labs.google/fx/tools/flow", wait_until="domcontentloaded")
+                page = await self._open_login_flow_page(browser)
                 await self._set_job_progress(
                     job_id,
                     "awaiting_login",
@@ -1998,6 +1998,36 @@ class FlowWebService:
             detail = self._flow_error_detail(exc)
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Đăng nhập thất bại: {detail}")
+
+    async def _open_login_flow_page(self, browser: Any) -> Any:
+        context = getattr(browser, "context", None)
+        target_url = "https://labs.google/fx/vi/tools/flow"
+        page = None
+        if context is not None:
+            try:
+                page = await context.new_page()
+            except Exception:
+                page = None
+        if page is None:
+            page = await browser.page()
+        try:
+            browser._page = page
+        except Exception:
+            pass
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception:
+            await page.goto(target_url, wait_until="commit", timeout=60_000)
+        try:
+            await page.bring_to_front()
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+        return page
 
     async def _run_flow_job(self, job_id: str, request: CreateJobRequest) -> None:
         await self.store.patch_job(job_id, status="running")
@@ -2477,6 +2507,10 @@ class FlowWebService:
         BrowserManager, _, _, _, _ = self._flow_modules()
         browser = BrowserManager(headless=False)
         await browser.start()
+        config = self.store.snapshot().config
+        project_id = self._normalize_project_id(config.project_id or config.project_url)
+        target_url = self._project_url(project_id) if project_id else "https://labs.google/fx/tools/flow"
+        await self._close_placeholder_flow_tabs(browser, target_url)
         self._shared_browser = browser
         return browser
 
@@ -2497,11 +2531,10 @@ class FlowWebService:
         client.workflow_id = workflow_id
         client._project_url = self._project_url(project_id)
 
-        page = await browser.page()
         target_url = client._project_url
-        if not page.url.startswith(target_url):
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=20_000)
-            await asyncio.sleep(2)
+        await self._repair_placeholder_flow_tabs(browser, target_url)
+        page = await self._acquire_fresh_flow_page(browser, target_url)
+        await self._ensure_valid_flow_project_page(page, target_url)
         return client
 
     def _is_browser_closed_error(self, exc: Exception) -> bool:
@@ -3466,6 +3499,127 @@ class FlowWebService:
 
     def _project_url(self, project_id: str) -> str:
         return canonical_project_url(project_id)
+
+    def _looks_like_placeholder_project_url(self, url: str) -> bool:
+        candidate = str(url or "").strip().lower()
+        if not candidate:
+            return False
+        return any(
+            marker in candidate
+            for marker in (
+                "/project/[projectid]",
+                "/project/%5bprojectid%5d",
+                "/project/%5bproject_id%5d",
+                "/project/[project_id]",
+            )
+        )
+
+    async def _ensure_valid_flow_project_page(self, page: Any, project_url: str) -> None:
+        target_url = str(project_url or "").strip()
+        if not target_url:
+            return
+
+        current_url = str(getattr(page, "url", "") or "").strip()
+        if current_url.startswith(target_url) and not self._looks_like_placeholder_project_url(current_url):
+            return
+
+        if self._looks_like_placeholder_project_url(current_url):
+            logging.getLogger(__name__).warning(
+                "Flow tab opened placeholder project route (%s); redirecting to %s",
+                current_url,
+                target_url,
+            )
+
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception:
+            await page.goto(target_url, wait_until="commit", timeout=60_000)
+        await asyncio.sleep(2.0)
+
+    async def _repair_placeholder_flow_tabs(self, browser: Any, project_url: str) -> None:
+        target_url = str(project_url or "").strip()
+        if not target_url:
+            return
+
+        context = getattr(browser, "context", None)
+        pages = list(getattr(context, "pages", []) or [])
+        for candidate in pages:
+            current_url = str(getattr(candidate, "url", "") or "").strip()
+            if not self._looks_like_placeholder_project_url(current_url):
+                continue
+            try:
+                logging.getLogger(__name__).warning(
+                    "Repairing stale Flow placeholder tab (%s) -> %s",
+                    current_url,
+                    target_url,
+                )
+                await self._ensure_valid_flow_project_page(candidate, target_url)
+            except Exception:
+                continue
+
+    async def _acquire_fresh_flow_page(self, browser: Any, project_url: str) -> Any:
+        target_url = str(project_url or "").strip()
+        context = getattr(browser, "context", None)
+        pages = list(getattr(context, "pages", []) or [])
+
+        for candidate in pages:
+            current_url = str(getattr(candidate, "url", "") or "").strip()
+            if current_url.startswith(target_url) and not self._looks_like_placeholder_project_url(current_url):
+                try:
+                    browser._page = candidate
+                except Exception:
+                    pass
+                return candidate
+
+        try:
+            fresh_page = await context.new_page()
+        except Exception:
+            fresh_page = await browser.page()
+        try:
+            browser._page = fresh_page
+        except Exception:
+            pass
+        return fresh_page
+
+    async def _close_placeholder_flow_tabs(self, browser: Any, project_url: str) -> None:
+        target_url = str(project_url or "").strip()
+        context = getattr(browser, "context", None)
+        pages = list(getattr(context, "pages", []) or [])
+        stale_pages = [
+            candidate
+            for candidate in pages
+            if self._looks_like_placeholder_project_url(str(getattr(candidate, "url", "") or ""))
+        ]
+        if not stale_pages:
+            return
+
+        logger = logging.getLogger(__name__)
+        for candidate in stale_pages:
+            current_url = str(getattr(candidate, "url", "") or "").strip()
+            try:
+                logger.warning("Closing stale Flow placeholder tab (%s)", current_url)
+                await candidate.close()
+            except Exception:
+                continue
+
+        remaining_pages = list(getattr(context, "pages", []) or [])
+        if remaining_pages:
+            try:
+                browser._page = remaining_pages[0]
+            except Exception:
+                pass
+            return
+
+        try:
+            fresh_page = await context.new_page()
+        except Exception:
+            return
+        try:
+            browser._page = fresh_page
+        except Exception:
+            pass
+        if target_url:
+            await self._ensure_valid_flow_project_page(fresh_page, target_url)
 
     def _normalize_project_id(self, project_value: str) -> str:
         return normalize_project_id(project_value)
@@ -5150,11 +5304,107 @@ class FlowWebService:
                 f"Em đang tải ảnh tham chiếu {index + 1}/{total} lên Flow trước khi chỉnh ảnh.",
             )
             await self.store.append_log(job_id, f"Đang tải ảnh tham chiếu {index + 1}/{total}: {Path(image_path).name}")
-            media_name = await client._api.upload_image(image_path)
+            media_name = await self._upload_project_image_robust(client, image_path)
             if media_name:
                 reference_media_names.append(media_name)
 
         return self._normalize_reference_media_names(reference_media_names)
+
+    async def _upload_project_image_robust(self, client: Any, image_path: str) -> str:
+        image_file = Path(str(image_path or "")).expanduser().resolve()
+        if not image_file.exists():
+            raise RuntimeError(f"Khong tim thay anh de tai len: {image_file}")
+
+        page = await client._bm.page()
+        project_url = str(
+            getattr(client, "_project_url", "")
+            or getattr(getattr(client, "_api", None), "_project_page_url", "")
+            or self._project_url(getattr(client, "project_id", ""))
+        ).strip()
+        await self._ensure_valid_flow_project_page(page, project_url)
+
+        before_data = await client._api.get_project_data()
+        known_media = self._project_media_names(before_data)
+
+        selectors = [
+            'input[type="file"][accept*="image"]',
+            'input[type="file"]',
+        ]
+        uploaded = False
+        for selector in selectors:
+            locator = page.locator(selector)
+            count = await locator.count()
+            for index in range(count):
+                candidate = locator.nth(index)
+                try:
+                    await candidate.set_input_files(str(image_file))
+                    uploaded = True
+                    break
+                except Exception:
+                    continue
+            if uploaded:
+                break
+
+        if not uploaded:
+            for trigger in (
+                page.locator("button").filter(has_text="Add Media").first,
+                page.get_by_text("Add Media", exact=True).first,
+                page.locator("button").filter(has_text="Upload image").first,
+                page.get_by_text("Upload image", exact=True).first,
+            ):
+                try:
+                    if await trigger.count() == 0:
+                        continue
+                    await trigger.click(force=True)
+                    await asyncio.sleep(0.5)
+                    for selector in selectors:
+                        locator = page.locator(selector)
+                        count = await locator.count()
+                        for index in range(count):
+                            candidate = locator.nth(index)
+                            try:
+                                await candidate.set_input_files(str(image_file))
+                                uploaded = True
+                                break
+                            except Exception:
+                                continue
+                        if uploaded:
+                            break
+                    if uploaded:
+                        break
+                except Exception:
+                    continue
+
+        if not uploaded:
+            raise RuntimeError(f"Failed to upload: {image_file}")
+
+        deadline = time.monotonic() + 25.0
+        while time.monotonic() < deadline:
+            data = await client._api.get_project_data()
+            for workflow in data.get("projectContents", {}).get("workflows", []) or []:
+                media_name = str((workflow.get("metadata") or {}).get("primaryMediaId") or "").strip()
+                if media_name and media_name not in known_media:
+                    return media_name
+                for media in workflow.get("medias", []) or []:
+                    media_name = str(media.get("name") or "").strip()
+                    if media_name and media_name not in known_media:
+                        return media_name
+            await asyncio.sleep(1.0)
+
+        raise RuntimeError(f"Flow da nhan thao tac upload nhung chua thay anh xuat hien: {image_file.name}")
+
+    def _project_media_names(self, project_data: Dict[str, Any]) -> set[str]:
+        names: set[str] = set()
+        for workflow in project_data.get("projectContents", {}).get("workflows", []) or []:
+            metadata = workflow.get("metadata", {}) or {}
+            primary_media_id = str(metadata.get("primaryMediaId") or "").strip()
+            if primary_media_id:
+                names.add(primary_media_id)
+            for media in workflow.get("medias", []) or []:
+                media_name = str(media.get("name") or "").strip()
+                if media_name:
+                    names.add(media_name)
+        return names
 
     async def _generate_image_edit_result(
         self,
@@ -5241,15 +5491,15 @@ class FlowWebService:
 
             await self.store.append_log(
                 job_id,
-                "Flow vua bat reCAPTCHA khi tao anh. Em dang tai lai project va thu gui lai 1 lan nua.",
+                "Flow vua bat reCAPTCHA khi tao anh. Em dang chuyen sang duong chay qua giao dien Flow de thu lai.",
             )
             await self._set_job_progress(
                 job_id,
                 "sending_request",
-                "Flow dang yeu cau xac nhan reCAPTCHA. Em dang tai lai trang project roi thu gui lai 1 lan nua.",
+                "Flow dang yeu cau xac nhan reCAPTCHA. Em dang tai lai trang project va gui lai bang giao dien Flow.",
             )
             await self._reload_flow_project_page(client)
-            return await self._generate_images_once(client, request, reference_media_names)
+            return await self._generate_images_via_ui(client, request, reference_media_names)
 
     async def _generate_images_once(
         self,
@@ -5272,6 +5522,93 @@ class FlowWebService:
             aspect_ratio=self._image_api_aspect_ratio(request.aspect),
             count=target_count,
         )
+
+    async def _generate_images_via_ui(
+        self,
+        client: Any,
+        request: CreateJobRequest,
+        reference_media_names: List[str],
+    ) -> List[Any]:
+        if reference_media_names:
+            if len(reference_media_names) > 1:
+                raise RuntimeError(
+                    "Flow dang chan nhanh ghep nhieu anh bang reCAPTCHA, nen em chua the fallback UI an toan cho hon 1 anh tham chieu."
+                )
+            return await self._generate_single_reference_image_via_ui(
+                client,
+                request.prompt,
+                workflow_id=request.workflow_id or "",
+                reference_media_name=reference_media_names[0],
+                count=max(1, min(4, int(request.count or 1))),
+                timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+            )
+        return await client.generate_image(
+            request.prompt,
+            aspect=request.aspect,
+            count=max(1, min(4, int(request.count or 1))),
+            timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+        )
+
+    async def _generate_single_reference_image_via_ui(
+        self,
+        client: Any,
+        prompt: str,
+        *,
+        reference_media_name: str,
+        workflow_id: str = "",
+        count: int = 1,
+        timeout_s: int = 120,
+    ) -> List[Any]:
+        from flow._ui_interceptor import UIInterceptor
+
+        resolved_workflow_id = str(workflow_id or "").strip() or await self._find_workflow_id_for_media(client, reference_media_name)
+        if not resolved_workflow_id:
+            raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
+
+        page = await client._bm.page()
+        edit_url = f"{self._project_url(client.project_id).rstrip('/')}/edit/{resolved_workflow_id}"
+        try:
+            await page.goto(edit_url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception:
+            await page.goto(edit_url, wait_until="commit", timeout=60_000)
+        await asyncio.sleep(2.5)
+
+        interceptor = UIInterceptor()
+        interceptor.attach(page)
+        interceptor.clear()
+
+        try:
+            await client._ui.open_settings_panel(page)
+            await client._ui.set_count(page, max(1, min(4, int(count or 1))))
+        except Exception:
+            pass
+
+        filled = await client._ui.fill_prompt(page, prompt)
+        if not filled:
+            raise RuntimeError("Google Flow chua dien duoc prompt vao man hinh chinh anh.")
+
+        clicked = await client._ui.click_submit(page)
+        if not clicked:
+            raise RuntimeError("Google Flow chua bam duoc nut tao anh o man hinh chinh anh.")
+
+        try:
+            entry = await interceptor.wait_for(
+                "batchGenerateImages",
+                timeout=max(30.0, min(120.0, float(timeout_s or 120))),
+                require_success=True,
+            )
+        except Exception as exc:
+            detail = str(exc or "").lower()
+            if "timed out" in detail or "timeout" in detail or "recaptcha" in detail:
+                raise RuntimeError(
+                    "Google Flow co the dang doi xac nhan reCAPTCHA tren tab Flow. "
+                    "Hay mo tab Google Flow, xac nhan neu thay captcha, roi bam Chay lai."
+                ) from exc
+            raise
+        images = self._parse_images_from_flow_payload(entry.resp, prompt=prompt, fallback_workflow_id=resolved_workflow_id)
+        if not images:
+            raise RuntimeError("Google Flow khong tra anh nao ve tu man hinh chinh anh.")
+        return images[: max(1, min(4, int(count or 1)))]
 
     async def _find_workflow_id_for_media(self, client: Any, media_name: str) -> str:
         safe_media_name = str(media_name or "").strip()
@@ -5306,13 +5643,14 @@ class FlowWebService:
         if not project_url:
             return
 
+        await self._ensure_valid_flow_project_page(page, project_url)
         try:
-            await page.goto(project_url, wait_until="networkidle", timeout=60_000)
+            await page.reload(wait_until="networkidle", timeout=60_000)
         except Exception:
             try:
-                await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
-            except Exception:
                 await page.reload(wait_until="domcontentloaded", timeout=60_000)
+            except Exception:
+                await self._ensure_valid_flow_project_page(page, project_url)
 
         try:
             ready = await page.wait_for_function(
@@ -5327,6 +5665,60 @@ class FlowWebService:
     def _is_recaptcha_error(self, exc: Exception) -> bool:
         detail = str(exc or "").lower()
         return "recaptcha" in detail and "failed" in detail
+
+    def _parse_images_from_flow_payload(
+        self,
+        payload: Any,
+        *,
+        prompt: str,
+        fallback_workflow_id: str = "",
+    ) -> List[Any]:
+        from flow._api import GeneratedImage
+
+        response = payload if isinstance(payload, dict) else {}
+        images: List[Any] = []
+
+        for media_item in response.get("media", []) or []:
+            if not isinstance(media_item, dict):
+                continue
+            image = GeneratedImage.__new__(GeneratedImage)
+            image._raw = media_item
+            image.media_name = str(media_item.get("name") or media_item.get("mediaName") or "").strip()
+            image.project_id = str(media_item.get("projectId") or "").strip()
+            image.workflow_id = str(media_item.get("workflowId") or fallback_workflow_id or "").strip()
+            generated = ((media_item.get("image") or {}).get("generatedImage") or {})
+            image.fife_url = str(
+                generated.get("fifeUrl")
+                or generated.get("url")
+                or media_item.get("fifeUrl")
+                or ""
+            ).strip()
+            image.seed = generated.get("seed", 0)
+            image.model = str(generated.get("modelNameType") or generated.get("model") or "").strip()
+            image.prompt = str(generated.get("prompt") or prompt or "").strip()
+            image.dimensions = media_item.get("dimensions", {}) or {}
+            image.file_path = None
+            images.append(image)
+
+        if images:
+            return images
+
+        for item in response.get("generatedImages", []) or []:
+            if not isinstance(item, dict):
+                continue
+            image = GeneratedImage.__new__(GeneratedImage)
+            image._raw = item
+            image.media_name = str(item.get("mediaName") or item.get("name") or "").strip()
+            image.project_id = ""
+            image.workflow_id = fallback_workflow_id
+            image.fife_url = str(item.get("fifeUrl") or item.get("url") or "").strip()
+            image.seed = int(item.get("seed", 0) or 0)
+            image.model = str(item.get("modelNameType") or item.get("model") or "").strip()
+            image.prompt = str(item.get("prompt") or prompt or "").strip()
+            image.dimensions = item.get("dimensions", {}) or {}
+            image.file_path = None
+            images.append(image)
+        return images
 
     async def _wait_for_video_with_progress(
         self,

@@ -58,7 +58,7 @@ def canonical_project_url(project_value: str) -> str:
     project_id = normalize_project_id(project_value)
     if not project_id:
         return ""
-    return f"https://labs.google/fx/tools/flow/project/{quote(project_id, safe='')}"
+    return f"https://labs.google/fx/vi/tools/flow/project/{quote(project_id, safe='')}"
 
 
 def normalized_app_config(config: Any) -> AppConfig:
