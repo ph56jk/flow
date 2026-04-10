@@ -13,6 +13,11 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 . (Join-Path $PSScriptRoot "windows_runtime.ps1")
 
+$currentSessionId = (Get-Process -Id $PID).SessionId
+if ($currentSessionId -eq 0 -and -not $PrepareOnly) {
+    Write-Warning "Flow Web UI dang chay trong Session 0 (thuong la SSH, task nen hoac service). Kieu nay app van len duoc, nhung cua so dang nhap Google Flow se khong hien tren desktop. Hay mo script nay truc tiep tren man hinh Windows de dang nhap."
+}
+
 $dataRoot = Get-PreferredDataRoot
 
 if ([string]::IsNullOrWhiteSpace($BrowserPath)) {

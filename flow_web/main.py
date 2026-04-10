@@ -117,6 +117,16 @@ async def logout(request: Request) -> Dict[str, Any]:
     return await service(request).logout_flow()
 
 
+@app.post("/api/flow/open-login")
+async def open_login_surface(request: Request) -> Dict[str, Any]:
+    return await service(request).open_flow_login_surface()
+
+
+@app.post("/api/flow/open-project")
+async def open_project_surface(request: Request) -> Dict[str, Any]:
+    return await service(request).open_flow_project_surface()
+
+
 @app.get("/api/credits")
 async def credits(request: Request) -> Dict[str, Any]:
     return await service(request).get_credits()

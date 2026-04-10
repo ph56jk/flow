@@ -10,6 +10,17 @@ const FALLBACK_IMAGE_MODELS = [
   { value: "NARWHAL", label: "Nano Banana 2" },
   { value: "IMAGEN_3", label: "Imagen 3" },
 ];
+const REFERENCE_ROLE_OPTIONS = [
+  { value: "base", label: "Ảnh chính", detail: "Ảnh người mẫu hoặc ảnh gốc cần giữ lại." },
+  { value: "logo", label: "Logo", detail: "Logo, hoạ tiết, nhãn hiệu hoặc chi tiết brand." },
+  { value: "product", label: "Sản phẩm", detail: "Ảnh sản phẩm, quần áo, phụ kiện, vật thể chính." },
+  { value: "reference", label: "Tham chiếu", detail: "Ảnh phụ để lấy màu, chất liệu, bố cục hoặc vibe." },
+];
+const ASPECT_DETAILS = {
+  landscape: { title: "Ngang 16:9", detail: "YouTube, cảnh ngang, widescreen" },
+  portrait: { title: "Dọc 9:16", detail: "Reels, Shorts, TikTok" },
+  square: { title: "Vuông 1:1", detail: "Feed, poster vuông, thumbnail" },
+};
 
 const MODE_CONFIG = {
   video: {
@@ -190,6 +201,7 @@ const elements = {
   projectStatus: document.querySelector("#projectStatus"),
   authStatus: document.querySelector("#authStatus"),
   topbarHint: document.querySelector("#topbarHint"),
+  openFlowButton: document.querySelector("#openFlowButton"),
   logoutButton: document.querySelector("#logoutButton"),
   setupToggle: document.querySelector("#setupToggle"),
   setupPanel: document.querySelector("#setupPanel"),
@@ -198,6 +210,9 @@ const elements = {
   projectName: document.querySelector("#projectName"),
   generationTimeout: document.querySelector("#generationTimeout"),
   loginButton: document.querySelector("#loginButton"),
+  openLoginButton: document.querySelector("#openLoginButton"),
+  openProjectButton: document.querySelector("#openProjectButton"),
+  focusProjectButton: document.querySelector("#focusProjectButton"),
   messageBar: document.querySelector("#messageBar"),
   composerTitle: document.querySelector("#composerTitle"),
   composerHint: document.querySelector("#composerHint"),
@@ -223,8 +238,12 @@ const elements = {
   composerSummaryMode: document.querySelector("#composerSummaryMode"),
   composerSummaryText: document.querySelector("#composerSummaryText"),
   editActionStrip: document.querySelector("#editActionStrip"),
+  editActionSummary: document.querySelector("#editActionSummary"),
+  editActionSummaryTitle: document.querySelector("#editActionSummaryTitle"),
+  editActionSummaryText: document.querySelector("#editActionSummaryText"),
   editActionButtons: Array.from(document.querySelectorAll("[data-edit-action]")),
   editSourceWrap: document.querySelector("#editSourceWrap"),
+  editSourceCards: document.querySelector("#editSourceCards"),
   editSourceSelect: document.querySelector("#editSourceSelect"),
   manualMediaId: document.querySelector("#manualMediaId"),
   manualWorkflowId: document.querySelector("#manualWorkflowId"),
@@ -242,6 +261,8 @@ const elements = {
   imageReferenceStatus: document.querySelector("#imageReferenceStatus"),
   generationOptionsWrap: document.querySelector("#generationOptionsWrap"),
   modelSelect: document.querySelector("#modelSelect"),
+  aspectChoices: document.querySelector("#aspectChoices"),
+  countChoices: document.querySelector("#countChoices"),
   editOptionsWrap: document.querySelector("#editOptionsWrap"),
   motionField: document.querySelector("#motionField"),
   motionSelect: document.querySelector("#motionSelect"),
@@ -483,6 +504,26 @@ function modelLabelForMode(mode, value) {
   return raw;
 }
 
+function aspectTitle(value) {
+  return ASPECT_DETAILS[String(value || "").trim()]?.title || "Ngang 16:9";
+}
+
+function referenceRoleLabel(value) {
+  return REFERENCE_ROLE_OPTIONS.find((item) => item.value === value)?.label || "Tham chiếu";
+}
+
+function referenceRoleDetail(value) {
+  return REFERENCE_ROLE_OPTIONS.find((item) => item.value === value)?.detail || "Ảnh phụ để tham chiếu.";
+}
+
+function normalizeReferenceRole(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "base" || raw === "logo" || raw === "product" || raw === "reference") {
+    return raw;
+  }
+  return "reference";
+}
+
 function syncDraftFromForm() {
   const draft = currentDraft();
   draft.prompt = elements.promptInput.value;
@@ -537,6 +578,22 @@ function applyEditInputsToForm() {
   elements.resolutionSelect.value = state.resolution || "1080p";
 }
 
+function renderAspectChoices() {
+  const selected = String(elements.aspectSelect.value || currentDraft().aspect || currentModeConfig().defaultAspect).trim();
+  const buttons = Array.from(elements.aspectChoices?.querySelectorAll("[data-aspect-option]") || []);
+  for (const button of buttons) {
+    button.classList.toggle("active", button.dataset.aspectOption === selected);
+  }
+}
+
+function renderCountChoices() {
+  const selected = String(elements.countInput.value || currentDraft().count || currentModeConfig().defaultCount);
+  const buttons = Array.from(elements.countChoices?.querySelectorAll("[data-count-option]") || []);
+  for (const button of buttons) {
+    button.classList.toggle("active", button.dataset.countOption === selected);
+  }
+}
+
 function applyPromptAiDraftToForm() {
   const draft = currentPromptAiDraft();
   if (!draft) {
@@ -566,6 +623,7 @@ function renderTopbar() {
   elements.projectStatus.dataset.state = projectId ? "ready" : "pending";
   elements.authStatus.textContent = state.auth?.authenticated ? "Đã đăng nhập" : "Chưa đăng nhập";
   elements.authStatus.dataset.state = state.auth?.authenticated ? "ready" : "pending";
+  elements.openFlowButton.textContent = projectId ? "Mở Flow" : "Mở đăng nhập";
   elements.logoutButton.hidden = !state.auth?.authenticated;
   elements.logoutButton.disabled = activeJobs > 0;
   elements.logoutButton.title = activeJobs > 0 ? "Hãy chờ các tác vụ đang chạy hoàn tất rồi đăng xuất." : "";
@@ -612,6 +670,8 @@ function renderComposer() {
   }
 
   applyDraftToForm();
+  renderAspectChoices();
+  renderCountChoices();
   renderEditControls();
   renderComposerSummary();
   renderUploadStatus();
@@ -639,8 +699,11 @@ function renderComposerSummary() {
   if (state.mode === "image") {
     const modelLabel = modelLabelForMode("image", currentDraft().model);
     if (state.imageReferenceItems.length) {
+      const baseItem = state.imageReferenceItems.find((item) => item.role === "base") || state.imageReferenceItems[0];
+      const logoCount = state.imageReferenceItems.filter((item) => item.role === "logo").length;
+      const productCount = state.imageReferenceItems.filter((item) => item.role === "product").length;
       elements.composerSummaryMode.textContent = "Chỉnh ảnh từ ảnh tham chiếu";
-      elements.composerSummaryText.textContent = `Đang dùng ${fileKindLabel(state.imageReferenceItems.length)} để ghép hoặc chỉnh theo prompt vừa nhập bằng model ${modelLabel}.`;
+      elements.composerSummaryText.textContent = `Đang dùng ${fileKindLabel(state.imageReferenceItems.length)} để ghép hoặc chỉnh bằng model ${modelLabel}. Ảnh chính là ${baseItem?.name || "ảnh đầu tiên"}${logoCount ? `, có thêm ${logoCount} logo` : ""}${productCount ? `, ${productCount} ảnh sản phẩm` : ""}.`;
       return;
     }
     elements.composerSummaryMode.textContent = "Ảnh từ prompt";
@@ -710,6 +773,10 @@ function availableVideoSources() {
       workflowId,
       label: `${item.job_title || item.title || "Video"} · ${formatTime(item.created_at)}`,
       title: item.title || item.job_title || "Video gần đây",
+      previewUrl: item.preview_url || item.local_file_url || item.source_url || "",
+      prompt: String(item.prompt || "").trim(),
+      createdAt: item.created_at || "",
+      mimeType: item.mime_type || "",
     });
   }
   return deduped;
@@ -723,6 +790,7 @@ function selectedEditSource() {
 function renderEditControls() {
   const isEdit = state.mode === "edit";
   elements.editActionStrip.hidden = !isEdit;
+  elements.editActionSummary.hidden = !isEdit;
   elements.editSourceWrap.hidden = !isEdit;
   elements.generationOptionsWrap.hidden = isEdit;
   elements.promptAiCard.hidden = !currentModeConfig().showPromptAi;
@@ -736,6 +804,10 @@ function renderEditControls() {
     button.classList.toggle("active", button.dataset.editAction === state.editAction);
   }
 
+  const action = currentEditConfig();
+  elements.editActionSummaryTitle.textContent = action.title;
+  elements.editActionSummaryText.textContent = action.hint;
+
   const sources = availableVideoSources();
   const options = ['<option value="">Chọn một video</option>']
     .concat(
@@ -745,18 +817,51 @@ function renderEditControls() {
     )
     .join("");
   elements.editSourceSelect.innerHTML = options;
+  if (!state.selectedEditSourceKey && !state.manualMediaId && !state.manualWorkflowId && sources[0]) {
+    state.selectedEditSourceKey = sources[0].key;
+  }
   if (!sources.some((item) => item.key === state.selectedEditSourceKey)) {
     state.selectedEditSourceKey = "";
   }
 
+  elements.editSourceCards.innerHTML = sources.length
+    ? sources
+        .map((item) => {
+          const active = item.key === state.selectedEditSourceKey;
+          const prompt = truncate(item.prompt || "", 88) || "Không có prompt lưu cùng video này.";
+          const mediaPreview = String(item.previewUrl || "").trim();
+          return `
+            <button
+              type="button"
+              class="source-card${active ? " active" : ""}"
+              data-action="pick-edit-source"
+              data-key="${escapeHtml(item.key)}"
+            >
+              ${
+                mediaPreview
+                  ? mediaPreview.includes(".mp4") || String(item.mimeType || "").startsWith("video/")
+                    ? `<video class="source-card-media" src="${escapeHtml(mediaPreview)}" muted playsinline preload="metadata"></video>`
+                    : `<img class="source-card-media" src="${escapeHtml(mediaPreview)}" alt="${escapeHtml(item.title)}" />`
+                  : `<div class="source-card-placeholder">Không có preview</div>`
+              }
+              <div class="source-card-copy">
+                <strong>${escapeHtml(item.title)}</strong>
+                <small>${escapeHtml(formatTime(item.createdAt))}</small>
+                <p>${escapeHtml(prompt)}</p>
+              </div>
+            </button>
+          `;
+        })
+        .join("")
+    : `<div class="empty-inline-card">Chưa có video gần đây để chọn. Khi chưa thấy nguồn ở đây, có thể mở phần nhập tay bên dưới.</div>`;
+
   applyEditInputsToForm();
 
-  const config = currentEditConfig();
-  const hasOptions = config.showMotion || config.showPosition || config.showResolution;
+  const hasOptions = action.showMotion || action.showPosition || action.showResolution;
   elements.editOptionsWrap.hidden = !hasOptions;
-  elements.motionField.hidden = !config.showMotion;
-  elements.positionField.hidden = !config.showPosition;
-  elements.resolutionField.hidden = !config.showResolution;
+  elements.motionField.hidden = !action.showMotion;
+  elements.positionField.hidden = !action.showPosition;
+  elements.resolutionField.hidden = !action.showResolution;
 }
 
 function renderImageReferenceStatus() {
@@ -782,19 +887,30 @@ function renderImageReferenceStatus() {
   elements.imageReferenceList.innerHTML = items
     .map((item, index) => {
       const source = item.publicUrl || uploadPublicUrlFromPath(item.path);
+      const role = normalizeReferenceRole(item.role || (index === 0 ? "base" : "reference"));
+      const roleOptions = REFERENCE_ROLE_OPTIONS.map(
+        (option) => `<option value="${escapeHtml(option.value)}"${option.value === role ? " selected" : ""}>${escapeHtml(option.label)}</option>`
+      ).join("");
       return `
         <article class="upload-preview reference-card">
           <img class="upload-preview-image" src="${escapeHtml(source)}" alt="${escapeHtml(item.name || "Ảnh tham chiếu")}" />
           <div class="upload-preview-copy">
             <strong>${escapeHtml(item.name || "Ảnh tham chiếu")}</strong>
-            <p>${escapeHtml(index === 0 ? "Ảnh chính hoặc ảnh người mẫu." : "Ảnh phụ để ghép logo, họa tiết hoặc chi tiết cần chèn.")}</p>
+            <p>${escapeHtml(referenceRoleDetail(role))}</p>
+            <label class="field inline-role-field">
+              <span>Vai trò</span>
+              <select data-action="reference-role" data-index="${index}">
+                ${roleOptions}
+              </select>
+            </label>
           </div>
           <button type="button" class="ghost-button card-button" data-action="remove-reference-image" data-index="${index}">Bỏ ảnh</button>
         </article>
       `;
     })
     .join("");
-  elements.imageReferenceStatus.textContent = `Đã gắn ${fileKindLabel(items.length)}. App sẽ dùng chúng làm ảnh tham chiếu khi tạo ảnh.`;
+  const baseItem = items.find((item) => normalizeReferenceRole(item.role) === "base") || items[0];
+  elements.imageReferenceStatus.textContent = `Đã gắn ${fileKindLabel(items.length)}. Ảnh chính hiện là ${baseItem?.name || "ảnh đầu tiên"}, các ảnh còn lại sẽ được dùng theo vai trò đã chọn.`;
 }
 
 function renderPromptAiResult() {
@@ -888,10 +1004,11 @@ function fillComposerFromSource(mode, payload = {}) {
     state.imageReferenceItems = (payload.reference_image_paths || [])
       .map((path) => String(path || "").trim())
       .filter(Boolean)
-      .map((path) => ({
+      .map((path, index) => ({
         path,
         name: basename(path),
         publicUrl: uploadPublicUrlFromPath(path),
+        role: normalizeReferenceRole(payload.reference_image_roles?.[index] || (index === 0 ? "base" : "reference")),
       }));
   } else {
     state.startImagePath = "";
@@ -984,6 +1101,7 @@ function renderLatestStatus() {
     latestJob.status === "interrupted" ||
     (latestJob.type === "video" && latestJob.status === "completed" && !(latestJob.artifacts || []).length);
   const canReuse = Boolean(String(latestJob.input?.prompt || "").trim());
+  const canOpenFlow = Boolean(state.config?.project_id);
 
   elements.latestStatusCard.className = "latest-status";
   elements.latestStatusCard.innerHTML = `
@@ -1000,6 +1118,11 @@ function renderLatestStatus() {
       <p class="run-note">${escapeHtml(note)}</p>
       <p class="run-note flow-open-note">Tab Google Flow vẫn được giữ mở để bạn xem trực tiếp trên đó.</p>
       <div class="card-actions">
+        ${
+          canOpenFlow
+            ? `<button type="button" class="ghost-button card-button" data-action="open-flow-project">Mở Flow</button>`
+            : ""
+        }
         ${
           canReuse
             ? `<button type="button" class="ghost-button card-button" data-action="reuse-job" data-job-id="${escapeHtml(latestJob.id)}">Dùng lại prompt</button>`
@@ -1081,12 +1204,50 @@ async function saveConfig(event) {
 async function loginFlow() {
   try {
     await api("/api/auth/login", { method: "POST" });
-    showMessage("Đang mở cửa sổ đăng nhập Google Flow. Em sẽ để nguyên tab này để dùng tiếp.", "success");
+    showMessage("Đang mở cửa sổ đăng nhập Google Flow. Nếu chưa thấy Chromium hiện ra, bấm thêm nút Mở Flow.", "success");
     state.setupOpen = true;
     renderTopbar();
   } catch (error) {
-    showMessage(error.message, "error");
+    showMessage(formatFlowWindowError(error.message), "error");
   }
+}
+
+async function openFlowLoginSurface() {
+  try {
+    const payload = await api("/api/flow/open-login", { method: "POST" });
+    showMessage(`Đã gọi lại cửa sổ đăng nhập Flow. Nếu vẫn chưa thấy, hãy kiểm tra Chromium/Chrome for Testing trên màn hình.`, "success");
+    state.setupOpen = true;
+    renderTopbar();
+    return payload;
+  } catch (error) {
+    showMessage(formatFlowWindowError(error.message), "error");
+    return null;
+  }
+}
+
+async function openFlowProjectSurface() {
+  try {
+    const payload = await api("/api/flow/open-project", { method: "POST" });
+    const hasProject = Boolean(state.config?.project_id);
+    showMessage(
+      hasProject
+        ? "Đã gọi lại tab project Flow đang dùng."
+        : "Đã mở lại Flow. Hãy lưu project hoặc đăng nhập nếu cần.",
+      "success"
+    );
+    return payload;
+  } catch (error) {
+    showMessage(formatFlowWindowError(error.message), "error");
+    return null;
+  }
+}
+
+function formatFlowWindowError(message) {
+  const text = String(message || "").trim();
+  if (/session 0|session nền của windows/i.test(text)) {
+    return `${text} Nếu đang dùng Windows, hãy chạy Flow Web UI ngay trên màn hình desktop rồi đăng nhập lại trong cửa sổ đó.`;
+  }
+  return text;
 }
 
 async function logoutFlow() {
@@ -1164,10 +1325,12 @@ async function uploadImageReferences(event) {
       const data = new FormData();
       data.append("file", file);
       const payload = await api("/api/uploads", { method: "POST", body: data });
+      const hasBase = state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "base");
       state.imageReferenceItems.push({
         path: payload.saved_path || "",
         name: payload.file_name || file.name,
         publicUrl: payload.public_url || uploadPublicUrlFromPath(payload.saved_path || file.name),
+        role: hasBase ? "reference" : "base",
       });
     }
     showMessage("Đã tải ảnh tham chiếu để ghép/chỉnh ảnh.", "success");
@@ -1197,9 +1360,31 @@ function removeReferenceImage(indexValue) {
     return;
   }
   state.imageReferenceItems.splice(index, 1);
+  if (state.imageReferenceItems.length && !state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "base")) {
+    state.imageReferenceItems[0].role = "base";
+  }
   renderComposerSummary();
   renderImageReferenceStatus();
   showMessage("Đã bỏ một ảnh tham chiếu.", "success");
+}
+
+function setReferenceImageRole(indexValue, roleValue) {
+  const index = Number(indexValue);
+  if (!Number.isInteger(index) || index < 0 || index >= state.imageReferenceItems.length) {
+    return;
+  }
+  const role = normalizeReferenceRole(roleValue);
+  state.imageReferenceItems = state.imageReferenceItems.map((item, itemIndex) => ({
+    ...item,
+    role: role === "base" && itemIndex !== index ? (normalizeReferenceRole(item.role) === "base" ? "reference" : normalizeReferenceRole(item.role)) : normalizeReferenceRole(item.role),
+  }));
+  state.imageReferenceItems[index].role = role;
+  if (!state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "base")) {
+    state.imageReferenceItems[0].role = "base";
+  }
+  renderComposerSummary();
+  renderImageReferenceStatus();
+  showMessage(`Đã đổi vai trò ảnh sang ${referenceRoleLabel(role).toLowerCase()}.`, "success");
 }
 
 async function submitCreate(event) {
@@ -1249,6 +1434,7 @@ async function submitCreate(event) {
     payload.type = "image";
     if (state.imageReferenceItems.length) {
       payload.reference_image_paths = state.imageReferenceItems.map((item) => item.path).filter(Boolean);
+      payload.reference_image_roles = state.imageReferenceItems.map((item, index) => normalizeReferenceRole(item.role || (index === 0 ? "base" : "reference")));
     }
   }
 
@@ -1368,6 +1554,7 @@ function buildRetryPayload(job) {
     count: Math.max(1, Math.min(4, Number(input.count || MODE_CONFIG[job.type]?.defaultCount || 1))),
     start_image_path: String(input.start_image_path || "").trim(),
     reference_image_paths: Array.isArray(input.reference_image_paths) ? input.reference_image_paths : [],
+    reference_image_roles: Array.isArray(input.reference_image_roles) ? input.reference_image_roles : [],
     reference_media_names: Array.isArray(input.reference_media_names) ? input.reference_media_names : [],
     media_id: String(input.media_id || "").trim(),
     workflow_id: String(input.workflow_id || "").trim(),
@@ -1498,21 +1685,50 @@ elements.setupToggle.addEventListener("click", () => {
 
 elements.configForm.addEventListener("submit", saveConfig);
 elements.loginButton.addEventListener("click", loginFlow);
+elements.openFlowButton.addEventListener("click", openFlowProjectSurface);
+elements.openLoginButton.addEventListener("click", openFlowLoginSurface);
+elements.openProjectButton.addEventListener("click", openFlowProjectSurface);
+elements.focusProjectButton.addEventListener("click", openFlowProjectSurface);
 elements.logoutButton.addEventListener("click", logoutFlow);
 elements.startImageFile.addEventListener("change", uploadStartImage);
 elements.imageReferenceFiles.addEventListener("change", uploadImageReferences);
 elements.clearStartImageButton.addEventListener("click", clearStartImage);
 elements.editSourceSelect.addEventListener("change", () => {
+  if (elements.editSourceSelect.value) {
+    state.manualMediaId = "";
+    state.manualWorkflowId = "";
+  }
   syncEditInputsFromForm();
   renderComposerSummary();
+  renderEditControls();
+});
+elements.editSourceCards.addEventListener("click", (event) => {
+  const actionTarget = event.target.closest("[data-action='pick-edit-source']");
+  if (!actionTarget) {
+    return;
+  }
+  state.selectedEditSourceKey = actionTarget.dataset.key || "";
+  state.manualMediaId = "";
+  state.manualWorkflowId = "";
+  applyEditInputsToForm();
+  renderComposerSummary();
+  renderEditControls();
 });
 elements.manualMediaId.addEventListener("input", () => {
+  if (elements.manualMediaId.value.trim()) {
+    state.selectedEditSourceKey = "";
+  }
   syncEditInputsFromForm();
   renderComposerSummary();
+  renderEditControls();
 });
 elements.manualWorkflowId.addEventListener("input", () => {
+  if (elements.manualWorkflowId.value.trim()) {
+    state.selectedEditSourceKey = "";
+  }
   syncEditInputsFromForm();
   renderComposerSummary();
+  renderEditControls();
 });
 elements.motionSelect.addEventListener("change", syncEditInputsFromForm);
 elements.positionSelect.addEventListener("change", syncEditInputsFromForm);
@@ -1531,11 +1747,39 @@ elements.modelSelect.addEventListener("change", () => {
   syncDraftFromForm();
   renderComposerSummary();
 });
-elements.aspectSelect.addEventListener("change", syncDraftFromForm);
-elements.countInput.addEventListener("input", syncDraftFromForm);
+elements.aspectSelect.addEventListener("change", () => {
+  syncDraftFromForm();
+  renderAspectChoices();
+});
+elements.aspectChoices.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-aspect-option]");
+  if (!button) {
+    return;
+  }
+  elements.aspectSelect.value = button.dataset.aspectOption || currentModeConfig().defaultAspect;
+  syncDraftFromForm();
+  renderAspectChoices();
+});
+elements.countInput.addEventListener("input", () => {
+  syncDraftFromForm();
+  renderCountChoices();
+});
+elements.countChoices.addEventListener("click", (event) => {
+  const button = event.target.closest("[data-count-option]");
+  if (!button) {
+    return;
+  }
+  elements.countInput.value = button.dataset.countOption || String(currentModeConfig().defaultCount);
+  syncDraftFromForm();
+  renderCountChoices();
+});
 elements.latestStatusCard.addEventListener("click", (event) => {
   const actionTarget = event.target.closest("[data-action]");
   if (!actionTarget) {
+    return;
+  }
+  if (actionTarget.dataset.action === "open-flow-project") {
+    openFlowProjectSurface();
     return;
   }
   if (actionTarget.dataset.action === "retry-job") {
@@ -1552,6 +1796,13 @@ elements.imageReferenceList.addEventListener("click", (event) => {
     return;
   }
   removeReferenceImage(actionTarget.dataset.index);
+});
+elements.imageReferenceList.addEventListener("change", (event) => {
+  const select = event.target.closest("[data-action='reference-role']");
+  if (!select) {
+    return;
+  }
+  setReferenceImageRole(select.dataset.index, select.value);
 });
 
 loadState();

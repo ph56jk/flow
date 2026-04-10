@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260409b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260410a" />
   </head>
   <body>
     <div class="app-shell">
@@ -32,6 +32,7 @@
         <div class="topbar-actions">
           <span class="status-pill" id="projectStatus">Chưa có project</span>
           <span class="status-pill" id="authStatus">Chưa đăng nhập</span>
+          <button type="button" class="ghost-button" id="openFlowButton">Mở Flow</button>
           <button type="button" class="ghost-button" id="logoutButton" hidden>Đăng xuất</button>
           <button type="button" class="ghost-button" id="setupToggle">Thiết lập</button>
         </div>
@@ -77,6 +78,18 @@
           <div class="setup-actions">
             <button type="submit">Lưu project</button>
             <button type="button" class="secondary-button" id="loginButton">Đăng nhập Google Flow</button>
+            <button type="button" class="ghost-button" id="openProjectButton">Mở project Flow</button>
+          </div>
+
+          <div class="setup-helper">
+            <div>
+              <strong>Không thấy cửa sổ Flow?</strong>
+              <p>Nếu bấm đăng nhập mà chưa thấy Chromium hiện ra, dùng các nút này để gọi lại tab Flow. Trên Windows, hãy mở app trực tiếp trên desktop, đừng chạy qua SSH hay tác vụ nền.</p>
+            </div>
+            <div class="card-actions">
+              <button type="button" class="ghost-button card-button" id="openLoginButton">Mở cửa sổ đăng nhập</button>
+              <button type="button" class="ghost-button card-button" id="focusProjectButton">Mở lại project đang dùng</button>
+            </div>
           </div>
         </form>
 
@@ -111,6 +124,11 @@
                 <button type="button" class="task-chip" data-edit-action="camera_position">Vị trí camera</button>
                 <button type="button" class="task-chip" data-edit-action="insert">Chèn vật thể</button>
                 <button type="button" class="task-chip" data-edit-action="remove">Xóa vật thể</button>
+              </div>
+
+              <div id="editActionSummary" class="action-summary" hidden>
+                <strong id="editActionSummaryTitle">Kéo dài video</strong>
+                <p id="editActionSummaryText">Dùng khi muốn nối thêm phần cuối video hiện có.</p>
               </div>
 
               <section class="prompt-ai-card" id="promptAiCard">
@@ -175,17 +193,18 @@
                   <div>
                     <p class="eyebrow">Nguồn để chỉnh</p>
                     <h3>Chọn video cần sửa</h3>
-                    <p class="section-copy">Ưu tiên chọn từ kết quả gần đây. Nếu chưa thấy, có thể nhập tay ở phần dưới.</p>
+                    <p class="section-copy">Bấm vào một video gần đây để sửa ngay. Nếu chưa thấy, mới cần nhập tay ở phần dưới.</p>
                   </div>
                 </div>
-                <label class="field wide">
-                  <span>Video gần đây</span>
-                  <select id="editSourceSelect">
-                    <option value="">Chọn một video</option>
-                  </select>
-                </label>
+                <div id="editSourceCards" class="source-card-grid"></div>
                 <details class="compact-details">
-                  <summary>Nhập tay nếu cần</summary>
+                  <summary>Chọn theo danh sách cũ hoặc nhập tay nếu cần</summary>
+                  <label class="field wide">
+                    <span>Video gần đây</span>
+                    <select id="editSourceSelect">
+                      <option value="">Chọn một video</option>
+                    </select>
+                  </label>
                   <div class="detail-grid">
                     <label class="field">
                       <span>Media ID</span>
@@ -244,18 +263,38 @@
                     <span>Model</span>
                     <select id="modelSelect"></select>
                   </label>
-                  <label class="field">
-                    <span>Tỉ lệ</span>
-                    <select id="aspectSelect">
+                  <div class="field">
+                    <span>Khung hình</span>
+                    <div id="aspectChoices" class="choice-grid" aria-label="Chọn khung hình">
+                      <button type="button" class="choice-card" data-aspect-option="landscape">
+                        <strong>Ngang 16:9</strong>
+                        <small>YouTube, cảnh ngang, widescreen</small>
+                      </button>
+                      <button type="button" class="choice-card" data-aspect-option="portrait">
+                        <strong>Dọc 9:16</strong>
+                        <small>Reels, Shorts, TikTok</small>
+                      </button>
+                      <button type="button" class="choice-card" data-aspect-option="square">
+                        <strong>Vuông 1:1</strong>
+                        <small>Feed, poster vuông, thumbnail</small>
+                      </button>
+                    </div>
+                    <select id="aspectSelect" hidden>
                       <option value="landscape">Ngang 16:9</option>
                       <option value="portrait">Dọc 9:16</option>
                       <option value="square">Vuông 1:1</option>
                     </select>
-                  </label>
-                  <label class="field">
+                  </div>
+                  <div class="field">
                     <span>Số lượng</span>
-                    <input type="number" id="countInput" min="1" max="4" value="1" />
-                  </label>
+                    <div id="countChoices" class="count-choice-row" aria-label="Chọn số lượng">
+                      <button type="button" class="count-choice" data-count-option="1">1</button>
+                      <button type="button" class="count-choice" data-count-option="2">2</button>
+                      <button type="button" class="count-choice" data-count-option="3">3</button>
+                      <button type="button" class="count-choice" data-count-option="4">4</button>
+                    </div>
+                    <input type="number" id="countInput" min="1" max="4" value="1" hidden />
+                  </div>
                 </div>
               </details>
 
@@ -320,6 +359,6 @@
         </section>
       </main>
     </div>
-    <script type="module" src="/static/app.js?v=20260409b"></script>
+    <script type="module" src="/static/app.js?v=20260410a"></script>
   </body>
 </html>

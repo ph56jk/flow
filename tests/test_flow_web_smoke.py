@@ -104,6 +104,30 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("NARWHAL", resolved.model)
 
+    def test_resolve_job_request_assigns_reference_image_roles(self) -> None:
+        config = AppConfig(project_id="pid", generation_timeout_s=420)
+        request = CreateJobRequest(
+            type="image",
+            prompt="ghép logo lên áo",
+            reference_image_paths=["/tmp/model.jpg", "/tmp/logo.png", "/tmp/tag.png"],
+            reference_image_roles=["logo", "base", "reference"],
+        )
+
+        resolved = self.service._resolve_job_request(request, config)
+
+        self.assertEqual(["logo", "base", "reference"], resolved.reference_image_roles)
+
+    def test_ordered_reference_media_names_keeps_base_first(self) -> None:
+        ordered = self.service._ordered_reference_media_names(
+            [
+                {"role": "logo", "media_name": "media-logo"},
+                {"role": "base", "media_name": "media-model"},
+                {"role": "product", "media_name": "media-shirt"},
+            ]
+        )
+
+        self.assertEqual(["media-model", "media-shirt", "media-logo"], ordered)
+
     def test_canonical_project_url_uses_vi_locale_route(self) -> None:
         self.assertEqual(
             "https://labs.google/fx/vi/tools/flow/project/f2d33dc4-39f7-4f0e-8249-ce97a5c9a403",
@@ -363,6 +387,98 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         jobs = self.store.snapshot().jobs
         self.assertEqual(1, len(jobs))
         self.assertEqual("failed", jobs[0].status)
+
+    async def test_open_flow_login_surface_uses_login_page(self) -> None:
+        page = SimpleNamespace(url="https://labs.google/fx/vi/tools/flow")
+        browser = SimpleNamespace()
+
+        with patch.object(self.service, "_ensure_shared_browser", AsyncMock(return_value=browser)) as ensure_browser, patch.object(
+            self.service,
+            "_open_login_flow_page",
+            AsyncMock(return_value=page),
+        ) as open_login_page:
+            payload = await self.service.open_flow_login_surface()
+
+        ensure_browser.assert_awaited_once()
+        open_login_page.assert_awaited_once_with(browser)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("https://labs.google/fx/vi/tools/flow", payload["url"])
+
+    async def test_open_flow_login_surface_fails_in_windows_session_zero(self) -> None:
+        with patch("flow_web.service.os.name", "nt"), patch.object(
+            self.service,
+            "_current_windows_session_id",
+            return_value=0,
+        ), patch.object(self.service, "_ensure_shared_browser", AsyncMock()) as ensure_browser:
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service.open_flow_login_surface()
+
+        ensure_browser.assert_not_awaited()
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("session nền của windows", str(ctx.exception.detail).lower())
+
+    async def test_open_flow_project_surface_opens_saved_project_page(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid-demo"))
+        page = SimpleNamespace(url="https://labs.google/fx/vi/tools/flow/project/pid-demo", bring_to_front=AsyncMock())
+        browser = SimpleNamespace()
+
+        with patch.object(self.service, "_ensure_shared_browser", AsyncMock(return_value=browser)) as ensure_browser, patch.object(
+            self.service,
+            "_repair_placeholder_flow_tabs",
+            AsyncMock(),
+        ) as repair_tabs, patch.object(
+            self.service,
+            "_acquire_fresh_flow_page",
+            AsyncMock(return_value=page),
+        ) as acquire_page, patch.object(
+            self.service,
+            "_ensure_valid_flow_project_page",
+            AsyncMock(),
+        ) as ensure_project, patch.object(
+            self.service,
+            "_foreground_native_flow_window",
+            AsyncMock(),
+        ) as focus_window:
+            payload = await self.service.open_flow_project_surface()
+
+        ensure_browser.assert_awaited_once()
+        repair_tabs.assert_awaited_once()
+        acquire_page.assert_awaited_once()
+        ensure_project.assert_awaited_once()
+        page.bring_to_front.assert_awaited_once()
+        focus_window.assert_awaited_once()
+        self.assertTrue(payload["ok"])
+        self.assertEqual("https://labs.google/fx/vi/tools/flow/project/pid-demo", payload["url"])
+
+    async def test_open_flow_project_surface_fails_in_windows_session_zero(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid-demo"))
+        with patch("flow_web.service.os.name", "nt"), patch.object(
+            self.service,
+            "_current_windows_session_id",
+            return_value=0,
+        ), patch.object(self.service, "_ensure_shared_browser", AsyncMock()) as ensure_browser:
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service.open_flow_project_surface()
+
+        ensure_browser.assert_not_awaited()
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("session nền của windows", str(ctx.exception.detail).lower())
+
+    async def test_launch_login_browser_fails_in_windows_session_zero(self) -> None:
+        job = JobRecord(type="login", status="queued", title="Đăng nhập Google Flow")
+        await self.store.add_job(job)
+
+        with patch("flow_web.service.os.name", "nt"), patch.object(
+            self.service,
+            "_current_windows_session_id",
+            return_value=0,
+        ), patch.object(self.service, "_ensure_shared_browser", AsyncMock()) as ensure_browser:
+            with self.assertRaises(HTTPException) as ctx:
+                await self.service._launch_login_browser(job.id)
+
+        ensure_browser.assert_not_awaited()
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("session nền của windows", str(ctx.exception.detail).lower())
 
     async def test_ensure_valid_flow_project_page_redirects_placeholder_route(self) -> None:
         page = SimpleNamespace(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import logging
 import os
@@ -125,6 +126,13 @@ class FlowWebService:
         "imagen 3": "IMAGEN_3",
         "imagen3": "IMAGEN_3",
         "imagen_3": "IMAGEN_3",
+    }
+    REFERENCE_IMAGE_ROLES = ("base", "logo", "product", "reference")
+    REFERENCE_IMAGE_ROLE_LABELS = {
+        "base": "ảnh chính",
+        "logo": "logo",
+        "product": "sản phẩm",
+        "reference": "tham chiếu",
     }
     PROMPT_SKILL_PREFIXES = (
         "guides/design/",
@@ -262,6 +270,38 @@ class FlowWebService:
             "ok": True,
             "had_session": had_session,
             "auth": _model_dump(self.get_auth_status()),
+        }
+
+    async def open_flow_login_surface(self) -> Dict[str, Any]:
+        self._assert_windows_interactive_browser_session("đăng nhập Google Flow")
+        async with self._browser_session_lock:
+            browser = await self._ensure_shared_browser()
+            page = await self._open_login_flow_page(browser)
+        return {
+            "ok": True,
+            "url": str(getattr(page, "url", "") or "https://labs.google/fx/vi/tools/flow"),
+        }
+
+    async def open_flow_project_surface(self) -> Dict[str, Any]:
+        self._assert_windows_interactive_browser_session("mở project Google Flow")
+        config = self._normalized_config(self.store.snapshot().config)
+        target_url = self._project_url(config.project_id) if config.project_id else "https://labs.google/fx/vi/tools/flow"
+        async with self._browser_session_lock:
+            browser = await self._ensure_shared_browser()
+            if config.project_id:
+                await self._repair_placeholder_flow_tabs(browser, target_url)
+                page = await self._acquire_fresh_flow_page(browser, target_url)
+                await self._ensure_valid_flow_project_page(page, target_url)
+                try:
+                    await page.bring_to_front()
+                except Exception:
+                    pass
+                await self._foreground_native_flow_window()
+            else:
+                page = await self._open_login_flow_page(browser)
+        return {
+            "ok": True,
+            "url": str(getattr(page, "url", "") or target_url),
         }
 
     def list_projects(self) -> List[ProjectEntry]:
@@ -2004,6 +2044,7 @@ class FlowWebService:
         )
 
     async def _launch_login_browser(self, job_id: str) -> Any:
+        self._assert_windows_interactive_browser_session("đăng nhập Google Flow")
         await self.store.patch_job(job_id, status="running")
         await self._set_job_progress(job_id, "launching_browser", "Em đang mở Chromium để đi tới Google Flow.")
         await self.store.append_log(job_id, "Đang mở Chromium để đăng nhập Google Flow")
@@ -2099,6 +2140,39 @@ class FlowWebService:
         if os.name != "nt":
             return
         await asyncio.to_thread(self._foreground_native_flow_window_sync)
+
+    def _assert_windows_interactive_browser_session(self, action: str) -> None:
+        if os.name != "nt":
+            return
+        session_id = self._current_windows_session_id()
+        if session_id == 0:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                "Flow Web UI đang chạy trong session nền của Windows (Session 0), thường là do mở app qua SSH, "
+                "tác vụ nền hoặc Task Scheduler. Kiểu này không thể bật cửa sổ để "
+                f"{action}. Hãy mở Flow Web UI trực tiếp trên desktop Windows rồi thử lại."
+                ),
+            )
+
+    def _current_windows_session_id(self) -> int | None:
+        if os.name != "nt":
+            return None
+        try:
+            kernel32 = ctypes.windll.kernel32
+            process_id = kernel32.GetCurrentProcessId()
+            session_id = ctypes.c_uint()
+            if kernel32.ProcessIdToSessionId(process_id, ctypes.byref(session_id)):
+                return int(session_id.value)
+        except Exception:
+            pass
+
+        session_name = str(os.environ.get("SESSIONNAME", "") or "").strip().lower()
+        if session_name in {"services", "service"}:
+            return 0
+        if session_name.startswith("console"):
+            return 1
+        return None
 
     def _foreground_native_flow_window_sync(self) -> None:
         if os.name != "nt":
@@ -4605,6 +4679,10 @@ exit 1
             for item in payload.get("reference_image_paths", [])
             if str(item).strip()
         ]
+        payload["reference_image_roles"] = self._normalize_reference_image_roles(
+            payload["reference_image_paths"],
+            payload.get("reference_image_roles", []),
+        )
         payload["reference_media_names"] = [
             str(item).strip()
             for item in payload.get("reference_media_names", [])
@@ -5466,6 +5544,56 @@ exit 1
         normalized = self._normalize_image_model(model)
         return self.IMAGE_MODEL_LABELS.get(normalized, self.IMAGE_MODEL_LABELS[self.DEFAULT_IMAGE_MODEL])
 
+    def _normalize_reference_image_role(self, role: str) -> str:
+        normalized = re.sub(r"[^a-z]+", "", str(role or "").strip().lower())
+        if normalized in {"base", "main", "model", "subject", "primary"}:
+            return "base"
+        if normalized in {"logo", "brand"}:
+            return "logo"
+        if normalized in {"product", "item"}:
+            return "product"
+        return "reference"
+
+    def _normalize_reference_image_roles(self, image_paths: List[str], roles: List[str]) -> List[str]:
+        path_count = len(image_paths or [])
+        if path_count <= 0:
+            return []
+
+        normalized = [
+            self._normalize_reference_image_role(roles[index] if index < len(roles or []) else "")
+            for index in range(path_count)
+        ]
+        if "base" not in normalized:
+            normalized[0] = "base"
+        else:
+            base_index = normalized.index("base")
+            normalized = ["reference" if role == "base" and index != base_index else role for index, role in enumerate(normalized)]
+        return normalized
+
+    def _ordered_reference_media_names(
+        self,
+        media_items: List[Dict[str, str]],
+        fallback_names: List[str] | None = None,
+    ) -> List[str]:
+        ordered: List[str] = []
+        seen: set[str] = set()
+
+        def push(name: str) -> None:
+            safe_name = str(name or "").strip()
+            if not safe_name or safe_name in seen:
+                return
+            seen.add(safe_name)
+            ordered.append(safe_name)
+
+        for role in ("base", "product", "logo", "reference"):
+            for item in media_items:
+                if str(item.get("role") or "") == role:
+                    push(item.get("media_name", ""))
+
+        for name in fallback_names or []:
+            push(name)
+        return ordered
+
     def _normalize_local_upload_paths(self, values: List[str]) -> List[str]:
         roots = [UPLOADS_DIR.resolve()]
         normalized: List[str] = []
@@ -5495,20 +5623,24 @@ exit 1
         if not reference_image_paths:
             return reference_media_names
 
+        reference_roles = self._normalize_reference_image_roles(reference_image_paths, request.reference_image_roles or [])
         total = len(reference_image_paths)
         await self.store.append_log(job_id, f"Đang chuẩn bị {total} ảnh tham chiếu để ghép/chỉnh ảnh.")
+        uploaded_items: List[Dict[str, str]] = []
         for index, image_path in enumerate(reference_image_paths):
+            role = reference_roles[index] if index < len(reference_roles) else ("base" if index == 0 else "reference")
+            role_label = self.REFERENCE_IMAGE_ROLE_LABELS.get(role, "tham chiếu")
             await self._set_job_progress(
                 job_id,
                 "sending_request",
-                f"Em đang tải ảnh tham chiếu {index + 1}/{total} lên Flow trước khi chỉnh ảnh.",
+                f"Em đang tải ảnh {role_label} {index + 1}/{total} lên Flow trước khi chỉnh ảnh.",
             )
-            await self.store.append_log(job_id, f"Đang tải ảnh tham chiếu {index + 1}/{total}: {Path(image_path).name}")
+            await self.store.append_log(job_id, f"Đang tải ảnh {role_label} {index + 1}/{total}: {Path(image_path).name}")
             media_name = await self._upload_project_image_robust(client, image_path)
             if media_name:
-                reference_media_names.append(media_name)
+                uploaded_items.append({"role": role, "media_name": media_name})
 
-        return self._normalize_reference_media_names(reference_media_names)
+        return self._ordered_reference_media_names(uploaded_items, reference_media_names)
 
     async def _upload_project_image_robust(self, client: Any, image_path: str) -> str:
         image_file = Path(str(image_path or "")).expanduser().resolve()
