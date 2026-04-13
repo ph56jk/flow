@@ -104,6 +104,24 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("NARWHAL", resolved.model)
 
+    def test_get_auth_status_uses_network_cookies_fallback(self) -> None:
+        with patch.object(self.service, "_flow_modules", return_value=(None, lambda: False, None, None, None)), patch.object(
+            self.service,
+            "_flow_profile_has_auth_cookies",
+            return_value=True,
+        ):
+            status = self.service.get_auth_status()
+
+        self.assertTrue(status.authenticated)
+
+    def test_start_image_search_terms_include_file_stem(self) -> None:
+        terms = self.service._start_image_search_terms(r"D:\flow\data\uploads\OIP-2.jfif")
+
+        self.assertIn("D:\\flow\\data\\uploads\\OIP-2.jfif", terms)
+        self.assertIn("OIP-2.jfif", terms)
+        self.assertIn("OIP-2", terms)
+        self.assertIn("oip 2", [item.lower() for item in terms])
+
     def test_resolve_job_request_assigns_reference_image_roles(self) -> None:
         config = AppConfig(project_id="pid", generation_timeout_s=420)
         request = CreateJobRequest(

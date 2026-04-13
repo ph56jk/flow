@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Dict, List
 
 from fastapi import HTTPException, UploadFile
@@ -230,7 +230,33 @@ class FlowWebService:
 
     def get_auth_status(self) -> AuthStatus:
         _, is_authenticated, _, _, _ = self._flow_modules()
-        return AuthStatus(authenticated=is_authenticated())
+        authenticated = False
+        try:
+            authenticated = bool(is_authenticated())
+        except Exception:
+            authenticated = False
+        if not authenticated:
+            authenticated = self._flow_profile_has_auth_cookies()
+        return AuthStatus(authenticated=authenticated)
+
+    def _flow_profile_has_auth_cookies(self) -> bool:
+        try:
+            from flow._storage import PROFILE_DIR
+        except Exception:
+            return False
+
+        profile_dir = Path(PROFILE_DIR)
+        candidates = [
+            profile_dir / "Default" / "Cookies",
+            profile_dir / "Default" / "Network" / "Cookies",
+        ]
+        for candidate in candidates:
+            try:
+                if candidate.exists() and candidate.stat().st_size > 0:
+                    return True
+            except OSError:
+                continue
+        return False
 
     async def logout_flow(self) -> Dict[str, Any]:
         snapshot = self.store.snapshot()
@@ -2234,7 +2260,10 @@ exit 1
 
             if request.type == "video":
                 requested_count = max(1, int(request.count or 1))
-                send_timeout_s = max(30, min(timeout_s, 90 * requested_count))
+                if request.start_image_path:
+                    send_timeout_s = timeout_s
+                else:
+                    send_timeout_s = max(30, min(timeout_s, 90 * requested_count))
                 if request.start_image_path:
                     await self.store.append_log(job_id, "Đang chuẩn bị tải ảnh đầu vào và gắn vào ô Start.")
                     await self._set_job_progress(
@@ -2926,6 +2955,65 @@ exit 1
                 f"Timed out ({timeout_s}s) waiting for {endpoint_tail}. Captured so far: {seen_tails}"
             )
 
+        async def _compat_wait_for_video_submit_call(
+            interceptor: Any,
+            start_index: int,
+            *,
+            timeout_s: float,
+            expect_start_image: bool,
+        ) -> Any:
+            deadline = time.monotonic() + timeout_s
+            seen_tails: List[str] = []
+            best_match = None
+            settle_deadline = 0.0
+
+            def _response_weight(call: Any) -> int:
+                if not isinstance(getattr(call, "resp", None), dict):
+                    return 0
+                resp = call.resp or {}
+                return (
+                    len(resp.get("jobs", []) or [])
+                    + len(resp.get("media", []) or [])
+                    + len(resp.get("workflows", []) or [])
+                )
+
+            while time.monotonic() < deadline:
+                completed = [
+                    call
+                    for call in getattr(interceptor, "_calls", [])[start_index:]
+                    if call.resp is not None
+                ]
+                if completed:
+                    seen_tails = [str(call.tail or "") for call in completed]
+
+                for call in reversed(completed):
+                    tail = str(call.tail or "")
+                    normalized = tail.lower()
+                    if "generatevideo" not in normalized:
+                        continue
+                    if call.status not in (200, 201):
+                        continue
+                    if expect_start_image and "text" in normalized:
+                        raise RuntimeError(
+                            "Google Flow đã gửi nhầm sang text-to-video. Ảnh đầu vào nhiều khả năng chưa được gắn vào Start."
+                        )
+                    if expect_start_image and not isinstance(getattr(call, "resp", None), dict):
+                        continue
+                    if expect_start_image and _response_weight(call) == 0:
+                        continue
+                    if best_match is None or _response_weight(call) >= _response_weight(best_match):
+                        best_match = call
+                        settle_deadline = time.monotonic() + 1.0
+
+                if best_match is not None and time.monotonic() >= settle_deadline:
+                    return best_match
+                await asyncio.sleep(0.25)
+
+            label = "image-to-video" if expect_start_image else "text-to-video"
+            raise RuntimeError(
+                f"Timed out ({timeout_s}s) waiting for {label} submit response. Captured so far: {seen_tails}"
+            )
+
         async def _compat_click_menu_trigger(page: Any) -> bool:
             index = await _compat_find_create_options_trigger_index(page)
             if index < 0:
@@ -3113,7 +3201,7 @@ exit 1
             label_map = {
                 GenerationMode.IMAGE: ["Image", "Hình ảnh", "Hinh anh"],
                 GenerationMode.VIDEO: ["Video"],
-                GenerationMode.FRAME_TO_VIDEO: ["Video"],
+                GenerationMode.FRAME_TO_VIDEO: ["Frames", "Frame", "Khung hình", "Khung"],
             }
             return await _compat_click_menu_tab(page, label_map.get(mode, []))
 
@@ -3223,56 +3311,212 @@ exit 1
                         continue
             return False
 
-        async def _compat_start_trigger(page: Any) -> Any | None:
-            candidates = [
-                page.locator('div[type="button"]').filter(has_text="Start").first,
-                page.locator("button").filter(has_text="Start").first,
-                page.get_by_text("Start", exact=True).first,
-            ]
-            for candidate in candidates:
+        async def _compat_visible_locator(locator: Any) -> Any | None:
+            try:
+                count = await locator.count()
+            except Exception:
+                return None
+            for index in range(count):
+                candidate = locator.nth(index)
                 try:
-                    if await candidate.count() > 0:
-                        return candidate
+                    box = await candidate.bounding_box()
                 except Exception:
+                    box = None
+                if not box or box["width"] < 16 or box["height"] < 16:
                     continue
+                try:
+                    disabled = await candidate.evaluate(
+                        """
+                        (el) => {
+                          const node = el instanceof HTMLElement ? el : el.closest('*');
+                          if (!node) return false;
+                          const style = window.getComputedStyle(node);
+                          return node.hasAttribute('disabled')
+                            || node.getAttribute('aria-disabled') === 'true'
+                            || style.pointerEvents === 'none';
+                        }
+                        """
+                    )
+                except Exception:
+                    disabled = False
+                if disabled:
+                    continue
+                return candidate
+            return None
+
+        async def _compat_start_trigger(page: Any) -> Any | None:
+            locators = [
+                page.locator('[aria-label*="Bắt đầu" i]'),
+                page.locator('[aria-label*="Bat dau" i]'),
+                page.locator('[aria-label*="Start image" i]'),
+                page.locator('[aria-label*="Start frame" i]'),
+                page.locator('[aria-label*="Add image" i]'),
+                page.locator('[aria-label*="Add media" i]'),
+                page.locator('[aria-label*="Start" i]'),
+                page.locator('[aria-label*="frame" i]'),
+                page.locator('button').filter(has_text=re.compile(r"^Bắt đầu$|^Bat dau$", re.I)),
+                page.locator('button').filter(has_text=re.compile(r"^Start image$", re.I)),
+                page.locator('button').filter(has_text=re.compile(r"^Start frame$", re.I)),
+                page.locator('button').filter(has_text=re.compile(r"^Add image$", re.I)),
+                page.locator('button').filter(has_text=re.compile(r"^Add Media$", re.I)),
+                page.locator('button').filter(has_text=re.compile(r"^Start$", re.I)),
+                page.locator('[role="button"]').filter(has_text=re.compile(r"^Bắt đầu$|^Bat dau$", re.I)),
+                page.locator('[role="button"]').filter(has_text=re.compile(r"^Start$", re.I)),
+                page.locator('[role="button"]').filter(has_text=re.compile(r"^Add image$", re.I)),
+                page.locator('[role="button"]').filter(has_text=re.compile(r"^Add Media$", re.I)),
+                page.locator('div[type="button"]').filter(has_text=re.compile(r"^Bắt đầu$|^Bat dau$", re.I)),
+                page.locator('div[type="button"]').filter(has_text=re.compile(r"^Start$", re.I)),
+                page.get_by_text("Bắt đầu", exact=True),
+                page.get_by_text("Bat dau", exact=True),
+                page.get_by_text("Start", exact=True),
+            ]
+            for locator in locators:
+                candidate = await _compat_visible_locator(locator)
+                if candidate is not None:
+                    return candidate
             return None
 
         async def _compat_open_start_dialog(page: Any) -> Any | None:
-            existing = page.locator('[role="dialog"]').last
-            if await existing.count() > 0:
-                return existing
+            deadline = time.monotonic() + 8.0
+            while time.monotonic() < deadline:
+                existing = page.locator('[role="dialog"]').last
+                if await existing.count() > 0:
+                    return existing
 
-            trigger = await _compat_start_trigger(page)
-            if trigger is None:
-                return None
-            await trigger.click(force=True)
+                trigger = await _compat_start_trigger(page)
+                if trigger is not None:
+                    try:
+                        await trigger.scroll_into_view_if_needed()
+                    except Exception:
+                        pass
+                    try:
+                        await trigger.click(force=True)
+                    except Exception:
+                        await asyncio.sleep(0.4)
+                    try:
+                        await page.wait_for_selector('[role="dialog"]', timeout=1500)
+                    except Exception:
+                        await asyncio.sleep(0.4)
+                        continue
+                    return page.locator('[role="dialog"]').last
+                await asyncio.sleep(0.5)
+            return None
+
+        async def _compat_first_start_image_option(dialog: Any) -> Any | None:
+            selectors = [
+                '[data-index]',
+                '[data-item-index]',
+                'button:has(img)',
+                '[role="button"]:has(img)',
+                'img[alt]',
+            ]
+            for selector in selectors:
+                locator = dialog.locator(selector)
+                count = await locator.count()
+                for index in range(count):
+                    candidate = locator.nth(index)
+                    try:
+                        box = await candidate.bounding_box()
+                    except Exception:
+                        box = None
+                    if not box or box["width"] < 48 or box["height"] < 48:
+                        continue
+                    return candidate
+            return None
+
+        async def _compat_confirm_start_dialog(page: Any, dialog: Any) -> bool:
+            labels = ["Use", "Select", "Done", "Add", "Choose", "Dùng", "Chọn", "Xong", "Thêm"]
+            for label in labels:
+                locator = dialog.locator("button").filter(has_text=label)
+                count = await locator.count()
+                for index in range(count):
+                    button = locator.nth(index)
+                    try:
+                        box = await button.bounding_box()
+                    except Exception:
+                        box = None
+                    if not box:
+                        continue
+                    try:
+                        await button.click(force=True)
+                    except Exception:
+                        continue
+                    await asyncio.sleep(0.35)
+                    if await page.locator('[role="dialog"]').count() == 0:
+                        return True
             try:
-                await page.wait_for_selector('[role="dialog"]', timeout=5000)
+                await page.keyboard.press("Enter")
+                await asyncio.sleep(0.25)
             except Exception:
-                return None
-            return page.locator('[role="dialog"]').last
+                pass
+            return await page.locator('[role="dialog"]').count() == 0
+
+        async def _compat_describe_start_dialog(dialog: Any) -> str:
+            try:
+                text = re.sub(r"\s+", " ", str(await dialog.text_content() or "")).strip()
+            except Exception:
+                text = ""
+            try:
+                button_count = await dialog.locator("button").count()
+            except Exception:
+                button_count = 0
+            try:
+                image_count = await dialog.locator("img").count()
+            except Exception:
+                image_count = 0
+            summary = f"dialog buttons={button_count}, images={image_count}"
+            if text:
+                return f"{summary}, text='{text[:220]}'"
+            return summary
 
         async def _compat_find_start_image_option(dialog: Any, image_name: str) -> Any | None:
             search = dialog.locator('input[type="text"]').first
-            if await search.count() > 0:
-                await search.fill(image_name)
-                await asyncio.sleep(0.5)
+            search_terms = self._start_image_search_terms(image_name)
+            if not search_terms:
+                search_terms = [str(image_name or "").strip()]
 
-            candidates = [
-                dialog.locator('[data-index]').filter(has_text=image_name).last,
-                dialog.locator('[data-item-index]').filter(has_text=image_name).last,
-                dialog.locator('img[alt]').filter(has_text=image_name).last,
-                dialog.locator('[role="button"]').filter(has_text=image_name).last,
-                dialog.locator("button").filter(has_text=image_name).last,
-                dialog.get_by_text(image_name, exact=True).last,
-            ]
-            for candidate in candidates:
-                try:
-                    if await candidate.count() > 0:
+            for term in search_terms:
+                if await search.count() > 0:
+                    try:
+                        await search.fill(term)
+                        await asyncio.sleep(0.4)
+                    except Exception:
+                        pass
+
+                candidates = [
+                    dialog.locator('[data-index]').filter(has_text=term).last,
+                    dialog.locator('[data-item-index]').filter(has_text=term).last,
+                    dialog.locator('[role="button"]').filter(has_text=term).last,
+                    dialog.locator("button").filter(has_text=term).last,
+                    dialog.get_by_text(term, exact=True).last,
+                ]
+                for candidate in candidates:
+                    try:
+                        if await candidate.count() > 0:
+                            return candidate
+                    except Exception:
+                        continue
+
+                image_candidates = dialog.locator("img[alt]")
+                image_count = await image_candidates.count()
+                for index in range(image_count):
+                    candidate = image_candidates.nth(index)
+                    try:
+                        alt_text = str(await candidate.get_attribute("alt") or "").strip()
+                    except Exception:
+                        alt_text = ""
+                    haystack = " ".join(self._start_image_search_terms(alt_text))
+                    if term.lower() and term.lower() in haystack.lower():
                         return candidate
+
+            if await search.count() > 0:
+                try:
+                    await search.fill("")
+                    await asyncio.sleep(0.2)
                 except Exception:
-                    continue
-            return None
+                    pass
+
+            return await _compat_first_start_image_option(dialog)
 
         async def _compat_close_dialog(page: Any) -> None:
             if await page.locator('[role="dialog"]').count() == 0:
@@ -3295,13 +3539,87 @@ exit 1
                 await asyncio.sleep(1.0)
             return False
 
-        async def _compat_upload_project_image(client_self: Any, page: Any, image_path: str) -> str:
+        async def _compat_wait_for_project_media_name(client_self: Any, known_media: set[str], *, timeout_s: float = 8.0) -> str:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                try:
+                    data = await client_self._api.get_project_data()
+                except Exception:
+                    data = {}
+                for workflow in data.get("projectContents", {}).get("workflows", []) or []:
+                    media_name = str((workflow.get("metadata") or {}).get("primaryMediaId") or "").strip()
+                    if media_name and media_name not in known_media:
+                        return media_name
+                    for media in workflow.get("medias", []) or []:
+                        media_name = str(media.get("name") or "").strip()
+                        if media_name and media_name not in known_media:
+                            return media_name
+                await asyncio.sleep(0.8)
+            return ""
+
+        def _compat_parse_video_jobs_from_project_data(
+            client_self: Any,
+            project_data: Dict[str, Any],
+            known_media: set[str],
+        ) -> list[Any]:
+            jobs: List[Any] = []
+            seen_media: set[str] = set()
+            workflows = project_data.get("projectContents", {}).get("workflows", []) or []
+            for workflow in workflows:
+                workflow_id = str(workflow.get("name") or "").strip()
+                metadata = workflow.get("metadata", {}) or {}
+                candidate_media: List[str] = []
+                primary_media_id = str(metadata.get("primaryMediaId") or "").strip()
+                if primary_media_id:
+                    candidate_media.append(primary_media_id)
+                for media in workflow.get("medias", []) or []:
+                    media_name = str(media.get("name") or "").strip()
+                    if media_name:
+                        candidate_media.append(media_name)
+                for media_name in candidate_media:
+                    if not media_name or media_name in known_media or media_name in seen_media:
+                        continue
+                    seen_media.add(media_name)
+                    job = VideoJob.__new__(VideoJob)
+                    job.media_name = media_name
+                    job.status = "PENDING"
+                    job.project_id = client_self.project_id
+                    job.workflow_id = workflow_id
+                    jobs.append(job)
+            return jobs
+
+        async def _compat_wait_for_video_jobs_from_project(
+            client_self: Any,
+            known_media: set[str],
+            *,
+            target_count: int,
+            timeout_s: float,
+        ) -> list[Any]:
+            deadline = time.monotonic() + timeout_s
+            while time.monotonic() < deadline:
+                try:
+                    data = await client_self._api.get_project_data()
+                except Exception:
+                    data = {}
+                jobs = _compat_parse_video_jobs_from_project_data(client_self, data, known_media)
+                if len(jobs) >= target_count:
+                    return jobs[:target_count]
+                await asyncio.sleep(1.0)
+            return []
+
+        async def _compat_upload_project_image(client_self: Any, page: Any, image_path: str) -> dict[str, str]:
             image_file = Path(str(image_path or "")).expanduser().resolve()
             file_name = image_file.name.strip()
             if not file_name:
                 raise RuntimeError("Chưa nhận được đường dẫn ảnh đầu vào hợp lệ.")
             if not image_file.exists():
                 raise RuntimeError("Không tìm thấy ảnh đầu vào trên máy để tải lên Flow.")
+
+            known_media: set[str] = set()
+            try:
+                known_media = self._project_media_names(await client_self._api.get_project_data())
+            except Exception:
+                known_media = set()
 
             uploaded = await _compat_upload_via_file_input(page, str(image_file))
             if not uploaded:
@@ -3324,30 +3642,56 @@ exit 1
             if not uploaded:
                 raise RuntimeError("Google Flow chưa tải được ảnh đầu vào lên project.")
 
-            verified = await _compat_wait_for_uploaded_image(page, file_name)
-            if not verified:
-                raise RuntimeError("Google Flow đã nhận thao tác tải ảnh nhưng ảnh chưa xuất hiện trong project.")
-            return file_name
+            media_name = await _compat_wait_for_project_media_name(client_self, known_media)
+            await asyncio.sleep(1.0)
+            return {"file_name": file_name, "media_name": media_name}
 
-        async def _compat_attach_start_frame(page: Any, image_name: str) -> bool:
+        async def _compat_attach_start_frame(page: Any, image_name: str, media_name: str = "") -> tuple[bool, str]:
             dialog = await _compat_open_start_dialog(page)
             if dialog is None:
-                return False
+                return False, "Không mở được dialog Start."
             row = await _compat_find_start_image_option(dialog, image_name)
+            if row is None and media_name:
+                row = await _compat_find_start_image_option(dialog, media_name)
             if row is None:
                 search = dialog.locator('input[type="text"]').first
                 if await search.count() > 0:
                     await search.fill("")
                     await asyncio.sleep(0.3)
                     row = await _compat_find_start_image_option(dialog, image_name)
+                    if row is None and media_name:
+                        row = await _compat_find_start_image_option(dialog, media_name)
             if row is None:
-                await _compat_close_dialog(page)
-                return False
+                row = await _compat_first_start_image_option(dialog)
+                if row is None:
+                    await _compat_close_dialog(page)
+                    return False, await _compat_describe_start_dialog(dialog)
 
             click_attempts = [
+                (
+                    "closest-clickable",
+                    lambda: row.evaluate(
+                        """(el) => {
+                            const target = el.closest('button, [role="button"], [data-index], [data-item-index]') || el;
+                            target.click();
+                        }"""
+                    ),
+                ),
                 ("row", lambda: row.click(force=True)),
+                ("row-double", lambda: row.dblclick(force=True)),
                 ("image", lambda: row.locator("img").first.click(force=True)),
                 ("first-child", lambda: row.evaluate("(el) => (el.firstElementChild || el).click()")),
+                (
+                    "dispatch-events",
+                    lambda: row.evaluate(
+                        """(el) => {
+                            const target = el.closest('button, [role="button"], [data-index], [data-item-index]') || el;
+                            ['mousedown','mouseup','click','dblclick'].forEach((type) => {
+                                target.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
+                            });
+                        }"""
+                    ),
+                ),
             ]
             for _, action in click_attempts:
                 try:
@@ -3363,12 +3707,16 @@ exit 1
                     pass
                 await asyncio.sleep(0.5)
                 if await page.locator('[role="dialog"]').count() == 0:
-                    return True
+                    return True, ""
+                if await _compat_confirm_start_dialog(page, dialog):
+                    return True, ""
+                dialog = page.locator('[role="dialog"]').last
             try:
+                detail = await _compat_describe_start_dialog(dialog)
                 await _compat_close_dialog(page)
             except Exception:
-                pass
-            return False
+                detail = ""
+            return False, detail
 
         async def _compat_generate_video(
             client_self: Any,
@@ -3388,34 +3736,87 @@ exit 1
             interceptor.attach(page)
             target_count = max(1, min(4, int(count or 1)))
 
-            uploaded_image_name = ""
-            if start_image:
-                uploaded_image_name = await _compat_upload_project_image(client_self, page, start_image)
-
             mode = GenerationMode.FRAME_TO_VIDEO if start_image else GenerationMode.VIDEO
-            submit_endpoint = "video:batchAsyncGenerateVideoStartImage" if start_image else "batchAsyncGenerateVideoText"
             ratio = AspectRatio.PORTRAIT if aspect == "portrait" else AspectRatio.LANDSCAPE
 
             await client_self._ui.open_settings_panel(page)
-            await client_self._ui.switch_mode(page, mode)
+            switched = await client_self._ui.switch_mode(page, mode)
+            if start_image and not switched:
+                raise RuntimeError(
+                    "Google Flow chưa chuyển được sang chế độ video từ ảnh (Frames), nên ảnh đầu vào chưa thể được gắn vào Start."
+                )
             await client_self._ui.select_video_model(page, model)
             await client_self._ui.set_aspect_ratio(page, ratio)
             await client_self._ui.set_count(page, target_count)
             await client_self._ui.fill_prompt(page, prompt)
-            if uploaded_image_name:
-                attached = await _compat_attach_start_frame(page, uploaded_image_name)
+            uploaded_image_info: dict[str, str] = {"file_name": "", "media_name": ""}
+            if start_image:
+                uploaded_image_info = await _compat_upload_project_image(client_self, page, start_image)
+            if uploaded_image_info.get("file_name") or uploaded_image_info.get("media_name"):
+                attached, attach_detail = await _compat_attach_start_frame(
+                    page,
+                    uploaded_image_info.get("file_name", ""),
+                    uploaded_image_info.get("media_name", ""),
+                )
                 if not attached:
-                    raise RuntimeError("Google Flow chưa gắn được ảnh đầu vào vào ô Start.")
+                    # Flow thay đổi UI khá thất thường: có lúc upload xong là ảnh đã tự gắn vào Start
+                    # mà không còn mở dialog theo đường cũ nữa. Đừng fail sớm ở đây; hãy thử submit
+                    # thật và bắt đúng endpoint i2v để biết ảnh có được gắn hay không.
+                    await asyncio.sleep(0.75)
+
+            try:
+                known_media_before_submit = self._project_media_names(await client_self._api.get_project_data())
+            except Exception:
+                known_media_before_submit = set()
 
             call_start = len(getattr(interceptor, "_calls", []))
             await client_self._ui.click_submit(page)
-            entry = await _compat_wait_for_new_call(
-                interceptor,
-                call_start,
-                submit_endpoint,
-                timeout_s=timeout_s,
-            )
-            jobs = _compat_parse_video_jobs(client_self, entry.resp)
+            jobs: list[Any] = []
+            submit_error: Exception | None = None
+            if start_image:
+                submit_task = asyncio.create_task(
+                    _compat_wait_for_video_submit_call(
+                        interceptor,
+                        call_start,
+                        timeout_s=timeout_s,
+                        expect_start_image=True,
+                    )
+                )
+                project_task = asyncio.create_task(
+                    _compat_wait_for_video_jobs_from_project(
+                        client_self,
+                        known_media_before_submit,
+                        target_count=target_count,
+                        timeout_s=min(timeout_s, 120),
+                    )
+                )
+                done, pending = await asyncio.wait(
+                    {submit_task, project_task},
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                for task in done:
+                    try:
+                        result = task.result()
+                    except Exception as exc:
+                        submit_error = exc
+                        continue
+                    if isinstance(result, list):
+                        jobs = result
+                    else:
+                        jobs = _compat_parse_video_jobs(client_self, result.resp)
+                    break
+                if not jobs and submit_error is not None:
+                    raise submit_error
+            else:
+                entry = await _compat_wait_for_video_submit_call(
+                    interceptor,
+                    call_start,
+                    timeout_s=timeout_s,
+                    expect_start_image=False,
+                )
+                jobs = _compat_parse_video_jobs(client_self, entry.resp)
             if not jobs:
                 raise RuntimeError("Google Flow chưa khởi tạo được clip video nào từ yêu cầu này.")
             if len(jobs) < target_count:
@@ -5553,6 +5954,45 @@ exit 1
         if normalized in {"product", "item"}:
             return "product"
         return "reference"
+
+    def _start_image_search_terms(self, value: str) -> List[str]:
+        raw = str(value or "").strip()
+        if not raw:
+            return []
+
+        candidates = [raw]
+        try:
+            path = PureWindowsPath(raw) if ("\\" in raw or re.match(r"^[A-Za-z]:", raw)) else Path(raw)
+        except Exception:
+            path = None
+
+        if path is not None:
+            name = path.name.strip()
+            stem = path.stem.strip()
+            if name:
+                candidates.append(name)
+            if stem:
+                candidates.append(stem)
+
+        normalized_variants: List[str] = []
+        for item in candidates:
+            compact = re.sub(r"\s+", " ", str(item or "").strip())
+            if compact:
+                normalized_variants.append(compact)
+            simple = re.sub(r"[^a-z0-9]+", " ", str(item or "").strip().lower())
+            simple = re.sub(r"\s+", " ", simple).strip()
+            if simple:
+                normalized_variants.append(simple)
+
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for item in normalized_variants:
+            key = item.lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            ordered.append(item)
+        return ordered
 
     def _normalize_reference_image_roles(self, image_paths: List[str], roles: List[str]) -> List[str]:
         path_count = len(image_paths or [])

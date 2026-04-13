@@ -817,12 +817,16 @@ textarea:focus {
 
 .choice-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
   gap: 10px;
 }
 
 .choice-card,
 .count-choice {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 100%;
+  box-sizing: border-box;
   border-radius: var(--radius-md);
   border: 1px solid var(--line);
   background: rgba(255, 255, 255, 0.02);
@@ -835,15 +839,18 @@ textarea:focus {
   display: grid;
   gap: 6px;
   text-align: left;
+  align-content: start;
 }
 
 .choice-card strong {
+  display: block;
   font-family: "Space Grotesk", sans-serif;
   font-size: 1rem;
   color: var(--text);
 }
 
 .choice-card small {
+  display: block;
   color: var(--muted);
   line-height: 1.45;
 }
@@ -857,13 +864,18 @@ textarea:focus {
 
 .count-choice-row {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(56px, 1fr));
   gap: 10px;
 }
 
 .count-choice {
   min-height: 52px;
+  padding: 0;
   font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text);
 }
 
 .ready-hint {
