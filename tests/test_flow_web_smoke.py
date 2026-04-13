@@ -12,7 +12,16 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException, UploadFile
 
-from flow_web.schemas import AppConfig, AuthStatus, CreateJobRequest, JobRecord, PromptCreateRequest, SkillRecord, StateSnapshot
+from flow_web.schemas import (
+    AppConfig,
+    AuthStatus,
+    CreateJobRequest,
+    JobRecord,
+    PromptCreateRequest,
+    SkillRecord,
+    StateSnapshot,
+    StoryboardPlanRequest,
+)
 from flow_web.service import FlowWebService
 from flow_web.store import StateStore
 
@@ -284,6 +293,33 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("layered foreground midground and background depth", expanded)
         self.assertGreater(len(expanded), len(short_prompt))
 
+    def test_storyboard_scene_count_prefers_explicit_request(self) -> None:
+        count = self.service._storyboard_scene_count("Cảnh 1. Cảnh 2. Cảnh 3.", 6)
+
+        self.assertEqual(6, count)
+
+    def test_local_storyboard_plan_builds_scene_prompts(self) -> None:
+        request = StoryboardPlanRequest(
+            script=(
+                "Cảnh 1: Một kiếm sĩ samurai đứng trong mưa trước cổng đền cổ.\n\n"
+                "Cảnh 2: Anh ta rút kiếm và lao về phía đối thủ giữa sân đá.\n\n"
+                "Cảnh 3: Hai người khóa kiếm, nước mưa bắn tung và đèn lồng rung mạnh."
+            ),
+            style="cinematic dramatic",
+            must_include="mưa lớn, đèn lồng đỏ, giáp samurai",
+            avoid="text, watermark",
+            aspect="landscape",
+        )
+
+        scenes = self.service._local_storyboard_plan(request, 3, [])
+
+        self.assertEqual(3, len(scenes))
+        self.assertEqual(1, scenes[0].index)
+        self.assertIn("storyboard keyframe", scenes[0].image_prompt.lower())
+        self.assertIn("same subject identity", scenes[0].image_prompt.lower())
+        self.assertIn("Giữ cùng nhân vật chính", scenes[0].continuity)
+        self.assertIn("mưa lớn", scenes[0].continuity)
+
     def test_logout_flow_clears_local_profile_session(self) -> None:
         profile_dir = self.temp_root / "flow-profile"
         cookies_path = profile_dir / "Default" / "Cookies"
@@ -338,6 +374,32 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.start_temp_paths()
         self.store = StateStore()
         self.service = FlowWebService(self.store)
+
+    async def test_plan_storyboard_returns_local_scenes_when_gemini_is_not_configured(self) -> None:
+        with patch.object(self.service, "ensure_media_skill_library", AsyncMock(return_value={})), patch.object(
+            self.service,
+            "_gemini_api_key",
+            return_value="",
+        ):
+            payload = await self.service.plan_storyboard(
+                StoryboardPlanRequest(
+                    script=(
+                        "Mở đầu là cảnh một cô gái đứng trước cửa hàng nhạc cụ vào buổi tối.\n\n"
+                        "Sau đó cô bước vào trong, chạm tay vào cây đàn piano đen bóng dưới ánh đèn ấm.\n\n"
+                        "Cuối cùng cô ngồi xuống chơi một đoạn ngắn, căn phòng phản chiếu ánh sáng vàng."
+                    ),
+                    style="cinematic luxury",
+                    must_include="đàn piano đen, ánh sáng vàng",
+                    aspect="landscape",
+                    scene_count=3,
+                )
+            )
+
+        self.assertEqual("local", payload["engine"])
+        self.assertEqual(3, payload["scene_count"])
+        self.assertEqual(3, len(payload["items"]))
+        self.assertIn("storyboard", payload["items"][0]["image_prompt"].lower())
+        self.assertIn("cảnh", payload["items"][0]["continuity"].lower())
 
     async def test_with_client_keeps_shared_flow_browser_open_in_visible_mode(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))

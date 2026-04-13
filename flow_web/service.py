@@ -54,6 +54,8 @@ from .schemas import (
     SkillCreateRequest,
     SkillImportRequest,
     SkillRecord,
+    StoryboardPlanRequest,
+    StoryboardScene,
     WorkspaceJobCounts,
     WorkspaceSnapshot,
     canonical_project_url,
@@ -1688,6 +1690,405 @@ class FlowWebService:
             "engine": engine,
             "engine_label": engine_label,
             "model": model,
+        }
+
+    def _storyboard_scene_count(self, script: str, requested: int) -> int:
+        try:
+            explicit = int(requested or 0)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit > 0:
+            return max(1, min(8, explicit))
+
+        normalized = str(script or "").replace("\r\n", "\n").replace("\r", "\n")
+        paragraphs = [block.strip() for block in re.split(r"\n\s*\n+", normalized) if block.strip()]
+        sentences = [
+            segment.strip()
+            for segment in re.split(r"(?<=[.!?…])\s+|\n+", normalized)
+            if segment.strip()
+        ]
+        rough = len(paragraphs) if len(paragraphs) >= 2 else len(sentences)
+        if rough <= 0:
+            rough = 4
+        if rough == 1 and len(normalized) > 480:
+            rough = 4
+        return max(1, min(8, rough))
+
+    def _storyboard_clean_unit(self, value: str) -> str:
+        text = str(value or "").strip()
+        text = re.sub(r"^\s*(?:[-*•]+|\d+[\).:\-])\s*", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    def _storyboard_segments(self, script: str, scene_count: int) -> List[str]:
+        normalized = str(script or "").replace("\r\n", "\n").replace("\r", "\n")
+        paragraphs = [
+            self._storyboard_clean_unit(block)
+            for block in re.split(r"\n\s*\n+", normalized)
+            if self._storyboard_clean_unit(block)
+        ]
+        sentences = [
+            self._storyboard_clean_unit(segment)
+            for segment in re.split(r"(?<=[.!?…])\s+|\n+", normalized)
+            if self._storyboard_clean_unit(segment)
+        ]
+        units = paragraphs if len(paragraphs) >= max(2, min(scene_count, 3)) else sentences
+        if not units:
+            cleaned = self._storyboard_clean_unit(normalized)
+            return [cleaned] if cleaned else []
+
+        target = max(1, min(scene_count, len(units)))
+        buckets: List[List[str]] = [[] for _ in range(target)]
+        total_units = max(1, len(units))
+        for index, unit in enumerate(units):
+            bucket_index = min(target - 1, (index * target) // total_units)
+            buckets[bucket_index].append(unit)
+        return [" ".join(bucket).strip() for bucket in buckets if bucket]
+
+    def _storyboard_scene_title(self, beat: str, index: int) -> str:
+        words = [token for token in re.split(r"\s+", re.sub(r"[^\w\sÀ-ỹ]", " ", str(beat or "").strip())) if token]
+        if not words:
+            return f"Cảnh {index}"
+        headline = " ".join(words[:6]).strip()
+        if len(words) > 6:
+            headline = f"{headline}…"
+        return headline[:1].upper() + headline[1:] if headline else f"Cảnh {index}"
+
+    def _storyboard_continuity_note(self, request: StoryboardPlanRequest, index: int, total: int) -> str:
+        note_parts = [
+            "Giữ cùng nhân vật chính, trang phục, ánh sáng và thế giới hình ảnh xuyên suốt storyboard."
+        ]
+        must_include = str(request.must_include or "").strip()
+        if must_include:
+            note_parts.append(f"Luôn giữ các chi tiết bắt buộc: {must_include}.")
+        if total > 1:
+            note_parts.append(f"Đây là cảnh {index}/{total}, nên bố cục phải nối mượt với cảnh trước và cảnh sau.")
+        return " ".join(note_parts)
+
+    def _storyboard_scene_prompt(
+        self,
+        beat: str,
+        request: StoryboardPlanRequest,
+        skills: List[SkillRecord],
+        index: int,
+        total: int,
+    ) -> str:
+        style_parts = [str(request.style or "").strip(), "cinematic storyboard keyframe"]
+        style = ", ".join([part for part in style_parts if part])
+        must_include_parts = [
+            str(request.must_include or "").strip(),
+            "storyboard keyframe from a longer video sequence",
+            f"scene {index} of {total}",
+            "same subject identity, wardrobe, props, lighting direction, and environment continuity across the storyboard",
+        ]
+        must_include = ", ".join([part for part in must_include_parts if part])
+        baseline = self._compose_prompt_draft(
+            PromptCreateRequest(
+                mode="image",
+                brief=beat,
+                style=style,
+                must_include=must_include,
+                avoid=str(request.avoid or "").strip(),
+                audience=str(request.audience or "").strip(),
+                aspect=self._parse_aspect(request.aspect or "landscape"),
+            ),
+            skills,
+        )
+        prompt, _ = self._ensure_prompt_detail(baseline, baseline, "image")
+        return prompt
+
+    def _parse_json_candidate(self, raw_text: str) -> Any:
+        text = str(raw_text or "").strip()
+        if not text:
+            raise RuntimeError("Gemini không trả về nội dung storyboard.")
+
+        candidates = [text]
+        for block in re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
+            cleaned = block.strip()
+            if cleaned:
+                candidates.append(cleaned)
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = text.find(opener)
+            end = text.rfind(closer)
+            if start != -1 and end > start:
+                candidates.append(text[start : end + 1].strip())
+
+        seen: set[str] = set()
+        for candidate in candidates:
+            key = candidate.strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+        raise RuntimeError("Gemini không trả về JSON storyboard hợp lệ.")
+
+    def _storyboard_from_payload(
+        self,
+        payload: Any,
+        request: StoryboardPlanRequest,
+        scene_count: int,
+        skills: List[SkillRecord],
+    ) -> List[StoryboardScene]:
+        raw_items = payload if isinstance(payload, list) else payload.get("scenes") or payload.get("items") or []
+        if not isinstance(raw_items, list):
+            raise RuntimeError("Payload storyboard không có danh sách cảnh.")
+
+        scenes: List[StoryboardScene] = []
+        for index, raw_item in enumerate(raw_items[:scene_count], start=1):
+            if not isinstance(raw_item, dict):
+                continue
+            beat = str(
+                raw_item.get("beat")
+                or raw_item.get("summary")
+                or raw_item.get("scene")
+                or raw_item.get("description")
+                or ""
+            ).strip()
+            prompt_text = str(
+                raw_item.get("image_prompt")
+                or raw_item.get("imagePrompt")
+                or raw_item.get("prompt")
+                or ""
+            ).strip()
+            if not beat and prompt_text:
+                beat = prompt_text
+            if not beat:
+                continue
+            title = str(raw_item.get("title") or "").strip() or self._storyboard_scene_title(beat, index)
+            continuity = str(
+                raw_item.get("continuity")
+                or raw_item.get("continuity_note")
+                or raw_item.get("continuityNote")
+                or ""
+            ).strip()
+            baseline_prompt = self._storyboard_scene_prompt(beat, request, skills, index, scene_count)
+            if prompt_text:
+                prompt_text, _ = self._ensure_prompt_detail(prompt_text, baseline_prompt, "image")
+            else:
+                prompt_text = baseline_prompt
+            if not continuity:
+                continuity = self._storyboard_continuity_note(request, index, scene_count)
+            scenes.append(
+                StoryboardScene(
+                    index=index,
+                    title=title,
+                    beat=beat,
+                    image_prompt=prompt_text,
+                    continuity=continuity,
+                )
+            )
+        return scenes
+
+    def _local_storyboard_plan(
+        self,
+        request: StoryboardPlanRequest,
+        scene_count: int,
+        skills: List[SkillRecord],
+    ) -> List[StoryboardScene]:
+        segments = self._storyboard_segments(request.script, scene_count)
+        if not segments:
+            return []
+
+        scenes: List[StoryboardScene] = []
+        total = min(scene_count, len(segments))
+        for index, beat in enumerate(segments[:scene_count], start=1):
+            scenes.append(
+                StoryboardScene(
+                    index=index,
+                    title=self._storyboard_scene_title(beat, index),
+                    beat=beat,
+                    image_prompt=self._storyboard_scene_prompt(beat, request, skills, index, total),
+                    continuity=self._storyboard_continuity_note(request, index, total),
+                )
+            )
+        return scenes
+
+    def _storyboard_skill_allowed(self, skill: SkillRecord) -> bool:
+        path = str(skill.source_path or "").lower()
+        if any(
+            token in path
+            for token in (
+                "app-store",
+                "landing-page",
+                "book-cover",
+                "og-image",
+                "logo-design",
+                "youtube-thumbnail",
+            )
+        ):
+            return False
+        return True
+
+    def _gemini_storyboard_request(
+        self,
+        request: StoryboardPlanRequest,
+        skills: List[SkillRecord],
+        scene_count: int,
+    ) -> Dict[str, Any]:
+        guidance = self._gemini_skill_guidance(skills) or "- Không có skill đặc biệt, chỉ cần chia cảnh rõ ràng."
+        aspect = self._parse_aspect(request.aspect or "landscape")
+        prompt_text = "\n".join(
+            [
+                "Bạn là đạo diễn storyboard cho Google Flow.",
+                "Hãy đọc kịch bản bên dưới và tách thành các ảnh keyframe cần thiết để sau này dựng video.",
+                f"Trả về đúng {scene_count} cảnh.",
+                "Chỉ trả về JSON hợp lệ, không markdown, không giải thích thêm.",
+                'Schema bắt buộc: {"scenes":[{"title":"...","beat":"...","image_prompt":"...","continuity":"..."}]}',
+                "Mỗi beat là mô tả ngắn của cảnh bằng ngôn ngữ người dùng đang dùng.",
+                "Mỗi image_prompt phải là prompt ảnh cực kỳ chi tiết, dán chạy được ngay trên Flow, giàu thông tin thị giác, nhấn mạnh đây là keyframe của một video dài hơn.",
+                "Phải giữ continuity chặt giữa các cảnh: cùng nhân vật, phục trang, đạo cụ, ánh sáng, bối cảnh, hướng chuyển động và mood.",
+                f"Tỉ lệ ưu tiên: {self._aspect_phrase(aspect, 'image')}",
+                f"Phong cách chung: {str(request.style or '').strip() or 'cinematic storyboard keyframe'}",
+                f"Phải có: {str(request.must_include or '').strip() or 'Không ghi rõ'}",
+                f"Tránh: {str(request.avoid or '').strip() or 'Không ghi rõ'}",
+                f"Dành cho ai: {str(request.audience or '').strip() or 'Không ghi rõ'}",
+                "Hướng dẫn rút ra từ kho skill:",
+                guidance,
+                "Kịch bản nguồn:",
+                str(request.script or "").strip(),
+            ]
+        )
+        return {
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text": prompt_text,
+                        }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.8,
+                "topP": 0.95,
+                "maxOutputTokens": 2048,
+                "responseMimeType": "application/json",
+            },
+        }
+
+    def _generate_storyboard_with_gemini(
+        self,
+        request: StoryboardPlanRequest,
+        skills: List[SkillRecord],
+        scene_count: int,
+    ) -> List[StoryboardScene]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Chưa cấu hình GEMINI_API_KEY.")
+
+        model = self._gemini_model()
+        payload = self._gemini_storyboard_request(request, skills, scene_count)
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(model, safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=self.GEMINI_TIMEOUT_S) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", {}).get("message", "")).strip()
+            except Exception:
+                message = ""
+            raise RuntimeError(message or f"Gemini API trả về HTTP {exc.code}.") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
+
+        text = self._extract_gemini_text(body)
+        parsed = self._parse_json_candidate(text)
+        scenes = self._storyboard_from_payload(parsed, request, scene_count, skills)
+        if not scenes:
+            raise RuntimeError("Gemini không trả về cảnh storyboard hợp lệ.")
+        return scenes
+
+    async def plan_storyboard(self, request: StoryboardPlanRequest) -> Dict[str, Any]:
+        script = str(request.script or "").strip()
+        if not script:
+            raise HTTPException(status_code=400, detail="Hãy dán kịch bản trước khi tách cảnh.")
+
+        await self.ensure_media_skill_library()
+        normalized_request = StoryboardPlanRequest(
+            script=script,
+            style=str(request.style or "").strip(),
+            must_include=str(request.must_include or "").strip(),
+            avoid=str(request.avoid or "").strip(),
+            audience=str(request.audience or "").strip(),
+            aspect=self._parse_aspect(request.aspect or "landscape"),
+            scene_count=int(request.scene_count or 0),
+        )
+        scene_count = self._storyboard_scene_count(script, normalized_request.scene_count)
+
+        selected: List[SkillRecord] = []
+        seen_skills: set[str] = set()
+        for skill in self._select_prompt_skills("video", script, normalized_request.style, normalized_request.must_include) + self._select_prompt_skills(
+            "image",
+            script,
+            normalized_request.style,
+            normalized_request.must_include,
+        ):
+            if not self._storyboard_skill_allowed(skill):
+                continue
+            key = str(skill.id or skill.name or "")
+            if not key or key in seen_skills:
+                continue
+            seen_skills.add(key)
+            selected.append(skill)
+
+        fallback_scenes = self._local_storyboard_plan(normalized_request, scene_count, selected)
+        scenes = fallback_scenes
+        engine = "local"
+        engine_label = "Nội bộ"
+        model = ""
+        summary = (
+            f"Đã tách {len(fallback_scenes)} cảnh keyframe và viết prompt ảnh bằng bộ lập cảnh nội bộ."
+        )
+
+        if self._gemini_api_key():
+            try:
+                gemini_scenes = await asyncio.to_thread(
+                    self._generate_storyboard_with_gemini,
+                    normalized_request,
+                    selected,
+                    scene_count,
+                )
+                if len(gemini_scenes) < scene_count and len(fallback_scenes) > len(gemini_scenes):
+                    gemini_scenes.extend(fallback_scenes[len(gemini_scenes) : scene_count])
+                scenes = gemini_scenes[:scene_count]
+                engine = "gemini"
+                engine_label = "Gemini"
+                model = self._gemini_model()
+                summary = (
+                    f"Gemini {model} đã tách {len(scenes)} cảnh và viết prompt ảnh storyboard để tạo video từ kịch bản này."
+                )
+            except Exception:
+                model = self._gemini_model()
+                summary = (
+                    f"Gemini {model} chưa phản hồi ổn định, app đã rơi về bộ lập cảnh nội bộ và vẫn tách được {len(scenes)} cảnh."
+                )
+
+        if not scenes:
+            raise HTTPException(status_code=400, detail="Kịch bản này chưa đủ rõ để tách thành các cảnh ảnh.")
+
+        return {
+            "title": "Storyboard ảnh từ kịch bản",
+            "summary": summary,
+            "scene_count": len(scenes),
+            "aspect": normalized_request.aspect,
+            "engine": engine,
+            "engine_label": engine_label,
+            "model": model,
+            "applied_skills": [skill.name for skill in selected],
+            "items": [_model_dump(scene) for scene in scenes],
         }
 
     async def sync_media_skills(self) -> Dict[str, Any]:

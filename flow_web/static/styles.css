@@ -633,7 +633,8 @@ textarea:focus {
   line-height: 1.5;
 }
 
-.prompt-ai-card {
+.prompt-ai-card,
+.storyboard-card {
   display: grid;
   gap: 16px;
   padding: 18px;
@@ -682,9 +683,29 @@ textarea:focus {
   align-items: center;
 }
 
+.storyboard-actions {
+  align-items: flex-end;
+}
+
+.storyboard-button-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
 .prompt-ai-result {
   display: grid;
   gap: 12px;
+  padding: 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.025);
+}
+
+.storyboard-result {
+  display: grid;
+  gap: 14px;
   padding: 16px;
   border-radius: var(--radius-md);
   border: 1px solid var(--line);
@@ -699,6 +720,44 @@ textarea:focus {
   color: var(--text);
   line-height: 1.7;
   white-space: pre-wrap;
+}
+
+.storyboard-scene-list {
+  display: grid;
+  gap: 12px;
+}
+
+.storyboard-scene-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.02);
+}
+
+.storyboard-scene-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.storyboard-scene-head strong {
+  font-family: "Space Grotesk", sans-serif;
+  font-size: 1rem;
+}
+
+.storyboard-scene-beat,
+.storyboard-scene-note {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.55;
+}
+
+.storyboard-scene-prompt {
+  font-size: 0.96rem;
 }
 
 .skill-chip-row {
@@ -1173,6 +1232,14 @@ textarea:focus {
   .choice-grid,
   .count-choice-row {
     grid-template-columns: 1fr;
+  }
+
+  .storyboard-button-row {
+    width: 100%;
+  }
+
+  .storyboard-button-row button {
+    flex: 1 1 220px;
   }
 
   .composer-summary,

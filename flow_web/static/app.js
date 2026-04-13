@@ -195,6 +195,15 @@ const state = {
     video: { brief: "", style: "", mustInclude: "", avoid: "", audience: "" },
     image: { brief: "", style: "", mustInclude: "", avoid: "", audience: "" },
   },
+  storyboardDraft: {
+    script: "",
+    style: "",
+    mustInclude: "",
+    avoid: "",
+    sceneCount: "0",
+  },
+  storyboardPlan: null,
+  storyboardBusy: false,
 };
 
 const elements = {
@@ -233,6 +242,22 @@ const elements = {
   promptAiResultText: document.querySelector("#promptAiResultText"),
   usePromptAiResultButton: document.querySelector("#usePromptAiResultButton"),
   promptAiCard: document.querySelector("#promptAiCard"),
+  storyboardCard: document.querySelector("#storyboardCard"),
+  storyboardBadge: document.querySelector("#storyboardBadge"),
+  storyboardScript: document.querySelector("#storyboardScript"),
+  storyboardStyle: document.querySelector("#storyboardStyle"),
+  storyboardMustInclude: document.querySelector("#storyboardMustInclude"),
+  storyboardAvoid: document.querySelector("#storyboardAvoid"),
+  storyboardSceneCount: document.querySelector("#storyboardSceneCount"),
+  storyboardHint: document.querySelector("#storyboardHint"),
+  storyboardPlanButton: document.querySelector("#storyboardPlanButton"),
+  storyboardGenerateButton: document.querySelector("#storyboardGenerateButton"),
+  storyboardResult: document.querySelector("#storyboardResult"),
+  storyboardResultTitle: document.querySelector("#storyboardResultTitle"),
+  storyboardResultMeta: document.querySelector("#storyboardResultMeta"),
+  storyboardResultSummary: document.querySelector("#storyboardResultSummary"),
+  storyboardSkillChips: document.querySelector("#storyboardSkillChips"),
+  storyboardSceneList: document.querySelector("#storyboardSceneList"),
   promptLabel: document.querySelector("#promptLabel"),
   promptInput: document.querySelector("#promptInput"),
   composerSummaryMode: document.querySelector("#composerSummaryMode"),
@@ -553,6 +578,14 @@ function syncPromptAiDraftFromForm() {
   draft.audience = elements.promptAiAudience.value;
 }
 
+function syncStoryboardDraftFromForm() {
+  state.storyboardDraft.script = elements.storyboardScript.value;
+  state.storyboardDraft.style = elements.storyboardStyle.value;
+  state.storyboardDraft.mustInclude = elements.storyboardMustInclude.value;
+  state.storyboardDraft.avoid = elements.storyboardAvoid.value;
+  state.storyboardDraft.sceneCount = elements.storyboardSceneCount.value || "0";
+}
+
 function applyDraftToForm() {
   const draft = currentDraft();
   const config = currentModeConfig();
@@ -609,6 +642,14 @@ function applyPromptAiDraftToForm() {
   elements.promptAiMustInclude.value = draft.mustInclude || "";
   elements.promptAiAvoid.value = draft.avoid || "";
   elements.promptAiAudience.value = draft.audience || "";
+}
+
+function applyStoryboardDraftToForm() {
+  elements.storyboardScript.value = state.storyboardDraft.script || "";
+  elements.storyboardStyle.value = state.storyboardDraft.style || "";
+  elements.storyboardMustInclude.value = state.storyboardDraft.mustInclude || "";
+  elements.storyboardAvoid.value = state.storyboardDraft.avoid || "";
+  elements.storyboardSceneCount.value = state.storyboardDraft.sceneCount || "0";
 }
 
 function isReady() {
@@ -679,6 +720,7 @@ function renderComposer() {
   if (currentModeConfig().showPromptAi) {
     renderPromptAssistant();
   }
+  renderStoryboardCard();
 }
 
 function renderComposerSummary() {
@@ -963,6 +1005,79 @@ function renderPromptAssistant() {
 
   applyPromptAiDraftToForm();
   renderPromptAiResult();
+}
+
+function renderStoryboardResult() {
+  const plan = state.storyboardPlan;
+  const items = Array.isArray(plan?.items) ? plan.items : [];
+  if (!items.length) {
+    elements.storyboardResult.hidden = true;
+    elements.storyboardResultTitle.textContent = "Storyboard ảnh";
+    elements.storyboardResultMeta.textContent = "0 cảnh";
+    elements.storyboardResultSummary.textContent = "";
+    elements.storyboardSkillChips.hidden = true;
+    elements.storyboardSkillChips.innerHTML = "";
+    elements.storyboardSceneList.innerHTML = "";
+    return;
+  }
+
+  elements.storyboardResult.hidden = false;
+  elements.storyboardResultTitle.textContent = plan.title || "Storyboard ảnh";
+  elements.storyboardResultMeta.textContent = `${items.length} cảnh`;
+  elements.storyboardResultSummary.textContent =
+    plan.summary || `Đã tách ${items.length} cảnh storyboard từ kịch bản.`;
+
+  const skills = Array.isArray(plan.applied_skills) ? plan.applied_skills.filter(Boolean) : [];
+  if (skills.length) {
+    elements.storyboardSkillChips.hidden = false;
+    elements.storyboardSkillChips.innerHTML = skills
+      .slice(0, 6)
+      .map((skill) => `<span class="skill-chip">${escapeHtml(skill)}</span>`)
+      .join("");
+  } else {
+    elements.storyboardSkillChips.hidden = true;
+    elements.storyboardSkillChips.innerHTML = "";
+  }
+
+  elements.storyboardSceneList.innerHTML = items
+    .map((item) => {
+      const title = String(item.title || `Cảnh ${item.index || 1}`).trim();
+      const beat = String(item.beat || "").trim();
+      const continuity = String(item.continuity || "").trim();
+      const prompt = String(item.image_prompt || "").trim();
+      return `
+        <article class="storyboard-scene-card">
+          <div class="storyboard-scene-head">
+            <strong>${escapeHtml(title)}</strong>
+            <span class="mini-pill">Cảnh ${escapeHtml(String(item.index || 1))}</span>
+          </div>
+          ${beat ? `<p class="storyboard-scene-beat">${escapeHtml(beat)}</p>` : ""}
+          ${continuity ? `<p class="storyboard-scene-note">${escapeHtml(continuity)}</p>` : ""}
+          <div class="prompt-ai-text storyboard-scene-prompt">${escapeHtml(prompt)}</div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+function renderStoryboardCard() {
+  const visible = state.mode === "video";
+  elements.storyboardCard.hidden = !visible;
+  if (!visible) {
+    return;
+  }
+
+  applyStoryboardDraftToForm();
+  const busy = Boolean(state.storyboardBusy);
+  const ready = isReady();
+  elements.storyboardBadge.textContent = ready ? "Storyboard ảnh" : "Lên cảnh trước";
+  elements.storyboardBadge.dataset.state = ready ? "ready" : "pending";
+  elements.storyboardHint.textContent = ready
+    ? "Dán kịch bản, app sẽ tách cảnh rồi có thể tạo luôn các ảnh keyframe bằng luồng tạo ảnh hiện tại."
+    : "Có thể tách cảnh trước. Muốn tạo luôn ảnh storyboard thì cần lưu project và đăng nhập Google Flow.";
+  elements.storyboardPlanButton.disabled = busy;
+  elements.storyboardGenerateButton.disabled = busy;
+  renderStoryboardResult();
 }
 
 function jobsForCurrentMode() {
@@ -1541,6 +1656,114 @@ function usePromptAiResult() {
   elements.promptInput.focus();
 }
 
+async function requestStoryboardPlan() {
+  syncStoryboardDraftFromForm();
+  const script = String(state.storyboardDraft.script || "").trim();
+  if (!script) {
+    showMessage("Hãy dán kịch bản trước khi tách cảnh.", "error");
+    elements.storyboardScript.focus();
+    return null;
+  }
+
+  const payload = await api("/api/storyboard/plan", {
+    method: "POST",
+    body: JSON.stringify({
+      script,
+      style: String(state.storyboardDraft.style || "").trim(),
+      must_include: String(state.storyboardDraft.mustInclude || "").trim(),
+      avoid: String(state.storyboardDraft.avoid || "").trim(),
+      aspect: elements.aspectSelect.value || currentModeConfig().defaultAspect,
+      scene_count: Math.max(0, Number(state.storyboardDraft.sceneCount || 0)),
+    }),
+  });
+  state.storyboardPlan = payload;
+  renderStoryboardCard();
+  return payload;
+}
+
+async function submitStoryboardPlan() {
+  state.storyboardBusy = true;
+  renderStoryboardCard();
+  try {
+    const payload = await requestStoryboardPlan();
+    if (!payload) {
+      return;
+    }
+    showMessage(`Đã tách ${payload.scene_count || 0} cảnh storyboard từ kịch bản.`, "success");
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    state.storyboardBusy = false;
+    renderStoryboardCard();
+  }
+}
+
+async function submitStoryboardImages() {
+  state.storyboardBusy = true;
+  renderStoryboardCard();
+  let createdCount = 0;
+  try {
+    const plan = await requestStoryboardPlan();
+    if (!plan) {
+      return;
+    }
+    if (!isReady()) {
+      showMessage(
+        `Đã tách ${plan.scene_count || 0} cảnh. Hãy đăng nhập Google Flow rồi bấm lại để app tạo luôn các ảnh storyboard.`,
+        "error"
+      );
+      return;
+    }
+
+    const imageModel = state.drafts.image.model || defaultModelForMode("image");
+    const aspect = elements.aspectSelect.value || currentModeConfig().defaultAspect;
+    const items = Array.isArray(plan.items) ? plan.items : [];
+    for (const item of items) {
+      const sceneIndex = Math.max(1, Number(item.index || createdCount + 1));
+      const title = String(item.title || `Cảnh ${sceneIndex}`).trim();
+      const prompt = String(item.image_prompt || "").trim();
+      if (!prompt) {
+        continue;
+      }
+      await api("/api/jobs", {
+        method: "POST",
+        body: JSON.stringify({
+          type: "image",
+          title: `Storyboard ảnh cảnh ${sceneIndex} · ${title}`,
+          prompt,
+          model: imageModel,
+          aspect,
+          count: 1,
+          timeout_s: Math.max(30, Number(state.config?.generation_timeout_s || 300)),
+        }),
+      });
+      createdCount += 1;
+    }
+
+    state.mode = "image";
+    state.setupOpen = false;
+    await loadState({ silent: true });
+    showMessage(
+      `Đã xếp ${createdCount} ảnh storyboard từ kịch bản. Em đã chuyển sang tab Ảnh để chủ nhân theo dõi kết quả.`,
+      "success"
+    );
+  } catch (error) {
+    if (createdCount > 0) {
+      state.mode = "image";
+      await loadState({ silent: true });
+      showMessage(
+        `Đã xếp ${createdCount} ảnh storyboard rồi, nhưng các cảnh tiếp theo dừng lại vì: ${error.message}`,
+        "error"
+      );
+    } else {
+      showMessage(error.message, "error");
+    }
+  } finally {
+    state.storyboardBusy = false;
+    renderStoryboardCard();
+  }
+}
+
 function buildRetryPayload(job) {
   const input = job?.input || {};
   return {
@@ -1737,11 +1960,18 @@ elements.composerForm.addEventListener("submit", submitCreate);
 elements.refreshButton.addEventListener("click", () => loadState());
 elements.promptAiSubmit.addEventListener("click", submitPromptAi);
 elements.usePromptAiResultButton.addEventListener("click", usePromptAiResult);
+elements.storyboardPlanButton.addEventListener("click", submitStoryboardPlan);
+elements.storyboardGenerateButton.addEventListener("click", submitStoryboardImages);
 elements.promptAiBrief.addEventListener("input", syncPromptAiDraftFromForm);
 elements.promptAiStyle.addEventListener("input", syncPromptAiDraftFromForm);
 elements.promptAiMustInclude.addEventListener("input", syncPromptAiDraftFromForm);
 elements.promptAiAvoid.addEventListener("input", syncPromptAiDraftFromForm);
 elements.promptAiAudience.addEventListener("input", syncPromptAiDraftFromForm);
+elements.storyboardScript.addEventListener("input", syncStoryboardDraftFromForm);
+elements.storyboardStyle.addEventListener("input", syncStoryboardDraftFromForm);
+elements.storyboardMustInclude.addEventListener("input", syncStoryboardDraftFromForm);
+elements.storyboardAvoid.addEventListener("input", syncStoryboardDraftFromForm);
+elements.storyboardSceneCount.addEventListener("change", syncStoryboardDraftFromForm);
 elements.promptInput.addEventListener("input", syncDraftFromForm);
 elements.modelSelect.addEventListener("change", () => {
   syncDraftFromForm();

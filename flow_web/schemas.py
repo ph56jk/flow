@@ -323,6 +323,24 @@ class PromptCreateRequest(BaseModel):
     aspect: str = ""
 
 
+class StoryboardPlanRequest(BaseModel):
+    script: str = ""
+    style: str = ""
+    must_include: str = ""
+    avoid: str = ""
+    audience: str = ""
+    aspect: str = "landscape"
+    scene_count: int = 0
+
+
+class StoryboardScene(BaseModel):
+    index: int = 1
+    title: str = ""
+    beat: str = ""
+    image_prompt: str = ""
+    continuity: str = ""
+
+
 class PromptAssistantSnapshot(BaseModel):
     ready: bool = False
     configured: bool = False

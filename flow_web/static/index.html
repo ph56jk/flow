@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260413b" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260413c" />
   </head>
   <body>
     <div class="app-shell">
@@ -188,6 +188,76 @@
                 </div>
               </section>
 
+              <section class="storyboard-card" id="storyboardCard" hidden>
+                <div class="prompt-ai-head">
+                  <div>
+                    <p class="eyebrow">Kịch bản sang storyboard</p>
+                    <h3>Tách cảnh và tạo ảnh keyframe</h3>
+                    <p class="section-copy">
+                      Dán kịch bản dài vào đây. App sẽ tự tách thành các cảnh chính, viết prompt ảnh cho từng cảnh, rồi có thể tạo luôn các ảnh cần để dựng video.
+                    </p>
+                  </div>
+                  <span class="status-pill prompt-ai-badge" id="storyboardBadge">Storyboard ảnh</span>
+                </div>
+
+                <label class="field wide">
+                  <span>Kịch bản video</span>
+                  <textarea
+                    id="storyboardScript"
+                    rows="6"
+                    placeholder="Ví dụ: Cảnh 1 mở bằng toàn cảnh thành phố ban đêm. Cảnh 2 nhân vật bước vào quán piano. Cảnh 3 cận tay chạm vào phím đàn..."
+                  ></textarea>
+                </label>
+
+                <details class="compact-details prompt-ai-details">
+                  <summary>Chỉnh thêm nếu muốn</summary>
+                  <div class="detail-grid">
+                    <label class="field">
+                      <span>Phong cách chung</span>
+                      <input type="text" id="storyboardStyle" placeholder="cinematic, anime, quảng cáo, editorial..." />
+                    </label>
+                    <label class="field">
+                      <span>Số cảnh</span>
+                      <select id="storyboardSceneCount">
+                        <option value="0">Tự tính theo kịch bản</option>
+                        <option value="3">3 cảnh</option>
+                        <option value="4">4 cảnh</option>
+                        <option value="5">5 cảnh</option>
+                        <option value="6">6 cảnh</option>
+                        <option value="7">7 cảnh</option>
+                        <option value="8">8 cảnh</option>
+                      </select>
+                    </label>
+                    <label class="field">
+                      <span>Phải có</span>
+                      <input type="text" id="storyboardMustInclude" placeholder="ví dụ: cùng một nhân vật, áo đỏ, đàn piano đen" />
+                    </label>
+                    <label class="field">
+                      <span>Tránh</span>
+                      <input type="text" id="storyboardAvoid" placeholder="ví dụ: text, watermark, biến dạng tay" />
+                    </label>
+                  </div>
+                </details>
+
+                <div class="submit-row prompt-ai-actions storyboard-actions">
+                  <p id="storyboardHint" class="ready-hint">Dùng khi muốn biến một kịch bản dài thành nhiều ảnh storyboard để dựng video.</p>
+                  <div class="storyboard-button-row">
+                    <button type="button" class="ghost-button" id="storyboardPlanButton">Chỉ tách cảnh</button>
+                    <button type="button" class="secondary-button" id="storyboardGenerateButton">Tạo ảnh từ kịch bản</button>
+                  </div>
+                </div>
+
+                <div id="storyboardResult" class="storyboard-result" hidden>
+                  <div class="prompt-ai-result-head">
+                    <strong id="storyboardResultTitle">Storyboard ảnh</strong>
+                    <span id="storyboardResultMeta" class="status-pill prompt-ai-badge">0 cảnh</span>
+                  </div>
+                  <p id="storyboardResultSummary" class="section-copy"></p>
+                  <div id="storyboardSkillChips" class="skill-chip-row" hidden></div>
+                  <div id="storyboardSceneList" class="storyboard-scene-list"></div>
+                </div>
+              </section>
+
               <section id="editSourceWrap" class="source-panel" hidden>
                 <div class="source-panel-head">
                   <div>
@@ -359,6 +429,6 @@
         </section>
       </main>
     </div>
-    <script type="module" src="/static/app.js?v=20260413b"></script>
+    <script type="module" src="/static/app.js?v=20260413c"></script>
   </body>
 </html>

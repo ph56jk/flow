@@ -19,6 +19,7 @@ from .schemas import (
     DownloadRequest,
     PromptCreateRequest,
     ReplayCleanupRequest,
+    StoryboardPlanRequest,
 )
 from .service import FlowWebService
 from .store import StateStore
@@ -166,6 +167,11 @@ async def sync_media_skills(request: Request) -> Dict[str, Any]:
 @app.post("/api/prompt-ai/generate")
 async def generate_prompt_ai(request: Request, payload: PromptCreateRequest) -> Dict[str, Any]:
     return await service(request).generate_prompt_draft(payload)
+
+
+@app.post("/api/storyboard/plan")
+async def plan_storyboard(request: Request, payload: StoryboardPlanRequest) -> Dict[str, Any]:
+    return await service(request).plan_storyboard(payload)
 
 
 @app.post("/api/jobs/{job_id}/download")
