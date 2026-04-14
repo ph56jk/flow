@@ -214,6 +214,17 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual("Tạo video từ ảnh", title)
 
+    def test_default_title_marks_video_with_references_as_auto_video(self) -> None:
+        request = CreateJobRequest(
+            type="video",
+            prompt="quảng cáo áo này",
+            reference_image_paths=["/tmp/shirt.png"],
+        )
+
+        title = self.service._default_title(request)
+
+        self.assertEqual("Tạo video từ ảnh tham chiếu", title)
+
     def test_default_title_marks_image_with_references_as_edit(self) -> None:
         request = CreateJobRequest(
             type="image",
@@ -224,6 +235,21 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         title = self.service._default_title(request)
 
         self.assertEqual("Chỉnh ảnh từ ảnh tham chiếu", title)
+
+    def test_video_start_frame_prompt_adds_model_and_product_guidance(self) -> None:
+        request = CreateJobRequest(
+            type="video",
+            prompt="quảng cáo chiếc áo hoodie này theo phong cách cinematic",
+            reference_image_paths=["/tmp/hoodie.png"],
+            reference_image_roles=["product"],
+            aspect="landscape",
+        )
+
+        prompt = self.service._video_start_frame_prompt(request)
+
+        self.assertIn("photoreal human model", prompt.lower())
+        self.assertIn("exact product design", prompt.lower())
+        self.assertIn("start frame", prompt.lower())
 
     def test_prompt_assistant_snapshot_reports_gemini_when_key_exists(self) -> None:
         skills = [
@@ -400,6 +426,50 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(3, len(payload["items"]))
         self.assertIn("storyboard", payload["items"][0]["image_prompt"].lower())
         self.assertIn("cảnh", payload["items"][0]["continuity"].lower())
+
+    async def test_prepare_video_start_image_from_references_downloads_intermediate_frame(self) -> None:
+        job = JobRecord(type="video", status="running", title="test")
+        await self.store.add_job(job)
+        request = CreateJobRequest(
+            type="video",
+            prompt="quảng cáo chiếc áo này với người mẫu",
+            reference_image_paths=["/tmp/shirt.png"],
+            reference_image_roles=["product"],
+            aspect="landscape",
+            timeout_s=300,
+        )
+        generated_image = SimpleNamespace(fife_url="https://example.com/frame.jpg")
+        client = SimpleNamespace(download=AsyncMock(return_value=str(self.uploads_dir / "job-start.jpg")))
+
+        with patch.object(
+            self.service,
+            "_resolve_image_reference_media",
+            AsyncMock(return_value=["media-shirt"]),
+        ) as resolve_media, patch.object(
+            self.service,
+            "_generate_images_with_retry",
+            AsyncMock(return_value=[generated_image]),
+        ) as generate_images, patch.object(
+            self.service,
+            "_set_job_progress",
+            AsyncMock(),
+        ), patch.object(
+            self.service.store,
+            "append_log",
+            AsyncMock(),
+        ):
+            local_path, prompt = await self.service._prepare_video_start_image_from_references(client, job.id, request)
+
+        resolve_media.assert_awaited_once()
+        generate_images.assert_awaited_once()
+        client.download.assert_awaited_once()
+        self.assertTrue(local_path.endswith("job-start.jpg"))
+        self.assertIn("photoreal human model", prompt.lower())
+        saved_job = self.store.get_job(job.id)
+        self.assertIsNotNone(saved_job)
+        self.assertEqual(local_path, saved_job.result.get("auto_start_frame_path"))
+        self.assertEqual("/files/uploads/job-start.jpg", saved_job.result.get("auto_start_frame_public_url"))
+        self.assertEqual(prompt, saved_job.result.get("auto_start_frame_prompt"))
 
     async def test_with_client_keeps_shared_flow_browser_open_in_visible_mode(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))

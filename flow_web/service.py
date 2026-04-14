@@ -61,6 +61,7 @@ from .schemas import (
     canonical_project_url,
     normalize_project_id,
     normalized_app_config,
+    utc_now,
 )
 from .store import StateStore
 
@@ -2661,11 +2662,23 @@ exit 1
 
             if request.type == "video":
                 requested_count = max(1, int(request.count or 1))
-                if request.start_image_path:
+                effective_start_image_path = str(request.start_image_path or "").strip()
+                if not effective_start_image_path and (request.reference_image_paths or request.reference_media_names):
+                    effective_start_image_path, _ = await self._prepare_video_start_image_from_references(
+                        client,
+                        job_id,
+                        request,
+                    )
+                    await self._set_job_progress(
+                        job_id,
+                        "sending_request",
+                        "Ảnh khung đầu đã sẵn sàng. Em đang gửi yêu cầu tạo video từ ảnh vừa dựng.",
+                    )
+                if effective_start_image_path:
                     send_timeout_s = timeout_s
                 else:
                     send_timeout_s = max(30, min(timeout_s, 90 * requested_count))
-                if request.start_image_path:
+                if effective_start_image_path:
                     await self.store.append_log(job_id, "Đang chuẩn bị tải ảnh đầu vào và gắn vào ô Start.")
                     await self._set_job_progress(
                         job_id,
@@ -2682,7 +2695,7 @@ exit 1
                             model=self._normalize_video_model(request.model),
                             aspect=request.aspect,
                             count=request.count,
-                            start_image=request.start_image_path or None,
+                            start_image=effective_start_image_path or None,
                             timeout_s=timeout_s,
                         ),
                         timeout=send_timeout_s,
@@ -2958,6 +2971,11 @@ exit 1
                 "saving_artifacts",
                 f"Đang lưu {len(artifacts)} artifact vào lịch sử tác vụ.",
             )
+            current_job = self.store.get_job(job_id)
+            if current_job is not None and current_job.result:
+                merged_result = dict(current_job.result)
+                merged_result.update(result)
+                result = merged_result
             await self.store.replace_artifacts(job_id, artifacts)
             await self.store.patch_job(job_id, status="completed", result=result)
             await self.store.append_log(job_id, "Tác vụ đã hoàn tất")
@@ -5531,6 +5549,8 @@ exit 1
         if request.type == "video":
             if request.start_image_path:
                 return "Tạo video từ ảnh"
+            if request.reference_image_paths or request.reference_media_names:
+                return "Tạo video từ ảnh tham chiếu"
             return "Tạo video từ prompt"
         if request.type == "image":
             if request.reference_image_paths or request.reference_media_names:
@@ -6283,6 +6303,9 @@ exit 1
         if request.type == "image" and len(request.reference_image_paths) > 4:
             raise HTTPException(status_code=400, detail="Tối đa 4 ảnh tham chiếu cho một lượt chỉnh ảnh.")
 
+        if request.type == "video" and len(request.reference_image_paths) > 4:
+            raise HTTPException(status_code=400, detail="Tối đa 4 ảnh tham chiếu cho một lượt tạo video.")
+
         if request.type in {"video", "image"} and not 1 <= int(request.count) <= 4:
             raise HTTPException(status_code=400, detail="Số lượng cho tác vụ tạo nội dung phải nằm trong khoảng 1 đến 4.")
 
@@ -6457,6 +6480,125 @@ exit 1
             seen.add(key)
             normalized.append(key)
         return normalized
+
+    def _video_reference_prompt_suffix(self, request: CreateJobRequest) -> str:
+        prompt_text = self._normalize_skill_token(request.prompt or "")
+        suffix_parts = [
+            "first storyboard keyframe for a later image-to-video shot",
+            "cinematic hero frame with clean full-subject readability",
+            "keep the exact product design, logo placement, fabric color, material texture, and silhouette from the reference images",
+            "if the reference image is clothing, accessories, or a product, place it naturally on a photoreal human model or in a believable real-world usage scene instead of leaving it as a flat packshot",
+            "strong continuity-ready frame that can animate cleanly into a video",
+        ]
+        if any(
+            token in prompt_text
+            for token in (
+                "ao",
+                "shirt",
+                "tshirt",
+                "hoodie",
+                "fashion",
+                "thoi trang",
+                "jacket",
+                "dress",
+                "quan",
+                "giay",
+                "shoe",
+                "bag",
+            )
+        ):
+            suffix_parts.append("show a photoreal fashion model wearing the referenced item naturally")
+        if any(token in prompt_text for token in ("logo", "brand", "thuong hieu", "nhan")):
+            suffix_parts.append("preserve brand marks sharply and naturally on the product")
+        return ", ".join(suffix_parts)
+
+    def _video_start_frame_prompt(self, request: CreateJobRequest) -> str:
+        selected = self._select_prompt_skills(
+            "image",
+            request.prompt,
+            "cinematic start frame for video",
+            self._video_reference_prompt_suffix(request),
+        )
+        baseline = self._compose_prompt_draft(
+            PromptCreateRequest(
+                mode="image",
+                brief=request.prompt,
+                style="cinematic start frame for video",
+                must_include=self._video_reference_prompt_suffix(request),
+                avoid="flat lay ecommerce photo, isolated catalog cutout, watermark, broken anatomy",
+                audience="video generation start frame",
+                aspect=self._parse_aspect(request.aspect or "landscape"),
+            ),
+            selected,
+        )
+        prompt, _ = self._ensure_prompt_detail(baseline, baseline, "image")
+        return prompt
+
+    async def _download_intermediate_image(
+        self,
+        client: Any,
+        job_id: str,
+        source_url: str,
+        *,
+        suffix: str = ".jpg",
+    ) -> str:
+        target = UPLOADS_DIR / f"{job_id}-video-start{suffix}"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            saved = await client.download(source_url, target)
+        except Exception as exc:
+            raise RuntimeError("Flow đã tạo ảnh khung đầu nhưng app chưa tải ảnh đó về máy để dựng video.") from exc
+        return str(Path(saved).expanduser().resolve())
+
+    async def _prepare_video_start_image_from_references(
+        self,
+        client: Any,
+        job_id: str,
+        request: CreateJobRequest,
+    ) -> tuple[str, str]:
+        reference_media_names = await self._resolve_image_reference_media(client, job_id, request)
+        if not reference_media_names:
+            raise RuntimeError("Chưa có ảnh tham chiếu hợp lệ để dựng khung đầu cho video.")
+
+        prompt = self._video_start_frame_prompt(request)
+        await self.store.append_log(job_id, "Đang dùng ảnh tham chiếu để dựng một ảnh khung đầu trước khi tạo video.")
+        await self._set_job_progress(
+            job_id,
+            "sending_request",
+            "Em đang dựng một ảnh khung đầu từ ảnh tham chiếu để dùng tiếp cho bước tạo video.",
+        )
+        image_request = CreateJobRequest(
+            type="image",
+            prompt=prompt,
+            model=self.DEFAULT_IMAGE_MODEL,
+            aspect=request.aspect,
+            count=1,
+            timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+            reference_media_names=reference_media_names,
+            workflow_id=request.workflow_id or "",
+        )
+        images = await self._generate_images_with_retry(client, job_id, image_request, reference_media_names)
+        if not images:
+            raise RuntimeError("Flow chưa dựng được ảnh khung đầu từ các ảnh tham chiếu.")
+
+        first_image = images[0]
+        source_url = str(getattr(first_image, "fife_url", "") or "").strip()
+        if not source_url:
+            raise RuntimeError("Flow đã dựng ảnh khung đầu nhưng chưa trả URL ảnh để tiếp tục tạo video.")
+        local_path = await self._download_intermediate_image(client, job_id, source_url)
+        current_job = self.store.get_job(job_id)
+        current_result = dict(getattr(current_job, "result", {}) or {})
+        current_result.update(
+            {
+                "auto_start_frame_path": local_path,
+                "auto_start_frame_public_url": f"/files/uploads/{Path(local_path).name}",
+                "auto_start_frame_prompt": prompt,
+                "auto_start_frame_at": utc_now(),
+            }
+        )
+        await self.store.patch_job(job_id, result=current_result)
+        await self.store.append_log(job_id, f"Đã dựng xong ảnh khung đầu và lưu tạm tại {Path(local_path).name}.")
+        return local_path, prompt
 
     async def _resolve_image_reference_media(self, client: Any, job_id: str, request: CreateJobRequest) -> List[str]:
         reference_media_names = self._normalize_reference_media_names(request.reference_media_names or [])

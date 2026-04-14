@@ -21,6 +21,26 @@ const ASPECT_DETAILS = {
   portrait: { title: "Dọc 9:16", detail: "Reels, Shorts, TikTok" },
   square: { title: "Vuông 1:1", detail: "Feed, poster vuông, thumbnail" },
 };
+const VIDEO_INPUT_MODE_CONFIG = {
+  prompt: {
+    note: "Chỉ cần mô tả cảnh. App sẽ tạo video trực tiếp từ prompt.",
+    hint: "Nhập mô tả cảnh muốn quay rồi bấm chạy.",
+    placeholder: "Ví dụ: một chú mèo nhìn ra cửa sổ, cinematic, gentle motion, ánh sáng buổi sáng",
+    readyText: "Sẵn sàng tạo video từ prompt.",
+  },
+  start: {
+    note: "Dùng khi đã có một khung hình đầu tiên và muốn app animate từ chính ảnh đó.",
+    hint: "Tải một ảnh đầu vào rồi mô tả chuyển động, góc máy hoặc diễn biến tiếp theo.",
+    placeholder: "Ví dụ: nhân vật quay đầu sang trái, tóc bay nhẹ, camera tiến gần, cinematic premium visual treatment",
+    readyText: "Sẵn sàng tạo video từ ảnh đầu vào.",
+  },
+  reference: {
+    note: "Dùng khi chỉ có ảnh áo, logo hoặc sản phẩm. App sẽ tự dựng một khung đầu có người mẫu hoặc bố cục phù hợp, rồi mới tạo video.",
+    hint: "Tải ảnh sản phẩm hoặc logo vào đây. App sẽ tự dựng người mẫu hoặc keyframe phù hợp rồi tạo video trong một lượt.",
+    placeholder: "Ví dụ: người mẫu bước ra trong studio, khoe rõ chiếc áo, ánh sáng premium, camera dolly in, cảm giác quảng cáo cao cấp",
+    readyText: "Sẵn sàng dựng khung đầu rồi tạo video.",
+  },
+};
 
 const MODE_CONFIG = {
   video: {
@@ -187,7 +207,7 @@ const state = {
     image: null,
   },
   drafts: {
-    video: { prompt: "", model: "Veo 3.1 - Fast", aspect: "landscape", count: 1 },
+    video: { prompt: "", model: "Veo 3.1 - Fast", aspect: "landscape", count: 1, inputMode: "prompt" },
     image: { prompt: "", model: "NARWHAL", aspect: "square", count: 2 },
     edit: { prompt: "", model: "", aspect: "landscape", count: 1 },
   },
@@ -225,6 +245,8 @@ const elements = {
   messageBar: document.querySelector("#messageBar"),
   composerTitle: document.querySelector("#composerTitle"),
   composerHint: document.querySelector("#composerHint"),
+  videoInputModeStrip: document.querySelector("#videoInputModeStrip"),
+  videoInputModeNote: document.querySelector("#videoInputModeNote"),
   promptAiSummary: document.querySelector("#promptAiSummary"),
   promptAiBadge: document.querySelector("#promptAiBadge"),
   promptAiBriefLabel: document.querySelector("#promptAiBriefLabel"),
@@ -282,6 +304,13 @@ const elements = {
   clearStartImageButton: document.querySelector("#clearStartImageButton"),
   imageReferenceWrap: document.querySelector("#imageReferenceWrap"),
   imageReferenceFiles: document.querySelector("#imageReferenceFiles"),
+  imageReferenceTitle: document.querySelector("#imageReferenceTitle"),
+  imageReferenceDescription: document.querySelector("#imageReferenceDescription"),
+  imageReferenceFieldLabel: document.querySelector("#imageReferenceFieldLabel"),
+  videoReferenceHero: document.querySelector("#videoReferenceHero"),
+  videoReferenceHeroImage: document.querySelector("#videoReferenceHeroImage"),
+  videoReferenceHeroTitle: document.querySelector("#videoReferenceHeroTitle"),
+  videoReferenceHeroText: document.querySelector("#videoReferenceHeroText"),
   imageReferenceList: document.querySelector("#imageReferenceList"),
   imageReferenceStatus: document.querySelector("#imageReferenceStatus"),
   generationOptionsWrap: document.querySelector("#generationOptionsWrap"),
@@ -303,6 +332,7 @@ const elements = {
   refreshButton: document.querySelector("#refreshButton"),
   latestStatusCard: document.querySelector("#latestStatusCard"),
   modeButtons: Array.from(document.querySelectorAll(".mode-button")),
+  videoInputModeButtons: Array.from(document.querySelectorAll("[data-video-input-mode]")),
 };
 
 function escapeHtml(value) {
@@ -490,6 +520,22 @@ function currentDraft() {
   return state.drafts[state.mode];
 }
 
+function normalizeVideoInputMode(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (raw === "start" || raw === "reference") {
+    return raw;
+  }
+  return "prompt";
+}
+
+function currentVideoInputMode() {
+  return normalizeVideoInputMode(state.drafts.video?.inputMode || "prompt");
+}
+
+function currentVideoInputConfig() {
+  return VIDEO_INPUT_MODE_CONFIG[currentVideoInputMode()] || VIDEO_INPUT_MODE_CONFIG.prompt;
+}
+
 function currentPromptAiDraft() {
   return state.promptAiDrafts[state.mode] || null;
 }
@@ -547,6 +593,78 @@ function normalizeReferenceRole(value) {
     return raw;
   }
   return "reference";
+}
+
+function referenceRoleOptionsForMode(mode) {
+  if (mode === "video") {
+    return REFERENCE_ROLE_OPTIONS.filter((item) => item.value !== "base");
+  }
+  return REFERENCE_ROLE_OPTIONS;
+}
+
+function primaryReferenceRoleForMode(mode = state.mode) {
+  return mode === "video" ? "product" : "base";
+}
+
+function normalizeReferenceRoleForMode(value, mode, index = 0) {
+  const role = normalizeReferenceRole(value);
+  if (mode === "video" && role === "base") {
+    return index === 0 ? "product" : "reference";
+  }
+  return role;
+}
+
+function ensurePrimaryReferenceRole(items, mode = state.mode) {
+  if (!Array.isArray(items) || !items.length) {
+    return [];
+  }
+  const primaryRole = primaryReferenceRoleForMode(mode);
+  const normalized = items.map((item, index) => ({
+    ...item,
+    role: normalizeReferenceRoleForMode(item.role, mode, index),
+  }));
+  if (!normalized.some((item) => item.role === primaryRole)) {
+    normalized[0] = { ...normalized[0], role: primaryRole };
+  }
+  return normalized;
+}
+
+function clearStartImageState({ resetInput = true } = {}) {
+  state.startImagePath = "";
+  state.startImageName = "";
+  state.startImagePublicUrl = "";
+  if (resetInput && elements.startImageFile) {
+    elements.startImageFile.value = "";
+  }
+}
+
+function clearReferenceImageState({ resetInput = true } = {}) {
+  state.imageReferenceItems = [];
+  if (resetInput && elements.imageReferenceFiles) {
+    elements.imageReferenceFiles.value = "";
+  }
+}
+
+function setVideoInputMode(mode, { clearConflicts = true, announce = false } = {}) {
+  const nextMode = normalizeVideoInputMode(mode);
+  const previousMode = currentVideoInputMode();
+  state.drafts.video.inputMode = nextMode;
+
+  if (clearConflicts) {
+    if (nextMode === "prompt") {
+      clearStartImageState();
+      clearReferenceImageState();
+    } else if (nextMode === "start") {
+      clearReferenceImageState();
+    } else if (nextMode === "reference") {
+      clearStartImageState();
+      state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, "video");
+    }
+  }
+
+  if (announce && nextMode !== previousMode) {
+    showMessage(currentVideoInputConfig().note, "success");
+  }
 }
 
 function syncDraftFromForm() {
@@ -694,21 +812,28 @@ function renderTopbar() {
 
 function renderComposer() {
   const config = currentOperationConfig();
+  const videoInput = state.mode === "video" ? currentVideoInputConfig() : null;
   elements.composerTitle.textContent = config.title;
-  elements.composerHint.textContent = config.hint;
+  elements.composerHint.textContent = videoInput?.hint || config.hint;
   elements.promptLabel.textContent = config.promptLabel;
-  elements.promptInput.placeholder = config.placeholder || "";
+  elements.promptInput.placeholder = videoInput?.placeholder || config.placeholder || "";
   elements.submitButton.textContent = config.submitLabel;
-  elements.startImageWrap.hidden = !(state.mode === "video" && config.showStartImage);
-  elements.imageReferenceWrap.hidden = state.mode !== "image";
+  elements.videoInputModeStrip.hidden = state.mode !== "video";
+  elements.videoInputModeNote.hidden = state.mode !== "video";
+  elements.startImageWrap.hidden = !(state.mode === "video" && config.showStartImage && currentVideoInputMode() === "start");
+  elements.imageReferenceWrap.hidden = !(state.mode === "image" || (state.mode === "video" && currentVideoInputMode() === "reference"));
   elements.readyHint.textContent = isReady()
-    ? `${config.readyText} Tab Google Flow sẽ được giữ mở sau khi gửi.`
+    ? `${videoInput?.readyText || config.readyText} Tab Google Flow sẽ được giữ mở sau khi gửi.`
     : "Lưu project và đăng nhập một lần rồi bấm chạy.";
   elements.promptLabel.parentElement.hidden = Boolean(state.mode === "edit" && !config.showPrompt);
 
   for (const button of elements.modeButtons) {
     button.classList.toggle("active", button.dataset.mode === state.mode);
   }
+  for (const button of elements.videoInputModeButtons) {
+    button.classList.toggle("active", button.dataset.videoInputMode === currentVideoInputMode());
+  }
+  elements.videoInputModeNote.textContent = videoInput?.note || "";
 
   applyDraftToForm();
   renderAspectChoices();
@@ -754,7 +879,24 @@ function renderComposerSummary() {
   }
 
   const videoModelLabel = modelLabelForMode("video", currentDraft().model);
-  if (state.startImagePath) {
+  if (currentVideoInputMode() === "reference") {
+    if (!state.imageReferenceItems.length) {
+      elements.composerSummaryMode.textContent = "Sản phẩm -> người mẫu -> video";
+      elements.composerSummaryText.textContent = `Thêm ít nhất 1 ảnh sản phẩm, logo hoặc ảnh tham chiếu. App sẽ tự dựng khung đầu rồi tạo video bằng model ${videoModelLabel}.`;
+      return;
+    }
+    const productCount = state.imageReferenceItems.filter((item) => normalizeReferenceRole(item.role) === "product").length;
+    const logoCount = state.imageReferenceItems.filter((item) => normalizeReferenceRole(item.role) === "logo").length;
+    elements.composerSummaryMode.textContent = "Sản phẩm -> người mẫu -> video";
+    elements.composerSummaryText.textContent = `App sẽ tự dựng một ảnh khung đầu từ ${fileKindLabel(state.imageReferenceItems.length)} rồi tạo video luôn bằng model ${videoModelLabel}.${productCount ? ` Có ${productCount} ảnh sản phẩm` : ""}${logoCount ? ` và ${logoCount} logo` : ""}.`;
+    return;
+  }
+  if (currentVideoInputMode() === "start") {
+    if (!state.startImagePath) {
+      elements.composerSummaryMode.textContent = "Video từ ảnh";
+      elements.composerSummaryText.textContent = `Chọn một ảnh đầu vào để app animate từ khung đầu tiên bằng model ${videoModelLabel}.`;
+      return;
+    }
     elements.composerSummaryMode.textContent = "Video từ ảnh";
     elements.composerSummaryText.textContent = `Đang dùng ${state.startImageName || "ảnh đầu vào"} làm khung đầu tiên bằng model ${videoModelLabel}.`;
     return;
@@ -765,7 +907,7 @@ function renderComposerSummary() {
 }
 
 function renderUploadStatus() {
-  if (state.mode !== "video") {
+  if (state.mode !== "video" || currentVideoInputMode() !== "start") {
     return;
   }
   const hasImage = Boolean(state.startImagePath);
@@ -787,7 +929,7 @@ function renderUploadStatus() {
     elements.startImageStatus.textContent = `Đã gắn ${state.startImageName || "ảnh đầu vào"}. App sẽ tạo video từ ảnh này.`;
     return;
   }
-  elements.startImageStatus.textContent = "Không có ảnh đầu vào. Nếu bỏ trống, app sẽ tạo video từ prompt.";
+  elements.startImageStatus.textContent = "Chưa có ảnh đầu vào. Hãy chọn một ảnh để app animate từ khung đầu này.";
 }
 
 function availableVideoSources() {
@@ -907,38 +1049,74 @@ function renderEditControls() {
 }
 
 function renderImageReferenceStatus() {
-  if (state.mode !== "image") {
+  if (state.mode !== "image" && !(state.mode === "video" && currentVideoInputMode() === "reference")) {
     return;
   }
 
+  const isVideo = state.mode === "video";
+  elements.imageReferenceTitle.textContent = isVideo
+    ? "Ảnh sản phẩm hoặc ảnh tham chiếu"
+    : "Ảnh tham chiếu để ghép hoặc chỉnh";
+  elements.imageReferenceDescription.textContent = isVideo
+    ? "Ví dụ: đưa ảnh áo hoặc sản phẩm vào đây. App sẽ tự dựng một ảnh người mẫu/keyframe trước, rồi dùng chính ảnh đó để tạo video luôn."
+    : "Ví dụ: một ảnh người mẫu và một ảnh logo áo. Sau đó viết yêu cầu như “ghép logo này lên áo của người mẫu”.";
+  elements.imageReferenceFieldLabel.textContent = isVideo
+    ? "Chọn 1 đến 4 ảnh sản phẩm hoặc ảnh tham chiếu"
+    : "Chọn 1 đến 4 ảnh tham chiếu";
+
   const items = state.imageReferenceItems || [];
   if (state.uploading && !items.length) {
+    elements.videoReferenceHero.hidden = true;
     elements.imageReferenceList.hidden = true;
     elements.imageReferenceList.innerHTML = "";
-    elements.imageReferenceStatus.textContent = "Đang tải ảnh tham chiếu...";
+    elements.imageReferenceStatus.textContent = isVideo ? "Đang tải ảnh sản phẩm/tham chiếu..." : "Đang tải ảnh tham chiếu...";
     return;
   }
   if (!items.length) {
+    elements.videoReferenceHero.hidden = true;
+    elements.videoReferenceHeroImage.removeAttribute("src");
+    elements.videoReferenceHeroTitle.textContent = "Chưa có ảnh chính";
+    elements.videoReferenceHeroText.textContent = "App sẽ ưu tiên ảnh này để dựng người mẫu hoặc keyframe trước khi tạo video.";
     elements.imageReferenceList.hidden = true;
     elements.imageReferenceList.innerHTML = "";
-    elements.imageReferenceStatus.textContent = "Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ dùng chúng để ghép/chỉnh ảnh.";
+    elements.imageReferenceStatus.textContent = isVideo
+      ? "Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ tự dựng khung đầu rồi tạo video luôn."
+      : "Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ dùng chúng để ghép/chỉnh ảnh.";
     return;
   }
 
   elements.imageReferenceList.hidden = false;
+  const primaryItem = isVideo
+    ? items.find((item) => normalizeReferenceRole(item.role) === "product") || items[0]
+    : items.find((item) => normalizeReferenceRole(item.role) === "base") || items[0];
+  elements.videoReferenceHero.hidden = !isVideo;
+  if (isVideo && primaryItem) {
+    elements.videoReferenceHeroImage.src = primaryItem.publicUrl || uploadPublicUrlFromPath(primaryItem.path);
+    elements.videoReferenceHeroTitle.textContent = primaryItem.name || "Ảnh sản phẩm chính";
+    elements.videoReferenceHeroText.textContent = "App sẽ ưu tiên ảnh này để dựng người mẫu hoặc keyframe đầu tiên trước khi tạo video.";
+  }
   elements.imageReferenceList.innerHTML = items
     .map((item, index) => {
       const source = item.publicUrl || uploadPublicUrlFromPath(item.path);
-      const role = normalizeReferenceRole(item.role || (index === 0 ? "base" : "reference"));
-      const roleOptions = REFERENCE_ROLE_OPTIONS.map(
+      const role = normalizeReferenceRoleForMode(item.role || (index === 0 ? primaryReferenceRoleForMode(state.mode) : "reference"), state.mode, index);
+      const roleOptions = referenceRoleOptionsForMode(state.mode).map(
         (option) => `<option value="${escapeHtml(option.value)}"${option.value === role ? " selected" : ""}>${escapeHtml(option.label)}</option>`
       ).join("");
+      const isPrimary = isVideo ? role === "product" : role === "base";
       return `
-        <article class="upload-preview reference-card">
+        <article class="upload-preview reference-card${isPrimary ? " is-primary" : ""}">
           <img class="upload-preview-image" src="${escapeHtml(source)}" alt="${escapeHtml(item.name || "Ảnh tham chiếu")}" />
           <div class="upload-preview-copy">
             <strong>${escapeHtml(item.name || "Ảnh tham chiếu")}</strong>
             <p>${escapeHtml(referenceRoleDetail(role))}</p>
+            <div class="reference-card-actions">
+              <span class="reference-role-pill">${escapeHtml(referenceRoleLabel(role))}</span>
+              ${
+                isVideo && !isPrimary
+                  ? `<button type="button" class="ghost-button card-button" data-action="promote-reference-image" data-index="${index}">Ưu tiên ảnh này</button>`
+                  : ""
+              }
+            </div>
             <label class="field inline-role-field">
               <span>Vai trò</span>
               <select data-action="reference-role" data-index="${index}">
@@ -951,8 +1129,9 @@ function renderImageReferenceStatus() {
       `;
     })
     .join("");
-  const baseItem = items.find((item) => normalizeReferenceRole(item.role) === "base") || items[0];
-  elements.imageReferenceStatus.textContent = `Đã gắn ${fileKindLabel(items.length)}. Ảnh chính hiện là ${baseItem?.name || "ảnh đầu tiên"}, các ảnh còn lại sẽ được dùng theo vai trò đã chọn.`;
+  elements.imageReferenceStatus.textContent = isVideo
+    ? `Đã gắn ${fileKindLabel(items.length)}. App sẽ dùng ${primaryItem?.name || "ảnh đầu tiên"} làm sản phẩm hoặc ảnh chính để dựng khung đầu, rồi mới tạo video.`
+    : `Đã gắn ${fileKindLabel(items.length)}. Ảnh chính hiện là ${primaryItem?.name || "ảnh đầu tiên"}, các ảnh còn lại sẽ được dùng theo vai trò đã chọn.`;
 }
 
 function renderPromptAiResult() {
@@ -1111,20 +1290,35 @@ function fillComposerFromSource(mode, payload = {}) {
     state.startImagePath = String(payload.start_image_path || "").trim();
     state.startImageName = basename(state.startImagePath);
     state.startImagePublicUrl = uploadPublicUrlFromPath(state.startImagePath);
-    state.imageReferenceItems = [];
-  } else if (resolvedMode === "image") {
-    state.startImagePath = "";
-    state.startImageName = "";
-    state.startImagePublicUrl = "";
-    state.imageReferenceItems = (payload.reference_image_paths || [])
+    state.imageReferenceItems = ensurePrimaryReferenceRole(
+      (payload.reference_image_paths || [])
       .map((path) => String(path || "").trim())
       .filter(Boolean)
       .map((path, index) => ({
         path,
         name: basename(path),
         publicUrl: uploadPublicUrlFromPath(path),
-        role: normalizeReferenceRole(payload.reference_image_roles?.[index] || (index === 0 ? "base" : "reference")),
-      }));
+        role: normalizeReferenceRoleForMode(payload.reference_image_roles?.[index] || (index === 0 ? "product" : "reference"), "video", index),
+      })),
+      "video"
+    );
+    state.drafts.video.inputMode = state.startImagePath ? "start" : state.imageReferenceItems.length ? "reference" : "prompt";
+  } else if (resolvedMode === "image") {
+    state.startImagePath = "";
+    state.startImageName = "";
+    state.startImagePublicUrl = "";
+    state.imageReferenceItems = ensurePrimaryReferenceRole(
+      (payload.reference_image_paths || [])
+      .map((path) => String(path || "").trim())
+      .filter(Boolean)
+      .map((path, index) => ({
+        path,
+        name: basename(path),
+        publicUrl: uploadPublicUrlFromPath(path),
+        role: normalizeReferenceRoleForMode(payload.reference_image_roles?.[index] || (index === 0 ? "base" : "reference"), "image", index),
+      })),
+      "image"
+    );
   } else {
     state.startImagePath = "";
     state.startImageName = "";
@@ -1191,6 +1385,195 @@ function jobDuration(job) {
   return formatDuration(Math.max(0, end - start));
 }
 
+function parseDateValue(value) {
+  if (!value) {
+    return null;
+  }
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return null;
+  }
+  return date;
+}
+
+function formatStepMoment(value) {
+  const date = parseDateValue(value);
+  if (!date) {
+    return "";
+  }
+  return new Intl.DateTimeFormat("vi-VN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function formatStepDuration(startValue, endValue) {
+  const start = parseDateValue(startValue);
+  const end = parseDateValue(endValue);
+  if (!start || !end) {
+    return "";
+  }
+  return formatDuration(Math.max(0, end.getTime() - start.getTime()));
+}
+
+function isReferenceToVideoJob(job) {
+  return job?.type === "video" && !String(job?.input?.start_image_path || "").trim() && Array.isArray(job?.input?.reference_image_paths) && job.input.reference_image_paths.length > 0;
+}
+
+function jobJourneySteps(job) {
+  if (isReferenceToVideoJob(job)) {
+    return [
+      { key: "prepare_frame", label: "Dựng khung đầu" },
+      { key: "send_video", label: "Gửi video" },
+      { key: "wait_video", label: "Chờ clip" },
+      { key: "save", label: "Lưu" },
+      { key: "done", label: "Xong" },
+    ];
+  }
+  return [
+    { key: "connect", label: "Kết nối" },
+    { key: "send", label: "Gửi" },
+    { key: "wait", label: "Chờ" },
+    { key: "save", label: "Lưu" },
+    { key: "done", label: "Xong" },
+  ];
+}
+
+function jobJourneyCurrentKey(job) {
+  const stage = String(job?.progress_snapshot?.stage || "").trim();
+  const blockedStage = String(job?.progress_hint?.stage || "").trim() || stage;
+  const isAutoReference = isReferenceToVideoJob(job);
+  const hasAutoStartFrame = Boolean(String(job?.result?.auto_start_frame_path || "").trim() || String(job?.result?.auto_start_frame_public_url || "").trim());
+  const effectiveStage = job?.status === "failed" || job?.status === "interrupted" ? blockedStage : stage;
+
+  if (job?.status === "completed") {
+    return "done";
+  }
+
+  if (effectiveStage === "saving_artifacts") {
+    return "save";
+  }
+  if (effectiveStage === "awaiting_response" || effectiveStage === "polling") {
+    return isAutoReference ? "wait_video" : "wait";
+  }
+  if (effectiveStage === "sending_request") {
+    if (isAutoReference) {
+      return hasAutoStartFrame ? "send_video" : "prepare_frame";
+    }
+    return "send";
+  }
+  if (effectiveStage === "connecting" || effectiveStage === "queued") {
+    return isAutoReference ? "prepare_frame" : "connect";
+  }
+  return isAutoReference ? "prepare_frame" : "connect";
+}
+
+function renderJobJourney(job) {
+  const steps = jobJourneySteps(job);
+  const currentKey = jobJourneyCurrentKey(job);
+  const currentIndex = Math.max(0, steps.findIndex((step) => step.key === currentKey));
+  const isBlocked = job.status === "failed" || job.status === "interrupted";
+  const allDone = job.status === "completed";
+
+  return `
+    <div class="job-journey" aria-label="Tiến trình chi tiết">
+      ${steps
+        .map((step, index) => {
+          let tone = "pending";
+          if (allDone) {
+            tone = "done";
+          } else if (isBlocked) {
+            if (index < currentIndex) {
+              tone = "done";
+            } else if (index === currentIndex) {
+              tone = "blocked";
+            }
+          } else if (index < currentIndex) {
+            tone = "done";
+          } else if (index === currentIndex) {
+            tone = "current";
+          }
+
+          return `<span class="job-journey-step" data-tone="${escapeHtml(tone)}">${escapeHtml(step.label)}</span>`;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function renderJobStepNotes(job) {
+  const notes = [];
+  const currentKey = jobJourneyCurrentKey(job);
+  const currentStep = jobJourneySteps(job).find((step) => step.key === currentKey);
+  const detail = describeJob(job);
+  const lastSignalAt = String(job?.progress_snapshot?.last_signal_at || job?.updated_at || "").trim();
+  const autoStartFrameAt = String(job?.result?.auto_start_frame_at || "").trim();
+  const autoStartFramePath = String(job?.result?.auto_start_frame_path || "").trim();
+
+  if (isReferenceToVideoJob(job) && autoStartFrameAt) {
+    const frameDuration = formatStepDuration(job.created_at, autoStartFrameAt);
+    notes.push({
+      title: "Dựng khung đầu",
+      meta: frameDuration ? `Xong sau ${frameDuration}` : formatStepMoment(autoStartFrameAt),
+      detail: autoStartFramePath
+        ? `Đã dựng xong ${basename(autoStartFramePath)} để dùng làm keyframe đầu tiên.`
+        : "App đã dựng xong ảnh khung đầu để dùng cho bước tạo video.",
+      tone: "done",
+    });
+  }
+
+  if (currentStep) {
+    const activePrefix =
+      job.status === "completed"
+        ? "Hoàn tất"
+        : job.status === "failed" || job.status === "interrupted"
+        ? "Dừng ở bước này"
+        : "Đang xử lý";
+    const activeDuration = job.status === "completed"
+      ? formatStepDuration(job.created_at, job.updated_at)
+      : formatStepDuration(lastSignalAt || job.created_at, new Date().toISOString());
+    notes.push({
+      title: currentStep.label,
+      meta: activeDuration ? `${activePrefix} · ${activeDuration}` : `${activePrefix}${formatStepMoment(lastSignalAt) ? ` · ${formatStepMoment(lastSignalAt)}` : ""}`,
+      detail,
+      tone: job.status === "failed" || job.status === "interrupted" ? "blocked" : job.status === "completed" ? "done" : "current",
+    });
+  }
+
+  const deduped = [];
+  const seen = new Set();
+  for (const note of notes) {
+    const key = `${note.title}::${note.detail}`;
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    deduped.push(note);
+  }
+
+  if (!deduped.length) {
+    return "";
+  }
+
+  return `
+    <div class="job-step-notes">
+      ${deduped
+        .map(
+          (note) => `
+            <article class="job-step-note" data-tone="${escapeHtml(note.tone)}">
+              <div class="job-step-note-head">
+                <strong>${escapeHtml(note.title)}</strong>
+                ${note.meta ? `<span>${escapeHtml(note.meta)}</span>` : ""}
+              </div>
+              <p>${escapeHtml(note.detail)}</p>
+            </article>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
 function renderLatestStatus() {
   const latestJob = jobsForCurrentMode()[0];
   if (!latestJob) {
@@ -1206,8 +1589,14 @@ function renderLatestStatus() {
   const referenceImageCount = Array.isArray(latestJob.input?.reference_image_paths)
     ? latestJob.input.reference_image_paths.length
     : 0;
+  const autoStartFramePath = String(latestJob.result?.auto_start_frame_path || "").trim();
+  const autoStartFramePreview = String(latestJob.result?.auto_start_frame_public_url || "").trim()
+    || uploadPublicUrlFromPath(autoStartFramePath);
+  const autoStartFramePrompt = truncate(latestJob.result?.auto_start_frame_prompt || "", 150);
   const sourceLabel = sourceImagePath
     ? `Ảnh gốc: ${basename(sourceImagePath)}`
+    : latestJob.type === "video" && referenceImageCount
+    ? `Ảnh tham chiếu: ${referenceImageCount}`
     : referenceImageCount
     ? `Ảnh tham chiếu: ${referenceImageCount}`
     : "";
@@ -1228,6 +1617,22 @@ function renderLatestStatus() {
         </div>
         <span class="status-chip" data-status="${escapeHtml(jobProgressTone(latestJob))}">${escapeHtml(jobProgressLabel(latestJob))}</span>
       </div>
+      ${renderJobJourney(latestJob)}
+      ${renderJobStepNotes(latestJob)}
+      ${
+        latestJob.type === "video" && autoStartFramePreview
+          ? `
+            <div class="status-start-frame">
+              <img class="status-start-frame-image" src="${escapeHtml(autoStartFramePreview)}" alt="Ảnh khung đầu tự dựng" />
+              <div class="status-start-frame-copy">
+                <span class="mini-pill">Khung đầu đã dựng</span>
+                <strong>${escapeHtml(basename(autoStartFramePath) || "Ảnh khung đầu tự dựng")}</strong>
+                <p>${escapeHtml(autoStartFramePrompt || "App sẽ dùng chính ảnh này làm keyframe đầu tiên trước khi render video.")}</p>
+              </div>
+            </div>
+          `
+          : ""
+      }
       ${sourceLabel ? `<p class="run-source">${escapeHtml(sourceLabel)}</p>` : ""}
       <p class="run-prompt">${escapeHtml(prompt)}</p>
       <p class="run-note">${escapeHtml(note)}</p>
@@ -1392,8 +1797,7 @@ async function logoutFlow() {
 async function uploadStartImage(event) {
   const file = event.target.files?.[0];
   if (!file) {
-    state.startImagePath = "";
-    state.startImageName = "";
+    clearStartImageState({ resetInput: false });
     renderUploadStatus();
     return;
   }
@@ -1404,14 +1808,16 @@ async function uploadStartImage(event) {
   renderUploadStatus();
   try {
     const payload = await api("/api/uploads", { method: "POST", body: data });
+    if (state.mode === "video") {
+      setVideoInputMode("start", { clearConflicts: true });
+      renderComposer();
+    }
     state.startImagePath = payload.saved_path || "";
     state.startImageName = payload.file_name || file.name;
     state.startImagePublicUrl = payload.public_url || uploadPublicUrlFromPath(payload.saved_path || file.name);
     showMessage("Đã tải ảnh đầu vào.", "success");
   } catch (error) {
-    state.startImagePath = "";
-    state.startImageName = "";
-    state.startImagePublicUrl = "";
+    clearStartImageState({ resetInput: false });
     event.target.value = "";
     showMessage(error.message, "error");
   } finally {
@@ -1429,26 +1835,43 @@ async function uploadImageReferences(event) {
 
   if (state.imageReferenceItems.length + files.length > 4) {
     event.target.value = "";
-    showMessage("Tối đa 4 ảnh tham chiếu cho một lượt ghép/chỉnh ảnh.", "error");
+    showMessage(
+      state.mode === "video"
+        ? "Tối đa 4 ảnh sản phẩm/tham chiếu cho một lượt dựng ảnh rồi tạo video."
+        : "Tối đa 4 ảnh tham chiếu cho một lượt ghép/chỉnh ảnh.",
+      "error"
+    );
     return;
   }
 
   state.uploading = true;
+  if (state.mode === "video") {
+    setVideoInputMode("reference", { clearConflicts: true });
+    renderComposer();
+  }
   renderImageReferenceStatus();
   try {
     for (const file of files) {
       const data = new FormData();
       data.append("file", file);
       const payload = await api("/api/uploads", { method: "POST", body: data });
-      const hasBase = state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "base");
+      const primaryRole = primaryReferenceRoleForMode(state.mode);
+      const hasPrimary = state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === primaryRole);
+      const defaultRole = hasPrimary ? "reference" : primaryRole;
       state.imageReferenceItems.push({
         path: payload.saved_path || "",
         name: payload.file_name || file.name,
         publicUrl: payload.public_url || uploadPublicUrlFromPath(payload.saved_path || file.name),
-        role: hasBase ? "reference" : "base",
+        role: defaultRole,
       });
     }
-    showMessage("Đã tải ảnh tham chiếu để ghép/chỉnh ảnh.", "success");
+    state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, state.mode);
+    showMessage(
+      state.mode === "video"
+        ? "Đã tải ảnh tham chiếu. App có thể tự dựng khung đầu rồi tạo video luôn."
+        : "Đã tải ảnh tham chiếu để ghép/chỉnh ảnh.",
+      "success"
+    );
   } catch (error) {
     showMessage(error.message, "error");
   } finally {
@@ -1460,12 +1883,13 @@ async function uploadImageReferences(event) {
 }
 
 function clearStartImage() {
-  state.startImagePath = "";
-  state.startImageName = "";
-  state.startImagePublicUrl = "";
-  elements.startImageFile.value = "";
+  clearStartImageState();
+  if (state.mode === "video" && currentVideoInputMode() === "start") {
+    state.drafts.video.inputMode = "prompt";
+  }
   renderComposerSummary();
   renderUploadStatus();
+  renderComposer();
   showMessage("Đã bỏ ảnh đầu vào.", "success");
 }
 
@@ -1475,11 +1899,14 @@ function removeReferenceImage(indexValue) {
     return;
   }
   state.imageReferenceItems.splice(index, 1);
-  if (state.imageReferenceItems.length && !state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "base")) {
-    state.imageReferenceItems[0].role = "base";
+  if (state.imageReferenceItems.length) {
+    state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, state.mode);
+  } else if (state.mode === "video" && currentVideoInputMode() === "reference") {
+    state.drafts.video.inputMode = "prompt";
   }
   renderComposerSummary();
   renderImageReferenceStatus();
+  renderComposer();
   showMessage("Đã bỏ một ảnh tham chiếu.", "success");
 }
 
@@ -1488,18 +1915,30 @@ function setReferenceImageRole(indexValue, roleValue) {
   if (!Number.isInteger(index) || index < 0 || index >= state.imageReferenceItems.length) {
     return;
   }
-  const role = normalizeReferenceRole(roleValue);
+  const role = normalizeReferenceRoleForMode(roleValue, state.mode, index);
+  const primaryRole = primaryReferenceRoleForMode(state.mode);
   state.imageReferenceItems = state.imageReferenceItems.map((item, itemIndex) => ({
     ...item,
-    role: role === "base" && itemIndex !== index ? (normalizeReferenceRole(item.role) === "base" ? "reference" : normalizeReferenceRole(item.role)) : normalizeReferenceRole(item.role),
+    role:
+      role === primaryRole && itemIndex !== index
+        ? normalizeReferenceRole(item.role) === primaryRole
+          ? "reference"
+          : normalizeReferenceRoleForMode(item.role, state.mode, itemIndex)
+        : normalizeReferenceRoleForMode(item.role, state.mode, itemIndex),
   }));
   state.imageReferenceItems[index].role = role;
-  if (!state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "base")) {
-    state.imageReferenceItems[0].role = "base";
-  }
+  state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, state.mode);
   renderComposerSummary();
   renderImageReferenceStatus();
   showMessage(`Đã đổi vai trò ảnh sang ${referenceRoleLabel(role).toLowerCase()}.`, "success");
+}
+
+function promoteReferenceImage(indexValue) {
+  const index = Number(indexValue);
+  if (!Number.isInteger(index) || index < 0 || index >= state.imageReferenceItems.length) {
+    return;
+  }
+  setReferenceImageRole(index, primaryReferenceRoleForMode(state.mode));
 }
 
 async function submitCreate(event) {
@@ -1540,8 +1979,22 @@ async function submitCreate(event) {
 
   if (state.mode === "video") {
     payload.type = "video";
-    if (state.startImagePath) {
+    if (currentVideoInputMode() === "start") {
+      if (!state.startImagePath) {
+        showMessage("Hãy tải ảnh đầu vào trước khi chạy video từ ảnh.", "error");
+        return;
+      }
       payload.start_image_path = state.startImagePath;
+    }
+    if (currentVideoInputMode() === "reference") {
+      if (!state.imageReferenceItems.length) {
+        showMessage("Hãy tải ít nhất 1 ảnh sản phẩm hoặc ảnh tham chiếu trước khi chạy.", "error");
+        return;
+      }
+      payload.reference_image_paths = state.imageReferenceItems.map((item) => item.path).filter(Boolean);
+      payload.reference_image_roles = state.imageReferenceItems.map((item, index) =>
+        normalizeReferenceRoleForMode(item.role || (index === 0 ? "product" : "reference"), "video", index)
+      );
     }
   }
 
@@ -1578,7 +2031,9 @@ async function submitCreate(event) {
       body: JSON.stringify(payload),
     });
     const submitMessage =
-      state.mode === "video" && state.startImagePath
+      state.mode === "video" && currentVideoInputMode() === "reference"
+        ? "Đã gửi yêu cầu dựng khung đầu rồi tạo video. Tab Google Flow sẽ được giữ mở."
+        : state.mode === "video" && currentVideoInputMode() === "start"
         ? "Đã gửi yêu cầu tạo video từ ảnh. Tab Google Flow sẽ được giữ mở."
         : state.mode === "image" && state.imageReferenceItems.length
         ? "Đã gửi yêu cầu chỉnh ảnh từ ảnh tham chiếu. Tab Google Flow sẽ được giữ mở."
@@ -1828,6 +2283,9 @@ function changeMode(mode) {
   syncDraftFromForm();
   syncPromptAiDraftFromForm();
   state.mode = mode;
+  if (mode === "video" && !state.drafts.video.inputMode) {
+    state.drafts.video.inputMode = "prompt";
+  }
   renderAll();
 }
 
@@ -1892,6 +2350,16 @@ function setupPolling() {
 
 elements.modeButtons.forEach((button) => {
   button.addEventListener("click", () => changeMode(button.dataset.mode));
+});
+
+elements.videoInputModeButtons.forEach((button) => {
+  button.addEventListener("click", () => {
+    if (state.mode !== "video") {
+      return;
+    }
+    setVideoInputMode(button.dataset.videoInputMode, { clearConflicts: true, announce: true });
+    renderAll();
+  });
 });
 
 elements.editActionButtons.forEach((button) => {
@@ -2021,6 +2489,11 @@ elements.latestStatusCard.addEventListener("click", (event) => {
   }
 });
 elements.imageReferenceList.addEventListener("click", (event) => {
+  const promoteTarget = event.target.closest("[data-action='promote-reference-image']");
+  if (promoteTarget) {
+    promoteReferenceImage(promoteTarget.dataset.index);
+    return;
+  }
   const actionTarget = event.target.closest("[data-action='remove-reference-image']");
   if (!actionTarget) {
     return;
