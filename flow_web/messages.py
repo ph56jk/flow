@@ -72,6 +72,13 @@ def humanize_flow_error(message: str) -> str:
         result = "Cửa sổ Chromium dùng cho Google Flow đã bị đóng giữa chừng."
         return "".join(prefixes) + result
 
+    if "audio generation failed" in lowered or "return silent videos" in lowered:
+        result = (
+            "Google Flow đã dựng tới bước âm thanh nhưng phần tạo audio bị lỗi. "
+            "Chủ nhân thử prompt khác, bật trả video im lặng trong Flow, hoặc đổi sang model không audio như Veo 2."
+        )
+        return "".join(prefixes) + result
+
     image_timeout = _IMAGE_TIMEOUT_RE.search(raw)
     if image_timeout:
         seconds = image_timeout.group("seconds")
@@ -249,6 +256,34 @@ def classify_job_error(message: str, *, job_type: str = "") -> JobErrorSnapshot:
                     id="view-jobs",
                     label="Xem lại bảng tác vụ",
                     description="So sánh log hiện tại trước khi chạy lại để biết Flow dừng ở bước nào.",
+                ),
+            ],
+        )
+
+    if _has_any(
+        lowered,
+        "audio generation failed",
+        "return silent videos",
+        "phần tạo audio bị lỗi",
+        "video im lặng",
+        "model không audio",
+    ):
+        return JobErrorSnapshot(
+            category="audio",
+            label="Lỗi audio",
+            title="Google Flow vấp ở bước tạo âm thanh",
+            message=humanized,
+            is_known=True,
+            actions=[
+                JobRecoveryAction(
+                    id="retry-prompt",
+                    label="Thử prompt khác",
+                    description="Rút gọn hoặc đổi prompt rồi chạy lại để giảm khả năng audio bị Flow từ chối.",
+                ),
+                JobRecoveryAction(
+                    id="switch-model",
+                    label="Dùng video im lặng",
+                    description="Bật trả video im lặng trong Flow hoặc đổi sang model không audio như Veo 2.",
                 ),
             ],
         )

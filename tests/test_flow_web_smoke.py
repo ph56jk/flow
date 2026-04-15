@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import os
@@ -12,6 +13,7 @@ from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException, UploadFile
 
+from flow_web.messages import classify_job_error, humanize_flow_error
 from flow_web.schemas import (
     AppConfig,
     AuthStatus,
@@ -202,6 +204,73 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         url = self.service._video_status_url(status, media_name="media-1")
 
         self.assertEqual("https://example.com/fallback.mp4", url)
+
+    def test_video_status_failure_detail_prefers_audio_failure_hint(self) -> None:
+        status = SimpleNamespace(
+            _raw={
+                "media": [
+                    {
+                        "mediaMetadata": {
+                            "mediaStatus": {
+                                "mediaGenerationStatus": "MEDIA_GENERATION_STATUS_FAILED",
+                                "errorMessage": "Audio generation failed. Please try a different prompt or send feedback.",
+                                "userFacingMessage": "You can update your settings to return silent videos.",
+                            }
+                        }
+                    }
+                ]
+            }
+        )
+
+        detail = self.service._video_status_failure_detail(status)
+
+        self.assertIn("Audio generation failed", detail)
+        self.assertIn("silent videos", detail)
+
+    def test_humanize_flow_error_maps_audio_generation_failure(self) -> None:
+        message = humanize_flow_error(
+            "Audio generation failed. Please try a different prompt or send feedback. "
+            "You can update your settings to return silent videos."
+        )
+
+        self.assertIn("phần tạo audio bị lỗi", message)
+        self.assertIn("video im lặng", message)
+
+    def test_classify_job_error_maps_audio_generation_failure(self) -> None:
+        snapshot = classify_job_error(
+            "Audio generation failed. Please try a different prompt or send feedback. "
+            "You can update your settings to return silent videos.",
+            job_type="video",
+        )
+
+        self.assertEqual("audio", snapshot.category)
+        self.assertEqual("Lỗi audio", snapshot.label)
+
+    def test_policy_preflight_notice_warns_for_minor_fashion_edit(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="ghép logo lên áo cho học sinh tuổi teen này và làm đẹp hơn",
+            reference_image_paths=["/tmp/model.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        notice = self.service._policy_preflight_notice(request)
+
+        self.assertIn("người chưa đủ tuổi", notice)
+        self.assertIn("mannequin", notice)
+
+    def test_policy_preflight_notice_warns_for_product_video_with_reference_images(self) -> None:
+        request = CreateJobRequest(
+            type="video",
+            prompt="cho logo này lên áo và làm người mẫu đẹp hơn",
+            reference_image_paths=["/tmp/shirt.png"],
+            reference_image_roles=["product"],
+        )
+
+        notice = self.service._policy_preflight_notice(request)
+
+        self.assertIn("ảnh tham chiếu", notice)
+        self.assertIn("người mẫu trưởng thành", notice)
 
     def test_default_title_marks_video_from_image(self) -> None:
         request = CreateJobRequest(
@@ -817,6 +886,34 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("https://example.com/video.mp4", saved.artifacts[0].url)
         self.assertEqual("video/mp4", saved.artifacts[0].mime_type)
 
+    async def test_enqueue_job_logs_policy_preflight_notice(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(
+            type="image",
+            prompt="ghép logo lên áo cho học sinh tuổi teen này và làm đẹp hơn",
+            reference_image_paths=["/tmp/model.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        started = asyncio.Event()
+
+        async def fake_run_flow_job(*args, **kwargs):
+            started.set()
+            await asyncio.sleep(60)
+
+        with patch.object(self.service, "_run_flow_job", side_effect=fake_run_flow_job):
+            job = await self.service.enqueue_job(request)
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertTrue(any("Cảnh báo an toàn" in log.message for log in saved.logs))
+        task = self.service._tasks.get(job.id)
+        self.assertIsNotNone(task)
+        await started.wait()
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
     async def test_run_flow_job_fails_when_video_submit_returns_too_few_jobs(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
         request = CreateJobRequest(type="video", prompt="cat", count=2)
@@ -878,6 +975,108 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIsNotNone(saved)
         self.assertEqual("failed", saved.status)
         self.assertIn("chưa gửi được yêu cầu tạo video", saved.error.lower())
+
+    async def test_run_flow_job_retries_audio_failure_with_no_audio_model(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        request = CreateJobRequest(type="video", prompt="cat cinematic", count=1, model="Veo 3.1 - Fast")
+        job = JobRecord(
+            type="video",
+            status="queued",
+            title=self.service._default_title(request),
+            input=request.model_dump(mode="json"),
+        )
+        await self.store.add_job(job)
+
+        video_job = SimpleNamespace(media_name="media-123", workflow_id="wf-123")
+        success_status = SimpleNamespace(
+            fife_url="",
+            download_url="",
+            url="",
+            media_name="media-123",
+            _raw={
+                "media": [
+                    {
+                        "video": {
+                            "generatedVideo": {
+                                "outputVideo": {
+                                    "fifeUrl": "https://example.com/video.mp4",
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+        )
+        fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[video_job]))
+
+        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+            return await fn(fake_client)
+
+        with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
+            self.service,
+            "_wait_for_video_with_progress",
+            AsyncMock(
+                side_effect=[
+                    RuntimeError(
+                        "Audio generation failed. Please try a different prompt or send feedback. "
+                        "You can update your settings to return silent videos."
+                    ),
+                    success_status,
+                ]
+            ),
+        ):
+            await self.service._run_flow_job(job.id, request)
+
+        self.assertEqual(2, fake_client.generate_video.await_count)
+        first_call = fake_client.generate_video.await_args_list[0]
+        second_call = fake_client.generate_video.await_args_list[1]
+        self.assertEqual("Veo 3.1 - Fast", first_call.kwargs["model"])
+        self.assertEqual("Veo 2 - Fast", second_call.kwargs["model"])
+
+        saved = self.store.get_job(job.id)
+        self.assertIsNotNone(saved)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual("Veo 2 - Fast", saved.result.get("model"))
+        self.assertEqual("Veo 3.1 - Fast", saved.result.get("fallback_from_model"))
+
+    async def test_wait_for_video_with_progress_surfaces_audio_failure_detail(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
+        job = JobRecord(type="video", status="queued", title="test audio fail")
+        await self.store.add_job(job)
+
+        status = SimpleNamespace(
+            status="MEDIA_GENERATION_STATUS_FAILED",
+            complete=False,
+            failed=True,
+            media_name="media-123",
+            _raw={
+                "media": [
+                    {
+                        "mediaMetadata": {
+                            "mediaStatus": {
+                                "mediaGenerationStatus": "MEDIA_GENERATION_STATUS_FAILED",
+                                "errorMessage": "Audio generation failed. Please try a different prompt or send feedback.",
+                                "userFacingMessage": "You can update your settings to return silent videos.",
+                            }
+                        }
+                    }
+                ]
+            },
+        )
+        client = SimpleNamespace(poll_video=AsyncMock(return_value=status))
+        video_job = SimpleNamespace(media_name="media-123")
+
+        with self.assertRaises(RuntimeError) as ctx:
+            await self.service._wait_for_video_with_progress(
+                client,
+                job.id,
+                video_job,
+                "Video 1",
+                poll_s=0.01,
+                timeout_s=30,
+            )
+
+        self.assertIn("phần tạo audio bị lỗi", str(ctx.exception))
 
     async def test_run_flow_job_uploads_reference_images_for_image_edit(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))

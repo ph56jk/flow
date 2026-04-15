@@ -21,6 +21,61 @@ const ASPECT_DETAILS = {
   portrait: { title: "Dọc 9:16", detail: "Reels, Shorts, TikTok" },
   square: { title: "Vuông 1:1", detail: "Feed, poster vuông, thumbnail" },
 };
+const POLICY_MINOR_TERMS = [
+  "tre vi thanh nien",
+  "vi thanh nien",
+  "tre em",
+  "em be",
+  "be gai",
+  "be trai",
+  "thieu nien",
+  "tuoi teen",
+  "teen",
+  "hoc sinh",
+  "minor",
+  "underage",
+  "child",
+  "kid",
+  "young girl",
+  "young boy",
+  "schoolgirl",
+  "school boy",
+];
+const POLICY_APPEARANCE_TERMS = [
+  "dep trai hon",
+  "dep gai hon",
+  "dep hon",
+  "lam dep",
+  "fashion",
+  "nguoi mau",
+  "model",
+  "sexy",
+  "goi cam",
+  "nong bong",
+  "makeup",
+  "trang diem",
+  "body",
+  "than hinh",
+  "bo kinh",
+  "thay do",
+  "mac do",
+  "mac ao",
+  "thu do",
+];
+const POLICY_APPAREL_TERMS = [
+  "ao",
+  "logo",
+  "dong phuc",
+  "quan ao",
+  "quan",
+  "vay",
+  "thoi trang",
+  "outfit",
+  "shirt",
+  "dress",
+  "clothing",
+  "fashion",
+];
 const VIDEO_INPUT_MODE_CONFIG = {
   prompt: {
     note: "Chỉ cần mô tả cảnh. App sẽ tạo video trực tiếp từ prompt.",
@@ -284,6 +339,11 @@ const elements = {
   promptInput: document.querySelector("#promptInput"),
   composerSummaryMode: document.querySelector("#composerSummaryMode"),
   composerSummaryText: document.querySelector("#composerSummaryText"),
+  composerPolicyNotice: document.querySelector("#composerPolicyNotice"),
+  composerPolicyPill: document.querySelector("#composerPolicyPill"),
+  composerPolicyTitle: document.querySelector("#composerPolicyTitle"),
+  composerPolicyText: document.querySelector("#composerPolicyText"),
+  composerPolicyList: document.querySelector("#composerPolicyList"),
   editActionStrip: document.querySelector("#editActionStrip"),
   editActionSummary: document.querySelector("#editActionSummary"),
   editActionSummaryTitle: document.querySelector("#editActionSummaryTitle"),
@@ -374,6 +434,68 @@ function normalizeProjectInput(value) {
   }
 
   return raw;
+}
+
+function normalizePolicyText(value) {
+  return String(value || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function policyTextHasAny(value, terms) {
+  const normalized = normalizePolicyText(value);
+  if (!normalized) {
+    return false;
+  }
+  return terms.some((term) => normalized.includes(term));
+}
+
+function currentComposerPolicyNotice() {
+  if (state.mode === "edit") {
+    return null;
+  }
+  const prompt = currentDraft().prompt || "";
+  const hasMinor = policyTextHasAny(prompt, POLICY_MINOR_TERMS);
+  const hasAppearance = policyTextHasAny(prompt, POLICY_APPEARANCE_TERMS);
+  const hasApparel = policyTextHasAny(prompt, POLICY_APPAREL_TERMS);
+  const hasReferenceImages = Boolean(state.startImagePath) || state.imageReferenceItems.length > 0;
+  const hasProductImages = state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "product");
+  const isProductVideoFlow = state.mode === "video" && currentVideoInputMode() === "reference";
+  const isImageEditFlow = state.mode === "image" && state.imageReferenceItems.length > 0;
+  const isStartVideoFlow = state.mode === "video" && currentVideoInputMode() === "start";
+
+  if (hasMinor && (hasAppearance || hasApparel || hasReferenceImages)) {
+    return {
+      tone: "warning",
+      pill: "Cảnh báo policy",
+      title: "Prompt này có nguy cơ bị Flow chặn vì liên quan người có thể chưa đủ tuổi.",
+      text: "Nếu ảnh hoặc mô tả ám chỉ người mẫu còn quá trẻ, Google Flow thường chặn các thao tác thay đồ, ghép logo lên áo, làm đẹp ngoại hình hoặc fashion edit.",
+      tips: [
+        "Đổi mô tả sang người mẫu trưởng thành rõ ràng, ví dụ: người mẫu trưởng thành 25 tuổi.",
+        "Nếu chỉ cần demo sản phẩm, dùng mannequin, flat-lay hoặc áo treo thay vì người thật.",
+        "Với luồng sản phẩm thành video, giữ ảnh sản phẩm nhưng mô tả rõ người mẫu trưởng thành.",
+      ],
+    };
+  }
+
+  if ((isProductVideoFlow || isImageEditFlow || isStartVideoFlow) && (hasAppearance || hasApparel || hasProductImages)) {
+    return {
+      tone: "watch",
+      pill: "Gợi ý an toàn",
+      title: "Flow có thể chặn nếu ảnh người mẫu trông quá trẻ.",
+      text: "Luồng hiện tại đang chạm vào thay đồ, làm đẹp hoặc dựng người mẫu từ sản phẩm. Nếu ảnh tham chiếu là người trông nhỏ tuổi, Google Flow hay từ chối ngay từ bước upload hoặc generate.",
+      tips: [
+        "Giữ mô tả theo hướng người mẫu trưởng thành, mannequin hoặc ảnh flat-lay.",
+        "Nếu chỉ muốn thử áo hoặc logo, dùng ảnh sản phẩm riêng thay vì ảnh người trông quá trẻ.",
+      ],
+    };
+  }
+
+  return null;
 }
 
 function formatTime(value) {
@@ -860,6 +982,7 @@ function renderComposerSummary() {
     } else {
       elements.composerSummaryText.textContent = "Chọn video cần chỉnh rồi bấm chạy.";
     }
+    renderComposerPolicyNotice();
     return;
   }
 
@@ -871,10 +994,12 @@ function renderComposerSummary() {
       const productCount = state.imageReferenceItems.filter((item) => item.role === "product").length;
       elements.composerSummaryMode.textContent = "Chỉnh ảnh từ ảnh tham chiếu";
       elements.composerSummaryText.textContent = `Đang dùng ${fileKindLabel(state.imageReferenceItems.length)} để ghép hoặc chỉnh bằng model ${modelLabel}. Ảnh chính là ${baseItem?.name || "ảnh đầu tiên"}${logoCount ? `, có thêm ${logoCount} logo` : ""}${productCount ? `, ${productCount} ảnh sản phẩm` : ""}.`;
+      renderComposerPolicyNotice();
       return;
     }
     elements.composerSummaryMode.textContent = "Ảnh từ prompt";
     elements.composerSummaryText.textContent = `App sẽ tạo ảnh trực tiếp từ mô tả vừa nhập bằng model ${modelLabel}.`;
+    renderComposerPolicyNotice();
     return;
   }
 
@@ -883,27 +1008,53 @@ function renderComposerSummary() {
     if (!state.imageReferenceItems.length) {
       elements.composerSummaryMode.textContent = "Sản phẩm -> người mẫu -> video";
       elements.composerSummaryText.textContent = `Thêm ít nhất 1 ảnh sản phẩm, logo hoặc ảnh tham chiếu. App sẽ tự dựng khung đầu rồi tạo video bằng model ${videoModelLabel}.`;
+      renderComposerPolicyNotice();
       return;
     }
     const productCount = state.imageReferenceItems.filter((item) => normalizeReferenceRole(item.role) === "product").length;
     const logoCount = state.imageReferenceItems.filter((item) => normalizeReferenceRole(item.role) === "logo").length;
     elements.composerSummaryMode.textContent = "Sản phẩm -> người mẫu -> video";
     elements.composerSummaryText.textContent = `App sẽ tự dựng một ảnh khung đầu từ ${fileKindLabel(state.imageReferenceItems.length)} rồi tạo video luôn bằng model ${videoModelLabel}.${productCount ? ` Có ${productCount} ảnh sản phẩm` : ""}${logoCount ? ` và ${logoCount} logo` : ""}.`;
+    renderComposerPolicyNotice();
     return;
   }
   if (currentVideoInputMode() === "start") {
     if (!state.startImagePath) {
       elements.composerSummaryMode.textContent = "Video từ ảnh";
       elements.composerSummaryText.textContent = `Chọn một ảnh đầu vào để app animate từ khung đầu tiên bằng model ${videoModelLabel}.`;
+      renderComposerPolicyNotice();
       return;
     }
     elements.composerSummaryMode.textContent = "Video từ ảnh";
     elements.composerSummaryText.textContent = `Đang dùng ${state.startImageName || "ảnh đầu vào"} làm khung đầu tiên bằng model ${videoModelLabel}.`;
+    renderComposerPolicyNotice();
     return;
   }
 
   elements.composerSummaryMode.textContent = "Video từ prompt";
   elements.composerSummaryText.textContent = `Không có ảnh đầu vào. App sẽ tạo video trực tiếp từ mô tả vừa nhập bằng model ${videoModelLabel}.`;
+  renderComposerPolicyNotice();
+}
+
+function renderComposerPolicyNotice() {
+  const notice = currentComposerPolicyNotice();
+  if (!notice) {
+    elements.composerPolicyNotice.hidden = true;
+    elements.composerPolicyNotice.dataset.tone = "";
+    elements.composerPolicyPill.textContent = "";
+    elements.composerPolicyTitle.textContent = "";
+    elements.composerPolicyText.textContent = "";
+    elements.composerPolicyList.innerHTML = "";
+    return;
+  }
+  elements.composerPolicyNotice.hidden = false;
+  elements.composerPolicyNotice.dataset.tone = notice.tone || "watch";
+  elements.composerPolicyPill.textContent = notice.pill || "Gợi ý an toàn";
+  elements.composerPolicyTitle.textContent = notice.title || "";
+  elements.composerPolicyText.textContent = notice.text || "";
+  elements.composerPolicyList.innerHTML = (notice.tips || [])
+    .map((tip) => `<li>${escapeHtml(tip)}</li>`)
+    .join("");
 }
 
 function renderUploadStatus() {
@@ -2441,6 +2592,7 @@ elements.storyboardMustInclude.addEventListener("input", syncStoryboardDraftFrom
 elements.storyboardAvoid.addEventListener("input", syncStoryboardDraftFromForm);
 elements.storyboardSceneCount.addEventListener("change", syncStoryboardDraftFromForm);
 elements.promptInput.addEventListener("input", syncDraftFromForm);
+elements.promptInput.addEventListener("input", renderComposerSummary);
 elements.modelSelect.addEventListener("change", () => {
   syncDraftFromForm();
   renderComposerSummary();

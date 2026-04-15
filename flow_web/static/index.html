@@ -10,7 +10,7 @@
       href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260414e" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260415a" />
   </head>
   <body>
     <div class="app-shell">
@@ -132,6 +132,15 @@
               <span class="mini-pill" id="composerSummaryMode">Video từ prompt</span>
               <p id="composerSummaryText">Không có ảnh đầu vào. App sẽ tạo từ mô tả vừa nhập.</p>
             </div>
+
+            <section class="policy-notice" id="composerPolicyNotice" hidden>
+              <div class="policy-notice-head">
+                <span class="mini-pill" id="composerPolicyPill">Gợi ý an toàn</span>
+                <strong id="composerPolicyTitle">Flow có thể chặn nếu ảnh trông quá trẻ.</strong>
+              </div>
+              <p id="composerPolicyText"></p>
+              <ul id="composerPolicyList" class="policy-notice-list"></ul>
+            </section>
 
             <form id="composerForm" class="composer-form">
               <div id="editActionStrip" class="action-strip" hidden>

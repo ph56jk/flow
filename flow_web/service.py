@@ -130,6 +130,61 @@ class FlowWebService:
         "imagen3": "IMAGEN_3",
         "imagen_3": "IMAGEN_3",
     }
+    POLICY_MINOR_TERMS = (
+        "tre vi thanh nien",
+        "vi thanh nien",
+        "tre em",
+        "em be",
+        "be gai",
+        "be trai",
+        "thieu nien",
+        "tuoi teen",
+        "teen",
+        "hoc sinh",
+        "minor",
+        "underage",
+        "child",
+        "kid",
+        "young girl",
+        "young boy",
+        "schoolgirl",
+        "school boy",
+    )
+    POLICY_APPEARANCE_TERMS = (
+        "dep trai hon",
+        "dep gai hon",
+        "dep hon",
+        "lam dep",
+        "fashion",
+        "nguoi mau",
+        "model",
+        "sexy",
+        "goi cam",
+        "nong bong",
+        "makeup",
+        "trang diem",
+        "body",
+        "than hinh",
+        "bo kinh",
+        "thay do",
+        "mac do",
+        "mac ao",
+        "thu do",
+    )
+    POLICY_APPAREL_TERMS = (
+        "ao",
+        "logo",
+        "dong phuc",
+        "quan ao",
+        "quan",
+        "vay",
+        "thoi trang",
+        "outfit",
+        "shirt",
+        "dress",
+        "clothing",
+        "fashion",
+    )
     REFERENCE_IMAGE_ROLES = ("base", "logo", "product", "reference")
     REFERENCE_IMAGE_ROLE_LABELS = {
         "base": "ảnh chính",
@@ -1054,6 +1109,9 @@ class FlowWebService:
                 job.id,
                 f"Đã clone payload từ job {source_job.id[:8]} để tạo lần chạy lại mới.",
             )
+        policy_notice = self._policy_preflight_notice(request)
+        if policy_notice:
+            await self.store.append_log(job.id, policy_notice)
         self._tasks[job.id] = asyncio.create_task(self._run_flow_job(job.id, request))
         return job
 
@@ -2662,6 +2720,7 @@ exit 1
 
             if request.type == "video":
                 requested_count = max(1, int(request.count or 1))
+                requested_model = self._normalize_video_model(request.model)
                 effective_start_image_path = str(request.start_image_path or "").strip()
                 if not effective_start_image_path and (request.reference_image_paths or request.reference_media_names):
                     effective_start_image_path, _ = await self._prepare_video_start_image_from_references(
@@ -2674,67 +2733,104 @@ exit 1
                         "sending_request",
                         "Ảnh khung đầu đã sẵn sàng. Em đang gửi yêu cầu tạo video từ ảnh vừa dựng.",
                     )
-                if effective_start_image_path:
-                    send_timeout_s = timeout_s
-                else:
-                    send_timeout_s = max(30, min(timeout_s, 90 * requested_count))
-                if effective_start_image_path:
-                    await self.store.append_log(job_id, "Đang chuẩn bị tải ảnh đầu vào và gắn vào ô Start.")
+
+                async def _run_video_attempt(model_label: str, *, fallback_from: str = "") -> Dict[str, Any]:
+                    if effective_start_image_path:
+                        send_timeout_s = timeout_s
+                    else:
+                        send_timeout_s = max(30, min(timeout_s, 90 * requested_count))
+
+                    if effective_start_image_path:
+                        await self.store.append_log(job_id, "Đang chuẩn bị tải ảnh đầu vào và gắn vào ô Start.")
+                        await self._set_job_progress(
+                            job_id,
+                            "sending_request",
+                            f"Em đang tải ảnh đầu vào lên Flow rồi gửi video bằng model {model_label}.",
+                        )
+                    else:
+                        await self._set_job_progress(
+                            job_id,
+                            "sending_request",
+                            f"Em đang gửi yêu cầu tạo video tới Flow bằng model {model_label}.",
+                        )
+
+                    try:
+                        jobs = await asyncio.wait_for(
+                            client.generate_video(
+                                request.prompt,
+                                model=model_label,
+                                aspect=request.aspect,
+                                count=request.count,
+                                start_image=effective_start_image_path or None,
+                                timeout_s=timeout_s,
+                            ),
+                            timeout=send_timeout_s,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise RuntimeError(
+                            f"Google Flow chưa gửi được yêu cầu tạo video sau {send_timeout_s} giây. "
+                            "Có thể Flow đang kẹt ở bước tải ảnh, gắn ảnh vào Start hoặc bấm Create."
+                        ) from exc
+
+                    if not jobs:
+                        raise RuntimeError("Google Flow chưa khởi tạo được clip video nào từ yêu cầu này.")
+                    if len(jobs) < requested_count:
+                        raise RuntimeError(
+                            f"Google Flow chỉ khởi tạo {len(jobs)}/{requested_count} clip trong lượt gửi này. "
+                            "Em không tự bấm gửi thêm để tránh tạo dư clip ngoài ý muốn. Hãy thử chạy lại."
+                        )
+
+                    await self.store.append_log(job_id, f"Đã gửi {len(jobs)} tác vụ tạo video bằng model {model_label}")
+                    await self._set_job_progress(
+                        job_id,
+                        "awaiting_response",
+                        f"Flow đã nhận yêu cầu tạo video bằng model {model_label}. Đang chờ tín hiệu tiến trình đầu tiên.",
+                    )
+                    statuses = await asyncio.gather(
+                        *[
+                            self._wait_for_video_with_progress(
+                                client,
+                                job_id,
+                                job,
+                                f"Video {index + 1}",
+                                poll_s=poll_s,
+                                timeout_s=timeout_s,
+                            )
+                            for index, job in enumerate(jobs)
+                        ]
+                    )
+                    payload: Dict[str, Any] = {
+                        "video_jobs": jobs,
+                        "statuses": statuses,
+                        "used_model": model_label,
+                    }
+                    if fallback_from:
+                        payload["fallback_from_model"] = fallback_from
+                    return payload
+
+                try:
+                    return await _run_video_attempt(requested_model)
+                except Exception as exc:
+                    fallback_model = self._audio_fallback_video_model(requested_model)
+                    if not self._is_audio_generation_failure(str(exc)) or not fallback_model:
+                        raise
+
+                    await self.store.append_log(
+                        job_id,
+                        f"Flow vấp ở bước audio với model {requested_model}. Em đang tự thử lại bằng {fallback_model}.",
+                    )
                     await self._set_job_progress(
                         job_id,
                         "sending_request",
-                        "Em đang tải ảnh đầu vào lên Flow rồi mới gửi yêu cầu tạo video.",
+                        f"Flow bị lỗi audio với model {requested_model}. Em đang tự thử lại bằng {fallback_model} để lấy video im lặng.",
                     )
-                else:
-                    await self._set_job_progress(job_id, "sending_request", "Em đang gửi yêu cầu tạo video tới Flow.")
-
-                try:
-                    jobs = await asyncio.wait_for(
-                        client.generate_video(
-                            request.prompt,
-                            model=self._normalize_video_model(request.model),
-                            aspect=request.aspect,
-                            count=request.count,
-                            start_image=effective_start_image_path or None,
-                            timeout_s=timeout_s,
-                        ),
-                        timeout=send_timeout_s,
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise RuntimeError(
-                        f"Google Flow chưa gửi được yêu cầu tạo video sau {send_timeout_s} giây. "
-                        "Có thể Flow đang kẹt ở bước tải ảnh, gắn ảnh vào Start hoặc bấm Create."
-                    ) from exc
-                if not jobs:
-                    raise RuntimeError("Google Flow chưa khởi tạo được clip video nào từ yêu cầu này.")
-                if len(jobs) < requested_count:
-                    raise RuntimeError(
-                        f"Google Flow chỉ khởi tạo {len(jobs)}/{requested_count} clip trong lượt gửi này. "
-                        "Em không tự bấm gửi thêm để tránh tạo dư clip ngoài ý muốn. Hãy thử chạy lại."
-                    )
-                await self.store.append_log(job_id, f"Đã gửi {len(jobs)} tác vụ tạo video")
-                await self._set_job_progress(
-                    job_id,
-                    "awaiting_response",
-                    "Flow đã nhận yêu cầu tạo video. Đang chờ tín hiệu tiến trình đầu tiên.",
-                )
-                statuses = await asyncio.gather(
-                    *[
-                        self._wait_for_video_with_progress(
-                            client,
-                            job_id,
-                            job,
-                            f"Video {index + 1}",
-                            poll_s=poll_s,
-                            timeout_s=timeout_s,
-                        )
-                        for index, job in enumerate(jobs)
-                    ]
-                )
-                return {
-                    "video_jobs": jobs,
-                    "statuses": statuses,
-                }
+                    try:
+                        return await _run_video_attempt(fallback_model, fallback_from=requested_model)
+                    except Exception as retry_exc:
+                        retry_detail = humanize_flow_error(str(retry_exc).strip()) or str(retry_exc).strip()
+                        raise RuntimeError(
+                            f"Flow bị lỗi audio với model {requested_model}. Em đã tự thử lại bằng {fallback_model} nhưng vẫn chưa lấy được clip. {retry_detail}"
+                        ) from retry_exc
 
             if request.type == "image":
                 reference_media_names = await self._resolve_image_reference_media(client, job_id, request)
@@ -2951,7 +3047,10 @@ exit 1
                     "count": len(artifacts),
                     "mode": "video",
                     "missing_count": len(missing_labels),
+                    "model": payload.get("used_model") or self._normalize_video_model(request.model),
                 }
+                if payload.get("fallback_from_model"):
+                    result["fallback_from_model"] = payload["fallback_from_model"]
             else:
                 job = payload["video_job"]
                 status = payload["status"]
@@ -3053,6 +3152,107 @@ exit 1
         fallback_media_name = str(media_name or getattr(status, "media_name", "") or "").strip()
         if fallback_media_name:
             return f"https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name={quote(fallback_media_name)}"
+        return ""
+
+    def _is_audio_generation_failure(self, message: str) -> bool:
+        lowered = str(message or "").strip().lower()
+        if not lowered:
+            return False
+        return (
+            "audio generation failed" in lowered
+            or "return silent videos" in lowered
+            or ("audio" in lowered and "failed" in lowered)
+            or ("audio" in lowered and "silent" in lowered)
+            or "phần tạo audio bị lỗi" in lowered
+            or "âm thanh bị lỗi" in lowered
+            or "video im lặng" in lowered
+            or "model không audio" in lowered
+        )
+
+    def _audio_fallback_video_model(self, model: str) -> str:
+        normalized = self._normalize_video_model(model)
+        mapping = {
+            "Veo 3.1 - Fast": "Veo 2 - Fast",
+            "Veo 3.1 - Quality": "Veo 2 - Quality",
+            "Veo 3.1 - Fast [Lower Priority]": "Veo 2 - Fast",
+        }
+        fallback = mapping.get(normalized, "")
+        if fallback == normalized:
+            return ""
+        return fallback
+
+    def _video_status_failure_detail(self, status: Any) -> str:
+        raw_status = getattr(status, "_raw", {}) or {}
+        if not isinstance(raw_status, dict):
+            return ""
+
+        preferred_fields = {
+            "message",
+            "messages",
+            "detail",
+            "details",
+            "error",
+            "errors",
+            "errormessage",
+            "failuremessage",
+            "failurereason",
+            "reason",
+            "description",
+            "statusmessage",
+            "usermessage",
+            "userfacingmessage",
+            "localizedmessage",
+            "displaymessage",
+            "title",
+        }
+        seen: set[str] = set()
+        audio_messages: list[str] = []
+        preferred_messages: list[str] = []
+        generic_messages: list[str] = []
+
+        def add_message(target: list[str], value: str) -> None:
+            normalized = " ".join(str(value or "").split()).strip()
+            if not normalized:
+                return
+            lowered = normalized.lower()
+            if lowered in seen:
+                return
+            if lowered in {
+                "media_generation_status_failed",
+                "media_generation_status_rejected",
+                "failed",
+                "rejected",
+            }:
+                return
+            seen.add(lowered)
+            target.append(normalized)
+
+        def visit(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    key_lower = str(key or "").strip().lower()
+                    if isinstance(value, str):
+                        lowered = value.strip().lower()
+                        if self._is_audio_generation_failure(value):
+                            add_message(audio_messages, value)
+                        elif key_lower in preferred_fields:
+                            add_message(preferred_messages, value)
+                        elif any(token in lowered for token in ("failed", "error", "rejected")):
+                            add_message(generic_messages, value)
+                    else:
+                        visit(value)
+            elif isinstance(node, list):
+                for item in node:
+                    visit(item)
+
+        visit(raw_status)
+
+        if audio_messages:
+            return " ".join(audio_messages[:2])
+        if preferred_messages:
+            return preferred_messages[0]
+        if generic_messages:
+            return generic_messages[0]
         return ""
 
     async def _with_client(
@@ -3499,6 +3699,39 @@ exit 1
                         return True
             return False
 
+        async def _compat_click_visible_surface_control(page: Any, labels: List[str]) -> bool:
+            wanted_labels = [str(label or "").strip() for label in labels if str(label or "").strip()]
+            if not wanted_labels:
+                return False
+
+            locators = []
+            for label in wanted_labels:
+                pattern = re.compile(re.escape(label), re.I)
+                locators.extend(
+                    [
+                        page.locator('[role="tab"]').filter(has_text=pattern),
+                        page.locator('button').filter(has_text=pattern),
+                        page.locator('[role="button"]').filter(has_text=pattern),
+                        page.locator('div[type="button"]').filter(has_text=pattern),
+                    ]
+                )
+
+            for locator in locators:
+                candidate = await _compat_visible_locator(locator)
+                if candidate is None:
+                    continue
+                try:
+                    await candidate.scroll_into_view_if_needed()
+                except Exception:
+                    pass
+                try:
+                    await candidate.click(force=True)
+                    await asyncio.sleep(0.5)
+                    return True
+                except Exception:
+                    continue
+            return False
+
         async def _compat_click_visible_menu_item(page: Any, wanted: str) -> bool:
             wanted = str(wanted or "").strip().lower()
             items = page.locator('[role="menuitem"]')
@@ -3622,7 +3855,26 @@ exit 1
                 GenerationMode.VIDEO: ["Video"],
                 GenerationMode.FRAME_TO_VIDEO: ["Frames", "Frame", "Khung hình", "Khung"],
             }
-            return await _compat_click_menu_tab(page, label_map.get(mode, []))
+            target_labels = label_map.get(mode, [])
+            if await _compat_click_menu_tab(page, target_labels):
+                return True
+
+            if mode == GenerationMode.FRAME_TO_VIDEO:
+                video_labels = label_map.get(GenerationMode.VIDEO, [])
+                if await _compat_click_visible_surface_control(page, video_labels):
+                    await _compat_open_settings_panel(_self, page)
+                    if await _compat_click_menu_tab(page, target_labels):
+                        return True
+                if await _compat_click_visible_surface_control(page, target_labels):
+                    return True
+                await _compat_open_settings_panel(_self, page)
+                return await _compat_click_menu_tab(page, target_labels)
+
+            if await _compat_click_visible_surface_control(page, target_labels):
+                return True
+
+            await _compat_open_settings_panel(_self, page)
+            return await _compat_click_menu_tab(page, target_labels)
 
         async def _compat_set_aspect_ratio(_self: Any, page: Any, ratio: Any) -> bool:
             await _compat_open_settings_panel(_self, page)
@@ -6358,6 +6610,46 @@ exit 1
             return self._normalize_image_model(model)
         return str(model or "").strip()
 
+    def _normalize_policy_text(self, value: str) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        normalized = unicodedata.normalize("NFD", raw)
+        normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
+        normalized = re.sub(r"[^a-zA-Z0-9\s]", " ", normalized).lower()
+        return re.sub(r"\s+", " ", normalized).strip()
+
+    def _policy_text_has_any(self, text: str, terms: tuple[str, ...]) -> bool:
+        if not text:
+            return False
+        return any(term in text for term in terms)
+
+    def _policy_preflight_notice(self, request: CreateJobRequest) -> str:
+        normalized_prompt = self._normalize_policy_text(request.prompt)
+        has_minor = self._policy_text_has_any(normalized_prompt, self.POLICY_MINOR_TERMS)
+        has_appearance = self._policy_text_has_any(normalized_prompt, self.POLICY_APPEARANCE_TERMS)
+        has_apparel = self._policy_text_has_any(normalized_prompt, self.POLICY_APPAREL_TERMS)
+        normalized_roles = self._normalize_reference_image_roles(
+            list(request.reference_image_paths or []),
+            list(request.reference_image_roles or []),
+        )
+        has_reference_images = bool(request.start_image_path or request.reference_image_paths or request.reference_media_names)
+        has_product_images = any(role == "product" for role in normalized_roles)
+
+        if has_minor and (has_appearance or has_apparel or has_reference_images):
+            return (
+                "Cảnh báo an toàn: prompt này có nguy cơ bị Google Flow chặn nếu ảnh hoặc mô tả ám chỉ người chưa đủ tuổi. "
+                "Nếu đang làm quần áo, logo hoặc beauty edit, hãy đổi sang người mẫu trưởng thành rõ ràng, mannequin hoặc flat-lay."
+            )
+
+        if has_reference_images and (has_appearance or has_apparel or has_product_images):
+            return (
+                "Gợi ý an toàn: nếu ảnh tham chiếu là người trông quá trẻ, Google Flow thường chặn các ca thay đồ, ghép logo lên áo hoặc làm đẹp ngoại hình. "
+                "Chủ nhân nên dùng người mẫu trưởng thành, mannequin hoặc ảnh sản phẩm riêng."
+            )
+
+        return ""
+
     def _image_api_model_name(self, model: str) -> str:
         return self._normalize_image_model(model)
 
@@ -7065,6 +7357,7 @@ exit 1
             status = await client.poll_video(video_job.media_name)
             remote_state = getattr(status, "status", "")
             state_message = self._describe_remote_status(remote_state)
+            failure_detail = humanize_flow_error(self._video_status_failure_detail(status))
 
             should_log = remote_state != last_state or (elapsed - last_logged_at) >= max(15.0, poll_s * 3)
             if should_log:
@@ -7077,13 +7370,14 @@ exit 1
                     )
                     await self.store.append_log(job_id, f"{label}: đã hoàn tất sau {int(elapsed)} giây.")
                 elif getattr(status, "failed", False):
+                    log_message = failure_detail or f"Flow báo thất bại với trạng thái {state_message}."
                     await self._set_job_progress(
                         job_id,
                         "polling",
-                        f"{label}: Flow báo thất bại với trạng thái {state_message}.",
+                        f"{label}: {log_message}",
                         remote_status=remote_state,
                     )
-                    await self.store.append_log(job_id, f"{label}: thất bại với trạng thái {state_message}.")
+                    await self.store.append_log(job_id, f"{label}: {log_message}")
                 else:
                     await self._set_job_progress(
                         job_id,
@@ -7105,7 +7399,7 @@ exit 1
                 return status
 
             if getattr(status, "failed", False):
-                raise RuntimeError(f"{label} thất bại với trạng thái {state_message}.")
+                raise RuntimeError(failure_detail or f"{label} thất bại với trạng thái {state_message}.")
 
             await asyncio.sleep(poll_s)
 
