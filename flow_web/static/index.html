@@ -3,913 +3,378 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Flow v2</title>
+    <title>Flow Etsy Console</title>
     <link rel="icon" href="data:," />
+    <script>
+      if (window.location.protocol === "file:") {
+        window.location.replace("http://127.0.0.1:8000/");
+      }
+    </script>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;700&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap"
       rel="stylesheet"
     />
-    <link rel="stylesheet" href="/static/styles.css?v=20260520f" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260701-amazon-flow" />
   </head>
-  <body class="flow-dashboard">
-    <div class="app-shell">
+  <body>
+    <div class="shell">
       <header class="topbar">
-        <div class="brand">
-          <div class="brand-mark" aria-hidden="true">
-            <span></span>
-            <span></span>
-            <span></span>
-            <span></span>
-          </div>
-          <div class="brand-copy">
-            <p class="eyebrow" id="automationBrandEyebrow">Flow v2</p>
-            <h1 id="automationBrandTitle">Flow v2</h1>
-            <p class="subcopy" id="topbarHint">Lưu project một lần rồi chỉ việc nhập prompt.</p>
-          </div>
+        <div>
+          <p class="kicker">Flow / Etsy</p>
+          <h1>Làm theo từng bước</h1>
+          <nav class="tool-switcher" aria-label="Chọn tool">
+            <a href="/" data-tool-link="combined">Tổng hợp</a>
+            <a href="/flow" data-tool-link="flow">Flow</a>
+            <a href="/etsy" data-tool-link="etsy">Etsy</a>
+            <a href="/amazon" data-tool-link="amazon">Amazon</a>
+          </nav>
         </div>
-
-        <div class="topbar-actions">
-          <label class="scenario-toggle" title="Bật/tắt luồng tự động trong giao diện">
-            <span>Inactive</span>
-            <input type="checkbox" id="automationEnabled" />
-            <i aria-hidden="true"></i>
-          </label>
-          <span class="status-pill" id="projectStatus">Chưa có project</span>
-          <span class="status-pill" id="authStatus">Chưa đăng nhập</span>
-          <button type="button" class="ghost-button" id="openFlowButton">Mở Flow</button>
-          <button type="button" class="ghost-button" id="logoutButton" hidden>Đăng xuất</button>
-          <button type="button" class="ghost-button" id="setupToggle">Thiết lập</button>
+        <div class="top-status">
+          <span class="pill" id="healthPill">Backend</span>
+          <span class="pill" id="flowPill">Flow</span>
+          <span class="pill" id="etsyPill">Etsy</span>
+          <button class="icon-button" id="refreshButton" type="button" title="Làm mới">↻</button>
         </div>
       </header>
 
-      <div id="messageBar" class="message-bar global-message" hidden></div>
-
-      <section class="scenario-workbench" aria-label="Flow automation dashboard">
-        <div class="scenario-primary">
-          <div class="scenario-nav">
-            <div class="scenario-tabs" role="tablist" aria-label="Automation views">
-	              <button type="button" class="scenario-tab active" data-automation-view="diagram">Sơ đồ</button>
-	              <button type="button" class="scenario-tab" data-automation-view="history">Lịch sử</button>
-	              <button type="button" class="scenario-tab" data-automation-view="incomplete">Cần xem lại</button>
-            </div>
-            <div class="scenario-toolbar">
-	              <button type="button" class="ghost-button" id="automationUseStudioButton">Sửa cục</button>
-	              <button type="button" class="ghost-button" id="automationOpenFlowButton">Mở Flow</button>
-	              <button type="button" class="ghost-button danger-button" id="automationResetReadyButton">Reset Ready</button>
-	              <button type="button" class="ghost-button" id="automationAutoRunButton">Auto Trello</button>
-	              <button type="button" class="secondary-button" id="automationRunButton">Chạy thử</button>
-	            </div>
-	          </div>
-
-	          <section class="easy-panel" id="automationEasyPanel" aria-label="Thao tác nhanh">
-	            <button type="button" class="easy-step" id="easyPromptButton">
-	              <span>1</span>
-	              <strong>Lấy prompt</strong>
-	              <small id="easyPromptStatus">Chưa có prompt</small>
-	            </button>
-	            <button type="button" class="easy-step" id="easyFlowButton">
-	              <span>2</span>
-	              <strong>Flow</strong>
-	              <small id="easyFlowStatus">Chưa đăng nhập</small>
-	            </button>
-	            <button type="button" class="easy-step" id="easyReviewButton">
-	              <span>3</span>
-	              <strong>Duyệt / lưu</strong>
-	              <small id="easyReviewStatus">Tuỳ chọn</small>
-	            </button>
-	            <button type="button" class="easy-step easy-step-run" id="easyRunButton">
-	              <span>4</span>
-	              <strong>Tạo ảnh</strong>
-	              <small>Bấm để chạy</small>
-	            </button>
-	          </section>
-
-          <div class="scenario-canvas" id="scenarioCanvas">
-            <div class="scenario-canvas-tools" aria-label="Điều khiển sơ đồ">
-              <button type="button" class="canvas-tool-button" id="automationZoomOut" title="Thu nhỏ sơ đồ">−</button>
-              <button type="button" class="canvas-tool-button canvas-zoom-label" id="automationZoomReset" title="Đưa zoom về 100%">100%</button>
-              <button type="button" class="canvas-tool-button" id="automationZoomIn" title="Phóng to sơ đồ">+</button>
-              <button type="button" class="canvas-tool-button" id="automationFitButton" title="Căn sơ đồ vừa màn hình">Vừa</button>
-            </div>
-            <div class="scenario-node-row" aria-label="Automation modules">
-              <button type="button" class="scenario-node" data-scenario-step="source">
-                <span class="node-icon node-icon-trello">T</span>
-                <strong id="nodeTitleSource">Flow AI Prompt</strong>
-                <small id="nodeDetailSource">Flow AI tự viết prompt</small>
-              </button>
-              <span class="scenario-link" aria-hidden="true"></span>
-              <button type="button" class="scenario-node" data-scenario-step="trello_source">
-                <span class="node-icon node-icon-trello">TS</span>
-                <strong id="nodeTitleTrelloSource">Trello Image Source</strong>
-                <small id="nodeDetailTrelloSource">Lấy ảnh gốc từ card</small>
-              </button>
-              <span class="scenario-link" aria-hidden="true"></span>
-              <button type="button" class="scenario-node" data-scenario-step="normalize">
-                <span class="node-icon node-icon-sheet">S</span>
-                <strong id="nodeTitleNormalize">Normalize Prompt</strong>
-                <small id="nodeDetailNormalize">Lọc dòng, lấy prompt mới</small>
-              </button>
-              <span class="scenario-link" aria-hidden="true"></span>
-              <button type="button" class="scenario-node active" data-scenario-step="flow">
-                <span class="node-icon node-icon-flow">F</span>
-                <strong id="nodeTitleFlow">Google Flow</strong>
-                <small id="nodeDetailFlow">Tạo ảnh thay Gemini</small>
-              </button>
-              <span class="scenario-link" aria-hidden="true"></span>
-              <button type="button" class="scenario-node" data-scenario-step="telegram">
-                <span class="node-icon node-icon-telegram">TG</span>
-                <strong id="nodeTitleTelegram">Telegram Review</strong>
-                <small id="nodeDetailTelegram">Gửi ảnh để duyệt</small>
-              </button>
-              <span class="scenario-link" aria-hidden="true"></span>
-              <button type="button" class="scenario-node" data-scenario-step="log">
-                <span class="node-icon node-icon-log">L</span>
-                <strong id="nodeTitleLog">Trello Archive</strong>
-                <small id="nodeDetailLog">Lưu ảnh vào card/list Trello</small>
-              </button>
-            </div>
-
-            <div class="break-route" aria-hidden="true">
-              <span></span>
-              <button type="button" class="break-node" data-scenario-step="review_hold">Pause for approval</button>
-            </div>
+      <main class="steps">
+        <section class="step-card setup-flow">
+          <button class="step-main" id="flowStatusButton" type="button">
+            <span class="step-no">1</span>
+            <span>
+              <strong>Flow</strong>
+              <small id="flowDetail">Bấm để setup Flow</small>
+            </span>
+            <em id="flowState">...</em>
+          </button>
+          <div class="step-actions">
+            <button id="openLoginButton" type="button">Login Google</button>
+            <button id="openFlowButton" type="button">Mở Flow</button>
           </div>
+        </section>
 
-          <section class="scenario-view-panel" id="scenarioHistoryPanel" hidden>
-            <div class="scenario-panel-head">
-              <div>
-                <p class="eyebrow">History</p>
-                <h2>Lịch sử chạy ảnh</h2>
-              </div>
-              <button type="button" class="ghost-button card-button" id="automationHistoryRefreshButton">Refresh</button>
-            </div>
-            <div id="automationHistoryPanelList" class="scenario-table-list"></div>
-          </section>
-
-          <section class="scenario-view-panel" id="scenarioIncompletePanel" hidden>
-            <div class="scenario-panel-head">
-              <div>
-                <p class="eyebrow">Incomplete executions</p>
-                <h2>Lượt cần xem lại</h2>
-              </div>
-              <button type="button" class="ghost-button card-button" id="automationIncompleteRefreshButton">Refresh</button>
-            </div>
-            <div id="automationIncompletePanelList" class="scenario-table-list"></div>
-          </section>
-
-          <div class="automation-command">
-            <label class="field wide prompt-field compact-prompt">
-              <span>Prompt để chạy thử luồng Flow</span>
-              <textarea
-                id="automationPromptInput"
-                rows="3"
-                placeholder="Tùy chọn. Nếu để trống, Flow AI sẽ tự viết prompt từ ảnh Trello."
-              ></textarea>
-            </label>
-            <div class="automation-command-side">
-              <label class="field">
-                <span>Nguồn prompt</span>
-                <select id="automationSourceType">
-                  <option value="flow_ai">Flow AI tự viết prompt</option>
-                  <option value="manual">Nhập tay / clipboard</option>
-                  <option value="trello">Trello list</option>
-                  <option value="sheets">Google Sheets tùy chọn</option>
-                  <option value="folder">Folder / CSV nội bộ</option>
-                </select>
-              </label>
-              <button type="button" id="automationRunImageButton">Tạo ảnh bằng Flow</button>
-            </div>
+        <section class="step-card setup-etsy">
+          <button class="step-main" id="etsyStatusButton" type="button">
+            <span class="step-no">2</span>
+            <span>
+              <strong>Máy ảo Etsy</strong>
+              <small id="etsyDetail">Extension nằm trên VM, máy này chỉ gửi queue</small>
+            </span>
+            <em id="etsyState">...</em>
+          </button>
+          <div class="step-actions">
+            <button id="connectEtsyTopButton" type="button">Xem queue</button>
+            <button id="previewEtsyButton" type="button">Preview payload</button>
+            <button id="saveEtsyShortcutButton" type="button">Nâng cao</button>
           </div>
+        </section>
 
-          <div class="scenario-usage">
-            <div>
-              <span id="automationImageTotalCount">0</span>
-              <small>Ảnh đã tạo</small>
-            </div>
-            <div>
-              <span id="automationActiveCount">0</span>
-              <small>Đang chạy</small>
-            </div>
-            <div>
-              <span id="automationFailureCount">0</span>
-              <small>Cần xem lại</small>
-            </div>
-            <svg viewBox="0 0 680 96" role="img" aria-label="Recent usage chart">
-              <polyline points="0,82 44,82 88,82 132,80 176,52 220,18 264,28 308,72 352,84 396,84 440,40 484,52 528,78 572,82 616,80 680,82" />
-              <polyline class="usage-line-alt" points="0,84 44,84 88,83 132,82 176,66 220,22 264,20 308,44 352,82 396,84 440,60 484,30 528,68 572,82 616,83 680,82" />
-            </svg>
-          </div>
-        </div>
+        <section class="step-card check-step">
+          <button class="step-main" id="preflightButton" type="button">
+            <span class="step-no">3</span>
+            <span>
+              <strong>Kiểm tra</strong>
+              <small>Bot sẽ báo thiếu gì trước khi chạy</small>
+            </span>
+            <em>Check</em>
+          </button>
+        </section>
 
-        <aside class="scenario-sidebar" aria-label="Scenario properties">
-          <section class="inspector-section">
-            <div class="inspector-head">
-              <p class="eyebrow">Scenario usage</p>
-              <button type="button" class="ghost-button card-button" id="automationRefreshButton">Refresh</button>
-            </div>
-            <div class="usage-metrics">
-              <p><strong id="automationCompletedCount">0</strong> images</p>
-              <p><strong id="automationTransferHint">Flow</strong> generator</p>
-            </div>
-          </section>
-
-          <section class="inspector-section assistant-section" id="userAssistantSection">
-            <div class="inspector-head">
-              <p class="eyebrow">AI trợ lý</p>
-              <span class="status-pill" id="userAssistantEngine">Nội bộ</span>
-            </div>
-            <div class="assistant-quick-row">
-              <button type="button" class="ghost-button card-button" data-assistant-question="Vì sao app lấy nhầm ảnh Trello?">Trello</button>
-              <button type="button" class="ghost-button card-button" data-assistant-question="Sheet prompt còn cần không hay AI tự viết prompt?">Sheet</button>
-              <button type="button" class="ghost-button card-button" data-assistant-question="Duyệt Telegram xong app lưu lại Trello ra sao?">Telegram</button>
-              <button type="button" class="ghost-button card-button" data-assistant-question="Dùng Flow AI Operator để tự động lấy ảnh Trello, viết prompt Flow, gửi Telegram duyệt và lưu lại Trello.">Flow AI</button>
-            </div>
-            <label class="field">
-              <span>Hỏi trợ lý</span>
-              <textarea
-                id="userAssistantQuestion"
-                rows="3"
-                placeholder="Ví dụ: vì sao nó không lấy ảnh trong Ready for AI?"
-              ></textarea>
+        <section class="step-card run-step">
+          <button class="step-main" id="runQuickJobButton" type="button">
+            <span class="step-no">4</span>
+            <span>
+              <strong>Chạy ảnh</strong>
+              <small>Flow tạo bộ ảnh nhanh</small>
+            </span>
+            <em>x4</em>
+          </button>
+          <div class="quick-options">
+            <textarea
+              id="quickPrompt"
+              rows="2"
+              placeholder="Prompt nhanh, hoặc để trống để Flow Agent tự viết từ ảnh Trello."
+            ></textarea>
+            <label>
+              <span>Số ảnh</span>
+              <input id="imageCount" type="number" min="1" max="4" value="4" />
             </label>
-            <button type="button" class="secondary-button" id="userAssistantAskButton">Hỏi AI</button>
-            <div id="userAssistantAnswer" class="assistant-answer">
-              Hỏi lỗi Trello, Sheet, Flow hoặc Telegram tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.
-            </div>
-          </section>
-
-          <section class="inspector-section" id="automationPromptSourceSection">
-            <div class="inspector-head">
-              <p class="eyebrow">AI prompt source</p>
-              <span class="status-pill" id="automationSheetStatus">Tùy chọn</span>
-            </div>
-            <label class="field">
-              <span>Google Sheet / CSV link tùy chọn</span>
-              <input type="text" id="automationSourceLocationInput" placeholder="Không bắt buộc. Dán link nếu muốn dùng prompt có sẵn." />
-            </label>
-            <label class="field">
-              <span>Từ khóa tìm Trello</span>
-              <input type="text" id="automationProductFilterInput" placeholder="Ví dụ: gấu bông, áo trẻ em, wedding_hoop" />
-            </label>
-            <label class="field">
-              <span>Paste prompt từ Sheet nếu muốn</span>
-              <textarea id="automationSheetPasteInput" rows="3" placeholder="Tùy chọn. Nếu để trống, AI sẽ tự viết prompt từ card Trello."></textarea>
-            </label>
-            <div class="customize-actions source-actions">
-              <button type="button" class="ghost-button card-button" id="automationSheetPreviewButton">Lấy prompt tùy chọn</button>
-              <button type="button" class="ghost-button card-button" id="automationSheetFileButton">Upload .xlsx/.csv</button>
-              <input
-                type="file"
-                id="automationSheetFileInput"
-                accept=".xlsx,.csv,.tsv,text/csv,text/tab-separated-values,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                hidden
-              />
-            </div>
-            <div id="automationSheetPreviewList" class="scenario-table-list prompt-source-preview"></div>
-          </section>
-
-          <section class="inspector-section">
-            <div class="inspector-head">
-              <p class="eyebrow">Module editor</p>
-              <span class="status-pill" id="automationModuleStatus">Đang chọn</span>
-            </div>
-            <label class="field">
-              <span>Module đang chọn</span>
-              <input type="text" id="automationStepNameInput" />
-            </label>
-            <label class="field">
-              <span>Ghi chú thao tác</span>
-              <textarea id="automationStepDetailInput" rows="3"></textarea>
-            </label>
-            <div class="detail-grid sidebar-detail-grid module-editor-grid">
-              <label class="field">
-                <span>Loại module</span>
-                <select id="automationModuleTypeInput">
-                  <option value="source">Prompt source</option>
-                  <option value="trello_source">Trello source</option>
-                  <option value="normalize">Normalize</option>
-                  <option value="flow">Google Flow</option>
-                  <option value="telegram">Telegram</option>
-                  <option value="trello">Trello</option>
-                  <option value="approval">Approval</option>
-                  <option value="custom">Custom</option>
-                </select>
-              </label>
-              <label class="field">
-                <span>Ký hiệu</span>
-                <input type="text" id="automationStepIconInput" maxlength="4" placeholder="F" />
-              </label>
-              <label class="field module-toggle-field">
-                <span>Bật module</span>
-                <input type="checkbox" id="automationModuleEnabledInput" />
-              </label>
-            </div>
-            <div class="customize-actions module-actions">
-              <button type="button" class="ghost-button card-button" id="automationModuleAddButton">Thêm cục</button>
-              <button type="button" class="ghost-button card-button" id="automationModuleDuplicateButton">Nhân bản</button>
-              <button type="button" class="ghost-button card-button" id="automationModuleMoveLeftButton">Sang trái</button>
-              <button type="button" class="ghost-button card-button" id="automationModuleMoveRightButton">Sang phải</button>
-              <button type="button" class="ghost-button card-button danger-button" id="automationModuleDeleteButton">Xóa cục</button>
-            </div>
-            <div id="automationModuleSettings" class="module-settings"></div>
-            <div class="detail-grid sidebar-detail-grid module-legacy-targets" hidden>
-              <label class="field">
-                <span>Telegram chat</span>
-                <input type="text" id="automationTelegramInput" placeholder="@review_channel hoặc chat id" />
-              </label>
-              <label class="field">
-                <span>Trello board lấy card</span>
-                <input type="text" id="automationTrelloBoardInput" placeholder="Board ID hoặc link board Trello" />
-              </label>
-              <label class="field">
-                <span>Trello card lưu ảnh</span>
-                <input type="text" id="automationTrelloCardInput" placeholder="Card ID hoặc link card Trello" />
-              </label>
-              <label class="field">
-                <span>Trello list tạo card mới</span>
-                <input type="text" id="automationTrelloListInput" placeholder="List ID nếu muốn mỗi job tạo card mới" />
-              </label>
-            </div>
-          </section>
-
-          <section class="inspector-section" id="automationTrelloSection">
-            <div class="inspector-head">
-              <p class="eyebrow">Trello storage</p>
-              <span class="status-pill" id="automationTrelloStatus">Chưa lưu</span>
-            </div>
-            <label class="field">
-              <span>Trello API key</span>
-              <input type="password" id="automationTrelloKeyInput" autocomplete="off" placeholder="Dán API key Trello" />
-            </label>
-            <label class="field">
-              <span>Trello token</span>
-              <input type="password" id="automationTrelloTokenInput" autocomplete="off" placeholder="Dán token Trello" />
-            </label>
-            <label class="field">
-              <span>Trello board URL</span>
-              <input type="text" id="automationTrelloBoardStorageInput" placeholder="https://trello.com/b/... hoặc board ID" />
-            </label>
-            <label class="field">
-              <span>Cách lưu ảnh</span>
-              <select id="automationTrelloUploadMode">
-                <option value="file">Upload file thật lên Trello</option>
-                <option value="url">Chỉ attach link ảnh</option>
+            <label>
+              <span>Tỉ lệ</span>
+              <select id="aspectSelect">
+                <option value="square">1:1</option>
+                <option value="portrait">9:16</option>
+                <option value="landscape">16:9</option>
               </select>
             </label>
-            <label class="field checkbox-field">
-              <input type="checkbox" id="automationTrelloUpscale2KInput" />
-              <span>Nâng cấp ảnh lên 2K trước khi upload (Flow UI 2K download)</span>
+            <label class="engine-select">
+              <span>Chế độ ảnh</span>
+              <select id="imageEngineSelect">
+                <option value="google_flow">Google Flow</option>
+                <option value="gemini_api">Gemini API key</option>
+              </select>
             </label>
-            <div class="customize-actions trello-actions">
-              <button type="button" class="ghost-button card-button" id="automationTrelloSaveButton">Lưu Trello</button>
-              <button type="button" class="ghost-button card-button" id="automationTrelloClearButton">Xóa key/token</button>
-            </div>
-          </section>
-
-          <section class="inspector-section" id="automationAppIntegrationsSection">
-            <div class="inspector-head">
-              <p class="eyebrow">App integrations</p>
-              <span class="status-pill" id="automationEnvStatus">Chưa lưu</span>
-            </div>
-            <label class="field">
-              <span>Gemini API key tuỳ chọn</span>
-              <input type="password" id="automationGeminiKeyInput" autocomplete="off" placeholder="Không cần nếu chỉ dùng Flow account" />
+            <label class="switch">
+              <input id="quickTrelloEnabled" type="checkbox" checked />
+              <span></span>
+              Trello
             </label>
-            <label class="field">
-              <span>Model nâng prompt tuỳ chọn</span>
-              <input type="text" id="automationGeminiModelInput" placeholder="gemini-2.5-flash" />
-            </label>
-            <label class="field">
-              <span>Telegram bot token</span>
-              <input type="password" id="automationTelegramTokenInput" autocomplete="off" placeholder="Dán token bot Telegram" />
-            </label>
-            <label class="field">
-              <span>Playwright browser path</span>
-              <input type="text" id="automationPlaywrightPathInput" placeholder="Để trống để app tự chọn, hoặc dán thư mục Playwright" />
-            </label>
-            <div class="customize-actions trello-actions">
-              <button type="button" class="ghost-button card-button" id="automationEnvSaveButton">Lưu app</button>
-              <button type="button" class="ghost-button card-button" id="automationEnvClearButton">Xóa secret</button>
-            </div>
-          </section>
-
-          <section class="inspector-section">
-            <p class="eyebrow">Tùy biến người dùng</p>
-            <label class="field">
-              <span>Nhãn nhỏ</span>
-              <input type="text" id="automationAppEyebrowInput" placeholder="Flow v2" />
-            </label>
-            <label class="field">
-              <span>Tên app / scenario</span>
-              <input type="text" id="automationAppTitleInput" placeholder="Flow v2" />
-            </label>
-            <label class="field">
-              <span>Mô tả trên thanh đầu</span>
-              <textarea id="automationAppSubtitleInput" rows="2" placeholder="Auto Trello lấy ảnh, AI viết prompt, Flow tạo ảnh, Telegram duyệt."></textarea>
-            </label>
-            <label class="field">
-              <span>Nguồn prompt cụ thể</span>
-              <small>Không cần Google Sheet. AI sẽ tự viết prompt; chỉ dán Sheet nếu muốn dùng prompt có sẵn.</small>
-            </label>
-            <label class="field color-field">
-              <span>Màu chủ đạo</span>
-              <input type="color" id="automationAccentInput" value="#7c2ee6" />
-            </label>
-            <div class="customize-actions">
-              <button type="button" class="ghost-button card-button" id="automationExportButton">Export</button>
-              <button type="button" class="ghost-button card-button" id="automationImportButton">Import</button>
-              <button type="button" class="ghost-button card-button" id="automationResetButton">Reset</button>
-              <input type="file" id="automationImportFile" accept="application/json,.json" hidden />
-            </div>
-          </section>
-
-          <section class="inspector-section">
-            <div class="inspector-head">
-              <p class="eyebrow">Currently running</p>
-              <span class="status-pill" id="automationRunningStatus">No execution</span>
-            </div>
-            <div id="automationHistory" class="automation-history">
-              Chưa có lượt chạy ảnh nào.
-            </div>
-          </section>
-        </aside>
-      </section>
-
-      <section class="setup-panel" id="setupPanel" hidden>
-        <div class="section-head">
-          <div>
-            <p class="eyebrow">Thiết lập một lần</p>
-            <h2>Kết nối Google Flow</h2>
-            <p class="section-copy">Chỉ cần lưu project và đăng nhập một lần. Xong rồi có thể ẩn phần này đi.</p>
-          </div>
-        </div>
-
-        <div class="setup-preview">
-          <div class="setup-chip">1. Dán project</div>
-          <div class="setup-chip">2. Đăng nhập</div>
-          <div class="setup-chip">3. Tạo ngay</div>
-        </div>
-
-        <form id="configForm" class="setup-form">
-          <label class="field wide">
-            <span>Link project hoặc mã project</span>
-            <input type="text" id="projectId" placeholder="Dán link project vào đây" />
-          </label>
-
-          <details class="compact-details">
-            <summary>Thêm một chút</summary>
-            <div class="detail-grid">
-              <label class="field">
-                <span>Tên gợi nhớ</span>
-                <input type="text" id="projectName" placeholder="Không bắt buộc" />
-              </label>
-              <label class="field">
-                <span>Thời gian chờ</span>
-                <input type="number" id="generationTimeout" min="30" step="10" value="300" />
-              </label>
-            </div>
-          </details>
-
-          <div class="setup-actions">
-            <button type="submit">Lưu project</button>
-            <button type="button" class="secondary-button" id="loginButton">Đăng nhập Google Flow</button>
-            <button type="button" class="ghost-button" id="openProjectButton">Mở project Flow</button>
-          </div>
-
-          <div class="setup-helper">
-            <div>
-              <strong>Không thấy cửa sổ Flow?</strong>
-              <p>Nếu bấm đăng nhập mà chưa thấy Chromium hiện ra, dùng các nút này để gọi lại tab Flow. Trên Windows, hãy mở app trực tiếp trên desktop, đừng chạy qua SSH hay tác vụ nền.</p>
-            </div>
-            <div class="card-actions">
-              <button type="button" class="ghost-button card-button" id="openLoginButton">Mở cửa sổ đăng nhập</button>
-              <button type="button" class="ghost-button card-button" id="focusProjectButton">Mở lại project đang dùng</button>
-            </div>
-          </div>
-        </form>
-
-      </section>
-
-      <main class="main-stack legacy-studio" hidden aria-hidden="true">
-        <section class="studio-card">
-          <div class="studio-aura" aria-hidden="true"></div>
-          <div class="studio-shell">
-            <div class="studio-head">
-              <p class="eyebrow">Studio</p>
-              <h2 id="composerTitle">Bạn muốn tạo video gì?</h2>
-              <p id="composerHint" class="studio-hint">Nhập mô tả rồi bấm chạy.</p>
-            </div>
-
-            <div class="mode-switch" role="tablist" aria-label="Chọn chế độ tạo">
-              <button type="button" class="mode-button active" data-mode="video">Video</button>
-              <button type="button" class="mode-button" data-mode="image">Ảnh</button>
-              <button type="button" class="mode-button" data-mode="edit">Chỉnh video</button>
-            </div>
-
-            <div id="videoInputModeStrip" class="video-flow-switch" role="tablist" aria-label="Chọn cách tạo video">
-              <button type="button" class="video-flow-chip active" data-video-input-mode="prompt">
-                <strong>Từ prompt</strong>
-                <small>Nhập mô tả rồi tạo video trực tiếp.</small>
-              </button>
-              <button type="button" class="video-flow-chip" data-video-input-mode="start">
-                <strong>Từ ảnh đầu vào</strong>
-                <small>Dùng một ảnh làm khung đầu rồi animate.</small>
-              </button>
-              <button type="button" class="video-flow-chip" data-video-input-mode="reference">
-                <strong>Sản phẩm thành video</strong>
-                <small>Đưa áo, logo hoặc sản phẩm vào. App tự dựng người mẫu rồi tạo video.</small>
-              </button>
-            </div>
-
-            <p id="videoInputModeNote" class="video-flow-note" hidden></p>
-
-            <div class="composer-summary">
-              <span class="mini-pill" id="composerSummaryMode">Video từ prompt</span>
-              <p id="composerSummaryText">Không có ảnh đầu vào. App sẽ tạo từ mô tả vừa nhập.</p>
-            </div>
-
-            <section class="policy-notice" id="composerPolicyNotice" hidden>
-              <div class="policy-notice-head">
-                <span class="mini-pill" id="composerPolicyPill">Gợi ý an toàn</span>
-                <strong id="composerPolicyTitle">Flow có thể chặn nếu ảnh trông quá trẻ.</strong>
-              </div>
-              <p id="composerPolicyText"></p>
-              <ul id="composerPolicyList" class="policy-notice-list"></ul>
-            </section>
-
-            <form id="composerForm" class="composer-form">
-              <div id="editActionStrip" class="action-strip" hidden>
-                <button type="button" class="task-chip active" data-edit-action="extend">Kéo dài</button>
-                <button type="button" class="task-chip" data-edit-action="upscale">Nâng chất lượng</button>
-                <button type="button" class="task-chip" data-edit-action="camera_motion">Chuyển động camera</button>
-                <button type="button" class="task-chip" data-edit-action="camera_position">Vị trí camera</button>
-                <button type="button" class="task-chip" data-edit-action="insert">Chèn vật thể</button>
-                <button type="button" class="task-chip" data-edit-action="remove">Xóa vật thể</button>
-              </div>
-
-              <div id="editActionSummary" class="action-summary" hidden>
-                <strong id="editActionSummaryTitle">Kéo dài video</strong>
-                <p id="editActionSummaryText">Dùng khi muốn nối thêm phần cuối video hiện có.</p>
-              </div>
-
-              <section class="prompt-ai-card" id="promptAiCard">
-                <div class="prompt-ai-head">
-                  <div>
-                    <p class="eyebrow">AI viết prompt</p>
-                    <h3>Chỉ cần mô tả ý muốn</h3>
-                    <p class="section-copy" id="promptAiSummary">AI sẽ viết prompt chi tiết hơn để chạy ngay.</p>
-                  </div>
-                  <span class="status-pill prompt-ai-badge" id="promptAiBadge">Đang nạp skill</span>
-                </div>
-
-                <label class="field wide">
-                  <span id="promptAiBriefLabel">Bạn muốn video như thế nào?</span>
-                  <textarea
-                    id="promptAiBrief"
-                    rows="3"
-                    placeholder="Ví dụ: video quảng cáo đàn piano sang trọng, có người chơi trong phòng tối và ánh sáng ấm"
-                  ></textarea>
-                </label>
-
-                <details class="compact-details prompt-ai-details">
-                  <summary>Nói kỹ hơn nếu muốn</summary>
-                  <div class="detail-grid">
-                    <label class="field">
-                      <span>Phong cách</span>
-                      <input type="text" id="promptAiStyle" placeholder="cinematic, tối giản, quảng cáo..." />
-                    </label>
-                    <label class="field">
-                      <span>Phải có</span>
-                      <input type="text" id="promptAiMustInclude" placeholder="ví dụ: người chơi piano, sương nhẹ" />
-                    </label>
-                    <label class="field">
-                      <span>Tránh</span>
-                      <input type="text" id="promptAiAvoid" placeholder="ví dụ: chữ, watermark, méo tay" />
-                    </label>
-                    <label class="field">
-                      <span>Dành cho ai</span>
-                      <input type="text" id="promptAiAudience" placeholder="ví dụ: quảng cáo mạng xã hội" />
-                    </label>
-                  </div>
-                </details>
-
-                <div class="submit-row prompt-ai-actions">
-                  <p id="promptAiHint" class="ready-hint">Đang nạp kho skill viết prompt cho ảnh và video.</p>
-                  <button type="button" class="secondary-button" id="promptAiSubmit">Viết prompt giúp tôi</button>
-                </div>
-
-                <div id="promptAiResult" class="prompt-ai-result" hidden>
-                  <div class="prompt-ai-result-head">
-                    <strong id="promptAiResultTitle">Prompt AI</strong>
-                    <button type="button" class="ghost-button card-button" id="usePromptAiResultButton">Dùng prompt này</button>
-                  </div>
-                  <p id="promptAiResultSummary" class="section-copy"></p>
-                  <div id="promptAiSkillChips" class="skill-chip-row" hidden></div>
-                  <div id="promptAiResultText" class="prompt-ai-text"></div>
-                </div>
-              </section>
-
-              <section class="storyboard-card" id="storyboardCard" hidden>
-                <div class="prompt-ai-head">
-                  <div>
-                    <p class="eyebrow">Kịch bản sang storyboard</p>
-                    <h3>Tách cảnh và tạo ảnh keyframe</h3>
-                    <p class="section-copy">
-                      Dán kịch bản dài vào đây. App sẽ tự tách thành các cảnh chính, viết prompt ảnh cho từng cảnh, rồi có thể tạo luôn các ảnh cần để dựng video.
-                    </p>
-                  </div>
-                  <span class="status-pill prompt-ai-badge" id="storyboardBadge">Storyboard ảnh</span>
-                </div>
-
-                <label class="field wide">
-                  <span>Kịch bản video</span>
-                  <textarea
-                    id="storyboardScript"
-                    rows="6"
-                    placeholder="Ví dụ: Cảnh 1 mở bằng toàn cảnh thành phố ban đêm. Cảnh 2 nhân vật bước vào quán piano. Cảnh 3 cận tay chạm vào phím đàn..."
-                  ></textarea>
-                </label>
-
-                <details class="compact-details prompt-ai-details">
-                  <summary>Chỉnh thêm nếu muốn</summary>
-                  <div class="detail-grid">
-                    <label class="field">
-                      <span>Phong cách chung</span>
-                      <input type="text" id="storyboardStyle" placeholder="cinematic, anime, quảng cáo, editorial..." />
-                    </label>
-                    <label class="field">
-                      <span>Số cảnh</span>
-                      <select id="storyboardSceneCount">
-                        <option value="0">Tự tính theo kịch bản</option>
-                        <option value="3">3 cảnh</option>
-                        <option value="4">4 cảnh</option>
-                        <option value="5">5 cảnh</option>
-                        <option value="6">6 cảnh</option>
-                        <option value="7">7 cảnh</option>
-                        <option value="8">8 cảnh</option>
-                      </select>
-                    </label>
-                    <label class="field">
-                      <span>Phải có</span>
-                      <input type="text" id="storyboardMustInclude" placeholder="ví dụ: cùng một nhân vật, áo đỏ, đàn piano đen" />
-                    </label>
-                    <label class="field">
-                      <span>Tránh</span>
-                      <input type="text" id="storyboardAvoid" placeholder="ví dụ: text, watermark, biến dạng tay" />
-                    </label>
-                  </div>
-                </details>
-
-                <div class="submit-row prompt-ai-actions storyboard-actions">
-                  <p id="storyboardHint" class="ready-hint">Dùng khi muốn biến một kịch bản dài thành nhiều ảnh storyboard để dựng video.</p>
-                  <div class="storyboard-button-row">
-                    <button type="button" class="ghost-button" id="storyboardPlanButton">Chỉ tách cảnh</button>
-                    <button type="button" class="secondary-button" id="storyboardGenerateButton">Tạo ảnh từ kịch bản</button>
-                  </div>
-                </div>
-
-                <div id="storyboardResult" class="storyboard-result" hidden>
-                  <div class="prompt-ai-result-head">
-                    <strong id="storyboardResultTitle">Storyboard ảnh</strong>
-                    <span id="storyboardResultMeta" class="status-pill prompt-ai-badge">0 cảnh</span>
-                  </div>
-                  <p id="storyboardResultSummary" class="section-copy"></p>
-                  <div id="storyboardSkillChips" class="skill-chip-row" hidden></div>
-                  <div id="storyboardSceneList" class="storyboard-scene-list"></div>
-                </div>
-              </section>
-
-              <section id="editSourceWrap" class="source-panel" hidden>
-                <div class="source-panel-head">
-                  <div>
-                    <p class="eyebrow">Nguồn để chỉnh</p>
-                    <h3>Chọn video cần sửa</h3>
-                    <p class="section-copy">Bấm vào một video gần đây để sửa ngay. Nếu chưa thấy, mới cần nhập tay ở phần dưới.</p>
-                  </div>
-                </div>
-                <div id="editSourceCards" class="source-card-grid"></div>
-                <details class="compact-details">
-                  <summary>Chọn theo danh sách cũ hoặc nhập tay nếu cần</summary>
-                  <label class="field wide">
-                    <span>Video gần đây</span>
-                    <select id="editSourceSelect">
-                      <option value="">Chọn một video</option>
-                    </select>
-                  </label>
-                  <div class="detail-grid">
-                    <label class="field">
-                      <span>Media ID</span>
-                      <input type="text" id="manualMediaId" placeholder="Ví dụ: 34dc0544-..." />
-                    </label>
-                    <label class="field">
-                      <span>Workflow ID</span>
-                      <input type="text" id="manualWorkflowId" placeholder="Ví dụ: a230f3de-..." />
-                    </label>
-                  </div>
-                </details>
-              </section>
-
-              <label class="field wide prompt-field">
-                <span id="promptLabel">Mô tả video</span>
-                <textarea
-                  id="promptInput"
-                  rows="5"
-                  placeholder="Ví dụ: Một video cinematic về con mèo đi bộ trong phòng khách đầy nắng"
-                ></textarea>
-              </label>
-
-              <div id="startImageWrap" class="upload-box">
-                <div id="startImagePreview" class="upload-preview" hidden>
-                  <img id="startImagePreviewImage" class="upload-preview-image" alt="Ảnh đầu vào" />
-                  <div class="upload-preview-copy">
-                    <strong id="startImagePreviewName">Ảnh đầu vào</strong>
-                    <p id="startImagePreviewHint">Video sẽ bám theo ảnh này khi render.</p>
-                  </div>
-                  <button type="button" class="ghost-button card-button" id="clearStartImageButton">Bỏ ảnh</button>
-                </div>
-                <label class="upload-field">
-                  <span>Ảnh đầu vào để tạo video từ ảnh</span>
-                  <input type="file" id="startImageFile" accept="image/*" />
-                </label>
-                <small id="startImageStatus">Không có ảnh đầu vào. Có thể bỏ qua.</small>
-              </div>
-
-              <div id="imageReferenceWrap" class="upload-box" hidden>
-                <div class="upload-box-head">
-                  <strong id="imageReferenceTitle">Ảnh tham chiếu để ghép hoặc chỉnh</strong>
-                  <p id="imageReferenceDescription">Ví dụ: một ảnh người mẫu và một ảnh logo áo. Sau đó viết yêu cầu như “ghép logo này lên áo của người mẫu”.</p>
-                </div>
-                <div id="videoReferenceHero" class="reference-hero" hidden>
-                  <img id="videoReferenceHeroImage" class="reference-hero-image" alt="Ảnh sản phẩm chính" />
-                  <div class="reference-hero-copy">
-                    <span class="mini-pill">Ảnh sản phẩm chính</span>
-                    <strong id="videoReferenceHeroTitle">Chưa có ảnh chính</strong>
-                    <p id="videoReferenceHeroText">App sẽ ưu tiên ảnh này để dựng người mẫu hoặc keyframe trước khi tạo video.</p>
-                  </div>
-                </div>
-                <div id="imageReferenceList" class="reference-list" hidden></div>
-                <label class="upload-field">
-                  <span id="imageReferenceFieldLabel">Chọn 1 đến 4 ảnh tham chiếu</span>
-                  <input type="file" id="imageReferenceFiles" accept="image/*" multiple />
-                </label>
-                <small id="imageReferenceStatus">Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ dùng chúng để ghép/chỉnh ảnh.</small>
-              </div>
-
-              <details class="compact-details" id="generationOptionsWrap">
-                <summary>Tùy chọn thêm</summary>
-                <div class="detail-grid">
-                  <label class="field">
-                    <span>Model</span>
-                    <select id="modelSelect"></select>
-                  </label>
-                  <div class="field">
-                    <span>Khung hình</span>
-                    <div id="aspectChoices" class="choice-grid" aria-label="Chọn khung hình">
-                      <button type="button" class="choice-card" data-aspect-option="landscape">
-                        <strong>Ngang 16:9</strong>
-                        <small>YouTube, cảnh ngang, widescreen</small>
-                      </button>
-                      <button type="button" class="choice-card" data-aspect-option="portrait">
-                        <strong>Dọc 9:16</strong>
-                        <small>Reels, Shorts, TikTok</small>
-                      </button>
-                      <button type="button" class="choice-card" data-aspect-option="square">
-                        <strong>Vuông 1:1</strong>
-                        <small>Feed, poster vuông, thumbnail</small>
-                      </button>
-                    </div>
-                    <select id="aspectSelect" hidden>
-                      <option value="landscape">Ngang 16:9</option>
-                      <option value="portrait">Dọc 9:16</option>
-                      <option value="square">Vuông 1:1</option>
-                    </select>
-                  </div>
-                  <div class="field">
-                    <span>Số lượng</span>
-                    <div id="countChoices" class="count-choice-row" aria-label="Chọn số lượng">
-                      <button type="button" class="count-choice" data-count-option="1">1</button>
-                      <button type="button" class="count-choice" data-count-option="2">2</button>
-                      <button type="button" class="count-choice" data-count-option="3">3</button>
-                      <button type="button" class="count-choice" data-count-option="4">4</button>
-                    </div>
-                    <input type="number" id="countInput" min="1" max="4" value="1" hidden />
-                  </div>
-                </div>
-              </details>
-
-              <details class="compact-details" id="editOptionsWrap" hidden>
-                <summary>Tùy chọn cho thao tác này</summary>
-                <div class="detail-grid">
-                  <label class="field" id="motionField" hidden>
-                    <span>Chuyển động camera</span>
-                    <select id="motionSelect">
-                      <option value="truck_left">Trượt trái</option>
-                      <option value="truck_right">Trượt phải</option>
-                      <option value="tilt_up">Ngẩng lên</option>
-                      <option value="tilt_down">Chúc xuống</option>
-                      <option value="pan_left">Pan trái</option>
-                      <option value="pan_right">Pan phải</option>
-                      <option value="zoom_in">Tiến gần</option>
-                      <option value="zoom_out">Lùi ra</option>
-                    </select>
-                  </label>
-                  <label class="field" id="positionField" hidden>
-                    <span>Vị trí camera</span>
-                    <select id="positionSelect">
-                      <option value="center">Giữa khung hình</option>
-                      <option value="left">Lệch trái</option>
-                      <option value="right">Lệch phải</option>
-                      <option value="high">Góc cao hơn</option>
-                      <option value="low">Góc thấp hơn</option>
-                      <option value="closer">Gần hơn</option>
-                      <option value="further">Xa hơn</option>
-                    </select>
-                  </label>
-                  <label class="field" id="resolutionField" hidden>
-                    <span>Độ phân giải</span>
-                    <select id="resolutionSelect">
-                      <option value="1080p">1080p</option>
-                      <option value="720p">720p</option>
-                    </select>
-                  </label>
-                </div>
-              </details>
-
-              <div class="submit-row">
-                <p id="readyHint" class="ready-hint">Lưu project và đăng nhập một lần rồi bấm chạy.</p>
-                <button type="submit" id="submitButton">Tạo video</button>
-              </div>
-            </form>
           </div>
         </section>
 
-        <section class="surface-card status-card">
-          <div class="section-head">
-            <div>
-              <p class="eyebrow">Trạng thái</p>
-              <h2>Luồng gần nhất</h2>
-              <p class="section-copy">App chỉ giữ một trạng thái ngắn gọn. Tab Google Flow sẽ được để nguyên để theo dõi trực tiếp.</p>
+        <section class="step-card auto-step">
+          <button class="step-main" id="runAutoButton" type="button">
+            <span class="step-no">5</span>
+            <span>
+              <strong>Chạy Flow</strong>
+              <small id="trelloBadge">Ready for AI -> Flow</small>
+            </span>
+            <em>Flow</em>
+          </button>
+          <div class="mode-intro etsy-only" hidden>
+            <span class="step-no">1</span>
+            <div class="mode-intro-text">
+              <strong>Chọn nguồn ảnh</strong>
+              <small>Chọn cột Trello hoặc nhập SKU đã có ảnh output, rồi bấm Listing ảnh Etsy bên dưới.</small>
             </div>
-            <button type="button" class="ghost-button" id="refreshButton">Làm mới</button>
           </div>
-          <div id="latestStatusCard" class="latest-status empty-state">
-            Chưa có lượt chạy nào. Sau khi bấm chạy, tab Google Flow sẽ được giữ mở.
+          <div class="auto-options">
+            <label class="field account-pick">
+              <span>Tài khoản Etsy</span>
+              <select id="autoAccountSelect" title="Chọn tài khoản Etsy đích. Mặc định = trung6 (board global). Tài khoản khác lấy board riêng đã đăng ký.">
+                <option value="">Mặc định (trung6)</option>
+              </select>
+            </label>
+            <input id="autoProduct" type="text" placeholder="Dán link card Trello, hoặc để trống lấy cột, hoặc nhập tên sản phẩm..." />
+            <div class="source-select" id="autoSourceGroup" role="group" aria-label="Nguồn Trello (chọn 1 hoặc nhiều cột)">
+              <span>Nguồn (chọn nhiều)</span>
+              <div class="board-load-row">
+                <input id="boardLinkInput" type="text" autocomplete="off" placeholder="Dán link board Trello để load cột (vd .../b/xxxx/...)" />
+                <button id="loadBoardColumnsButton" type="button">Load cột</button>
+              </div>
+              <div class="source-checks" id="autoSourceChecks">
+                <label class="source-check"><input type="checkbox" name="autoSource" value="c6" checked /><span>C6 VN32</span></label>
+              </div>
+            </div>
+            <input id="autoLimit" type="number" min="0" max="100" placeholder="0 = tất cả" title="Giới hạn card (để trống hoặc 0 = tất cả card có ảnh; Flow mặc định 40)" />
+            <label class="switch auto-continuous">
+              <input id="autoContinuous" type="checkbox" />
+              <span></span>
+              Treo
+            </label>
+            <button id="checkAutoButton" type="button">Check</button>
           </div>
         </section>
+
+        <section class="step-card etsy-listing-step">
+          <button class="step-main etsy-listing-main" id="listLatestEtsyButton" type="button" disabled>
+            <span class="step-no">6</span>
+            <span>
+              <strong>Listing ảnh Etsy</strong>
+              <small id="latestEtsyHint">Chạy Flow xong sẽ có job ảnh để gửi Etsy Draft</small>
+            </span>
+            <em>Draft</em>
+          </button>
+        </section>
+
+        <section class="small-status">
+          <button id="extensionStatusButton" type="button">
+            <strong>Extension</strong>
+            <span id="extensionState">...</span>
+            <small id="extensionDetail">-</small>
+          </button>
+          <button id="jobsStatusButton" type="button">
+            <strong>Jobs</strong>
+            <span id="jobState">0</span>
+            <small id="jobDetail">-</small>
+          </button>
+          <a href="/api/extension/download">Tải EXT</a>
+        </section>
+
+        <details class="setup-panel" id="flowDrawer">
+          <summary>
+            <span>Setup Flow</span>
+            <strong id="flowSetupStatus">Bấm Flow để mở</strong>
+          </summary>
+          <form id="flowForm" autocomplete="off">
+            <div class="form-row">
+              <label class="field">
+                <span>Project ID</span>
+                <input id="flowProjectId" type="text" autocomplete="off" placeholder="project id của Google Flow" />
+              </label>
+              <label class="field">
+                <span>Tên project</span>
+                <input id="flowProjectName" type="text" autocomplete="off" placeholder="tuỳ chọn" />
+              </label>
+            </div>
+            <div class="form-row">
+              <label class="field">
+                <span>Timeout</span>
+                <input id="flowTimeout" type="number" min="60" value="300" />
+              </label>
+              <label class="field">
+                <span>CDP URL</span>
+                <input id="flowCdpUrl" type="text" autocomplete="off" placeholder="để trống nếu không dùng" />
+              </label>
+            </div>
+            <div class="form-row gemini-settings">
+              <label class="field">
+                <span>Gemini API key</span>
+                <input id="geminiApiKey" type="password" autocomplete="off" placeholder="đã lưu/env thì bỏ trống" />
+              </label>
+              <label class="field">
+                <span>Gemini image model</span>
+                <input id="geminiModel" type="text" autocomplete="off" placeholder="gemini-2.5-flash-image" />
+              </label>
+            </div>
+            <div class="panel-actions">
+              <button id="saveFlowButton" type="button">Lưu Flow</button>
+              <button id="saveGeminiButton" type="button">Lưu Gemini</button>
+              <button id="openFlowFromSetupButton" type="button">Mở Flow</button>
+            </div>
+          </form>
+        </details>
+
+        <details class="setup-panel" id="etsyDrawer">
+          <summary>
+            <span>Cấu hình máy ảo Etsy</span>
+            <strong id="etsySetupStatus">Extension trên VM sẽ tự lấy queue</strong>
+          </summary>
+          <form id="etsyForm" autocomplete="off">
+            <div class="etsy-warning" id="etsyWarning" hidden></div>
+
+            <div class="connect-box">
+              <div class="connect-head">
+                <span class="connect-status" id="etsyConnectStatus">
+                  <span class="dot" id="etsyConnectDot"></span>
+                  <span id="etsyConnectLabel">Luồng chính dùng extension</span>
+                </span>
+                <div class="connect-actions">
+                  <button id="connectEtsyButton" type="button">Xem queue</button>
+                  <button id="runEtsyCopyButton" type="button">Queue thử</button>
+                  <button id="disconnectEtsyButton" type="button" hidden>Ngắt</button>
+                </div>
+              </div>
+              <p class="connect-hint">
+                Extension Etsy nằm trên máy ảo và đang polling backend. Máy này không cần login Etsy, không mở OAuth,
+                không mở tab Etsy local. Nút Listing ảnh Etsy mới queue task để máy ảo tự copy listing và lưu Draft.
+              </p>
+            </div>
+
+            <details class="advanced-etsy-api">
+              <summary>API Etsy tuỳ chọn, không dùng cho luồng VM</summary>
+              <div class="callback-row">
+                <code id="etsyCallbackHint">…</code>
+                <button id="copyCallbackButton" type="button" class="link-button">Copy callback</button>
+              </div>
+              <div class="form-row">
+                <label class="field">
+                  <span>Keystring</span>
+                  <input id="etsyApiKey" type="password" autocomplete="off" placeholder="đã lưu/env thì bỏ trống" />
+                </label>
+                <label class="field">
+                  <span>Shared secret</span>
+                  <input id="etsyApiSecret" type="password" autocomplete="off" placeholder="copy trong Etsy app" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label class="field">
+                  <span>Shop ID</span>
+                  <input id="etsyShopId" type="text" autocomplete="off" />
+                </label>
+                <label class="field">
+                  <span>User ID</span>
+                  <input id="etsyUserId" type="text" autocomplete="off" placeholder="tự điền sau khi connect" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label class="field">
+                  <span>Taxonomy</span>
+                  <input id="etsyTaxonomyId" type="text" autocomplete="off" />
+                </label>
+                <label class="field">
+                  <span>Shipping</span>
+                  <input id="etsyShippingProfileId" type="text" autocomplete="off" />
+                </label>
+              </div>
+              <div class="form-row">
+                <label class="field">
+                  <span>Giá</span>
+                  <input id="etsyPrice" type="text" value="9.99" autocomplete="off" />
+                </label>
+                <label class="field">
+                  <span>SL</span>
+                  <input id="etsyQuantity" type="number" min="1" value="1" />
+                </label>
+              </div>
+              <button id="saveEtsyButton" type="button">Lưu API Etsy</button>
+            </details>
+          </form>
+        </details>
+
+        <details class="setup-panel" id="accountsDrawer">
+          <summary>
+            <span>Tài khoản Etsy (multi-account)</span>
+            <button id="accountsRefreshButton" type="button">↻</button>
+          </summary>
+          <p class="connect-hint">
+            Mỗi máy chạy 1 tài khoản Etsy, mỗi tài khoản lấy ảnh/thông tin từ 1 board Trello riêng.
+            Mặc định ("") = VM trung6 cũ, dùng board global. Thêm tài khoản mới với slug + board Trello riêng.
+            Trên máy mới, mở popup extension và nhập đúng slug này.
+          </p>
+          <div id="accountsList" class="account-list"></div>
+          <form id="accountForm" class="account-form" autocomplete="off">
+            <div class="form-row">
+              <label class="field">
+                <span>Slug</span>
+                <input id="accSlug" type="text" autocomplete="off" placeholder="vd: shop-2" />
+              </label>
+              <label class="field">
+                <span>Nhãn</span>
+                <input id="accLabel" type="text" autocomplete="off" placeholder="Tên gợi nhớ" />
+              </label>
+            </div>
+            <div class="form-row">
+              <label class="field">
+                <span>Trello board id/link</span>
+                <input id="accBoard" type="text" autocomplete="off" placeholder="board nguồn của tài khoản này" />
+              </label>
+              <label class="field">
+                <span>Trello list id (tuỳ chọn)</span>
+                <input id="accList" type="text" autocomplete="off" placeholder="để trống = cả board" />
+              </label>
+            </div>
+            <div class="form-row">
+              <label class="field">
+                <span>Etsy shop id (tuỳ chọn)</span>
+                <input id="accShop" type="text" autocomplete="off" />
+              </label>
+            </div>
+            <button id="addAccountButton" type="button">Thêm / cập nhật tài khoản</button>
+          </form>
+          <div id="accountStatus" class="status" hidden></div>
+        </details>
+
+        <details class="setup-panel" id="jobsDrawer">
+          <summary>
+            <span>Jobs gần đây</span>
+            <button id="jobsRefreshButton" type="button">↻</button>
+          </summary>
+          <div id="jobsList" class="job-list"></div>
+        </details>
+
+        <details class="setup-panel" id="consoleDrawer">
+          <summary>
+            <span>Console</span>
+            <button id="clearConsoleButton" type="button">Clear</button>
+          </summary>
+          <pre id="consoleOutput" class="console-output">Sẵn sàng.</pre>
+        </details>
       </main>
     </div>
 
-    <div id="trelloSetupWizard" class="setup-wizard" hidden aria-hidden="true" role="dialog" aria-labelledby="trelloSetupWizardTitle">
-      <div class="setup-wizard__backdrop" data-trello-wizard-close></div>
-      <div class="setup-wizard__panel" role="document">
-        <header class="setup-wizard__head">
-          <p class="eyebrow">Setup lần đầu</p>
-          <h2 id="trelloSetupWizardTitle">Kết nối Trello để Flow v2 tự lấy ảnh sản phẩm</h2>
-          <p class="setup-wizard__lead">
-            Điền 3 ô dưới đây 1 lần. App sẽ lưu vào <code>.env.local</code> ở thư mục dự án để giữ creds qua mọi lần khởi động — không cần nhập lại.
-          </p>
-        </header>
-
-        <div class="setup-wizard__body">
-          <label class="field">
-            <span>Trello API key</span>
-            <input type="password" id="trelloWizardKeyInput" autocomplete="off" placeholder="Dán API key Trello" />
-            <small class="field-hint">
-              Lấy tại
-              <a href="https://trello.com/power-ups/admin/" target="_blank" rel="noopener noreferrer">trello.com/power-ups/admin</a>
-              → "New" → tạo Power-Up → mở tab Generate, sao chép "API key".
-            </small>
-          </label>
-          <label class="field">
-            <span>Trello token</span>
-            <input type="password" id="trelloWizardTokenInput" autocomplete="off" placeholder="Dán token Trello" />
-            <small class="field-hint">
-              Trong cùng trang Generate, bấm "Token" → cấp quyền cho key → sao chép token trả về.
-            </small>
-          </label>
-          <label class="field">
-            <span>Trello board URL</span>
-            <input type="text" id="trelloWizardBoardInput" placeholder="https://trello.com/b/abc123/ten-board" />
-            <small class="field-hint">
-              Dán URL board chứa card có ảnh sản phẩm để Auto Trello quét.
-            </small>
-          </label>
-          <div class="setup-wizard__status" id="trelloWizardStatus" hidden></div>
-        </div>
-
-        <footer class="setup-wizard__actions">
-          <button type="button" class="ghost-button" id="trelloWizardLaterButton" data-trello-wizard-close>
-            Để sau
-          </button>
-          <button type="button" class="primary-button" id="trelloWizardSaveButton">
-            Lưu vĩnh viễn (.env.local)
-          </button>
-        </footer>
-      </div>
-    </div>
-
-    <script type="module" src="/static/app.js?v=20260522c"></script>
+    <script src="/static/app.js?v=20260701-amazon-flow" defer></script>
   </body>
 </html>

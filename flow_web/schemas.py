@@ -36,9 +36,45 @@ class TrelloConfig(BaseModel):
     updated_at: str = ""
 
 
+class EtsyConfig(BaseModel):
+    api_key: str = ""
+    api_secret: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+    user_id: str = ""
+    shop_id: str = ""
+    taxonomy_id: str = ""
+    shipping_profile_id: str = ""
+    return_policy_id: str = ""
+    readiness_state_id: str = ""
+    quantity: int = 1
+    price: str = "9.99"
+    who_made: str = "i_did"
+    when_made: str = "made_to_order"
+    is_supply: bool = False
+    should_auto_renew: bool = False
+    updated_at: str = ""
+
+
+class EtsyAccount(BaseModel):
+    # One additional Etsy account in the multi-account fleet. The DEFAULT account
+    # (slug == "") is NOT stored here — it is the existing global TrelloConfig +
+    # EtsyConfig, so legacy single-account state keeps working untouched. Entries
+    # in this list are ONLY the extra accounts (shop2, shop3, …), each with its
+    # own Trello board (image/info source) and its own Etsy shop.
+    slug: str = ""
+    label: str = ""
+    trello_board_id: str = ""
+    trello_list_id: str = ""
+    etsy_shop_id: str = ""
+    enabled: bool = True
+    updated_at: str = ""
+
+
 class IntegrationConfig(BaseModel):
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
+    gemini_image_model: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     playwright_browsers_path: str = ""
@@ -248,6 +284,8 @@ class PublicSkillSnapshot(BaseModel):
 class StateSnapshot(BaseModel):
     config: AppConfig = Field(default_factory=AppConfig)
     trello_config: TrelloConfig = Field(default_factory=TrelloConfig)
+    etsy_config: EtsyConfig = Field(default_factory=EtsyConfig)
+    etsy_accounts: List[EtsyAccount] = Field(default_factory=list)
     integration_config: IntegrationConfig = Field(default_factory=IntegrationConfig)
     flow_profile_quota_blocked_until: Dict[str, float] = Field(default_factory=dict)
     flow_profile_agent_retry_error_counts: Dict[str, int] = Field(default_factory=dict)
@@ -279,14 +317,61 @@ class TrelloConfigUpdateRequest(BaseModel):
     persist_to_env: bool = False  # also write to .env.local so creds survive state resets
 
 
+class EtsyConfigUpdateRequest(BaseModel):
+    api_key: str = ""
+    api_secret: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+    user_id: str = ""
+    shop_id: str = ""
+    taxonomy_id: str = ""
+    shipping_profile_id: str = ""
+    return_policy_id: str = ""
+    readiness_state_id: str = ""
+    quantity: int = 1
+    price: str = "9.99"
+    who_made: str = "i_did"
+    when_made: str = "made_to_order"
+    is_supply: bool = False
+    should_auto_renew: bool = False
+    clear_credentials: bool = False
+
+
+class EtsyAccountUpsertRequest(BaseModel):
+    slug: str = ""
+    label: str = ""
+    trello_board_id: str = ""
+    trello_list_id: str = ""
+    etsy_shop_id: str = ""
+    enabled: bool = True
+
+
+class EtsyAccountDeleteRequest(BaseModel):
+    slug: str = ""
+
+
 class ResetReadyTrelloRequest(BaseModel):
     trello_board_id: str = ""
     trello_list_id: str = ""
 
 
+class EtsySectionSyncRequest(BaseModel):
+    trello_board_id: str = ""
+    trello_list_id: str = ""
+    include_list_ids: List[str] = Field(default_factory=list)
+    include_list_names: List[str] = Field(default_factory=list)
+    exclude_list_names: List[str] = Field(default_factory=list)
+    dry_run: bool = True
+    create_missing: bool = False
+    tracking_only: bool = False
+    replace_tracking: bool = False
+    max_sections: int = 100
+
+
 class IntegrationConfigUpdateRequest(BaseModel):
     gemini_api_key: str = ""
     gemini_model: str = ""
+    gemini_image_model: str = ""
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     playwright_browsers_path: str = ""
@@ -316,6 +401,27 @@ class AutomationGraphRequest(BaseModel):
     selected_module_id: str = ""
 
 
+class EtsyVariationValueRequest(BaseModel):
+    value: str = ""
+    price: str = ""
+    quantity: int = 0
+    is_enabled: bool = True
+
+
+class EtsyVariationRequest(BaseModel):
+    property_name: str = ""
+    property_id: int = 0
+    scale_id: int = 0
+    values: List[EtsyVariationValueRequest] = Field(default_factory=list)
+
+
+class EtsyAttributeRequest(BaseModel):
+    property_id: int = 0
+    scale_id: int = 0
+    value_ids: List[int] = Field(default_factory=list)
+    values: List[str] = Field(default_factory=list)
+
+
 class CreateJobRequest(BaseModel):
     type: str
     prompt: str = ""
@@ -323,6 +429,7 @@ class CreateJobRequest(BaseModel):
     timeout_s: int = 0
     source_job_id: str = ""
     model: str = ""
+    image_engine: str = "google_flow"
     aspect: str = "landscape"
     count: int = 1
     start_image_path: str = ""
@@ -334,6 +441,8 @@ class CreateJobRequest(BaseModel):
     telegram_chat_id: str = ""
     telegram_enabled: bool = True
     trello_enabled: bool = True
+    etsy_enabled: bool = False
+    amazon_enabled: bool = False
     flow_agent_enabled: bool = True
     flow_agent_auto_approve: bool = True
     automation_graph: AutomationGraphRequest = Field(default_factory=AutomationGraphRequest)
@@ -344,6 +453,41 @@ class CreateJobRequest(BaseModel):
     trello_source_card_id: str = ""
     trello_source_attachment_ids: List[str] = Field(default_factory=list)
     trello_set_cover: bool = True
+    etsy_listing_title: str = ""
+    etsy_listing_description: str = ""
+    etsy_listing_tags: List[str] = Field(default_factory=list)
+    etsy_listing_materials: List[str] = Field(default_factory=list)
+    etsy_browser_copy_enabled: bool = False
+    etsy_account_id: str = ""
+    etsy_template_listing_url: str = ""
+    etsy_template_listing_id: str = ""
+    etsy_section_name: str = ""
+    etsy_listing_sku: str = ""
+    etsy_vm_image_dir: str = ""
+    etsy_keep_color_chart: bool = True
+    etsy_delete_existing_images: bool = True
+    etsy_price: str = ""
+    etsy_quantity: int = 0
+    etsy_taxonomy_id: str = ""
+    etsy_shipping_profile_id: str = ""
+    etsy_return_policy_id: str = ""
+    etsy_readiness_state_id: str = ""
+    etsy_publish: bool = False
+    etsy_variations: List[EtsyVariationRequest] = Field(default_factory=list)
+    etsy_attributes: List[EtsyAttributeRequest] = Field(default_factory=list)
+    amazon_browser_copy_enabled: bool = False
+    amazon_account_id: str = ""
+    amazon_template_listing_url: str = ""
+    amazon_template_listing_id: str = ""
+    amazon_listing_title: str = ""
+    amazon_listing_description: str = ""
+    amazon_listing_sku: str = ""
+    amazon_product_type: str = ""
+    amazon_vm_image_dir: str = ""
+    amazon_delete_existing_images: bool = True
+    amazon_price: str = ""
+    amazon_quantity: int = 0
+    amazon_publish: bool = False
     prompt_source_row: int = 0
     prompt_product: str = ""
     prompt_product_key: str = ""
@@ -380,9 +524,29 @@ class PromptBatchRequest(BaseModel):
     title: str = ""
     limit: int = 40
     auto_trello: bool = False
+    create_etsy_draft: bool = False
+    etsy_only: bool = False
     run_until_empty: bool = False
     continuous: bool = False
     poll_interval_s: int = 30
+
+
+class ExtensionAutoTrelloPlanRequest(BaseModel):
+    batch: PromptBatchRequest = Field(default_factory=PromptBatchRequest)
+
+
+class ExtensionAutoTrelloImageRequest(BaseModel):
+    data_url: str = ""
+    url: str = ""
+    name: str = ""
+    mime_type: str = ""
+
+
+class ExtensionAutoTrelloArchiveRequest(BaseModel):
+    job: CreateJobRequest = Field(default_factory=lambda: CreateJobRequest(type="image"))
+    item: Dict[str, Any] = Field(default_factory=dict)
+    images: List[ExtensionAutoTrelloImageRequest] = Field(default_factory=list)
+    extension_result: Dict[str, Any] = Field(default_factory=dict)
 
 
 class DownloadRequest(BaseModel):
@@ -463,6 +627,16 @@ class FlowOperatorRequest(BaseModel):
     instruction: str = ""
     context: str = ""
     run_mode: str = "plan"
+
+
+class MasterBotRequest(BaseModel):
+    instruction: str = ""
+    context: str = ""
+    run_mode: str = "plan"
+    auto_trello: bool = False
+    continuous: bool = False
+    limit: int = 0
+    create_etsy_draft: bool = False
 
 
 class StoryboardScene(BaseModel):

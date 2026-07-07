@@ -8,6 +8,8 @@ from .messages import classify_job_error, humanize_flow_error
 from .paths import STATE_FILE, ensure_app_dirs
 from .schemas import (
     AppConfig,
+    EtsyAccount,
+    EtsyConfig,
     IntegrationConfig,
     JobArtifact,
     JobErrorSnapshot,
@@ -46,6 +48,8 @@ class StateStore:
         self._state = self._load()
         self._normalize_saved_config()
         self._normalize_saved_trello_config()
+        self._normalize_saved_etsy_config()
+        self._normalize_saved_etsy_accounts()
         self._normalize_saved_integration_config()
         self._normalize_saved_jobs()
         self._repair_incomplete_jobs()
@@ -64,6 +68,18 @@ class StateStore:
             self._state.trello_config = self._normalize_trello_config(config)
             await self._save_locked()
         return self._state.trello_config
+
+    async def replace_etsy_config(self, config: EtsyConfig) -> EtsyConfig:
+        async with self._lock:
+            self._state.etsy_config = self._normalize_etsy_config(config)
+            await self._save_locked()
+        return self._state.etsy_config
+
+    async def replace_etsy_accounts(self, accounts: List[EtsyAccount]) -> List[EtsyAccount]:
+        async with self._lock:
+            self._state.etsy_accounts = self._normalize_etsy_accounts(accounts)
+            await self._save_locked()
+        return list(self._state.etsy_accounts)
 
     async def replace_integration_config(self, config: IntegrationConfig) -> IntegrationConfig:
         async with self._lock:
@@ -332,6 +348,29 @@ class StateStore:
             encoding="utf-8",
         )
 
+    def _normalize_saved_etsy_config(self) -> None:
+        normalized = self._normalize_etsy_config(getattr(self._state, "etsy_config", EtsyConfig()))
+        if _model_dump(normalized) == _model_dump(getattr(self._state, "etsy_config", EtsyConfig())):
+            return
+        self._state.etsy_config = normalized
+        STATE_FILE.write_text(
+            json.dumps(_model_dump(self._state), indent=2),
+            encoding="utf-8",
+        )
+
+    def _normalize_saved_etsy_accounts(self) -> None:
+        # getattr-safe: legacy state.json predates etsy_accounts, so an absent
+        # field must read as an empty list (zero extra accounts = default-only).
+        current = list(getattr(self._state, "etsy_accounts", []) or [])
+        normalized = self._normalize_etsy_accounts(current)
+        if [_model_dump(item) for item in normalized] == [_model_dump(item) for item in current]:
+            return
+        self._state.etsy_accounts = normalized
+        STATE_FILE.write_text(
+            json.dumps(_model_dump(self._state), indent=2),
+            encoding="utf-8",
+        )
+
     def _normalize_saved_integration_config(self) -> None:
         normalized = self._normalize_integration_config(self._state.integration_config)
         if _model_dump(normalized) == _model_dump(self._state.integration_config):
@@ -373,6 +412,72 @@ class StateStore:
             playwright_browsers_path=str(payload.get("playwright_browsers_path") or "").strip(),
             updated_at=str(payload.get("updated_at") or "").strip(),
         )
+
+    def _normalize_etsy_config(self, config: EtsyConfig) -> EtsyConfig:
+        payload = _model_dump(config)
+        api_key = str(payload.get("api_key") or "").strip()
+        api_secret = str(payload.get("api_secret") or "").strip()
+        if ":" in api_key and not api_secret:
+            api_key, api_secret = [part.strip() for part in api_key.split(":", 1)]
+        try:
+            quantity = int(payload.get("quantity") or 1)
+        except (TypeError, ValueError):
+            quantity = 1
+        return EtsyConfig(
+            api_key=api_key,
+            api_secret=api_secret,
+            access_token=str(payload.get("access_token") or "").strip(),
+            refresh_token=str(payload.get("refresh_token") or "").strip(),
+            user_id=str(payload.get("user_id") or "").strip(),
+            shop_id=str(payload.get("shop_id") or "").strip(),
+            taxonomy_id=str(payload.get("taxonomy_id") or "").strip(),
+            shipping_profile_id=str(payload.get("shipping_profile_id") or "").strip(),
+            return_policy_id=str(payload.get("return_policy_id") or "").strip(),
+            readiness_state_id=str(payload.get("readiness_state_id") or "").strip(),
+            quantity=max(1, quantity),
+            price=str(payload.get("price") or "9.99").strip() or "9.99",
+            who_made=str(payload.get("who_made") or "i_did").strip() or "i_did",
+            when_made=str(payload.get("when_made") or "made_to_order").strip() or "made_to_order",
+            is_supply=bool(payload.get("is_supply")),
+            should_auto_renew=bool(payload.get("should_auto_renew")),
+            updated_at=str(payload.get("updated_at") or "").strip(),
+        )
+
+    @staticmethod
+    def _normalize_account_slug(value: Any) -> str:
+        slug = str(value or "").strip().lower()
+        slug = "".join(ch if (ch.isalnum() or ch in "_-") else "-" for ch in slug)
+        return slug.strip("-")
+
+    def _normalize_etsy_account(self, account: EtsyAccount) -> EtsyAccount:
+        payload = _model_dump(account)
+        slug = self._normalize_account_slug(payload.get("slug"))
+        return EtsyAccount(
+            slug=slug,
+            label=str(payload.get("label") or "").strip() or slug,
+            trello_board_id=str(payload.get("trello_board_id") or "").strip(),
+            trello_list_id=str(payload.get("trello_list_id") or "").strip(),
+            etsy_shop_id=str(payload.get("etsy_shop_id") or "").strip(),
+            enabled=payload.get("enabled") is not False,
+            updated_at=str(payload.get("updated_at") or "").strip(),
+        )
+
+    def _normalize_etsy_accounts(self, accounts: Any) -> List[EtsyAccount]:
+        # Drop reserved slugs ("" / "default" belong to the implicit default
+        # account = global TrelloConfig/EtsyConfig, never stored here) and dedup
+        # by slug (last write wins, original order preserved).
+        seen: Dict[str, EtsyAccount] = {}
+        order: List[str] = []
+        for raw in (accounts or []):
+            account = raw if isinstance(raw, EtsyAccount) else _model_validate(EtsyAccount, dict(raw or {}))
+            normalized = self._normalize_etsy_account(account)
+            slug = normalized.slug
+            if not slug or slug == "default":
+                continue
+            if slug not in seen:
+                order.append(slug)
+            seen[slug] = normalized
+        return [seen[slug] for slug in order]
 
     def _normalize_saved_jobs(self) -> None:
         changed = False

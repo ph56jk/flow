@@ -34,3 +34,17 @@ logs/
 # Ralph runtime files
 .ralph-output/
 .ralph-tui/
+
+# Secrets / runtime data (never commit)
+data/etsy_oauth_pending.json
+data/etsy_section_tracking.json
+data/*.bak-*
+data/state.json.bak-quota
+.claude/
+.tmp/
+
+# Stray junk files
+/no
+*.err
+etsy_vm_backend_proxy.log
+C:\\Users*

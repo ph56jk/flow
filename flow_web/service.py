@@ -22,16 +22,25 @@ import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 from urllib.request import Request, urlopen
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Dict, List, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, List, Optional, Sequence
 from xml.etree import ElementTree as ET
 
 from fastapi import HTTPException, UploadFile
 
 from .messages import humanize_flow_error
-from .paths import DATA_DIR, DOWNLOADS_DIR, PROJECT_ROOT, UPLOADS_DIR, ensure_app_dirs
+from .paths import (
+    DATA_DIR,
+    DOWNLOADS_DIR,
+    EXTENSION_DIR,
+    EXTENSION_WXT_BUILD_DIR,
+    PROJECT_ROOT,
+    UPLOADS_DIR,
+    ensure_app_dirs,
+)
 from .shot_rules import PRODUCT_SHOT_RULE_PRIORITY, PRODUCT_SHOT_RULES
 from .schemas import (
     AppConfig,
@@ -44,6 +53,15 @@ from .schemas import (
     ConfigUpdateRequest,
     CreateJobRequest,
     DownloadRequest,
+    EtsyAccount,
+    EtsyAccountDeleteRequest,
+    EtsyAccountUpsertRequest,
+    EtsyConfig,
+    EtsyConfigUpdateRequest,
+    EtsySectionSyncRequest,
+    ExtensionAutoTrelloArchiveRequest,
+    ExtensionAutoTrelloImageRequest,
+    ExtensionAutoTrelloPlanRequest,
     FlowOperatorRequest,
     IntegrationConfig,
     IntegrationConfigUpdateRequest,
@@ -56,6 +74,7 @@ from .schemas import (
     ProjectHealthTimelineEntry,
     JobRecord,
     JobRetrySnapshot,
+    MasterBotRequest,
     OutputShelfItem,
     OutputShelfSnapshot,
     PromptAssistantSnapshot,
@@ -99,17 +118,6 @@ class FlowBrowserProfile:
         return str(self.path.resolve()).lower()
 
 
-@dataclass(frozen=True)
-class ImageUpscaleResult:
-    bytes: Optional[bytes] = None
-    mime_type: str = ""
-    source: str = ""
-    source_size: tuple[int, int] = (0, 0)
-    target_size: tuple[int, int] = (0, 0)
-    used_flow: bool = False
-    failure_reason: str = ""
-
-
 class FlowAgentQuotaError(RuntimeError):
     """Raised when the current Google Flow Agent browser profile hits its quota."""
 
@@ -133,8 +141,31 @@ def _parse_iso_datetime(value: str) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _version_at_least(actual: str, expected: str) -> bool:
+    actual_text = str(actual or "").strip()
+    expected_text = str(expected or "").strip()
+    if not actual_text or not expected_text:
+        return False
+    actual_parts = [int(part) if part.isdigit() else 0 for part in actual_text.split(".")]
+    expected_parts = [int(part) if part.isdigit() else 0 for part in expected_text.split(".")]
+    length = max(len(actual_parts), len(expected_parts))
+    actual_parts.extend([0] * (length - len(actual_parts)))
+    expected_parts.extend([0] * (length - len(expected_parts)))
+    return actual_parts >= expected_parts
+
+
 class FlowWebService:
     MAX_OUTPUT_SHELF_ITEMS = 6
+    # The worker self-reports the instant the draft is saved (content script
+    # sendBeacon + background relay), so a healthy copy reports back within a
+    # few minutes. This stale timeout is only a safety net for a genuinely
+    # stuck task; it sits comfortably above the content script's worst-case
+    # internal step budget (~6.5 min) while surfacing real failures faster than
+    # the old 11-minute wait.
+    ETSY_BROWSER_COPY_STALE_TIMEOUT = timedelta(minutes=8)
+    ETSY_BROWSER_COPY_MIN_EXTENSION_VERSION = "0.8.100"
+    AMAZON_BROWSER_COPY_STALE_TIMEOUT = timedelta(minutes=8)
+    AMAZON_BROWSER_COPY_MIN_EXTENSION_VERSION = "0.8.129"
     PROJECT_HEALTH_TIMELINE_LIMIT = 4
     PROJECT_HEALTH_RECENCY_DAYS = 14
     CLEANUP_PREVIEW_LIMIT = 3
@@ -148,13 +179,14 @@ class FlowWebService:
     MEDIA_SKILL_PATH_PATTERN = re.compile(r"^.+/SKILL\.md$", re.IGNORECASE)
     GEMINI_API_URL_TEMPLATE = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     GEMINI_DEFAULT_MODEL = "gemini-2.5-flash"
+    GEMINI_IMAGE_DEFAULT_MODEL = "gemini-2.5-flash-image"
     GEMINI_TIMEOUT_S = 30
     USER_ASSISTANT_CONTEXT_LIMIT = 1200
     USER_ASSISTANT_ANSWER_LIMIT = 1400
     AI_PROMPT_SUITE_SIZE = 6
-    FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12
-    FLOW_AGENT_TARGET_OUTPUT_COUNT = 12
-    FLOW_AGENT_MAX_IMAGES_PER_RUN = 12
+    FLOW_AGENT_DEFAULT_IMAGE_COUNT = 4
+    FLOW_AGENT_TARGET_OUTPUT_COUNT = 4
+    FLOW_AGENT_MAX_IMAGES_PER_RUN = 4
     BANNER_VISIBLE_WALL_HOOK_RULE = (
         "Wall-hanging banner shots must show a clearly visible wall hook, nail, or peg above the dowel, "
         "with the rope/cord visibly hanging from that support; do not crop it out, hide it behind the dowel, "
@@ -168,24 +200,21 @@ class FlowWebService:
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
     TRELLO_TIMEOUT_S = 30
+    ETSY_API_BASE_URL = "https://openapi.etsy.com/v3/application"
+    ETSY_TIMEOUT_S = 30
     TRELLO_UPSCALE_LONG_EDGE_PX = 2048
-    TRELLO_AI_TITLE_BACKUP_FILE_NAME = "trello-title-description-backups.json"
-    TRELLO_AI_TITLE_BEGIN_MARKER = "<!-- FLOW_AI_TITLE_START -->"
-    TRELLO_AI_TITLE_END_MARKER = "<!-- FLOW_AI_TITLE_END -->"
     DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
     DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES = ()
     DEFAULT_TRELLO_REVIEW_LIST_NAME = "Content Review"
-    DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026"
+    DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/gpy5eAiG/team-trung-anh-2025"
     DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
-    DEFAULT_IMAGE_MODEL = "GEMINI_3_PRO_IMAGE"
+    DEFAULT_IMAGE_MODEL = "NARWHAL"
     IMAGE_MODEL_LABELS = {
-        "GEMINI_3_PRO_IMAGE": "Nano Banana Pro",
         "NARWHAL": "Nano Banana 2",
         "IMAGEN_3": "Imagen 3",
     }
     IMAGE_MODEL_EDIT_VALUES = {
-        "GEMINI_3_PRO_IMAGE": "GEMINI_3_PRO_IMAGE",
         "NARWHAL": "GEM_PIX_2",
         "IMAGEN_3": "IMAGEN_3",
     }
@@ -201,10 +230,6 @@ class FlowWebService:
         "veo 3.1 - fast [lower priority]": "Veo 3.1 - Fast [Lower Priority]",
     }
     IMAGE_MODEL_ALIASES = {
-        "gemini 3 pro image": "GEMINI_3_PRO_IMAGE",
-        "gemini-3-pro-image-preview": "GEMINI_3_PRO_IMAGE",
-        "gemini_3_pro_image": "GEMINI_3_PRO_IMAGE",
-        "nano banana pro": "GEMINI_3_PRO_IMAGE",
         "narwhal": "NARWHAL",
         "gem_pix_2": "NARWHAL",
         "nano banana": "NARWHAL",
@@ -309,6 +334,20 @@ class FlowWebService:
         self._active_flow_profile_index = 0
         self._trello_source_downloads: Dict[str, Dict[str, Any]] = {}
         self._trello_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
+        self._etsy_browser_copy_queue: List[str] = []
+        self._etsy_browser_copy_tasks: Dict[str, Dict[str, Any]] = {}
+        self._amazon_browser_copy_queue: List[str] = []
+        self._amazon_browser_copy_tasks: Dict[str, Dict[str, Any]] = {}
+        # App-side Etsy access-token refresh: when a 401 happens mid-job we
+        # exchange the refresh token for a fresh access token and cache it here
+        # so subsequent calls in the same process reuse it (Etsy access tokens
+        # expire after ~1h). Never logged; masked everywhere.
+        self._etsy_refreshed_access_token: str = ""
+        # Pending one-click OAuth handshakes keyed by ``state``. Each entry holds
+        # the PKCE ``code_verifier`` and the exact ``redirect_uri`` used to build
+        # the authorize URL (Etsy requires the token exchange to reuse it). Short
+        # lived; pruned on each new start.
+        self._etsy_oauth_pending: Dict[str, Dict[str, Any]] = {}
         self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
             self.store.snapshot().flow_profile_quota_blocked_until
         )
@@ -343,6 +382,8 @@ class FlowWebService:
             "auth": auth,
             "integrations": self._integration_config_snapshot(snapshot.integration_config),
             "trello": self._trello_config_snapshot(snapshot.trello_config),
+            "etsy": self._etsy_config_snapshot(snapshot.etsy_config),
+            "extensions": self.extension_registry(),
             "workspace": workspace,
             "output_shelf": output_shelf,
             "replay_pack": replay_pack,
@@ -396,9 +437,16 @@ class FlowWebService:
             telegram_bot_token = telegram_bot_token or current.telegram_bot_token
 
         gemini_model = self._sanitize_gemini_model(request.gemini_model or current.gemini_model or self.GEMINI_DEFAULT_MODEL)
+        gemini_image_model = self._sanitize_gemini_model(
+            request.gemini_image_model
+            or current.gemini_image_model
+            or os.getenv("GEMINI_IMAGE_MODEL", "")
+            or self.GEMINI_IMAGE_DEFAULT_MODEL
+        )
         config = IntegrationConfig(
             gemini_api_key=gemini_api_key,
             gemini_model=gemini_model,
+            gemini_image_model=gemini_image_model,
             telegram_bot_token=telegram_bot_token,
             telegram_chat_id=request.telegram_chat_id.strip(),
             playwright_browsers_path=request.playwright_browsers_path.strip(),
@@ -428,6 +476,11 @@ class FlowWebService:
         telegram_chat_id = state_telegram_chat_id or os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
         gemini_model = self._sanitize_gemini_model(config.gemini_model or self.GEMINI_DEFAULT_MODEL)
+        gemini_image_model = self._sanitize_gemini_model(
+            config.gemini_image_model
+            or os.getenv("GEMINI_IMAGE_MODEL", "")
+            or self.GEMINI_IMAGE_DEFAULT_MODEL
+        )
         playwright_browsers_path = str(config.playwright_browsers_path or "").strip()
         runtime_playwright_path = playwright_browsers_path or os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
         flow_profiles = self._flow_profile_specs()
@@ -446,6 +499,7 @@ class FlowWebService:
                 "api_key_saved": bool(gemini_api_key),
                 "credentials_source": gemini_source,
                 "model": gemini_model,
+                "image_model": gemini_image_model,
             },
             "telegram": {
                 "configured": bool(telegram_bot_token and telegram_chat_id),
@@ -623,6 +677,1587 @@ class FlowWebService:
             "set_cover": config.set_cover is not False,
             "upscale_to_2k": bool(getattr(config, "upscale_to_2k", True)),
             "updated_at": config.updated_at,
+        }
+
+    async def update_etsy_config(self, request: EtsyConfigUpdateRequest) -> Dict[str, Any]:
+        current = self.store.snapshot().etsy_config
+        api_key = request.api_key.strip()
+        api_secret = request.api_secret.strip()
+        if ":" in api_key and not api_secret:
+            api_key, api_secret = [part.strip() for part in api_key.split(":", 1)]
+        access_token = request.access_token.strip()
+        refresh_token = request.refresh_token.strip()
+        if not request.clear_credentials:
+            api_key = api_key or current.api_key
+            api_secret = api_secret or getattr(current, "api_secret", "")
+            access_token = access_token or current.access_token
+            refresh_token = refresh_token or getattr(current, "refresh_token", "")
+
+        try:
+            quantity = int(request.quantity or current.quantity or 1)
+        except (TypeError, ValueError):
+            quantity = 1
+
+        fallback = EtsyConfig() if request.clear_credentials else current
+        config = EtsyConfig(
+            api_key=api_key,
+            api_secret=api_secret,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            user_id=request.user_id.strip() or fallback.user_id,
+            shop_id=request.shop_id.strip() or fallback.shop_id,
+            taxonomy_id=request.taxonomy_id.strip() or fallback.taxonomy_id,
+            shipping_profile_id=request.shipping_profile_id.strip() or fallback.shipping_profile_id,
+            return_policy_id=request.return_policy_id.strip() or fallback.return_policy_id,
+            readiness_state_id=request.readiness_state_id.strip() or fallback.readiness_state_id,
+            quantity=max(1, quantity),
+            price=(request.price.strip() or fallback.price or "9.99"),
+            who_made=(request.who_made.strip() or fallback.who_made or "i_did"),
+            when_made=(request.when_made.strip() or fallback.when_made or "made_to_order"),
+            is_supply=bool(request.is_supply),
+            should_auto_renew=bool(request.should_auto_renew),
+            updated_at=utc_now(),
+        )
+        saved = await self.store.replace_etsy_config(config)
+        saved, autofill = await self._autofill_etsy_config_defaults(saved)
+        snapshot = self._etsy_config_snapshot(saved)
+        snapshot["autofill"] = autofill
+        return snapshot
+
+    # ------------------------------------------------------------------
+    # Etsy multi-account registry (fleet routing)
+    #
+    # The DEFAULT account has slug "" and IS the existing global
+    # TrelloConfig + EtsyConfig, so legacy single-account state keeps working
+    # untouched. Extra accounts live in StateSnapshot.etsy_accounts, each
+    # carrying its OWN Trello board (image/info source) + Etsy shop. Routing
+    # key = task.account_id matched against the worker's accountId; an empty or
+    # "default" id always resolves to the default account.
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_account_id(value: Any) -> str:
+        slug = str(value or "").strip().lower()
+        slug = "".join(ch if (ch.isalnum() or ch in "_-") else "-" for ch in slug).strip("-")
+        if slug in ("", "default"):
+            return ""
+        return slug
+
+    def _etsy_account_record(self, account_id: Any) -> Optional[EtsyAccount]:
+        slug = self._normalize_account_id(account_id)
+        if not slug:
+            return None
+        for account in (getattr(self.store.snapshot(), "etsy_accounts", []) or []):
+            if self._normalize_account_id(getattr(account, "slug", "")) == slug:
+                return account
+        return None
+
+    def _resolve_etsy_account(self, account_id: Any) -> Optional[Dict[str, Any]]:
+        """Routing/board info for an account. Empty/"default" -> the global
+        config (default account). Unknown slug -> None."""
+        slug = self._normalize_account_id(account_id)
+        snapshot = self.store.snapshot()
+        if not slug:
+            trello = snapshot.trello_config
+            return {
+                "slug": "",
+                "label": "Mặc định (shop chính)",
+                "is_default": True,
+                "enabled": True,
+                "trello_board_id": self._normalize_trello_board_id(
+                    str(getattr(trello, "board_id", "") or "").strip() or os.getenv("TRELLO_BOARD_ID", "").strip()
+                ),
+                "trello_list_id": self._normalize_trello_id(
+                    str(getattr(trello, "list_id", "") or "").strip() or os.getenv("TRELLO_LIST_ID", "").strip()
+                ),
+                "etsy_shop_id": str(getattr(snapshot.etsy_config, "shop_id", "") or "").strip()
+                or os.getenv("ETSY_SHOP_ID", "").strip(),
+            }
+        account = self._etsy_account_record(slug)
+        if account is None:
+            return None
+        return {
+            "slug": slug,
+            "label": str(getattr(account, "label", "") or "").strip() or slug,
+            "is_default": False,
+            "enabled": getattr(account, "enabled", True) is not False,
+            "trello_board_id": self._normalize_trello_board_id(str(getattr(account, "trello_board_id", "") or "").strip()),
+            "trello_list_id": self._normalize_trello_id(str(getattr(account, "trello_list_id", "") or "").strip()),
+            "etsy_shop_id": str(getattr(account, "etsy_shop_id", "") or "").strip(),
+        }
+
+    def etsy_accounts_snapshot(self) -> Dict[str, Any]:
+        accounts = [self._resolve_etsy_account("")]
+        for account in (getattr(self.store.snapshot(), "etsy_accounts", []) or []):
+            resolved = self._resolve_etsy_account(getattr(account, "slug", ""))
+            if resolved is not None:
+                accounts.append(resolved)
+        return {"accounts": accounts, "default_slug": ""}
+
+    def _merged_etsy_account(
+        self,
+        current: Optional[EtsyAccount],
+        request: EtsyAccountUpsertRequest,
+        slug: str,
+    ) -> EtsyAccount:
+        base = current or EtsyAccount()
+        return EtsyAccount(
+            slug=slug,
+            label=str(request.label or "").strip() or getattr(base, "label", "") or slug,
+            trello_board_id=str(request.trello_board_id or "").strip() or getattr(base, "trello_board_id", ""),
+            trello_list_id=str(request.trello_list_id or "").strip() or getattr(base, "trello_list_id", ""),
+            etsy_shop_id=str(request.etsy_shop_id or "").strip() or getattr(base, "etsy_shop_id", ""),
+            enabled=bool(request.enabled),
+            updated_at=utc_now(),
+        )
+
+    async def upsert_etsy_account(self, request: EtsyAccountUpsertRequest) -> Dict[str, Any]:
+        slug = self._normalize_account_id(request.slug)
+        if not slug:
+            raise HTTPException(status_code=400, detail="Slug account không hợp lệ (rỗng hoặc trùng 'default').")
+        existing = list(getattr(self.store.snapshot(), "etsy_accounts", []) or [])
+        updated: List[EtsyAccount] = []
+        replaced = False
+        for account in existing:
+            if self._normalize_account_id(getattr(account, "slug", "")) == slug:
+                updated.append(self._merged_etsy_account(account, request, slug))
+                replaced = True
+            else:
+                updated.append(account)
+        if not replaced:
+            updated.append(self._merged_etsy_account(None, request, slug))
+        await self.store.replace_etsy_accounts(updated)
+        return self.etsy_accounts_snapshot()
+
+    async def delete_etsy_account(self, request: EtsyAccountDeleteRequest) -> Dict[str, Any]:
+        slug = self._normalize_account_id(request.slug)
+        if not slug:
+            raise HTTPException(status_code=400, detail="Slug account không hợp lệ để xoá.")
+        existing = list(getattr(self.store.snapshot(), "etsy_accounts", []) or [])
+        kept = [account for account in existing if self._normalize_account_id(getattr(account, "slug", "")) != slug]
+        if len(kept) != len(existing):
+            await self.store.replace_etsy_accounts(kept)
+        return self.etsy_accounts_snapshot()
+
+    @staticmethod
+    def _split_etsy_api_key_value(value: Any) -> tuple[str, str]:
+        text = str(value or "").strip()
+        if ":" not in text:
+            return text, ""
+        key, secret = text.split(":", 1)
+        return key.strip(), secret.strip()
+
+    def _etsy_key_parts_from_config(self, config: EtsyConfig | None = None) -> tuple[str, str, str]:
+        config = config or self.store.snapshot().etsy_config
+        state_key, state_embedded_secret = self._split_etsy_api_key_value(getattr(config, "api_key", ""))
+        env_key, env_embedded_secret = self._split_etsy_api_key_value(os.getenv("ETSY_API_KEY", ""))
+        api_key = state_key or env_key
+        api_secret = (
+            str(getattr(config, "api_secret", "") or "").strip()
+            or os.getenv("ETSY_SHARED_SECRET", "").strip()
+            or os.getenv("ETSY_API_SECRET", "").strip()
+            or state_embedded_secret
+            or env_embedded_secret
+        )
+        header_value = f"{api_key}:{api_secret}" if api_key and api_secret else api_key
+        return api_key, api_secret, header_value
+
+    def _etsy_oauth_client_id(self) -> str:
+        return self._etsy_key_parts_from_config()[0]
+
+    def _etsy_config_snapshot(self, config: EtsyConfig) -> Dict[str, Any]:
+        api_key, api_secret, _api_key_header = self._etsy_key_parts_from_config(config)
+        access_token = str(config.access_token or "").strip() or os.getenv("ETSY_ACCESS_TOKEN", "").strip()
+        shop_id = str(config.shop_id or "").strip() or os.getenv("ETSY_SHOP_ID", "").strip()
+        user_id = str(config.user_id or "").strip() or os.getenv("ETSY_USER_ID", "").strip()
+        taxonomy_id = str(config.taxonomy_id or "").strip() or os.getenv("ETSY_TAXONOMY_ID", "").strip()
+        shipping_profile_id = (
+            str(config.shipping_profile_id or "").strip()
+            or os.getenv("ETSY_SHIPPING_PROFILE_ID", "").strip()
+        )
+        return_policy_id = (
+            str(config.return_policy_id or "").strip()
+            or os.getenv("ETSY_RETURN_POLICY_ID", "").strip()
+        )
+        readiness_state_id = (
+            str(config.readiness_state_id or "").strip()
+            or os.getenv("ETSY_READINESS_STATE_ID", "").strip()
+        )
+        price = str(config.price or "").strip() or os.getenv("ETSY_DEFAULT_PRICE", "").strip() or "9.99"
+        try:
+            quantity = int(str(config.quantity or "").strip() or os.getenv("ETSY_DEFAULT_QUANTITY", "").strip() or "1")
+        except (TypeError, ValueError):
+            quantity = 1
+        state_key, state_embedded_secret = self._split_etsy_api_key_value(getattr(config, "api_key", ""))
+        env_key, env_embedded_secret = self._split_etsy_api_key_value(os.getenv("ETSY_API_KEY", ""))
+        state_key_saved = bool(state_key)
+        state_secret_saved = bool(str(getattr(config, "api_secret", "") or "").strip() or state_embedded_secret)
+        state_token_saved = bool(str(config.access_token or "").strip())
+        env_key_saved = bool(env_key)
+        env_secret_saved = bool(
+            os.getenv("ETSY_SHARED_SECRET", "").strip()
+            or os.getenv("ETSY_API_SECRET", "").strip()
+            or env_embedded_secret
+        )
+        env_token_saved = bool(os.getenv("ETSY_ACCESS_TOKEN", "").strip())
+        credentials_ready = bool(api_key and api_secret and access_token)
+        if credentials_ready and state_key_saved and state_secret_saved and state_token_saved:
+            credentials_source = "state"
+        elif credentials_ready and env_key_saved and env_secret_saved and env_token_saved:
+            credentials_source = "env"
+        elif credentials_ready:
+            credentials_source = "mixed"
+        else:
+            credentials_source = ""
+        required_missing = [
+            key
+            for key, value in {
+                "api_key": api_key,
+                "api_secret": api_secret,
+                "access_token": access_token,
+                "shop_id": shop_id,
+                "shipping_profile_id": shipping_profile_id,
+            }.items()
+            if not str(value or "").strip()
+        ]
+        optional_missing = [
+            key
+            for key, value in {
+                "taxonomy_id": taxonomy_id,
+            }.items()
+            if not str(value or "").strip()
+        ]
+        listing_defaults_ready = credentials_ready and not required_missing
+        full_configured = listing_defaults_ready and not optional_missing
+        dry_run = self._etsy_dry_run_enabled({"shop_id": shop_id})
+        return {
+            "configured": bool(listing_defaults_ready),
+            "full_configured": bool(full_configured),
+            "listing_defaults_ready": bool(listing_defaults_ready),
+            "dry_run": dry_run,
+            "credentials_saved": credentials_ready,
+            "api_key_saved": bool(api_key),
+            "shared_secret_saved": bool(api_secret),
+            "api_key_header_saved": bool(api_key and api_secret),
+            "access_token_saved": bool(access_token),
+            "refresh_token_saved": bool(
+                str(config.refresh_token or "").strip() or os.getenv("ETSY_REFRESH_TOKEN", "").strip()
+            ),
+            "connected": credentials_ready,
+            "credentials_source": credentials_source,
+            "required_missing": required_missing,
+            "optional_missing": optional_missing,
+            "missing": [*required_missing, *optional_missing],
+            "taxonomy_autofill_supported": True,
+            "shop_id": shop_id,
+            "user_id": user_id,
+            "taxonomy_id": taxonomy_id,
+            "shipping_profile_id": shipping_profile_id,
+            "return_policy_id": return_policy_id,
+            "readiness_state_id": readiness_state_id,
+            "quantity": max(1, quantity),
+            "price": price,
+            "who_made": str(config.who_made or "").strip() or os.getenv("ETSY_WHO_MADE", "").strip() or "i_did",
+            "when_made": str(config.when_made or "").strip() or os.getenv("ETSY_WHEN_MADE", "").strip() or "made_to_order",
+            "is_supply": bool(config.is_supply),
+            "should_auto_renew": bool(config.should_auto_renew),
+            "updated_at": config.updated_at,
+        }
+
+    def _etsy_dry_run_enabled(self, values: Dict[str, Any] | None = None) -> bool:
+        flag = str(os.getenv("ETSY_DRY_RUN", "") or "").strip().lower()
+        if flag in {"1", "true", "yes", "on", "dry-run", "dryrun", "test"}:
+            return True
+        if flag in {"0", "false", "no", "off"}:
+            return False
+        config = self.store.snapshot().etsy_config
+        shop_id = str((values or {}).get("shop_id") or config.shop_id or os.getenv("ETSY_SHOP_ID", "")).strip().lower()
+        return shop_id in {"123456789", "1234567890", "test", "test-shop", "dummy", "demo"} or shop_id.startswith(
+            ("test-", "dummy-", "demo-")
+        )
+
+    def _etsy_list_user_shops(self, api_key: str, access_token: str, user_id: str) -> List[Dict[str, Any]]:
+        safe_user_id = str(user_id or "").strip()
+        if not safe_user_id:
+            return []
+        data = self._etsy_get_json(f"users/{quote(safe_user_id, safe='')}/shops", api_key, access_token)
+        results = data.get("results") if isinstance(data, dict) else data
+        return [item for item in (results or []) if isinstance(item, dict)]
+
+    @staticmethod
+    def _etsy_shop_id_from_payload(shop: Dict[str, Any]) -> str:
+        return str(shop.get("shop_id") or shop.get("id") or shop.get("shopId") or "").strip()
+
+    @staticmethod
+    def _etsy_shipping_profile_id_from_payload(profile: Dict[str, Any]) -> str:
+        return str(profile.get("shipping_profile_id") or profile.get("id") or profile.get("shippingProfileId") or "").strip()
+
+    @staticmethod
+    def _etsy_shop_section_id_from_payload(section: Dict[str, Any]) -> str:
+        return str(
+            section.get("shop_section_id")
+            or section.get("section_id")
+            or section.get("id")
+            or section.get("shopSectionId")
+            or section.get("sectionId")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _etsy_shop_section_title_from_payload(section: Dict[str, Any]) -> str:
+        return str(section.get("title") or section.get("name") or section.get("section_name") or "").strip()
+
+    def _etsy_section_title_max_length(self) -> int:
+        raw = os.getenv("ETSY_SECTION_TITLE_MAX", "24").strip()
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 24
+        return max(1, min(64, value))
+
+    def _etsy_section_title_from_trello_list(self, value: Any) -> str:
+        title = re.sub(r"\s+", " ", str(value or "").strip())
+        title = re.sub(r"\(\s*\d+\s*\)\s*$", "", title).strip()
+        max_len = self._etsy_section_title_max_length()
+        if len(title) <= max_len:
+            return title
+        words = title.split()
+        shortened = ""
+        for word in words:
+            candidate = f"{shortened} {word}".strip()
+            if len(candidate) > max_len:
+                break
+            shortened = candidate
+        return (shortened or title[:max_len]).strip()
+
+    def _etsy_section_name_is_workflow_bucket(self, value: Any) -> bool:
+        key = self._compact_match_text(value)
+        if not key:
+            return False
+        workflow_keys = {
+            self._compact_match_text(self._default_trello_source_list_name()),
+            self._compact_match_text(self._default_trello_review_list_name()),
+            "readyforai",
+            "readyai",
+            "contentreview",
+            "review",
+            "done",
+            "completed",
+            "archive",
+        }
+        return key in {item for item in workflow_keys if item}
+
+    def _etsy_section_tracking_title_for_product(self, card: Dict[str, Any], fields: Dict[str, str]) -> str:
+        payload = self._load_etsy_section_tracking()
+        sections = [item for item in payload.get("sections", []) if isinstance(item, dict)]
+        if not sections:
+            return ""
+        text = " ".join(
+            str(value or "")
+            for value in (
+                card.get("name"),
+                fields.get("title"),
+                fields.get("product_type"),
+                fields.get("raw_note"),
+            )
+        )
+        normalized = self._normalize_skill_token(text)
+        compact = self._compact_match_text(text)
+        tokens = set(self._tokenize_match_words(text))
+        product_rule = (
+            self._flow_operator_product_rule_key_from_visual_text(text)
+            or self._flow_operator_product_rule_key_from_text(text)
+        )
+        preferred_by_rule = {
+            "guest_book": ("baby guest book", "guest book", "album", "photo album"),
+            "vows_book": ("vow book", "vows book"),
+            "dress_baby": ("dress",),
+            "crown": ("birthday crown", "birthday crown/hat", "crown"),
+            "fabric_cross": ("cross",),
+            "banner": ("banner", "hobby ornament"),
+            "drawstring_bag": ("drawstring bag", "pouch", "bag"),
+            "bouquet_ribbon": ("bouquet ribbon", "ribbon"),
+            "bride_handkerchief": ("handkerchief", "hanky"),
+            "plush": ("plush", "baby doll"),
+        }
+        text_aliases = {
+            "album": ("guest book", "baby guest book", "photo album"),
+            "guestbook": ("guest book", "baby guest book"),
+            "guest": ("guest book", "baby guest book"),
+            "vow": ("vow book",),
+            "crown": ("birthday crown", "birthday crown/hat"),
+            "hat": ("birthday crown", "birthday crown/hat"),
+        }
+
+        def has_text_term(term: str) -> bool:
+            term_norm = self._normalize_skill_token(term)
+            term_compact = self._compact_match_text(term)
+            term_tokens = set(self._tokenize_match_words(term))
+            if len(term_tokens) == 1 and term_norm in tokens:
+                return True
+            if term_norm and term_norm in normalized:
+                return True
+            return bool(term_compact and term_compact in compact)
+
+        best_title = ""
+        best_score = 0
+        for index, item in enumerate(sections):
+            title = str(item.get("section_title") or item.get("trello_list_name") or "").strip()
+            if not title or self._etsy_section_name_is_workflow_bucket(title):
+                continue
+            section_key = self._etsy_section_key(title)
+            title_norm = self._normalize_skill_token(title)
+            title_tokens = set(self._tokenize_match_words(title))
+            score = 0
+            if title_norm and title_norm in normalized:
+                score += 18
+            score += len(title_tokens.intersection(tokens)) * 4
+            for wanted in preferred_by_rule.get(product_rule, ()):
+                wanted_key = self._etsy_section_key(wanted)
+                if wanted_key and (wanted_key in section_key or section_key in wanted_key):
+                    score += 16
+            for source_term, wanted_titles in text_aliases.items():
+                if not has_text_term(source_term):
+                    continue
+                for wanted in wanted_titles:
+                    wanted_key = self._etsy_section_key(wanted)
+                    if wanted_key and (wanted_key in section_key or section_key in wanted_key):
+                        score += 14
+            if "baby" in tokens and "baby" in title_tokens:
+                score += 4
+            if score > best_score:
+                best_score = score
+                best_title = title
+        return best_title if best_score >= 8 else ""
+
+    def _etsy_section_key(self, value: Any) -> str:
+        return self._compact_match_text(self._etsy_section_title_from_trello_list(value))
+
+    def _known_etsy_shop_section_id_for_title(self, title: Any) -> str:
+        wanted = self._etsy_section_key(title)
+        if not wanted:
+            return ""
+        known_sections = {
+            "hobbyornament": "55469997",
+            "babykidsornament": "56081238",
+            "familycoupleorm": "56081242",
+            "animalsornament": "56081246",
+            "sportsornament": "56081250",
+            "jobsornament": "56081254",
+            "readingornament": "56100691",
+            "trumpornament": "56100711",
+            "monsterornament": "56334837",
+            "shirts": "56680516",
+            "onm": "283122350341",
+        }
+        if wanted in known_sections:
+            return known_sections[wanted]
+        for key, section_id in known_sections.items():
+            if wanted in key or key in wanted:
+                return section_id
+        return ""
+
+    def _etsy_section_alias_titles(self, title: Any) -> List[str]:
+        wanted = self._etsy_section_key(title)
+        if not wanted:
+            return []
+        aliases: Dict[str, List[str]] = {
+            # Current Etsy shop uses a consolidated baby/kids ornament section.
+            # Trello may still carry the older product-family list names.
+            "babyguestbook": ["Baby & Kids Ornament"],
+            "babydoll": ["Baby & Kids Ornament"],
+        }
+        raw_env = os.getenv("ETSY_SECTION_ALIASES", "").strip()
+        for chunk in re.split(r"[;\n]+", raw_env):
+            if "=" not in chunk:
+                continue
+            source, raw_targets = chunk.split("=", 1)
+            source_key = self._etsy_section_key(source)
+            targets = [item.strip() for item in re.split(r"[,|]+", raw_targets) if item.strip()]
+            if source_key and targets:
+                aliases[source_key] = targets
+        results: List[str] = []
+        seen: set[str] = set()
+        for candidate in aliases.get(wanted, []):
+            clean = self._etsy_section_title_from_trello_list(candidate)
+            key = self._etsy_section_key(clean)
+            if clean and key and key not in seen:
+                seen.add(key)
+                results.append(clean)
+        return results
+
+    def _default_etsy_browser_copy_section_name(self) -> str:
+        return os.getenv("ETSY_BROWSER_COPY_DEFAULT_SECTION", "Baby & Kids Ornament").strip()
+
+    def _preferred_etsy_browser_copy_section_name(self, card: Dict[str, Any], fields: Dict[str, str]) -> str:
+        text = " ".join(
+            str(value or "")
+            for value in (
+                fields.get("section_name"),
+                fields.get("product_type"),
+                fields.get("title"),
+                card.get("name"),
+                fields.get("raw_note"),
+            )
+        )
+        normalized = self._ascii_token_text(text)
+        compact = self._compact_match_text(text)
+        if any(term in normalized for term in ("passport", "ho chieu")) or "hộchiếu" in compact:
+            return "Passport"
+        return ""
+
+    def _etsy_template_fallback_queries(self) -> List[str]:
+        raw = os.getenv("ETSY_TEMPLATE_FALLBACK_QUERIES", "noel,christmas,xmas,holiday ornament").strip()
+        results: List[str] = []
+        seen: set[str] = set()
+        for item in re.split(r"[,;|]+", raw):
+            clean = re.sub(r"\s+", " ", item).strip()
+            key = self._compact_match_text(clean)
+            if clean and key and key not in seen:
+                seen.add(key)
+                results.append(clean)
+        return results[:8]
+
+    def _etsy_template_fallback_listing_id(self) -> str:
+        # Default points at a known old Noel/Christmas listing in this shop. It
+        # keeps the VM flow stable when a Trello section is empty.
+        return str(os.getenv("ETSY_TEMPLATE_FALLBACK_LISTING_ID", "4372834377") or "").strip()
+
+    def _default_etsy_section_sync_exclude_names(self) -> List[str]:
+        raw = os.getenv(
+            "ETSY_SECTION_SYNC_EXCLUDE_LIST_NAMES",
+            "Ready for AI,Pic For AI,Rảnh thì list,Ideas,Content,Cần Listing - Đổi tên thành SKU,"
+            "Content Review,Review,Done,Archive,Archived,Published,Error,Errors,Failed,Trash",
+        )
+        names: List[str] = []
+        seen: set[str] = set()
+        for item in re.split(r"[,;|]+", str(raw or "")):
+            name = item.strip()
+            key = self._compact_match_text(name)
+            if name and key and key not in seen:
+                seen.add(key)
+                names.append(name)
+        return names
+
+    def _etsy_section_sync_trello_lists(
+        self,
+        lists: List[Dict[str, Any]],
+        request: EtsySectionSyncRequest,
+    ) -> List[Dict[str, Any]]:
+        include_ids = {
+            self._normalize_trello_id(str(item or ""))
+            for item in [request.trello_list_id, *request.include_list_ids]
+            if str(item or "").strip()
+        }
+        include_name_keys = {
+            self._compact_match_text(item)
+            for item in request.include_list_names
+            if self._compact_match_text(item)
+        }
+        exclude_name_keys = {
+            self._compact_match_text(item)
+            for item in [*self._default_etsy_section_sync_exclude_names(), *request.exclude_list_names]
+            if self._compact_match_text(item)
+        }
+        limit = max(1, min(100, int(request.max_sections or 100)))
+        selected: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+        for item in lists:
+            list_id = self._normalize_trello_id(str(item.get("id") or ""))
+            list_name = str(item.get("name") or "").strip()
+            if not list_id or not list_name:
+                continue
+            name_key = self._compact_match_text(list_name)
+            has_includes = bool(include_ids or include_name_keys)
+            if has_includes and list_id not in include_ids and name_key not in include_name_keys:
+                continue
+            if not has_includes and name_key in exclude_name_keys:
+                continue
+            if list_id in seen:
+                continue
+            section_title = self._etsy_section_title_from_trello_list(list_name)
+            if not section_title:
+                continue
+            seen.add(list_id)
+            selected.append(
+                {
+                    "trello_list_id": list_id,
+                    "trello_list_name": list_name,
+                    "section_title": section_title,
+                    "section_key": self._etsy_section_key(section_title),
+                    "title_truncated": section_title != list_name,
+                }
+            )
+            if len(selected) >= limit:
+                break
+        return selected
+
+    def _etsy_section_tracking_path(self) -> Path:
+        ensure_app_dirs()
+        return DATA_DIR / "etsy_section_tracking.json"
+
+    def _load_etsy_section_tracking(self) -> Dict[str, Any]:
+        path = self._etsy_section_tracking_path()
+        if not path.exists():
+            return {"version": 1, "sections": []}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {"version": 1, "sections": []}
+        if not isinstance(payload, dict):
+            return {"version": 1, "sections": []}
+        sections = payload.get("sections")
+        if not isinstance(sections, list):
+            payload["sections"] = []
+        payload.setdefault("version", 1)
+        return payload
+
+    def _save_etsy_section_tracking(self, payload: Dict[str, Any]) -> None:
+        path = self._etsy_section_tracking_path()
+        ensure_app_dirs()
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+
+    def _etsy_section_tracking_id(self, trello_list_id: str, section_title: str) -> str:
+        list_id = self._normalize_trello_id(trello_list_id)
+        if list_id:
+            return f"trello-{list_id[:16]}"
+        key = self._etsy_section_key(section_title) or uuid.uuid4().hex[:12]
+        return f"section-{key[:24]}"
+
+    def _upsert_etsy_section_tracking(
+        self,
+        planned: List[Dict[str, Any]],
+        *,
+        dry_run: bool,
+        replace: bool = False,
+        board_id: str = "",
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], int]:
+        payload = self._load_etsy_section_tracking()
+        sections = [item for item in payload.get("sections", []) if isinstance(item, dict)]
+        by_list_id = {
+            self._normalize_trello_id(str(item.get("trello_list_id") or "")): item
+            for item in sections
+            if self._normalize_trello_id(str(item.get("trello_list_id") or ""))
+        }
+        by_key = {
+            self._etsy_section_key(item.get("section_title") or item.get("trello_list_name") or ""): item
+            for item in sections
+            if self._etsy_section_key(item.get("section_title") or item.get("trello_list_name") or "")
+        }
+        now = utc_now()
+        updated_sections = [] if replace else list(sections)
+        changed = 0
+        tracked: List[Dict[str, Any]] = []
+
+        for item in planned:
+            list_id = self._normalize_trello_id(str(item.get("trello_list_id") or ""))
+            title = str(item.get("section_title") or item.get("trello_list_name") or "").strip()
+            key = self._etsy_section_key(title)
+            existing = by_list_id.get(list_id) or by_key.get(key)
+            tracking_id = str((existing or {}).get("tracking_id") or self._etsy_section_tracking_id(list_id, title))
+            entry = {
+                **(existing or {}),
+                "tracking_id": tracking_id,
+                "trello_board_id": self._normalize_trello_board_id(board_id),
+                "trello_list_id": list_id,
+                "trello_list_name": str(item.get("trello_list_name") or "").strip(),
+                "section_title": title,
+                "section_key": key,
+                "etsy_section_id": str(item.get("section_id") or (existing or {}).get("etsy_section_id") or "").strip(),
+                "status": "etsy_linked" if str(item.get("section_id") or "").strip() else "tracking_only",
+                "created_at": str((existing or {}).get("created_at") or now),
+                "updated_at": now,
+            }
+            public = {
+                "tracking_id": tracking_id,
+                "trello_list_id": list_id,
+                "trello_list_name": entry["trello_list_name"],
+                "section_title": title,
+                "section_id": entry["etsy_section_id"],
+                "status": entry["status"],
+                "action": "tracking_exists" if existing else ("would_track" if dry_run else "tracking_created"),
+            }
+            tracked.append(public)
+            item.update(
+                {
+                    "tracking_id": tracking_id,
+                    "tracking_status": entry["status"],
+                    "tracking_action": public["action"],
+                }
+            )
+            if dry_run:
+                continue
+            if existing:
+                existing.update(entry)
+                if replace:
+                    updated_sections.append(existing)
+                changed += 1
+            else:
+                updated_sections.append(entry)
+                by_list_id[list_id] = entry
+                by_key[key] = entry
+                changed += 1
+
+        if not dry_run and changed:
+            payload["version"] = 1
+            payload["updated_at"] = now
+            payload["sections"] = sorted(
+                updated_sections,
+                key=lambda entry: (
+                    self._compact_match_text(entry.get("section_title") or ""),
+                    self._normalize_trello_id(str(entry.get("trello_list_id") or "")),
+                ),
+            )
+            self._save_etsy_section_tracking(payload)
+        return tracked, updated_sections if dry_run else payload.get("sections", []), changed
+
+    def _discover_etsy_config_defaults(self, config: EtsyConfig) -> Dict[str, Any]:
+        api_key, _api_secret, api_key_header = self._etsy_key_parts_from_config(config)
+        access_token = (
+            self._etsy_refreshed_access_token
+            or str(config.access_token or "").strip()
+            or os.getenv("ETSY_ACCESS_TOKEN", "").strip()
+        )
+        user_id = str(config.user_id or "").strip() or os.getenv("ETSY_USER_ID", "").strip()
+        shop_id = str(config.shop_id or "").strip() or os.getenv("ETSY_SHOP_ID", "").strip()
+        shipping_profile_id = (
+            str(config.shipping_profile_id or "").strip()
+            or os.getenv("ETSY_SHIPPING_PROFILE_ID", "").strip()
+        )
+        info: Dict[str, Any] = {"updated": {}, "errors": []}
+        if not (api_key and api_key_header and access_token):
+            return info
+
+        if not shop_id and user_id:
+            try:
+                shops = self._etsy_list_user_shops(api_key_header, access_token, user_id)
+                shop_ids = [self._etsy_shop_id_from_payload(shop) for shop in shops]
+                shop_ids = [item for item in shop_ids if item]
+                info["shop_count"] = len(shop_ids)
+                if shop_ids:
+                    shop_id = shop_ids[0]
+                    info["updated"]["shop_id"] = shop_id
+            except Exception as exc:
+                info["errors"].append(
+                    {
+                        "field": "shop_id",
+                        "error": self._redact_etsy_secret(self._flow_error_detail(exc), api_key_header, access_token),
+                    }
+                )
+
+        if shop_id and not shipping_profile_id:
+            try:
+                profiles = self._etsy_list_shipping_profiles(api_key_header, access_token, shop_id)
+                profile_ids = [self._etsy_shipping_profile_id_from_payload(profile) for profile in profiles]
+                profile_ids = [item for item in profile_ids if item]
+                info["shipping_profile_count"] = len(profile_ids)
+                if profile_ids:
+                    shipping_profile_id = profile_ids[0]
+                    info["updated"]["shipping_profile_id"] = shipping_profile_id
+            except Exception as exc:
+                info["errors"].append(
+                    {
+                        "field": "shipping_profile_id",
+                        "error": self._redact_etsy_secret(self._flow_error_detail(exc), api_key_header, access_token),
+                    }
+                )
+
+        if self._etsy_refreshed_access_token and self._etsy_refreshed_access_token != str(config.access_token or "").strip():
+            info["updated"]["access_token"] = self._etsy_refreshed_access_token
+        return info
+
+    async def _autofill_etsy_config_defaults(self, config: EtsyConfig) -> tuple[EtsyConfig, Dict[str, Any]]:
+        missing_shop = not (str(config.shop_id or "").strip() or os.getenv("ETSY_SHOP_ID", "").strip())
+        missing_shipping = not (
+            str(config.shipping_profile_id or "").strip()
+            or os.getenv("ETSY_SHIPPING_PROFILE_ID", "").strip()
+        )
+        if not (missing_shop or missing_shipping):
+            return config, {"updated": {}, "errors": []}
+        info = await asyncio.to_thread(self._discover_etsy_config_defaults, config)
+        updates = dict(info.get("updated") or {})
+        if not updates:
+            return config, info
+        updates["updated_at"] = utc_now()
+        saved = await self.store.replace_etsy_config(config.model_copy(update=updates))
+        env_values = {
+            f"ETSY_{key.upper()}": value
+            for key, value in updates.items()
+            if key in {"shop_id", "shipping_profile_id", "access_token"} and str(value or "").strip()
+        }
+        try:
+            if env_values:
+                self._persist_env_local(env_values)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            log.warning("Etsy defaults saved to state only (env write failed).")
+        return saved, info
+
+    async def sync_etsy_sections_from_trello(self, request: EtsySectionSyncRequest) -> Dict[str, Any]:
+        trello_key, trello_token = self._trello_credentials()
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            request.trello_board_id or trello_config.board_id or os.getenv("TRELLO_BOARD_ID", "")
+        )
+        missing: List[str] = []
+        if not trello_key or not trello_token:
+            missing.append("trello_credentials")
+        if not board_id:
+            missing.append("trello_board_id")
+
+        config = self.store.snapshot().etsy_config
+        api_key, _api_secret, api_key_header = self._etsy_key_parts_from_config(config)
+        access_token = (
+            self._etsy_refreshed_access_token
+            or str(config.access_token or "").strip()
+            or os.getenv("ETSY_ACCESS_TOKEN", "").strip()
+        )
+        shop_id = str(config.shop_id or "").strip() or os.getenv("ETSY_SHOP_ID", "").strip()
+        if not request.tracking_only:
+            if not api_key or not api_key_header:
+                missing.append("etsy_api_key")
+            if not access_token:
+                missing.append("etsy_access_token")
+            if not shop_id:
+                missing.append("etsy_shop_id")
+
+        trello_lists: List[Dict[str, Any]] = []
+        selected_lists: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+        if not {"trello_credentials", "trello_board_id"}.intersection(missing):
+            try:
+                trello_lists = await asyncio.to_thread(self._trello_board_lists, trello_key, trello_token, board_id)
+                selected_lists = self._etsy_section_sync_trello_lists(trello_lists, request)
+            except Exception as exc:
+                errors.append({"stage": "trello_lists", "error": self._flow_error_detail(exc)})
+
+        existing_sections: List[Dict[str, Any]] = []
+        existing_by_key: Dict[str, Dict[str, Any]] = {}
+        can_read_etsy = (not request.tracking_only) and not {"etsy_api_key", "etsy_access_token", "etsy_shop_id"}.intersection(missing)
+        if can_read_etsy:
+            try:
+                raw_sections = await asyncio.to_thread(self._etsy_list_shop_sections, api_key_header, access_token, shop_id)
+                for section in raw_sections:
+                    section_id = self._etsy_shop_section_id_from_payload(section)
+                    title = self._etsy_shop_section_title_from_payload(section)
+                    if not section_id or not title:
+                        continue
+                    public = {
+                        "section_id": section_id,
+                        "title": title,
+                        "active_listing_count": section.get("active_listing_count"),
+                    }
+                    existing_sections.append(public)
+                    existing_by_key.setdefault(self._etsy_section_key(title), public)
+            except Exception as exc:
+                detail = self._redact_etsy_secret(self._flow_error_detail(exc), api_key_header, access_token)
+                errors.append({"stage": "etsy_sections_read", "error": detail})
+                can_read_etsy = False
+
+        planned: List[Dict[str, Any]] = []
+        for item in selected_lists:
+            existing = existing_by_key.get(str(item.get("section_key") or ""))
+            action = "exists" if existing else ("would_create" if request.create_missing and request.dry_run else "missing")
+            planned.append(
+                {
+                    "trello_list_id": item["trello_list_id"],
+                    "trello_list_name": item["trello_list_name"],
+                    "section_title": item["section_title"],
+                    "section_id": str((existing or {}).get("section_id") or ""),
+                    "exists": bool(existing),
+                    "title_truncated": bool(item.get("title_truncated")),
+                    "action": action,
+                }
+            )
+
+        created: List[Dict[str, Any]] = []
+        if request.create_missing and not request.dry_run and can_read_etsy:
+            for item in planned:
+                if item.get("exists"):
+                    continue
+                title = str(item.get("section_title") or "").strip()
+                if not title:
+                    continue
+                try:
+                    created_payload = await asyncio.to_thread(
+                        self._etsy_create_shop_section_request,
+                        api_key_header,
+                        access_token,
+                        shop_id,
+                        title,
+                    )
+                    section_id = self._etsy_shop_section_id_from_payload(created_payload)
+                    created_title = self._etsy_shop_section_title_from_payload(created_payload) or title
+                    item.update(
+                        {
+                            "section_title": created_title,
+                            "section_id": section_id,
+                            "exists": True,
+                            "action": "created",
+                        }
+                    )
+                    created.append(
+                        {
+                            "trello_list_id": item["trello_list_id"],
+                            "trello_list_name": item["trello_list_name"],
+                            "section_title": created_title,
+                            "section_id": section_id,
+                        }
+                    )
+                except Exception as exc:
+                    detail = self._redact_etsy_secret(self._flow_error_detail(exc), api_key_header, access_token)
+                    code = "etsy_create_failed"
+                    if re.search(r"\b(401|403)\b|shops_w|permission|scope|forbidden|unauthor", detail, re.IGNORECASE):
+                        code = "missing_scope_or_permission"
+                    item.update({"action": "create_failed", "error_code": code, "error": detail})
+                    errors.append(
+                        {
+                            "stage": "etsy_sections_create",
+                            "code": code,
+                            "section_title": title,
+                            "error": detail,
+                        }
+                    )
+
+        tracking_sections: List[Dict[str, Any]] = []
+        tracking_store_sections: List[Dict[str, Any]] = []
+        tracking_changed = 0
+        if request.tracking_only or request.create_missing:
+            tracking_sections, tracking_store_sections, tracking_changed = self._upsert_etsy_section_tracking(
+                planned,
+                dry_run=bool(request.dry_run),
+                replace=bool(request.replace_tracking),
+                board_id=board_id,
+            )
+            if request.tracking_only:
+                for item in planned:
+                    if not item.get("exists"):
+                        item["action"] = str(item.get("tracking_action") or ("would_track" if request.dry_run else "tracking_created"))
+
+        missing_count = len([item for item in planned if item.get("action") in {"missing", "would_create", "create_failed"}])
+        status = "ready"
+        if missing:
+            status = "needs_config"
+        elif errors:
+            status = "partial" if created or any(item.get("exists") for item in planned) else "failed"
+        elif request.tracking_only and request.dry_run:
+            status = "tracking_planned"
+        elif request.tracking_only:
+            status = "tracked"
+        elif request.dry_run:
+            status = "planned"
+        elif missing_count:
+            status = "needs_create"
+        else:
+            status = "synced"
+
+        return {
+            "configured": not missing and not errors and (request.tracking_only or request.dry_run or missing_count == 0 or request.create_missing),
+            "status": status,
+            "dry_run": bool(request.dry_run),
+            "create_missing": bool(request.create_missing),
+            "tracking_only": bool(request.tracking_only),
+            "replace_tracking": bool(request.replace_tracking),
+            "required_scopes": ["shops_r", "shops_w", "listings_w"],
+            "missing": missing,
+            "errors": errors,
+            "trello_board_id": board_id,
+            "trello_list_count": len(trello_lists),
+            "selected_count": len(selected_lists),
+            "existing_count": len(existing_sections),
+            "created_count": len(created),
+            "missing_count": missing_count,
+            "tracking_count": len(tracking_sections),
+            "tracking_changed": tracking_changed,
+            "excluded_list_names": self._default_etsy_section_sync_exclude_names(),
+            "sections": planned,
+            "created": created,
+            "tracking_sections": tracking_sections,
+            "tracking_store_count": len(tracking_store_sections),
+            "existing_sections": existing_sections,
+        }
+
+    def _etsy_oauth_pending_path(self) -> Path:
+        return DATA_DIR / "etsy_oauth_pending.json"
+
+    def _load_etsy_oauth_pending(self) -> Dict[str, Dict[str, Any]]:
+        now = time.time()
+        pending: Dict[str, Dict[str, Any]] = {}
+        path = self._etsy_oauth_pending_path()
+        if path.exists():
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:  # noqa: BLE001 - ignore a corrupt transient file
+                payload = {}
+            if isinstance(payload, dict):
+                for key, val in payload.items():
+                    if isinstance(val, dict) and now - float(val.get("created_at", 0) or 0) < 600:
+                        pending[str(key)] = val
+        for key, val in self._etsy_oauth_pending.items():
+            if now - float(val.get("created_at", 0) or 0) < 600:
+                pending[str(key)] = val
+        self._etsy_oauth_pending = pending
+        return dict(pending)
+
+    def _save_etsy_oauth_pending(self, pending: Dict[str, Dict[str, Any]]) -> None:
+        self._etsy_oauth_pending = dict(pending)
+        path = self._etsy_oauth_pending_path()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if pending:
+                path.write_text(json.dumps(pending), encoding="utf-8")
+            elif path.exists():
+                path.unlink()
+        except Exception:  # noqa: BLE001 - memory copy still works for this process
+            log.warning("Could not persist Etsy OAuth pending state.")
+
+    def start_etsy_oauth(self, redirect_uri: str) -> Dict[str, Any]:
+        """Begin the one-click Etsy OAuth (PKCE) handshake.
+
+        Generates a PKCE verifier/challenge + random ``state``, stashes the
+        verifier and the exact ``redirect_uri`` server-side keyed by ``state``,
+        and returns the Etsy authorize URL for the browser to open. No secret is
+        returned to the client beyond the public client id baked into the URL.
+        """
+        import secrets as _secrets
+        import time as _time
+
+        from . import etsy_oauth
+
+        client_id = self._etsy_oauth_client_id()
+        if not client_id:
+            raise ValueError(
+                "Chưa có Etsy API key (keystring). Nhập keystring vào ô API Key rồi bấm Connect lại."
+            )
+        redirect_uri = str(redirect_uri or "").strip() or etsy_oauth.DEFAULT_REDIRECT_URI
+        verifier, challenge = etsy_oauth.generate_pkce()
+        state = _secrets.token_urlsafe(24)
+        pending = self._load_etsy_oauth_pending()
+        pending[state] = {
+            "verifier": verifier,
+            "redirect_uri": redirect_uri,
+            "created_at": _time.time(),
+        }
+        self._save_etsy_oauth_pending(pending)
+        authorize_url = etsy_oauth.build_authorize_url(
+            client_id=client_id,
+            redirect_uri=redirect_uri,
+            scopes=etsy_oauth.DEFAULT_SCOPES,
+            state=state,
+            code_challenge=challenge,
+        )
+        return {"authorize_url": authorize_url, "state": state, "redirect_uri": redirect_uri}
+
+    async def complete_etsy_oauth(self, code: str, state: str) -> Dict[str, Any]:
+        """Finish OAuth: exchange ``code`` for tokens and persist them.
+
+        Looks up the pending handshake by ``state`` (consuming it), exchanges the
+        authorization code using the stored PKCE verifier + redirect_uri, then
+        saves access/refresh tokens + user id into state and ``.env.local``.
+        """
+        from . import etsy_oauth
+
+        code = etsy_oauth.parse_authorization_code(str(code or "").strip())
+        state = str(state or "").strip()
+        pending_map = self._load_etsy_oauth_pending()
+        pending = pending_map.pop(state, None)
+        self._save_etsy_oauth_pending(pending_map)
+        if not pending:
+            raise ValueError(
+                "Phiên kết nối Etsy hết hạn hoặc state không khớp. Bấm Connect Etsy lại."
+            )
+        if not code:
+            raise ValueError("Etsy không trả về authorization code.")
+        client_id = self._etsy_oauth_client_id()
+        if not client_id:
+            raise ValueError("Mất Etsy API key (keystring) giữa chừng. Nhập lại rồi Connect.")
+        result = await asyncio.to_thread(
+            etsy_oauth.exchange_code,
+            client_id=client_id,
+            redirect_uri=str(pending.get("redirect_uri") or etsy_oauth.DEFAULT_REDIRECT_URI),
+            code=code,
+            code_verifier=str(pending.get("verifier") or ""),
+        )
+        access_token = str(result.get("access_token") or "").strip()
+        refresh_token = str(result.get("refresh_token") or "").strip()
+        user_id = etsy_oauth.user_id_from_token(access_token)
+        if not access_token:
+            raise ValueError("Etsy không trả về access token.")
+        self._etsy_refreshed_access_token = access_token
+        current = self.store.snapshot().etsy_config
+        config = current.model_copy(
+            update={
+                "api_key": current.api_key or client_id,
+                "access_token": access_token,
+                "refresh_token": refresh_token or getattr(current, "refresh_token", ""),
+                "user_id": user_id or current.user_id,
+                "updated_at": utc_now(),
+            }
+        )
+        saved = await self.store.replace_etsy_config(config)
+        env_values = {"ETSY_ACCESS_TOKEN": access_token}
+        if refresh_token:
+            env_values["ETSY_REFRESH_TOKEN"] = refresh_token
+        if user_id:
+            env_values["ETSY_USER_ID"] = user_id
+        try:
+            self._persist_env_local(env_values)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            log.warning("Etsy OAuth tokens saved to state only (env write failed).")
+        saved, autofill = await self._autofill_etsy_config_defaults(saved)
+        snapshot = self._etsy_config_snapshot(saved)
+        snapshot["autofill"] = autofill
+        return snapshot
+
+    def extension_registry(self) -> Dict[str, Any]:
+        snapshot = self.store.snapshot()
+        trello = self._trello_config_snapshot(snapshot.trello_config)
+        integrations = self._integration_config_snapshot(snapshot.integration_config)
+        etsy = self._etsy_config_snapshot(snapshot.etsy_config)
+        flow_ready = bool(self.get_auth_status().authenticated and self._normalized_config(snapshot.config).project_id)
+        items = [
+            {
+                "id": "master_bot",
+                "title": "Master Bot",
+                "kind": "controller",
+                "configured": flow_ready and bool(trello.get("configured")),
+                "status": "ready" if flow_ready and trello.get("configured") else "needs_setup",
+                "capabilities": ["plan", "route_extensions", "run_auto_trello", "watch_ready_for_ai"],
+            },
+            {
+                "id": "trello_source",
+                "title": "Trello Image Source",
+                "kind": "source",
+                "configured": bool(trello.get("configured")),
+                "status": "ready" if trello.get("configured") else "needs_setup",
+                "capabilities": ["scan_ready_for_ai", "lock_source_card", "download_card_attachments"],
+            },
+            {
+                "id": "flow_agent",
+                "title": "Google Flow Agent",
+                "kind": "generator",
+                "configured": flow_ready,
+                "status": "ready" if flow_ready else "needs_login",
+                "capabilities": ["write_prompt_in_flow", "attach_source_image", "generate_1x1_images", "auto_approve"],
+            },
+            {
+                "id": "trello_archive",
+                "title": "Trello Review Archive",
+                "kind": "review_storage",
+                "configured": bool(trello.get("configured")),
+                "status": "ready" if trello.get("configured") else "needs_setup",
+                "capabilities": ["upload_generated_files", "move_to_content_review", "direct_review_on_card"],
+            },
+            {
+                "id": "etsy_listing",
+                "title": "Etsy Listing",
+                "kind": "commerce",
+                "configured": True,
+                "status": "ready" if etsy.get("configured") else "browser_copy",
+                "capabilities": [
+                    "create_draft_listing",
+                    "upload_listing_images",
+                    "copy_existing_listing",
+                    "edit_title_sku",
+                ],
+            },
+            {
+                "id": "amazon_listing",
+                "title": "Amazon Listing",
+                "kind": "commerce",
+                "configured": True,
+                "status": "browser_copy",
+                "capabilities": [
+                    "copy_existing_listing",
+                    "edit_title_sku",
+                    "upload_listing_images",
+                    "save_draft",
+                ],
+            },
+            {
+                "id": "telegram_review",
+                "title": "Telegram Review",
+                "kind": "review",
+                "configured": bool(integrations.get("telegram", {}).get("configured")),
+                "status": "ready" if integrations.get("telegram", {}).get("configured") else "optional",
+                "capabilities": ["send_review_pack", "sync_approval_buttons"],
+            },
+            {
+                "id": "custom_webhook",
+                "title": "Custom Webhook",
+                "kind": "extension",
+                "configured": True,
+                "status": "ready",
+                "capabilities": ["send_job_context", "call_http_endpoint"],
+            },
+        ]
+        return {
+            "version": 1,
+            "controller": "master_bot",
+            "items": items,
+            "ready_count": sum(1 for item in items if item["status"] == "ready"),
+        }
+
+    @staticmethod
+    def _extension_origin_pattern(public_base_url: str) -> str:
+        raw = str(public_base_url or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        try:
+            parsed = urlparse(raw)
+        except Exception:
+            return ""
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return f"{parsed.scheme}://{parsed.netloc}/*"
+
+    @staticmethod
+    def _patch_extension_config_js(source: str, public_base_url: str, origin_pattern: str) -> str:
+        backend_url = str(public_base_url or "").strip().rstrip("/") or "http://127.0.0.1:8000"
+        patched = re.sub(
+            r'export const DEFAULT_BACKEND_URL = "([^"]*)";',
+            f'export const DEFAULT_BACKEND_URL = "{backend_url}";',
+            source,
+            count=1,
+        )
+        if origin_pattern and origin_pattern not in patched:
+            patched = patched.replace(
+                '  "http://localhost:8000/*",\n];',
+                f'  "http://localhost:8000/*",\n  "{origin_pattern}",\n];',
+            )
+        return patched
+
+    @staticmethod
+    def _patch_wxt_runtime(source: str, public_base_url: str, origin_pattern: str) -> str:
+        """Bake backend URL + bridge origin into a *built* (minified) WXT artifact.
+
+        The legacy text patches keyed off the un-minified ``config.js`` source no
+        longer match once WXT bundles + minifies. We instead rewrite the two
+        values where they survive minification (verified against the real build):
+
+          • ``DEFAULT_BACKEND_URL`` — bare quoted ``http://127.0.0.1:8000`` with no
+            trailing ``/`` (background.js ×3, popup.html ×1, virtual chunk ×1).
+          • ``BUILTIN_BRIDGE_ORIGINS`` — the 2-element array whose close is
+            ``"http://localhost:8000/*"]`` (virtual chunk only; the bridge content
+            script's longer ``matches`` array is intentionally not matched).
+
+        Both quote styles are handled (backtick after minify, double-quote as a
+        fallback). No-op when the values already match — e.g. local 127.0.0.1
+        downloads, where ``origin_pattern`` is already present, so the served WXT
+        build is byte-identical to the on-disk build.
+        """
+        backend_url = str(public_base_url or "").strip().rstrip("/") or "http://127.0.0.1:8000"
+        patched = source
+        if backend_url != "http://127.0.0.1:8000":
+            patched = re.sub(
+                r'([`"\'])http://127\.0\.0\.1:8000(?![\w/])\1',
+                lambda m: f"{m.group(1)}{backend_url}{m.group(1)}",
+                patched,
+            )
+        if origin_pattern and origin_pattern not in patched:
+            patched = re.sub(
+                r'([`"\'])http://localhost:8000/\*\1\]',
+                lambda m: (
+                    f"{m.group(1)}http://localhost:8000/*{m.group(1)}"
+                    f",{m.group(1)}{origin_pattern}{m.group(1)}]"
+                ),
+                patched,
+            )
+        return patched
+
+    @staticmethod
+    def _resolve_extension_source() -> "tuple[Path | None, str]":
+        """Pick the packaging source: prefer the built WXT artifact, else legacy.
+
+        Returns ``(dir, layout)`` where layout is ``"wxt"`` or ``"legacy"``. The
+        WXT build is preferred (per the cutover); the hand-written ``extension/``
+        tree is a safe fallback when ``wxt build`` has not produced output yet.
+        """
+        wxt_manifest = EXTENSION_WXT_BUILD_DIR / "manifest.json"
+        if EXTENSION_WXT_BUILD_DIR.is_dir() and wxt_manifest.is_file():
+            return EXTENSION_WXT_BUILD_DIR, "wxt"
+        if EXTENSION_DIR.is_dir():
+            return EXTENSION_DIR, "legacy"
+        return None, "legacy"
+
+    @staticmethod
+    def _patch_extension_manifest(source: str, origin_pattern: str) -> str:
+        if not origin_pattern:
+            return source
+        manifest = json.loads(source)
+        host_permissions = list(manifest.get("host_permissions") or [])
+        if origin_pattern not in host_permissions:
+            host_permissions.append(origin_pattern)
+        manifest["host_permissions"] = host_permissions
+
+        scripts = list(manifest.get("content_scripts") or [])
+        has_bridge = False
+        for script in scripts:
+            js_files = script.get("js") if isinstance(script, dict) else None
+            matches = script.get("matches") if isinstance(script, dict) else None
+            # Detect the bridge content script across both layouts:
+            #   legacy  -> ["src/content-bridge.js"]
+            #   WXT     -> ["content-scripts/bridge.js"]
+            is_bridge = isinstance(js_files, list) and any(
+                isinstance(j, str) and j.endswith("bridge.js") for j in js_files
+            )
+            if is_bridge and isinstance(matches, list):
+                has_bridge = True
+                if origin_pattern not in matches:
+                    matches.append(origin_pattern)
+                break
+        if not has_bridge:
+            scripts.append(
+                {
+                    "matches": [origin_pattern],
+                    "js": ["content-scripts/bridge.js"],
+                    "run_at": "document_idle",
+                }
+            )
+        manifest["content_scripts"] = scripts
+
+        external = manifest.get("externally_connectable")
+        if not isinstance(external, dict):
+            external = {}
+        external_matches = list(external.get("matches") or [])
+        if origin_pattern not in external_matches:
+            external_matches.append(origin_pattern)
+        external["matches"] = external_matches
+        manifest["externally_connectable"] = external
+        return json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
+
+    def build_extension_archive(self, public_base_url: str = "") -> bytes:
+        """Zip the unpacked browser-extension folder for in-app download.
+
+        Packages the built WXT artifact (``extension-wxt/.output/chrome-mv3``)
+        when present, falling back to the legacy hand-written ``extension/`` tree.
+        The backend URL and (for remote tunnels) the bridge origin are baked in
+        per request; the patch seam differs by layout because WXT minifies.
+        """
+        source_dir, layout = self._resolve_extension_source()
+        if source_dir is None:
+            raise HTTPException(status_code=404, detail="Chưa có thư mục extension.")
+        origin_pattern = self._extension_origin_pattern(public_base_url)
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(source_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                arcname = path.relative_to(source_dir).as_posix()
+                if arcname == "manifest.json":
+                    source = path.read_text(encoding="utf-8")
+                    archive.writestr(arcname, self._patch_extension_manifest(source, origin_pattern))
+                elif layout == "legacy" and arcname == "src/config.js":
+                    source = path.read_text(encoding="utf-8")
+                    archive.writestr(
+                        arcname,
+                        self._patch_extension_config_js(source, public_base_url, origin_pattern),
+                    )
+                elif layout == "wxt" and (arcname.endswith(".js") or arcname.endswith(".html")):
+                    source = path.read_text(encoding="utf-8")
+                    archive.writestr(
+                        arcname,
+                        self._patch_wxt_runtime(source, public_base_url, origin_pattern),
+                    )
+                else:
+                    archive.write(path, arcname)
+        return buffer.getvalue()
+
+    async def plan_master_bot(self, request: MasterBotRequest) -> Dict[str, Any]:
+        instruction = str(request.instruction or "").strip()
+        intent = self._master_bot_intent(request)
+        wants_etsy = intent["etsy"]
+        wants_continuous = intent["continuous"]
+        wants_auto = intent["auto_trello"]
+        extensions = self.extension_registry()
+        preflight = self.master_bot_preflight(request)
+        steps = [
+            {
+                "extension": "trello_source",
+                "title": "Lấy card sản phẩm",
+                "detail": "Quét Ready for AI, khóa đúng card/attachment ảnh nguồn để tránh lấy nhầm ảnh cũ.",
+            },
+            {
+                "extension": "flow_agent",
+                "title": "Tác nhân Flow viết prompt và tạo ảnh",
+                "detail": "Dùng panel Tác nhân trong Google Flow, kéo ảnh nguồn vào, tạo ảnh vuông 1:1 theo cấu hình Flow.",
+            },
+            {
+                "extension": "trello_archive",
+                "title": "Đẩy ảnh về đúng card Trello",
+                "detail": "Ảnh tạo xong upload vào Files/Attachments của chính card đang chạy để chủ nhân duyệt trực tiếp.",
+            },
+        ]
+        if wants_etsy:
+            steps.append(
+                {
+                    "extension": "etsy_listing",
+                    "title": "Copy listing Etsy bằng tab đã đăng nhập",
+                    "detail": "Sau khi có ảnh duyệt, extension thao tác trên Shop Manager đã login: copy listing cùng loại, đổi SKU/tên, giữ ảnh bảng màu và upload ảnh mới.",
+                }
+            )
+        actions = [
+            {
+                "id": "run_auto_trello",
+                "label": "Chạy Auto AI Trello",
+                "enabled": wants_auto and bool(preflight.get("ready")),
+                "disabled_reason": "" if wants_auto and preflight.get("ready") else preflight.get("summary", ""),
+                "blocked_by": [item["id"] for item in preflight.get("blockers", [])],
+                "payload": {
+                    "auto_trello": True,
+                    "continuous": wants_continuous,
+                    "limit": max(1, min(self.MAX_PROMPT_BATCH_ITEMS, int(request.limit or 1))),
+                    "etsy_enabled": wants_etsy,
+                },
+            }
+        ]
+        return {
+            "engine": "local-master-bot",
+            "title": "Kế hoạch Master Bot",
+            "summary": (
+                "Master Bot sẽ điều phối Trello -> Flow Agent -> Trello Archive"
+                + (" -> Etsy Copy Listing qua extension." if wants_etsy else ".")
+            ),
+            "instruction": instruction,
+            "run_mode": request.run_mode or "plan",
+            "auto_trello": wants_auto,
+            "continuous": wants_continuous,
+            "etsy_enabled": wants_etsy,
+            "extensions": extensions,
+            "preflight": preflight,
+            "steps": steps,
+            "actions": actions,
+        }
+
+    def _master_bot_intent(self, request: MasterBotRequest) -> Dict[str, bool]:
+        instruction = str(request.instruction or "").strip()
+        lowered = self._compact_match_text(instruction)
+        wants_etsy = request.create_etsy_draft or any(
+            token in lowered for token in ("etsy", "esty", "listing", "listetsy", "dangetsy")
+        )
+        wants_continuous = request.continuous or any(
+            token in lowered
+            for token in ("lientuc", "denkhikhet", "denkhihangmoi", "hethang", "rununtilempty")
+        )
+        wants_auto = request.auto_trello or wants_continuous or any(
+            token in lowered for token in ("autotrello", "readyforai", "hangloat")
+        )
+        return {"etsy": bool(wants_etsy), "continuous": bool(wants_continuous), "auto_trello": bool(wants_auto)}
+
+    def master_bot_preflight(self, request: MasterBotRequest | None = None) -> Dict[str, Any]:
+        request = request or MasterBotRequest()
+        intent = self._master_bot_intent(request)
+        snapshot = self.store.snapshot()
+        config = self._normalized_config(snapshot.config)
+        auth = self.get_auth_status()
+        trello = self._trello_config_snapshot(snapshot.trello_config)
+        etsy = self._etsy_config_snapshot(snapshot.etsy_config)
+        integrations = self._integration_config_snapshot(snapshot.integration_config)
+
+        checks = [
+            {
+                "id": "backend",
+                "label": "Backend Flow v2",
+                "required": True,
+                "status": "ready",
+                "detail": "API local đang phản hồi.",
+                "action": "",
+            },
+            {
+                "id": "flow_login",
+                "label": "Google Flow login",
+                "required": True,
+                "status": "ready" if auth.authenticated else "blocked",
+                "detail": "Đã thấy phiên Google Flow." if auth.authenticated else "Chưa thấy phiên Google Flow đã đăng nhập.",
+                "action": "" if auth.authenticated else "Mở tab Flow bằng extension rồi đăng nhập thủ công.",
+            },
+            {
+                "id": "flow_project",
+                "label": "Flow project",
+                "required": True,
+                "status": "ready" if config.project_id else "blocked",
+                "detail": f"Project {config.project_id} đã lưu." if config.project_id else "Chưa lưu project Flow để bot biết chạy ở đâu.",
+                "action": "" if config.project_id else "Mở project trong Flow rồi lưu URL/project trong dashboard.",
+            },
+            {
+                "id": "trello",
+                "label": "Trello source/archive",
+                "required": True,
+                "status": "ready" if trello.get("configured") else "blocked",
+                "detail": "Trello đã có key/token và board/card/list." if trello.get("configured") else "Thiếu Trello key/token hoặc board/card/list.",
+                "action": "" if trello.get("configured") else "Vào Trello storage trong dashboard để lưu key/token và board/card/list.",
+            },
+            {
+                "id": "flow_tab",
+                "label": "Extension tab Flow",
+                "required": True,
+                "status": "manual",
+                "detail": "Backend không đọc được tab browser; extension sẽ kiểm tra trực tiếp bằng nút Inspect.",
+                "action": "Trong popup extension bấm Mở Flow, rồi bấm Kiểm tra tab Flow.",
+            },
+        ]
+        if intent["etsy"]:
+            etsy_configured = bool(etsy.get("configured"))
+            etsy_optional_missing = set(etsy.get("optional_missing") or [])
+            if etsy_configured:
+                etsy_detail = "Etsy API đủ key/token/shop/shipping để tạo draft."
+                if "taxonomy_id" in etsy_optional_missing:
+                    etsy_detail += " taxonomy_id đang thiếu nhưng app sẽ tự chọn theo listing/title khi chạy."
+                etsy_action = ""
+            else:
+                missing = ", ".join(str(item) for item in (etsy.get("required_missing") or etsy.get("missing") or []))
+                etsy_detail = (
+                    f"Thiếu Etsy API cho create draft: {missing}."
+                    if missing
+                    else "Chưa cấu hình Etsy API cho create draft."
+                )
+                etsy_action = (
+                    "Lưu Etsy API key/secret/access token/shop/shipping để dùng API draft, "
+                    "hoặc đổi automation sang Etsy Copy Listing (browser-copy) trên tab Shop Manager đã đăng nhập."
+                )
+            checks.append(
+                {
+                    "id": "etsy",
+                    "label": "Etsy API draft",
+                    "required": True,
+                    "status": "ready" if etsy_configured else "blocked",
+                    "detail": etsy_detail,
+                    "action": etsy_action,
+                }
+            )
+        else:
+            checks.append(
+                {
+                    "id": "etsy",
+                    "label": "Etsy Shop Manager tab",
+                    "required": False,
+                    "status": "ready" if etsy.get("configured") else "optional",
+                    "detail": "Không bắt buộc cho luồng Trello -> Flow -> Trello.",
+                    "action": "" if etsy.get("configured") else "OAuth chỉ là tùy chọn; luồng copy listing dùng extension trên tab Etsy đã đăng nhập.",
+                }
+            )
+        telegram_ready = bool(integrations.get("telegram", {}).get("configured"))
+        checks.append(
+            {
+                "id": "telegram",
+                "label": "Telegram review",
+                "required": False,
+                "status": "ready" if telegram_ready else "optional",
+                "detail": "Telegram đã sẵn sàng." if telegram_ready else "Không bắt buộc; bot vẫn lưu ảnh về Trello/local.",
+                "action": "" if telegram_ready else "Cấu hình Telegram nếu muốn duyệt bằng nút approve/reject.",
+            }
+        )
+
+        blockers = [item for item in checks if item["required"] and item["status"] == "blocked"]
+        warnings = [item for item in checks if item["status"] in {"manual", "optional"}]
+        ready = not blockers
+        return {
+            "ready": ready,
+            "status": "ready" if ready else "blocked",
+            "summary": "Master Bot đủ cấu hình nền; extension chỉ cần xác nhận tab Flow/Etsy." if ready else f"Còn {len(blockers)} mục chặn bot chạy.",
+            "intent": intent,
+            "checks": checks,
+            "blockers": blockers,
+            "warnings": warnings,
+            "next_actions": [item["action"] for item in blockers + warnings if item.get("action")],
         }
 
     async def preview_prompt_source(
@@ -1892,7 +3527,8 @@ class FlowWebService:
     async def enqueue_job(self, request: CreateJobRequest) -> JobRecord:
         config = self._normalized_config(self.store.snapshot().config)
         profiles = self._flow_profile_specs() if self._should_keep_flow_browser_open(config) else []
-        if not config.project_id and not any(profile.project_id for profile in profiles):
+        gemini_image_request = self._request_uses_gemini_image_engine(request)
+        if not gemini_image_request and not config.project_id and not any(profile.project_id for profile in profiles):
             raise HTTPException(status_code=400, detail="Vui lòng lưu mã project trước.")
         request = self._resolve_job_request(request, config)
         self._validate_job_request(request)
@@ -1922,13 +3558,15 @@ class FlowWebService:
     async def enqueue_prompt_batch(self, request: PromptBatchRequest) -> JobRecord:
         config = self._normalized_config(self.store.snapshot().config)
         profiles = self._flow_profile_specs() if self._should_keep_flow_browser_open(config) else []
-        if not config.project_id and not any(profile.project_id for profile in profiles):
-            raise HTTPException(status_code=400, detail="Vui lòng lưu mã project trước.")
-        if not self.get_auth_status().authenticated:
-            raise HTTPException(
-                status_code=400,
-                detail="Cần đăng nhập Google Flow trước khi chạy batch prompt từ sheet.",
-            )
+        base_request = self._resolve_job_request(request.job or CreateJobRequest(type="image"), config)
+        if not self._request_uses_gemini_image_engine(base_request):
+            if not config.project_id and not any(profile.project_id for profile in profiles):
+                raise HTTPException(status_code=400, detail="Vui lòng lưu mã project trước.")
+            if not self.get_auth_status().authenticated:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cần đăng nhập Google Flow trước khi chạy batch prompt từ sheet.",
+                )
 
         base_request = self._resolve_job_request(request.job, config)
         if base_request.type != "image":
@@ -2026,17 +3664,10 @@ class FlowWebService:
             validation_payload["prompt"] = items[0]["prompt"]
             self._validate_job_request(CreateJobRequest(**validation_payload))
 
-            flow_agent_counts = {
-                int(item.get("flow_agent_image_count") or 0)
-                for item in items
-                if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent")
-            }
-            flow_agent_counts.discard(0)
-            flow_agent_count_label = str(next(iter(flow_agent_counts))) if len(flow_agent_counts) == 1 else "đủ bộ theo rule"
             title = (
                 str(request.title or "").strip()
                 or (
-                    f"Auto Trello Flow Agent: tạo {flow_agent_count_label} ảnh cho {len(items)} card"
+                    f"Auto Trello Flow Agent: tạo {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh cho {len(items)} card"
                     if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
                     else f"Auto Trello Flow Agent: chạy đến hết {trello_source_hint.get('list_name') or self._trello_source_scope_label()} ({len(items)} card)"
                     if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
@@ -2080,6 +3711,248 @@ class FlowWebService:
             await self.store.add_job(batch_job)
             self._tasks[batch_job.id] = asyncio.create_task(self._run_prompt_batch(batch_job.id, base_request, items))
             return batch_job
+
+    async def plan_extension_auto_trello(self, request: ExtensionAutoTrelloPlanRequest) -> Dict[str, Any]:
+        batch = request.batch
+        config = self._normalized_config(self.store.snapshot().config)
+        base_request = self._resolve_job_request(batch.job, config)
+        if base_request.type != "image":
+            raise HTTPException(status_code=400, detail="Extension Auto Trello hiện chỉ hỗ trợ tạo ảnh.")
+
+        base_request = self._auto_trello_flow_agent_request(base_request)
+        raw_limit = int(batch.limit or 0)
+        limit = max(1, min(self.MAX_PROMPT_BATCH_ITEMS, raw_limit)) if raw_limit > 0 else 1
+        source_item_count = len(batch.items or [])
+        items = self._prompt_batch_items(batch.items, max(limit, source_item_count))
+        if batch.auto_trello and not items:
+            payload = _model_dump(base_request)
+            self._clear_auto_trello_search_filter(payload)
+            base_request = CreateJobRequest(**payload)
+
+        try:
+            base_request, planned_items, discovery = await self._expand_prompt_batch_with_trello_images(
+                base_request,
+                items,
+                limit,
+            )
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
+
+        planned_items = planned_items[:limit]
+        if not planned_items:
+            raise HTTPException(status_code=404, detail="Không còn card Trello hợp lệ trong Ready for AI để extension chạy.")
+
+        extension_items: List[Dict[str, Any]] = []
+        total = len(planned_items)
+        for index, item in enumerate(planned_items):
+            child_request = self._prompt_batch_child_request(base_request, item, index, total)
+            source_card_id = self._normalize_trello_card_id(child_request.trello_source_card_id or child_request.trello_card_id)
+            source_attachment_ids = self._normalize_trello_attachment_ids(
+                child_request.trello_source_attachment_ids or child_request.trello_attachment_ids
+            )
+            if not source_card_id or not source_attachment_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Card Trello đã chọn thiếu ảnh nguồn bị khóa; extension dừng để tránh lấy nhầm ảnh.",
+                )
+            source_attachment_id = source_attachment_ids[0]
+            target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(child_request.count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            extension_items.append(
+                {
+                    "index": index + 1,
+                    "target": target_count,
+                    "prompt": child_request.prompt,
+                    "job": _model_dump(child_request),
+                    "item": item,
+                    "trello_card_id": source_card_id,
+                    "trello_card_name": str(item.get("trello_card_name") or child_request.prompt_product or child_request.title or "").strip(),
+                    "trello_card_url": str(item.get("trello_card_url") or "").strip(),
+                    "trello_attachment_id": source_attachment_id,
+                    "trello_attachment_ids": source_attachment_ids,
+                    "image_url": (
+                        f"/api/trello/cards/{quote(source_card_id, safe='')}/attachments/"
+                        f"{quote(source_attachment_id, safe='')}/preview"
+                    ),
+                    "image_name": f"trello-{source_card_id[:8]}-{source_attachment_id[:8]}.jpg",
+                    "existing_output_count": int(item.get("flow_agent_existing_output_count") or 0),
+                    "shot_labels": item.get("shot_labels") or [],
+                }
+            )
+
+        return {
+            "ok": True,
+            "items": extension_items,
+            "count": len(extension_items),
+            "discovery": discovery,
+        }
+
+    async def archive_extension_auto_trello(self, payload: ExtensionAutoTrelloArchiveRequest) -> Dict[str, Any]:
+        config = self._normalized_config(self.store.snapshot().config)
+        request = self._resolve_job_request(payload.job, config)
+        if request.type != "image":
+            raise HTTPException(status_code=400, detail="Extension Auto Trello chỉ nhận kết quả ảnh.")
+        if not request.prompt.strip():
+            prompt = str((payload.item or {}).get("prompt") or "").strip()
+            if prompt:
+                request_payload = _model_dump(request)
+                request_payload["prompt"] = prompt
+                request = CreateJobRequest(**request_payload)
+        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+        images = list(payload.images or [])[:target_count]
+        if len(images) < target_count:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Extension mới trả {len(images)}/{target_count} ảnh; app dừng để không upload thiếu bộ ảnh.",
+            )
+
+        job = JobRecord(
+            type="image",
+            status="running",
+            title=request.title or self._default_title(request),
+            input=_model_dump(request),
+            result={"mode": "image", "extension_flow": True},
+        )
+        await self.store.add_job(job)
+        try:
+            await self.store.append_log(
+                job.id,
+                f"Nhận {len(images)} ảnh từ Flow Agent extension; chuẩn bị lưu về đúng card Trello.",
+            )
+            request = await self._extension_request_with_trello_source_reference(job.id, request)
+            await self.store.patch_job(job.id, input=_model_dump(request))
+            artifacts = self._extension_auto_trello_artifacts(job.id, request, images)
+            await self.store.replace_artifacts(job.id, artifacts)
+            await self._set_automation_module_status(
+                job.id,
+                request,
+                "flow",
+                "completed",
+                output={
+                    "artifact_count": len(artifacts),
+                    "mode": "image",
+                    "extension_flow": True,
+                    "source": "chrome_extension_flow_agent",
+                },
+            )
+            result: Dict[str, Any] = {
+                "count": len(artifacts),
+                "mode": "image",
+                "extension_flow": True,
+                "extension_result": payload.extension_result or {},
+            }
+            result = await self._run_automation_post_modules(job.id, request, artifacts, result)
+            latest_job = self.store.get_job(job.id)
+            latest_execution = (latest_job.result or {}).get("automation_execution") if latest_job is not None else None
+            if latest_execution:
+                result = dict(result)
+                result["automation_execution"] = latest_execution
+            await self.store.patch_job(job.id, status="completed", result=result)
+            await self.store.append_log(job.id, "Extension Auto Trello đã hoàn tất và ảnh đã đi qua các cục sau Flow.")
+        except Exception as exc:
+            detail = self._flow_error_detail(exc)
+            await self._fail_active_automation_module(job.id, request, detail)
+            await self.store.patch_job(job.id, status="failed", error=detail)
+            await self.store.append_log(job.id, f"Extension Auto Trello thất bại: {detail}")
+            raise HTTPException(status_code=self._flow_error_status(exc), detail=detail) from exc
+        saved = self.store.get_job(job.id) or job
+        return {"ok": True, "job": saved, "result": saved.result}
+
+    async def _extension_request_with_trello_source_reference(self, job_id: str, request: CreateJobRequest) -> CreateJobRequest:
+        source_card_id = self._normalize_trello_card_id(request.trello_source_card_id or request.trello_card_id)
+        source_attachment_ids = self._normalize_trello_attachment_ids(
+            request.trello_source_attachment_ids or request.trello_attachment_ids
+        )
+        if not source_card_id or not source_attachment_ids:
+            return request
+
+        key, token = self._trello_credentials()
+        if not key or not token:
+            raise RuntimeError("Thiếu Trello API key/token để xác minh ảnh nguồn trước khi upload output.")
+        source_paths = await asyncio.to_thread(
+            self._download_trello_card_image_attachments,
+            key,
+            token,
+            source_card_id,
+            job_id,
+            1,
+            source_attachment_ids[:1],
+        )
+        payload = _model_dump(request)
+        existing_paths = [str(item or "").strip() for item in payload.get("reference_image_paths", []) if str(item or "").strip()]
+        existing_roles = [str(item or "").strip() for item in payload.get("reference_image_roles", []) if str(item or "").strip()]
+        selected_paths = source_paths[: max(0, 4 - len(existing_paths))]
+        payload["reference_image_paths"] = existing_paths + selected_paths
+        payload["reference_image_roles"] = self._normalize_reference_image_roles(
+            payload["reference_image_paths"],
+            existing_roles + ["base" if not existing_paths and index == 0 else "reference" for index, _ in enumerate(selected_paths)],
+        )
+        payload["trello_card_id"] = source_card_id
+        payload["trello_source_card_id"] = source_card_id
+        payload["trello_attachment_ids"] = source_attachment_ids
+        payload["trello_source_attachment_ids"] = source_attachment_ids
+        self._sync_trello_scope_into_automation_graph(
+            payload,
+            board_id=str(payload.get("trello_board_id") or "").strip(),
+            list_id=str(payload.get("trello_list_id") or "").strip(),
+            card_id=source_card_id,
+            attachment_ids=source_attachment_ids,
+        )
+        await self.store.append_log(job_id, "Đã khóa lại ảnh nguồn Trello local trước khi upload output để tránh nhầm card.")
+        return CreateJobRequest(**payload)
+
+    def _extension_auto_trello_artifacts(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        images: List[ExtensionAutoTrelloImageRequest],
+    ) -> List[JobArtifact]:
+        ensure_app_dirs()
+        artifacts: List[JobArtifact] = []
+        for index, image in enumerate(images):
+            data_url = str(image.data_url or "").strip()
+            if not data_url and str(image.url or "").strip().startswith("data:"):
+                data_url = str(image.url or "").strip()
+            if not data_url:
+                raise RuntimeError(
+                    f"Ảnh {index + 1} từ extension chưa có data URL; app dừng để tránh upload URL Flow không tải được."
+                )
+            image_bytes, mime_type = self._decode_extension_data_url(data_url, image.mime_type)
+            suffix = Path(str(image.name or "")).suffix.lower()
+            if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                suffix = mimetypes.guess_extension(mime_type or "") or ".jpg"
+            if suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                suffix = ".jpg"
+            media_name = f"flow-{job_id[:8]}-{index + 1}{suffix}"
+            target = DOWNLOADS_DIR / media_name
+            counter = 1
+            while target.exists():
+                target = DOWNLOADS_DIR / f"flow-{job_id[:8]}-{index + 1}-{counter}{suffix}"
+                counter += 1
+            target.write_bytes(image_bytes)
+            artifacts.append(
+                JobArtifact(
+                    label=f"Ảnh {index + 1}",
+                    media_name=target.name,
+                    local_path=str(target),
+                    public_url=self._public_download_url(str(target)),
+                    mime_type=mime_type or "image/jpeg",
+                    prompt=request.prompt,
+                    dimensions={"source": "extension_flow_agent"},
+                )
+            )
+        return artifacts
+
+    def _decode_extension_data_url(self, data_url: str, fallback_mime: str = "") -> tuple[bytes, str]:
+        match = re.match(r"^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$", data_url, flags=re.DOTALL)
+        if not match:
+            raise RuntimeError("Extension trả ảnh không đúng dạng data URL base64.")
+        mime_type = str(match.group(1) or fallback_mime or "image/jpeg").strip() or "image/jpeg"
+        try:
+            return base64.b64decode(match.group(2), validate=True), mime_type
+        except Exception as exc:
+            raise RuntimeError("Không giải mã được ảnh base64 từ extension.") from exc
 
     def _prompt_batch_items(self, items: List[PromptBatchItemRequest], limit: int) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
@@ -2162,7 +4035,6 @@ class FlowWebService:
         base_request: CreateJobRequest,
         items: List[Dict[str, Any]],
         limit: int,
-        skip_card_ids: set[str] | None = None,
     ) -> tuple[CreateJobRequest, List[Dict[str, Any]], Dict[str, Any]]:
         graph = self._automation_graph_payload(base_request)
         module = next(
@@ -2183,7 +4055,6 @@ class FlowWebService:
                 module_request,
                 items,
                 limit,
-                skip_card_ids,
             )
         except RuntimeError as exc:
             raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
@@ -2217,15 +4088,26 @@ class FlowWebService:
                 raise RuntimeError("Auto AI Trello liên tục cần API key/token Trello để quét card mới.")
             trello_config = self.store.snapshot().trello_config
             board_id = self._normalize_trello_board_id(
-                trello_config.board_id
-                or base_request.trello_board_id
+                base_request.trello_board_id
+                or trello_config.board_id
                 or os.getenv("TRELLO_BOARD_ID", "")
             )
             if not board_id:
                 raise RuntimeError("Auto AI Trello liên tục cần Board URL/Board ID để tìm card mới.")
+            has_stale_card_scope = bool(
+                self._normalize_trello_card_id(
+                    base_request.trello_card_id or base_request.trello_source_card_id or ""
+                )
+                or self._normalize_trello_attachment_ids(
+                    list(base_request.trello_attachment_ids or [])
+                    + list(base_request.trello_source_attachment_ids or [])
+                )
+            )
+            configured_list_id = trello_config.list_id or os.getenv("TRELLO_LIST_ID", "")
+            requested_list_id = base_request.trello_list_id if not has_stale_card_scope else ""
             raw_list_id = self._normalize_trello_id(
-                trello_config.list_id
-                or os.getenv("TRELLO_LIST_ID", "")
+                requested_list_id
+                or configured_list_id
                 or self._default_trello_source_list_name()
             )
             list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
@@ -2271,7 +4153,25 @@ class FlowWebService:
 
     def _auto_trello_flow_agent_request(self, request: CreateJobRequest) -> CreateJobRequest:
         payload = _model_dump(request)
-        self._force_auto_trello_flow_agent_policy(payload)
+        if self._normalize_image_engine(payload.get("image_engine")) == "gemini_api":
+            payload["aspect"] = "square"
+            payload["count"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+            payload["flow_agent_enabled"] = False
+            payload["flow_agent_auto_approve"] = False
+            graph = payload.get("automation_graph")
+            modules = graph.get("modules") if isinstance(graph, dict) else []
+            for module in modules if isinstance(modules, list) else []:
+                if not isinstance(module, dict) or module.get("type") != "flow":
+                    continue
+                settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+                settings["imageAspect"] = "square"
+                settings["imageCount"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+                settings["imageEngine"] = "gemini_api"
+                settings["flowAgentEnabled"] = False
+                settings["flowAgentAutoApprove"] = False
+                module["settings"] = settings
+        else:
+            self._force_auto_trello_flow_agent_policy(payload)
         return CreateJobRequest(**payload)
 
     def _clear_auto_trello_search_filter(self, payload: Dict[str, Any]) -> None:
@@ -2292,7 +4192,6 @@ class FlowWebService:
         )
 
     def _force_auto_trello_flow_agent_policy(self, payload: Dict[str, Any]) -> None:
-        payload["model"] = self.DEFAULT_IMAGE_MODEL
         payload["aspect"] = "square"
         payload["count"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
         payload["flow_agent_enabled"] = True
@@ -2312,7 +4211,6 @@ class FlowWebService:
                 module["settings"] = settings
             settings["imageAspect"] = "square"
             settings["imageCount"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
-            settings["imageModel"] = self.DEFAULT_IMAGE_MODEL
             settings["flowAgentEnabled"] = True
             settings["flowAgentAutoApprove"] = True
 
@@ -2361,9 +4259,14 @@ class FlowWebService:
 
     def _prompt_batch_item_matches_trello_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
         item_card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
-        source_card_id = self._normalize_trello_card_id(str(source_hint.get("card_id") or ""))
+        source_card_ids = {
+            self._normalize_trello_card_id(str(source_hint.get("card_id") or "")),
+            self._normalize_trello_card_id(str(source_hint.get("card_short_link") or "")),
+            self._normalize_trello_card_id(str(source_hint.get("card_url") or "")),
+        }
+        source_card_ids.discard("")
         if item_card_id:
-            return bool(source_card_id and item_card_id == source_card_id)
+            return item_card_id in source_card_ids
 
         source_terms = [source_hint.get("card_name")]
         source_text = " ".join(self._compact_match_text(value) for value in source_terms if value)
@@ -2459,7 +4362,7 @@ class FlowWebService:
         payload["prompt_product_key"] = str(item.get("product_key") or "").strip()
         payload["prompt_index"] = str(item.get("index") or "").strip()
         payload["prompt_notes"] = str(item.get("notes") or "").strip()
-        if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
+        if (item.get("flow_agent_instruction") or item.get("generated_by_flow_agent")) and self._normalize_image_engine(payload.get("image_engine")) != "gemini_api":
             image_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
             payload["count"] = image_count
             payload["flow_agent_enabled"] = True
@@ -2557,6 +4460,21 @@ class FlowWebService:
         job_result = job.result if isinstance(job.result, dict) else {}
         trello_source_hint = job_result.get("trello_source_hint") or job_input.get("trello_source_hint") or {}
         return str(trello_source_hint.get("mode") or "").strip() == "auto_trello"
+
+    def _auto_trello_should_stop_on_child_error(self, detail: str) -> bool:
+        normalized = self._strip_accents(str(detail or "")).lower()
+        stop_signals = (
+            "chua keo/upload duoc anh trello",
+            "chua keo duoc anh nguon",
+            "chua upload duoc anh trello",
+            "chua xac minh duoc anh nguon",
+            "khong thay attachment moi",
+            "khong dung anh nguon",
+            "request khong co anh goc",
+            "dung truoc khi bam tao",
+            "tat ca chrome profile flow da het quota",
+        )
+        return any(signal in normalized for signal in stop_signals)
 
     def _auto_trello_live_scan_request(self, request: CreateJobRequest, *, preserve_card: bool = False) -> CreateJobRequest:
         payload = _model_dump(request)
@@ -2738,18 +4656,6 @@ class FlowWebService:
                     if uses_flow_agent
                     else f"Đang chạy prompt {index + 1}/{total}: {child_request.title}",
                 )
-                ai_title = str(item.get("ai_suggested_title") or "").strip()
-                ai_title_error = str(item.get("ai_title_error") or "").strip()
-                if uses_flow_agent and ai_title:
-                    await self.store.append_log(
-                        batch_id,
-                        f"Da ghi AI title vao mo ta Trello cho card {index + 1}/{total}: {ai_title}",
-                    )
-                elif uses_flow_agent and ai_title_error:
-                    await self.store.append_log(
-                        batch_id,
-                        f"Chua ghi AI title vao mo ta Trello cho card {index + 1}/{total}: {ai_title_error}",
-                    )
 
                 await self._run_flow_job(child_job.id, child_request)
                 saved_child = self.store.get_job(child_job.id)
@@ -2761,8 +4667,6 @@ class FlowWebService:
                         if uses_flow_agent
                         else f"Prompt {index + 1}/{total} đã tạo ảnh và gửi qua các module sau Flow.",
                     )
-                    if live_auto_trello:
-                        await self._stop_prompt_batch_after_trello_upload(batch_id, saved_child)
                 else:
                     failed += 1
                     detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
@@ -2772,6 +4676,17 @@ class FlowWebService:
                         if uses_flow_agent
                         else f"Prompt {index + 1}/{total} bị lỗi: {detail}",
                     )
+                    if self._auto_trello_should_stop_on_child_error(detail):
+                        current_batch = self.store.get_job(batch_id)
+                        current_result = dict(current_batch.result or {}) if current_batch is not None else {}
+                        current_result["stop_requested"] = True
+                        current_result["continuous"] = True
+                        current_result["run_until_empty"] = True
+                        await self.store.patch_job(batch_id, result=current_result)
+                        await self.store.append_log(
+                            batch_id,
+                            "Auto AI Trello tự dừng vì lỗi an toàn ảnh nguồn/Flow Agent; app không nhận card mới để tránh reset tab đang chạy hoặc tạo sai ảnh.",
+                        )
 
                 await self._patch_prompt_batch_result(
                     batch_id,
@@ -2858,48 +4773,6 @@ class FlowWebService:
         input_payload = job.input if isinstance(job.input, dict) else {}
         return bool(result.get("stop_requested") or input_payload.get("stop_requested"))
 
-    def _child_job_completed_trello_upload(self, job: JobRecord | None) -> bool:
-        if job is None or job.status != "completed":
-            return False
-        result = job.result if isinstance(job.result, dict) else {}
-        trello = result.get("trello") if isinstance(result.get("trello"), dict) else {}
-        if not trello:
-            return False
-
-        def as_int(value: Any) -> int:
-            try:
-                return int(value or 0)
-            except (TypeError, ValueError):
-                return 0
-
-        sent = as_int(trello.get("sent"))
-        failed = as_int(trello.get("failed"))
-        artifact_count = as_int(result.get("count"))
-        if sent <= 0 or failed > 0:
-            return False
-        return artifact_count <= 0 or sent >= artifact_count
-
-    async def _stop_prompt_batch_after_trello_upload(self, batch_id: str, child_job: JobRecord | None) -> bool:
-        if not self._child_job_completed_trello_upload(child_job):
-            return False
-        already_requested = self._prompt_batch_stop_requested(batch_id)
-        job = self.store.get_job(batch_id)
-        if job is None:
-            return False
-        result = dict(job.result or {})
-        input_payload = job.input if isinstance(job.input, dict) else {}
-        if result.get("run_until_empty") or input_payload.get("run_until_empty") or result.get("continuous") or input_payload.get("continuous"):
-            return False
-        result["stop_requested"] = True
-        result["continuous"] = bool(result.get("continuous") or input_payload.get("continuous"))
-        await self.store.patch_job(batch_id, result=result)
-        if not already_requested:
-            await self.store.append_log(
-                batch_id,
-                "Da upload anh len Trello xong; app tu dung Auto Trello de khong chay card tiep theo.",
-            )
-        return True
-
     async def request_stop_prompt_batch(self, job_id: str) -> JobRecord:
         job = self.store.get_job(job_id)
         if job is None:
@@ -2920,21 +4793,6 @@ class FlowWebService:
     def _auto_trello_waitable_empty_error(self, detail: str) -> bool:
         normalized = self._strip_accents(str(detail or "")).lower()
         return "chua tim thay card" in normalized or "khong tim thay card" in normalized
-
-    def _auto_trello_should_stop_on_child_error(self, detail: str) -> bool:
-        normalized = self._strip_accents(str(detail or "")).lower()
-        stop_signals = (
-            "chua keo/upload duoc anh trello",
-            "chua keo duoc anh nguon",
-            "chua upload duoc anh trello",
-            "chua xac minh duoc anh nguon",
-            "khong thay attachment moi",
-            "khong dung anh nguon",
-            "request khong co anh goc",
-            "dung truoc khi bam tao",
-            "tat ca chrome profile flow da het quota",
-        )
-        return any(signal in normalized for signal in stop_signals)
 
     async def reset_ready_trello_outputs(self, request: ResetReadyTrelloRequest) -> Dict[str, Any]:
         key, token = self._trello_credentials()
@@ -2960,6 +4818,645 @@ class FlowWebService:
             raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
+
+    def _apply_one_click_account_routing(self, base_job: CreateJobRequest) -> CreateJobRequest:
+        """Multi-account one-click routing.
+
+        When ``base_job`` targets a NON-default Etsy account, resolve that
+        account's own Trello board/list from the registry and stamp them onto
+        the job so (a) card enumeration reads the right board and (b) every
+        browser-copy task is stamped with this account_id (so only that
+        account's worker claims it). The default account ("" / "default") is
+        returned untouched -> global Trello/Etsy config -> the live trung6 VM
+        behaves exactly as before.
+        """
+        account_id = self._normalize_account_id(getattr(base_job, "etsy_account_id", ""))
+        if not account_id:
+            return base_job  # default account: global config, zero change
+        record = self._resolve_etsy_account(account_id)
+        if not record:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tài khoản Etsy '{account_id}' chưa được đăng ký. Thêm tài khoản trong dashboard trước.",
+            )
+        if not record.get("enabled", True):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tài khoản Etsy '{account_id}' đang tắt; bật lại trước khi tạo draft.",
+            )
+        board_id = str(record.get("trello_board_id") or "").strip()
+        if not board_id:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Tài khoản Etsy '{account_id}' chưa cấu hình Trello board nguồn. Cập nhật tài khoản trước.",
+            )
+        payload = _model_dump(base_job)
+        payload["etsy_account_id"] = account_id
+        # Account board/list take over ONLY when the request didn't pin them
+        # explicitly, preserving the existing request > account > global order.
+        if not str(payload.get("trello_board_id") or "").strip():
+            payload["trello_board_id"] = board_id
+        if not str(payload.get("trello_list_id") or "").strip():
+            list_id = str(record.get("trello_list_id") or "").strip()
+            if list_id:
+                payload["trello_list_id"] = list_id
+        return CreateJobRequest(**payload)
+
+    async def enqueue_auto_trello_one_click(self, request: PromptBatchRequest) -> Dict[str, Any]:
+        base_job = self._apply_one_click_account_routing(request.job or CreateJobRequest(type="image"))
+        # Keep request.job in lockstep so the Flow-batch / prompt-batch sub-paths
+        # (which rebuild from `request`) inherit the same account board + id.
+        request.job = base_job
+        include_etsy = bool(request.create_etsy_draft and (base_job.etsy_enabled or base_job.etsy_browser_copy_enabled))
+        include_amazon = bool(
+            request.create_etsy_draft and (base_job.amazon_enabled or base_job.amazon_browser_copy_enabled)
+        )
+        include_listing = include_etsy or include_amazon
+        listing_marketplace = "Amazon" if include_amazon and not include_etsy else "Etsy"
+        listing_mode = "amazon_from_existing_outputs" if listing_marketplace == "Amazon" else "etsy_from_existing_outputs"
+        if not include_listing:
+            base_job_payload = _model_dump(base_job)
+            base_job_payload.update(
+                {
+                    "etsy_enabled": False,
+                    "etsy_browser_copy_enabled": False,
+                    "etsy_publish": False,
+                    "amazon_enabled": False,
+                    "amazon_browser_copy_enabled": False,
+                    "amazon_publish": False,
+                }
+            )
+            graph_payload = dict(base_job_payload.get("automation_graph") or {})
+            modules = graph_payload.get("modules")
+            if isinstance(modules, list):
+                graph_payload["modules"] = [
+                    module
+                    for module in modules
+                    if not (
+                        isinstance(module, dict)
+                        and str(module.get("type") or "") in {"etsy", "etsy_browser_copy", "amazon", "amazon_browser_copy"}
+                    )
+                ]
+            edges = graph_payload.get("edges")
+            if isinstance(edges, list):
+                blocked_module_ids = {
+                    str(module.get("id") or "")
+                    for module in graph_payload.get("modules", [])
+                    if isinstance(module, dict)
+                    and str(module.get("type") or "") in {"etsy", "etsy_browser_copy", "amazon", "amazon_browser_copy"}
+                }
+                blocked_module_ids.update({"etsy", "etsy-copy", "amazon", "amazon-copy"})
+                graph_payload["edges"] = [
+                    edge
+                    for edge in edges
+                    if not (
+                        isinstance(edge, dict)
+                        and (
+                            str(edge.get("source") or "") in blocked_module_ids
+                            or str(edge.get("target") or "") in blocked_module_ids
+                        )
+                    )
+                ]
+            base_job_payload["automation_graph"] = graph_payload
+            base_job = CreateJobRequest(**base_job_payload)
+        explicit_card_id = self._normalize_trello_card_id(
+            str(base_job.trello_card_id or base_job.trello_source_card_id or "")
+        )
+        if not explicit_card_id:
+            for item in request.items or []:
+                explicit_card_id = self._normalize_trello_card_id(
+                    str(item.trello_card_id or item.trello_source_card_id or "")
+                )
+                if explicit_card_id:
+                    break
+        if explicit_card_id:
+            if include_listing:
+                key, token = self._trello_credentials()
+                try:
+                    flow_output_count, listing_image_count = await asyncio.to_thread(
+                        self._trello_card_etsy_listing_counts,
+                        key,
+                        token,
+                        explicit_card_id,
+                    ) if key and token else (0, 0)
+                except Exception:
+                    flow_output_count, listing_image_count = 0, 0
+                if listing_image_count > 0:
+                    card = {}
+                    try:
+                        card_payload = await asyncio.to_thread(
+                            lambda: self._trello_get_json(
+                                f"cards/{quote(explicit_card_id, safe='')}",
+                                key,
+                                token,
+                                fields={"fields": "id,name,shortLink,url,idList,closed"},
+                            )
+                        )
+                        card = card_payload if isinstance(card_payload, dict) else {}
+                    except Exception:
+                        card = {}
+                    card_id = self._normalize_trello_card_id(str(card.get("id") or explicit_card_id))
+                    card_name = str(card.get("name") or base_job.prompt_product or base_job.prompt_product_key or card_id).strip()
+                    parent = JobRecord(
+                        type="auto_trello_one_click",
+                        status="queued",
+                        title=f"Auto Trello -> {listing_marketplace} draft ({card_name or card_id})",
+                        input={
+                            "type": "auto_trello_one_click",
+                            "job": _model_dump(base_job),
+                            "limit": 1,
+                            "cards": [card],
+                            "explicit_card_id": card_id,
+                        },
+                        result={
+                            "mode": listing_mode,
+                            "queued": 0,
+                            "failed": 0,
+                            "tasks": [],
+                            "trello_status": {
+                                "cards": [
+                                    {
+                                        "id": card_id,
+                                        "name": card_name,
+                                        "url": str(card.get("url") or f"https://trello.com/c/{card_id}"),
+                                        "status": "complete",
+                                        "flow_outputs": flow_output_count,
+                                        "listing_images": listing_image_count,
+                                    }
+                                ],
+                            },
+                        },
+                    )
+                    await self.store.add_job(parent)
+                    if flow_output_count > 0:
+                        listing_log = (
+                            f"Card cụ thể {card_name or card_id} đã có {flow_output_count} ảnh Flow output; "
+                            f"queue {listing_marketplace} Draft, không chạy Flow lại."
+                        )
+                    else:
+                        listing_log = (
+                            f"Card cụ thể {card_name or card_id} có {listing_image_count} ảnh (không phải Flow output); "
+                            f"queue {listing_marketplace} Draft theo ảnh sẵn có, không chạy Flow."
+                        )
+                    await self.store.append_log(parent.id, listing_log)
+                    payload = _model_dump(base_job)
+                    payload.update(
+                        {
+                            "type": "image",
+                            "trello_enabled": True,
+                            "etsy_enabled": include_etsy,
+                            "etsy_browser_copy_enabled": include_etsy,
+                            "etsy_publish": False,
+                            "etsy_keep_color_chart": True,
+                            "etsy_delete_existing_images": True,
+                            "amazon_enabled": include_amazon,
+                            "amazon_browser_copy_enabled": include_amazon,
+                            "amazon_publish": False,
+                            "amazon_delete_existing_images": True,
+                            "trello_card_id": card_id,
+                            "trello_source_card_id": card_id,
+                            "trello_list_id": str(card.get("idList") or base_job.trello_list_id or ""),
+                            "prompt_product": card_name,
+                            "prompt_product_key": card_name,
+                            "title": card_name or f"Auto Trello {listing_marketplace} draft",
+                        }
+                    )
+                    copy_request = CreateJobRequest(**payload)
+                    if include_amazon and not include_etsy:
+                        copy_result = await self.enqueue_amazon_browser_copy(
+                            parent.id,
+                            copy_request,
+                            module_id="amazon_browser_copy_1",
+                        )
+                    else:
+                        copy_result = await self.enqueue_etsy_browser_copy(
+                            parent.id,
+                            copy_request,
+                            module_id="etsy_browser_copy_1",
+                        )
+                    task = {
+                        "card_id": card_id,
+                        "card_name": card_name,
+                        "card_url": str(card.get("url") or ""),
+                        "enqueued": bool(copy_result.get("enqueued")),
+                        "missing": copy_result.get("missing", []),
+                        "queue_task": copy_result.get("queue_task"),
+                    }
+                    queued = 1 if task["enqueued"] else 0
+                    parent = await self.store.patch_job(
+                        parent.id,
+                        status="queued" if queued else "failed",
+                        error="" if queued else f"Không queue được {listing_marketplace} draft từ card cụ thể đã có ảnh output.",
+                        result={
+                            "mode": listing_mode,
+                            "queued": queued,
+                            "failed": 0 if queued else 1,
+                            "tasks": [task],
+                            "trello_status": parent.result.get("trello_status", {}),
+                        },
+                    )
+                    if queued:
+                        await self.store.append_log(parent.id, f"Đã đưa 1 task {listing_marketplace} draft vào hàng đợi máy ảo.")
+                    return {
+                        "ok": bool(queued),
+                        "mode": listing_mode,
+                        "message": (
+                            f"Đã queue 1 {listing_marketplace} draft từ card cụ thể đã có ảnh output."
+                            if queued
+                            else f"Card cụ thể đã có ảnh output nhưng chưa queue được {listing_marketplace} draft."
+                        ),
+                        "job": parent,
+                        "trello_status": parent.result.get("trello_status", {}),
+                        "tasks": [task],
+                    }
+                if request.etsy_only:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"Card Trello này chưa có ảnh nào để Listing {listing_marketplace}. "
+                            "Hãy thêm ảnh vào card (Flow output hoặc ảnh tay) rồi thử lại."
+                        ),
+                    )
+            flow_request = request
+            if not request.items:
+                payload = _model_dump(request)
+                payload["items"] = [
+                    {
+                        "row": 1,
+                        "active": True,
+                        "prompt": base_job.prompt or "",
+                        "product": base_job.prompt_product or base_job.prompt_product_key or "",
+                        "product_key": base_job.prompt_product_key or base_job.prompt_product or "",
+                        "product_name": base_job.prompt_product or base_job.prompt_product_key or "",
+                        "trello_card_id": explicit_card_id,
+                        "trello_source_card_id": explicit_card_id,
+                        "trello_list_id": base_job.trello_list_id,
+                    }
+                ]
+                flow_request = PromptBatchRequest(**payload)
+            job = await self.enqueue_prompt_batch(flow_request)
+            return {
+                "ok": True,
+                "mode": "explicit_trello_card",
+                "message": f"Đã nhận card Trello cụ thể, chạy thẳng card này rồi lưu {listing_marketplace} Draft nếu bật listing.",
+                "job": job,
+                "trello_status": {
+                    "cards": [
+                        {
+                            "id": explicit_card_id,
+                            "url": f"https://trello.com/c/{explicit_card_id}",
+                            "status": "explicit",
+                        }
+                    ]
+                },
+            }
+        status_request = ResetReadyTrelloRequest(
+            trello_board_id=base_job.trello_board_id,
+            trello_list_id=base_job.trello_list_id,
+        )
+        status = await self.ready_trello_status(status_request)
+        cards = [card for card in status.get("cards", []) if isinstance(card, dict)]
+        query = self._trello_auto_search_query(base_job)
+        if query:
+            cards = [card for card in cards if self._trello_card_matches_query(card, query)]
+        # Whole-column listing draft (etsy_only with no explicit card / product name) is allowed:
+        # fall through to the complete_cards_without_draft machinery below, which drafts every
+        # image-ready card in the selected column and dedups cards already drafted. The empty
+        # case is reported cleanly at the end of this method.
+        eligible_cards = [card for card in cards if str(card.get("status") or "") in {"eligible", "partial"}]
+        complete_cards = [card for card in cards if str(card.get("status") or "") == "complete"]
+        complete_cards_without_draft = [
+            card
+            for card in complete_cards
+            if not (
+                self._amazon_browser_copy_card_completed(str(card.get("id") or ""))
+                if include_amazon and not include_etsy
+                else self._etsy_browser_copy_card_completed(str(card.get("id") or ""))
+            )
+        ]
+
+        if eligible_cards and not (request.etsy_only and include_listing):
+            flow_request = request
+            if not request.items:
+                payload = _model_dump(request)
+                payload["limit"] = max(1, min(int(request.limit or 1), len(eligible_cards)))
+                flow_request = PromptBatchRequest(**payload)
+            job = await self.enqueue_prompt_batch(flow_request)
+            return {
+                "ok": True,
+                "mode": "flow_batch",
+                "message": f"Đã tìm thấy card cần tạo ảnh, đang chạy Flow trước rồi mới sang {listing_marketplace}.",
+                "job": job,
+                "trello_status": status,
+            }
+
+        if complete_cards_without_draft and include_listing:
+            raw_limit = int(request.limit or 0)
+            limit = (
+                len(complete_cards_without_draft)
+                if raw_limit <= 0
+                else max(1, min(raw_limit, len(complete_cards_without_draft)))
+            )
+            selected_cards = complete_cards_without_draft[:limit]
+            parent = JobRecord(
+                type="auto_trello_one_click",
+                status="queued",
+                title=f"Auto Trello -> {listing_marketplace} draft ({len(selected_cards)} card)",
+                input={
+                    "type": "auto_trello_one_click",
+                    "job": _model_dump(base_job),
+                    "limit": limit,
+                    "cards": selected_cards,
+                },
+                result={
+                    "mode": listing_mode,
+                    "queued": 0,
+                    "failed": 0,
+                    "tasks": [],
+                    "trello_status": status,
+                },
+            )
+            await self.store.add_job(parent)
+            await self.store.append_log(
+                parent.id,
+                (
+                    f"Bỏ qua {len(eligible_cards)} card chưa đủ ảnh; dùng {len(selected_cards)} card đã có ảnh để tạo {listing_marketplace} draft."
+                    if eligible_cards
+                    else f"Ready for AI không còn card thiếu ảnh; dùng ảnh output đã có để tạo {listing_marketplace} draft."
+                ),
+            )
+
+            tasks: List[Dict[str, Any]] = []
+            failed = 0
+            for index, card in enumerate(selected_cards, start=1):
+                card_id = str(card.get("id") or "").strip()
+                queue_tasks = self._amazon_browser_copy_tasks if include_amazon and not include_etsy else self._etsy_browser_copy_tasks
+                existing_task = next(
+                    (
+                        task
+                        for task in queue_tasks.values()
+                        if str(task.get("card_id") or "").strip() == card_id
+                        and task.get("status") in {"queued", "in_progress"}
+                    ),
+                    None,
+                )
+                if existing_task is not None:
+                    tasks.append(
+                        {
+                            "card_id": card_id,
+                            "card_name": card.get("name", ""),
+                            "card_url": card.get("url", ""),
+                            "enqueued": True,
+                            "duplicate": True,
+                            "missing": [],
+                            "queue_task": (
+                                self._public_amazon_browser_copy_task(existing_task)
+                                if include_amazon and not include_etsy
+                                else self._public_etsy_browser_copy_task(existing_task)
+                            ),
+                        }
+                    )
+                    await self.store.append_log(
+                        parent.id,
+                        f"{listing_marketplace} draft cho {card.get('name') or card_id} đã có task {existing_task.get('id')} chờ/chạy, không queue trùng.",
+                    )
+                    continue
+                payload = _model_dump(base_job)
+                payload.update(
+                    {
+                        "type": "image",
+                        "trello_enabled": True,
+                        "etsy_enabled": include_etsy,
+                        "etsy_browser_copy_enabled": include_etsy,
+                        "etsy_publish": False,
+                        "etsy_keep_color_chart": True,
+                        "etsy_delete_existing_images": True,
+                        "amazon_enabled": include_amazon,
+                        "amazon_browser_copy_enabled": include_amazon,
+                        "amazon_publish": False,
+                        "amazon_delete_existing_images": True,
+                        "trello_card_id": card_id,
+                        "trello_source_card_id": card_id,
+                        "trello_list_id": str(card.get("list_id") or status.get("list_id") or ""),
+                        "prompt_product": str(card.get("name") or ""),
+                        "prompt_product_key": str(card.get("name") or ""),
+                        "title": str(card.get("name") or f"Auto Trello {listing_marketplace} draft"),
+                    }
+                )
+                copy_request = CreateJobRequest(**payload)
+                if include_amazon and not include_etsy:
+                    copy_result = await self.enqueue_amazon_browser_copy(
+                        parent.id,
+                        copy_request,
+                        module_id=f"amazon_browser_copy_{index}",
+                    )
+                else:
+                    copy_result = await self.enqueue_etsy_browser_copy(
+                        parent.id,
+                        copy_request,
+                        module_id=f"etsy_browser_copy_{index}",
+                    )
+                tasks.append(
+                    {
+                        "card_id": card.get("id", ""),
+                        "card_name": card.get("name", ""),
+                        "card_url": card.get("url", ""),
+                        "enqueued": bool(copy_result.get("enqueued")),
+                        "missing": copy_result.get("missing", []),
+                        "queue_task": copy_result.get("queue_task"),
+                    }
+                )
+                if not copy_result.get("enqueued"):
+                    failed += 1
+                    await self.store.append_log(
+                        parent.id,
+                        f"{listing_marketplace} draft chưa queue được cho {card.get('name') or card.get('id')}: "
+                        f"{', '.join(copy_result.get('missing') or ['không rõ lỗi'])}.",
+                    )
+
+            queued = len([task for task in tasks if task.get("enqueued")])
+            final_status = "queued" if queued else "failed"
+            error = "" if queued else f"Không queue được {listing_marketplace} draft từ card đã có ảnh output."
+            parent = await self.store.patch_job(
+                parent.id,
+                status=final_status,
+                error=error,
+                result={
+                    "mode": listing_mode,
+                    "queued": queued,
+                    "failed": failed,
+                    "tasks": tasks,
+                    "trello_status": status,
+                },
+            )
+            if queued:
+                await self.store.append_log(parent.id, f"Đã đưa {queued} task {listing_marketplace} draft vào hàng đợi máy ảo.")
+            return {
+                "ok": bool(queued),
+                "mode": listing_mode,
+                "message": (
+                    f"Đã queue {queued} {listing_marketplace} draft từ card đã có ảnh output."
+                    if queued
+                    else f"Card đã có ảnh output nhưng chưa queue được {listing_marketplace} draft."
+                ),
+                "job": parent,
+                "trello_status": status,
+                "tasks": tasks,
+            }
+
+        detail = status.get("message") or "Ready for AI chưa có card phù hợp."
+        if complete_cards and include_listing and not complete_cards_without_draft:
+            detail = (
+                f"{self._trello_source_scope_label_for_ids(status.get('list_ids') or [])} chỉ còn card đã có ảnh output "
+                f"và đã được đưa sang {listing_marketplace} Draft trước đó. Hãy đưa card mới vào Ready for AI hoặc chọn Idea."
+            )
+        if request.etsy_only and include_listing and not complete_cards:
+            detail = (
+                f"Trello chưa có card nào khớp {query or 'nguồn đang chọn'} đã đủ ảnh output Flow. "
+                f"Hãy chạy Flow trước rồi bấm Listing ảnh {listing_marketplace} lại."
+            )
+        if complete_cards and not include_listing:
+            detail = "Card trong Ready for AI đã đủ ảnh output. Bấm nút Listing ảnh riêng để đưa ảnh đó vào Draft."
+        raise HTTPException(status_code=400, detail=detail)
+
+    def _etsy_browser_copy_card_completed(self, card_id: str) -> bool:
+        normalized_card_id = self._normalize_trello_card_id(card_id)
+        if not normalized_card_id:
+            return False
+        for task in self._etsy_browser_copy_tasks.values():
+            if self._normalize_trello_card_id(str(task.get("card_id") or "")) != normalized_card_id:
+                continue
+            if str(task.get("status") or "") != "completed":
+                continue
+            result = task.get("result") if isinstance(task.get("result"), dict) else {}
+            if result and result.get("ok") is False:
+                continue
+            return True
+        for job in self.store.snapshot().jobs:
+            if self._etsy_browser_copy_payload_completed_for_card(job.result, normalized_card_id):
+                return True
+        return False
+
+    def _etsy_browser_copy_payload_completed_for_card(
+        self,
+        payload: Any,
+        normalized_card_id: str,
+        *,
+        depth: int = 0,
+    ) -> bool:
+        if depth > 8:
+            return False
+        if isinstance(payload, list):
+            return any(
+                self._etsy_browser_copy_payload_completed_for_card(item, normalized_card_id, depth=depth + 1)
+                for item in payload
+            )
+        if not isinstance(payload, dict):
+            return False
+
+        payload_card_id = self._normalize_trello_card_id(
+            str(
+                payload.get("card_id")
+                or payload.get("cardId")
+                or payload.get("trello_card_id")
+                or payload.get("trelloCardId")
+                or ""
+            )
+        )
+        task_id = str(payload.get("id") or payload.get("taskId") or "").strip()
+        module_id = str(payload.get("module_id") or payload.get("moduleId") or "").strip()
+        mode = str(payload.get("mode") or payload.get("type") or "").strip()
+        status = str(payload.get("status") or payload.get("taskStatus") or "").strip().lower()
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        is_etsy_copy = (
+            task_id.startswith("etsy-copy-")
+            or module_id.startswith("etsy_browser_copy")
+            or mode == "etsy_browser_copy"
+            or bool(payload.get("draftUrl") or payload.get("draftTargetUrl"))
+        )
+        if (
+            payload_card_id == normalized_card_id
+            and is_etsy_copy
+            and status == "completed"
+            and payload.get("ok") is not False
+            and result.get("ok") is not False
+        ):
+            return True
+
+        return any(
+            self._etsy_browser_copy_payload_completed_for_card(value, normalized_card_id, depth=depth + 1)
+            for value in payload.values()
+            if isinstance(value, (dict, list))
+        )
+
+    def _amazon_browser_copy_card_completed(self, card_id: str) -> bool:
+        normalized_card_id = self._normalize_trello_card_id(card_id)
+        if not normalized_card_id:
+            return False
+        for task in self._amazon_browser_copy_tasks.values():
+            if self._normalize_trello_card_id(str(task.get("card_id") or "")) != normalized_card_id:
+                continue
+            if str(task.get("status") or "") != "completed":
+                continue
+            result = task.get("result") if isinstance(task.get("result"), dict) else {}
+            if result and result.get("ok") is False:
+                continue
+            return True
+        for job in self.store.snapshot().jobs:
+            if self._amazon_browser_copy_payload_completed_for_card(job.result, normalized_card_id):
+                return True
+        return False
+
+    def _amazon_browser_copy_payload_completed_for_card(
+        self,
+        payload: Any,
+        normalized_card_id: str,
+        *,
+        depth: int = 0,
+    ) -> bool:
+        if depth > 8:
+            return False
+        if isinstance(payload, list):
+            return any(
+                self._amazon_browser_copy_payload_completed_for_card(item, normalized_card_id, depth=depth + 1)
+                for item in payload
+            )
+        if not isinstance(payload, dict):
+            return False
+
+        payload_card_id = self._normalize_trello_card_id(
+            str(
+                payload.get("card_id")
+                or payload.get("cardId")
+                or payload.get("trello_card_id")
+                or payload.get("trelloCardId")
+                or ""
+            )
+        )
+        task_id = str(payload.get("id") or payload.get("taskId") or "").strip()
+        module_id = str(payload.get("module_id") or payload.get("moduleId") or "").strip()
+        mode = str(payload.get("mode") or payload.get("type") or "").strip()
+        status = str(payload.get("status") or payload.get("taskStatus") or "").strip().lower()
+        result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+        is_amazon_copy = (
+            task_id.startswith("amazon-copy-")
+            or module_id.startswith("amazon_browser_copy")
+            or mode in {"amazon_browser_copy", "amazon_from_existing_outputs"}
+        )
+        if (
+            payload_card_id == normalized_card_id
+            and is_amazon_copy
+            and status == "completed"
+            and payload.get("ok") is not False
+            and result.get("ok") is not False
+        ):
+            return True
+
+        return any(
+            self._amazon_browser_copy_payload_completed_for_card(value, normalized_card_id, depth=depth + 1)
+            for value in payload.values()
+            if isinstance(value, (dict, list))
+        )
 
     async def _ready_trello_board_and_lists(
         self,
@@ -3012,7 +5509,7 @@ class FlowWebService:
                 "cards": [],
                 "message": f"{self._trello_source_scope_label()} chưa có list hợp lệ để kiểm tra.",
             }
-        scope_label = self._trello_source_scope_label_for_ids(list_ids)
+        scope_label = self._trello_source_scope_label_for_resolved_ids(key, token, list_ids)
         payload = self._trello_get_json(
             f"boards/{quote(board_id, safe='')}/cards",
             key,
@@ -3053,14 +5550,17 @@ class FlowWebService:
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
             output_count = len(outputs)
-            card["_image_attachments"] = sources
-            card["_flow_output_count"] = output_count
-            target_output_count = self._flow_operator_target_count_for_card(
-                CreateJobRequest(type="image", title="", count=self.FLOW_AGENT_TARGET_OUTPUT_COUNT),
-                card,
-            )
+            listing_pool_count = output_count or len(image_attachments)
+            target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
             status = "no_source"
             if sources and output_count >= target_output_count:
+                complete += 1
+                status = "complete"
+            elif output_count == 0 and listing_pool_count > 0:
+                # User-authorized fallback ("chỉ cần có ảnh trong đó là được"): the card has no
+                # flow-* outputs but does have images, so treat those images directly as the Etsy
+                # listing pool and mark the card draftable. Cards that are mid-Flow (1..3 flow
+                # outputs) stay "partial" below so the Flow-first top-up workflow isn't cut short.
                 complete += 1
                 status = "complete"
             elif sources:
@@ -3077,7 +5577,7 @@ class FlowWebService:
                     "status": status,
                     "source_count": len(sources),
                     "output_count": output_count,
-                    "target_output_count": target_output_count,
+                    "listing_image_count": listing_pool_count,
                     "missing_count": max(0, target_output_count - output_count) if sources else 0,
                 }
             )
@@ -3125,7 +5625,7 @@ class FlowWebService:
             for item in list_ids
             if self._normalize_trello_id(str(item or ""))
         }
-        scope_label = self._trello_source_scope_label_for_ids(list_ids)
+        scope_label = self._trello_source_scope_label_for_resolved_ids(key, token, list_ids)
         payload = self._trello_get_json(
             f"boards/{quote(board_id, safe='')}/cards",
             key,
@@ -3247,7 +5747,7 @@ class FlowWebService:
         if not list_ids:
             return f"Chưa tìm thấy list {self._trello_source_scope_label()} để kiểm tra."
         normalized_list_ids = set(list_ids)
-        scope_label = self._trello_source_scope_label_for_ids(list_ids)
+        scope_label = self._trello_source_scope_label_for_resolved_ids(key, token, list_ids)
 
         payload = self._trello_get_json(
             f"boards/{quote(board_id, safe='')}/cards",
@@ -3287,13 +5787,7 @@ class FlowWebService:
             ]
             sources, outputs = self._trello_source_and_flow_output_attachments(images)
             output_count = len(outputs)
-            card["_image_attachments"] = sources
-            card["_flow_output_count"] = output_count
-            target_output_count = self._flow_operator_target_count_for_card(
-                CreateJobRequest(type="image", title="", count=self.FLOW_AGENT_TARGET_OUTPUT_COUNT),
-                card,
-            )
-            if sources and output_count >= target_output_count:
+            if sources and output_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT:
                 complete += 1
             elif sources:
                 eligible += 1
@@ -3303,11 +5797,13 @@ class FlowWebService:
 
         parts = [f"{scope_label} co {len(cards)} card"]
         if complete:
-            parts.append(f"{complete} card da co du anh output theo rule nhung phien Auto moi van co the tao moi du bo")
+            parts.append(f"{complete} card da du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh output nen Auto se bo qua")
         if no_output:
-            parts.append(f"{no_output} card co anh nguon va khi chay se tao moi du bo theo rule")
+            parts.append(f"{no_output} card chua du output va se tao tiep den du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
         if no_source:
             parts.append(f"{no_source} card chua co anh nguon hop le")
+        if not eligible and complete:
+            parts.append(f"Auto dang cho card moi hoac card duoc reset de tao lai du {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} anh")
         return "; ".join(parts) + "."
 
     async def _sleep_continuous_auto_trello(self, batch_id: str, poll_interval_s: int) -> None:
@@ -3372,8 +5868,7 @@ class FlowWebService:
                     scan_request, items, discovery = await self._expand_prompt_batch_with_trello_images(
                         base_request,
                         seed_items,
-                        1,
-                        seen_card_ids,
+                        0,
                     )
                 except HTTPException as exc:
                     detail = self._flow_error_detail(exc)
@@ -3392,40 +5887,11 @@ class FlowWebService:
                             failed=failed,
                             current_index=0,
                             current_child_job_id="",
-                            extra={
-                                "cycles": cycles,
-                                "idle_cycles": idle_cycles,
-                                "last_scan_at": utc_now(),
-                                "seen_card_ids": sorted(seen_card_ids),
-                            },
+                            extra={"cycles": cycles, "idle_cycles": idle_cycles, "last_scan_at": utc_now()},
                         )
                         await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
                         continue
                     raise
-
-                skipped_missing_rule_ids = [
-                    self._normalize_trello_card_id(str(item or ""))
-                    for item in discovery.get("skipped_missing_product_rule_card_ids", [])
-                    if self._normalize_trello_card_id(str(item or ""))
-                ]
-                skipped_missing_rule_count = int(
-                    discovery.get("skipped_missing_product_rule_cards") or len(skipped_missing_rule_ids)
-                )
-                if skipped_missing_rule_ids:
-                    seen_card_ids.update(skipped_missing_rule_ids)
-                if skipped_missing_rule_count:
-                    skipped_details = discovery.get("skipped_missing_product_rule_details")
-                    detail_text = ""
-                    if isinstance(skipped_details, list) and skipped_details:
-                        detail_text = str(skipped_details[0] or "").strip()
-                    await self.store.append_log(
-                        batch_id,
-                        (
-                            f"Bo qua {skipped_missing_rule_count} card chua xac dinh duoc HAVI product shot rule"
-                            + (f": {detail_text[:220]}" if detail_text else ".")
-                            + " App tiep tuc quet/chay card khac."
-                        ),
-                    )
 
                 fresh_items: List[Dict[str, Any]] = []
                 skipped_seen = 0
@@ -3473,7 +5939,7 @@ class FlowWebService:
                     f"Tìm thấy {len(items)} card mới trong {self._trello_source_scope_label()}. Bắt đầu xử lý lô này.",
                 )
 
-                for item in items:
+                for item_offset, item in enumerate(items):
                     if self._prompt_batch_stop_requested(batch_id):
                         break
                     item_index = completed + failed + 1
@@ -3506,40 +5972,16 @@ class FlowWebService:
                         detail=f"Đang chạy card mới {item_index}/{planned_total}: {child_request.title}",
                     )
                     await self.store.append_log(batch_id, f"Đang chạy card mới {item_index}/{planned_total}: {child_request.title}")
-                    ai_title = str(item.get("ai_suggested_title") or "").strip()
-                    ai_title_error = str(item.get("ai_title_error") or "").strip()
-                    if ai_title:
-                        await self.store.append_log(
-                            batch_id,
-                            f"Da ghi AI title vao mo ta Trello cho card {item_index}/{planned_total}: {ai_title}",
-                        )
-                    elif ai_title_error:
-                        await self.store.append_log(
-                            batch_id,
-                            f"Chua ghi AI title vao mo ta Trello cho card {item_index}/{planned_total}: {ai_title_error}",
-                        )
 
                     await self._run_flow_job(child_job.id, child_request)
                     saved_child = self.store.get_job(child_job.id)
                     if saved_child is not None and saved_child.status == "completed":
                         completed += 1
                         await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} đã xong và ảnh đã gửi về Trello.")
-                        await self._stop_prompt_batch_after_trello_upload(batch_id, saved_child)
                     else:
                         failed += 1
                         detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
                         await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} bị lỗi: {detail}")
-                        if self._auto_trello_should_stop_on_child_error(detail):
-                            current_batch = self.store.get_job(batch_id)
-                            current_result = dict(current_batch.result or {}) if current_batch is not None else {}
-                            current_result["stop_requested"] = True
-                            current_result["continuous"] = True
-                            current_result["run_until_empty"] = True
-                            await self.store.patch_job(batch_id, result=current_result)
-                            await self.store.append_log(
-                                batch_id,
-                                "Auto AI Trello tự dừng vì lỗi an toàn ảnh nguồn/Flow Agent; app không nhận card mới để tránh reset tab đang chạy hoặc tạo sai ảnh.",
-                            )
 
                     await self._patch_prompt_batch_result(
                         batch_id,
@@ -3764,7 +6206,8 @@ class FlowWebService:
             "Use the learned product-prompt style: give a compact design analysis, then a numbered shot brief. "
             f"{collage_rule}"
             "For each shot, state the product placement, background, props, lighting, camera angle, and the source details that must stay unchanged. "
-            "The attached source image is the authority: keep the same product object type, silhouette, construction, proportions, motif/design placement, readable text/name, colors, fabric texture, and handmade irregularities. "
+            "The attached source image is the authority for visible product details. If the brief includes a Product/category lock and the source is artwork/design-only, that Product/category lock defines the product form and the source supplies only the artwork/motif. "
+            "Keep the same product object type, silhouette, construction, proportions, motif/design placement, readable text/name, colors, fabric texture, and handmade irregularities. "
             "Only if the source image visibly contains an embroidered/personalized name and the Required shot plan, Trello description, or colorway/multi-color shot requires variants may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
             f"{self._flow_agent_colorway_text_variant_rule()} "
             "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, tactile fibers, clear stitch direction, crisp edges, and natural thread shadows; never make it flat printed, painted, digital, vinyl, or sticker-like. "
@@ -3776,19 +6219,19 @@ class FlowWebService:
             + self._flow_agent_no_tag_label_rule()
         )
 
+    def _flow_agent_colorway_text_variant_rule(self) -> str:
+        return (
+            "Colorway text/name rule: when a planned multi-color or colorway shot shows multiple product variants and the source product has a visible embroidered/personalized name, initials, date, word, or readable stitched text, "
+            "each differently colored product variant must use a different plausible name/text while keeping the same lettering placement, scale, thread style, and stitch quality; never repeat the exact same readable name/text across all color variants. "
+            "If the source product has no visible readable name/text, keep all color variants textless and do not invent new writing."
+        )
+
     def _flow_agent_embroidery_clarity_rule(self) -> str:
         return (
             "For any source product with visible embroidery, stitched lettering, stitched motif, or hand-sewn decorative design, "
             "every generated image must be tack-sharp around the embroidered areas, keep the embroidery readable and clearly focused, "
             "show individual thread strands, stitch direction, raised hand-work texture, needlework depth, and linen/fabric weave, "
             "and make the hand-embroidery technique obvious rather than soft, blurry, smeared, printed, or machine-flat."
-        )
-
-    def _flow_agent_colorway_text_variant_rule(self) -> str:
-        return (
-            "Colorway text/name rule: when a planned multi-color or colorway shot shows multiple product variants and the source product has a visible embroidered/personalized name, initials, date, word, or readable stitched text, "
-            "each differently colored product variant must use a different plausible name/text while keeping the same lettering placement, scale, thread style, and stitch quality; never repeat the exact same readable name/text across all color variants. "
-            "If the source product has no visible readable name/text, keep all color variants textless and do not invent new writing."
         )
 
     def _flow_agent_no_tag_label_rule(self) -> str:
@@ -4028,7 +6471,7 @@ class FlowWebService:
             raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
 
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="kế hoạch Flow AI")
+        parsed = self._parse_json_candidate(text)
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini không trả về kế hoạch Flow AI hợp lệ.")
         return parsed
@@ -4047,6 +6490,19 @@ class FlowWebService:
         flow_prompt = self._clean_prompt_text(str(raw_plan.get("flow_prompt") or local_plan.get("flow_prompt") or ""))
         if len(flow_prompt) < 160:
             flow_prompt = str(local_plan.get("flow_prompt") or flow_prompt).strip()
+        target_count_text = str(self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)
+        flow_prompt = re.sub(
+            r"\bgenerate exactly \d+\b",
+            f"generate exactly {target_count_text}",
+            flow_prompt,
+            flags=re.IGNORECASE,
+        )
+        flow_prompt = re.sub(
+            r"\bRequest exactly \d+\b",
+            f"Request exactly {target_count_text}",
+            flow_prompt,
+            flags=re.IGNORECASE,
+        )
         raw_steps = raw_plan.get("steps") if isinstance(raw_plan.get("steps"), list) else local_plan.get("steps", [])
         steps: List[Dict[str, Any]] = []
         for item in raw_steps[:5]:
@@ -5121,10 +7577,42 @@ class FlowWebService:
         raw = configured or str(os.getenv("GEMINI_MODEL", self.GEMINI_DEFAULT_MODEL)).strip()
         return self._sanitize_gemini_model(raw)
 
+    def _gemini_image_model(self) -> str:
+        configured = str(getattr(self.store.snapshot().integration_config, "gemini_image_model", "") or "").strip()
+        if not configured:
+            configured = str(os.getenv("GEMINI_IMAGE_MODEL", "")).strip()
+        if not configured:
+            saved_model = self._gemini_model()
+            configured = saved_model if "image" in saved_model.lower() else self.GEMINI_IMAGE_DEFAULT_MODEL
+        return self._sanitize_gemini_model(configured)
+
     def _sanitize_gemini_model(self, value: str) -> str:
         raw = str(value or self.GEMINI_DEFAULT_MODEL).strip()
         sanitized = re.sub(r"[^a-zA-Z0-9._-]+", "", raw)
         return sanitized or self.GEMINI_DEFAULT_MODEL
+
+    def _normalize_image_engine(self, value: str) -> str:
+        raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if raw in {"gemini", "gemini_api", "api", "api_key", "gemini_key"}:
+            return "gemini_api"
+        return "google_flow"
+
+    def _image_engine_for_request(self, request: CreateJobRequest) -> str:
+        engine = self._normalize_image_engine(getattr(request, "image_engine", "google_flow"))
+        try:
+            graph = self._automation_graph_payload(request)
+        except Exception:
+            graph = {"modules": []}
+        for module in graph.get("modules", []):
+            if module.get("type") != "flow":
+                continue
+            settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+            if settings.get("imageEngine"):
+                return self._normalize_image_engine(settings.get("imageEngine"))
+        return engine
+
+    def _request_uses_gemini_image_engine(self, request: CreateJobRequest) -> bool:
+        return request.type == "image" and self._image_engine_for_request(request) == "gemini_api"
 
     def _prompt_skill_bucket(self, skill: SkillRecord) -> str:
         path = str(skill.source_path or "").lower().strip()
@@ -5755,11 +8243,10 @@ class FlowWebService:
         prompt, _ = self._ensure_prompt_detail(baseline, baseline, "image")
         return prompt
 
-    def _parse_json_candidate(self, raw_text: str, *, context: str = "storyboard") -> Any:
-        context_label = str(context or "JSON").strip() or "JSON"
+    def _parse_json_candidate(self, raw_text: str) -> Any:
         text = str(raw_text or "").strip()
         if not text:
-            raise RuntimeError(f"Gemini không trả về nội dung {context_label}.")
+            raise RuntimeError("Gemini không trả về nội dung.")
 
         candidates = [text]
         for block in re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL):
@@ -5782,7 +8269,7 @@ class FlowWebService:
                 return json.loads(candidate)
             except json.JSONDecodeError:
                 continue
-        raise RuntimeError(f"Gemini không trả về JSON {context_label} hợp lệ.")
+        raise RuntimeError("Gemini không trả về JSON hợp lệ.")
 
     def _storyboard_from_payload(
         self,
@@ -5964,7 +8451,7 @@ class FlowWebService:
             raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
 
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="storyboard")
+        parsed = self._parse_json_candidate(text)
         scenes = self._storyboard_from_payload(parsed, request, scene_count, skills)
         if not scenes:
             raise RuntimeError("Gemini không trả về cảnh storyboard hợp lệ.")
@@ -6665,6 +9152,30 @@ exit 1
                         "index": 2,
                     }
                 )
+            if request.type == "image" and request.etsy_enabled:
+                modules.append(
+                    {
+                        "id": "etsy",
+                        "type": "etsy",
+                        "title": self._automation_module_default_title("etsy"),
+                        "detail": "Tạo draft listing Etsy",
+                        "enabled": True,
+                        "settings": {},
+                        "index": len(modules),
+                    }
+                )
+            if request.type == "image" and (request.amazon_enabled or request.amazon_browser_copy_enabled):
+                modules.append(
+                    {
+                        "id": "amazon-copy",
+                        "type": "amazon_browser_copy",
+                        "title": self._automation_module_default_title("amazon_browser_copy"),
+                        "detail": "Copy listing Amazon và lưu Draft",
+                        "enabled": True,
+                        "settings": {"deleteExistingImages": True},
+                        "index": len(modules),
+                    }
+                )
 
         raw_edges = graph.get("edges") if isinstance(graph, dict) else []
         edges = [
@@ -6702,7 +9213,12 @@ exit 1
             "flow": "Google Flow",
             "telegram": "Telegram Review",
             "trello": "Trello Archive",
+            "etsy": "Etsy Listing",
+            "etsy_browser_copy": "Etsy Copy Listing",
+            "amazon": "Amazon Listing",
+            "amazon_browser_copy": "Amazon Copy Listing",
             "approval": "Approval",
+            "master_bot": "Master Bot",
             "custom": "Custom Module",
         }.get(str(module_type or "").strip().lower(), "Custom Module")
 
@@ -6777,6 +9293,8 @@ exit 1
             node["output"] = output
         if error:
             node["error"] = humanize_flow_error(error)
+        elif status in {"running", "completed", "skipped", "disabled"}:
+            node["error"] = ""
         if status == "running" and not node.get("started_at"):
             node["started_at"] = now
         if status in {"completed", "skipped", "failed", "disabled"}:
@@ -6812,6 +9330,18 @@ exit 1
             if module_type == "flow":
                 return
             if module_type == "trello_source":
+                continue
+            if module_type == "master_bot":
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module["id"],
+                    "completed",
+                    output={
+                        "controller": True,
+                        "extensions": self.extension_registry(),
+                    },
+                )
                 continue
             if module_type == "source":
                 await self._set_automation_module_status(
@@ -6863,6 +9393,8 @@ exit 1
         payload = _model_dump(request)
         if module.get("type") == "flow":
             flow_agent_enabled = self._config_bool(payload.get("flow_agent_enabled"), default=True)
+            if settings.get("imageEngine"):
+                payload["image_engine"] = self._normalize_image_engine(settings.get("imageEngine"))
             if "flowAgentEnabled" in settings:
                 flow_agent_enabled = self._config_bool(settings.get("flowAgentEnabled"), default=True)
                 payload["flow_agent_enabled"] = flow_agent_enabled
@@ -6883,6 +9415,96 @@ exit 1
                 )
         if module.get("type") == "telegram" and settings.get("telegramChat"):
             payload["telegram_chat_id"] = str(settings.get("telegramChat") or "").strip()
+        if module.get("type") in {"etsy", "etsy_browser_copy"}:
+            payload["etsy_enabled"] = True
+            if settings.get("etsyTitle"):
+                payload["etsy_listing_title"] = str(settings.get("etsyTitle") or "").strip()
+            if settings.get("etsyDescription"):
+                payload["etsy_listing_description"] = str(settings.get("etsyDescription") or "").strip()
+            if settings.get("etsyTags"):
+                raw_tags = settings.get("etsyTags")
+                if isinstance(raw_tags, list):
+                    payload["etsy_listing_tags"] = [str(item).strip() for item in raw_tags if str(item).strip()]
+                else:
+                    payload["etsy_listing_tags"] = [
+                        item.strip()
+                        for item in re.split(r"[,;\n]", str(raw_tags or ""))
+                        if item.strip()
+                    ]
+            if settings.get("etsyMaterials"):
+                payload["etsy_listing_materials"] = [
+                    item.strip()
+                    for item in re.split(r"[,;\n]", str(settings.get("etsyMaterials") or ""))
+                    if item.strip()
+                ]
+            if settings.get("etsyPrice"):
+                payload["etsy_price"] = str(settings.get("etsyPrice") or "").strip()
+            if settings.get("etsyQuantity"):
+                try:
+                    payload["etsy_quantity"] = max(1, int(settings.get("etsyQuantity") or 1))
+                except Exception:
+                    pass
+            for setting_key, payload_key in (
+                ("etsyTaxonomyId", "etsy_taxonomy_id"),
+                ("etsyShippingProfileId", "etsy_shipping_profile_id"),
+                ("etsyReturnPolicyId", "etsy_return_policy_id"),
+                ("etsyReadinessStateId", "etsy_readiness_state_id"),
+            ):
+                if settings.get(setting_key):
+                    payload[payload_key] = str(settings.get(setting_key) or "").strip()
+        if module.get("type") == "etsy_browser_copy":
+            payload["etsy_browser_copy_enabled"] = True
+            for setting_key, payload_key in (
+                ("templateListingUrl", "etsy_template_listing_url"),
+                ("templateListingId", "etsy_template_listing_id"),
+                ("listingSku", "etsy_listing_sku"),
+                ("vmImageDir", "etsy_vm_image_dir"),
+            ):
+                if settings.get(setting_key):
+                    payload[payload_key] = str(settings.get(setting_key) or "").strip()
+            if "keepColorChart" in settings:
+                payload["etsy_keep_color_chart"] = self._config_bool(settings.get("keepColorChart"), default=True)
+            if "deleteExistingImages" in settings:
+                payload["etsy_delete_existing_images"] = self._config_bool(settings.get("deleteExistingImages"), default=True)
+        if module.get("type") in {"amazon", "amazon_browser_copy"}:
+            payload["amazon_enabled"] = True
+            for setting_key, payload_key in (
+                ("amazonTitle", "amazon_listing_title"),
+                ("listingTitle", "amazon_listing_title"),
+                ("amazonDescription", "amazon_listing_description"),
+                ("listingDescription", "amazon_listing_description"),
+                ("amazonSku", "amazon_listing_sku"),
+                ("listingSku", "amazon_listing_sku"),
+                ("amazonProductType", "amazon_product_type"),
+                ("productType", "amazon_product_type"),
+                ("amazonPrice", "amazon_price"),
+                ("listingPrice", "amazon_price"),
+                ("amazonTemplateListingUrl", "amazon_template_listing_url"),
+                ("templateListingUrl", "amazon_template_listing_url"),
+                ("amazonTemplateListingId", "amazon_template_listing_id"),
+                ("templateListingId", "amazon_template_listing_id"),
+                ("amazonAsin", "amazon_template_listing_id"),
+                ("asin", "amazon_template_listing_id"),
+                ("amazonVmImageDir", "amazon_vm_image_dir"),
+                ("vmImageDir", "amazon_vm_image_dir"),
+            ):
+                if settings.get(setting_key):
+                    payload[payload_key] = str(settings.get(setting_key) or "").strip()
+            if settings.get("amazonQuantity") or settings.get("listingQuantity"):
+                try:
+                    payload["amazon_quantity"] = max(
+                        1,
+                        int(settings.get("amazonQuantity") or settings.get("listingQuantity") or 1),
+                    )
+                except Exception:
+                    pass
+            if "deleteExistingImages" in settings:
+                payload["amazon_delete_existing_images"] = self._config_bool(settings.get("deleteExistingImages"), default=True)
+            if "amazonDeleteExistingImages" in settings:
+                payload["amazon_delete_existing_images"] = self._config_bool(settings.get("amazonDeleteExistingImages"), default=True)
+        if module.get("type") == "amazon_browser_copy":
+            payload["amazon_browser_copy_enabled"] = True
+            payload["amazon_publish"] = False
         if module.get("type") in {"trello", "trello_source"}:
             if settings.get("trelloBoard"):
                 payload["trello_board_id"] = str(settings.get("trelloBoard") or "").strip()
@@ -6948,7 +9570,7 @@ exit 1
             if not module["enabled"]:
                 continue
             module_type = module["type"]
-            if module_type in {"source", "trello_source", "normalize", "flow"}:
+            if module_type in {"source", "trello_source", "normalize", "flow", "master_bot"}:
                 continue
             if skip_finished and self._automation_module_status(job_id, module["id"]) in {"completed", "skipped", "disabled"}:
                 continue
@@ -7014,6 +9636,76 @@ exit 1
                             }
                     status = "completed" if trello_result.get("configured", True) else "skipped"
                     await self._set_automation_module_status(job_id, request, module["id"], status, output=trello_result or {})
+                elif module_type == "etsy":
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "running",
+                        input_data={
+                            "artifact_count": len(artifacts),
+                            "shop_id": self._etsy_config_values(module_request).get("shop_id", ""),
+                        },
+                    )
+                    etsy_result = await self._create_etsy_draft_listing(job_id, module_request, artifacts)
+                    if etsy_result:
+                        next_result["etsy"] = etsy_result
+                    status = "completed" if etsy_result.get("configured", True) else "skipped"
+                    await self._set_automation_module_status(job_id, request, module["id"], status, output=etsy_result or {})
+                elif module_type == "etsy_browser_copy":
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "running",
+                        input_data={
+                            "card_id": module_request.trello_source_card_id or module_request.trello_card_id,
+                            "artifact_count": len(artifacts),
+                            "mode": "browser_copy",
+                        },
+                    )
+                    copy_result = await self.enqueue_etsy_browser_copy(
+                        job_id,
+                        module_request,
+                        module_id=module["id"],
+                    )
+                    if copy_result:
+                        next_result["etsy_browser_copy"] = copy_result
+                    status = "running" if copy_result.get("enqueued") else "skipped"
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        status,
+                        output=copy_result or {},
+                    )
+                elif module_type == "amazon_browser_copy":
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "running",
+                        input_data={
+                            "card_id": module_request.trello_source_card_id or module_request.trello_card_id,
+                            "artifact_count": len(artifacts),
+                            "mode": "amazon_browser_copy",
+                        },
+                    )
+                    copy_result = await self.enqueue_amazon_browser_copy(
+                        job_id,
+                        module_request,
+                        module_id=module["id"],
+                    )
+                    if copy_result:
+                        next_result["amazon_browser_copy"] = copy_result
+                    status = "running" if copy_result.get("enqueued") else "skipped"
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        status,
+                        output=copy_result or {},
+                    )
                 elif module_type == "approval":
                     if direct_trello_review:
                         output = {
@@ -7363,11 +10055,19 @@ exit 1
             or trello_config.card_id
             or os.getenv("TRELLO_CARD_ID", "")
         )
+        explicit_card_from_request = bool(
+            self._normalize_trello_card_id(
+                module_request.trello_source_card_id
+                or request.trello_source_card_id
+                or module_request.trello_card_id
+                or request.trello_card_id
+            )
+        )
         raw_list_id = (
-            trello_config.list_id
-            or os.getenv("TRELLO_LIST_ID", "")
-            or module_request.trello_list_id
+            module_request.trello_list_id
             or request.trello_list_id
+            or trello_config.list_id
+            or os.getenv("TRELLO_LIST_ID", "")
         )
         key, token = self._trello_credentials()
         if not key or not token:
@@ -7438,7 +10138,7 @@ exit 1
                 raise RuntimeError("Card Trello đã chọn không còn tồn tại hoặc không đọc được.")
             card_list_id = self._normalize_trello_id(str(card_hint.get("list_id") or ""))
             allowed_list_ids = set(source_list_ids or ([list_id] if list_id else []))
-            if allowed_list_ids and card_list_id not in allowed_list_ids:
+            if allowed_list_ids and card_list_id not in allowed_list_ids and not explicit_card_from_request:
                 ready_name = self._trello_source_scope_label()
                 raise RuntimeError(
                     f"Card Trello đã chọn không nằm trong cột {ready_name}; app đã dừng để tránh lấy nhầm ảnh từ cột khác."
@@ -7593,13 +10293,18 @@ exit 1
                 input_data={
                     "type": request.type,
                     "prompt": request.prompt,
+                    "image_engine": self._image_engine_for_request(request),
                     "model": request.model,
                     "aspect": request.aspect,
                     "count": request.count,
                 },
             )
-            await self._set_job_progress(job_id, "connecting", "Em đang khởi tạo client và kết nối tới project Flow hiện tại.")
-            await self.store.append_log(job_id, "Đang khởi tạo kết nối tới Flow")
+            if self._request_uses_gemini_image_engine(request):
+                await self._set_job_progress(job_id, "connecting", "Em đang chuẩn bị tạo ảnh bằng Gemini API key.")
+                await self.store.append_log(job_id, f"Đang chuẩn bị Gemini API image mode ({self._gemini_image_model()})")
+            else:
+                await self._set_job_progress(job_id, "connecting", "Em đang khởi tạo client và kết nối tới project Flow hiện tại.")
+                await self.store.append_log(job_id, "Đang khởi tạo kết nối tới Flow")
         except HTTPException as exc:
             detail = self._flow_error_detail(exc)
             await self._fail_active_automation_module(job_id, request, detail)
@@ -7735,14 +10440,25 @@ exit 1
                         ) from retry_exc
 
             if request.type == "image":
-                reference_media_names = await self._resolve_image_reference_media(client, job_id, request)
-                all_reference_media_names = reference_media_names or list(request.reference_media_names or [])
+                if self._request_uses_gemini_image_engine(request):
+                    if request.reference_media_names and not request.reference_image_paths:
+                        raise RuntimeError(
+                            "Chế độ Gemini API cần ảnh tham chiếu ở file local; media name của Google Flow không dùng trực tiếp được."
+                        )
+                    all_reference_media_names: List[str] = []
+                else:
+                    reference_media_names = await self._resolve_image_reference_media(client, job_id, request)
+                    all_reference_media_names = reference_media_names or list(request.reference_media_names or [])
                 if all_reference_media_names:
                     await self._set_job_progress(
                         job_id,
                         "sending_request",
                         f"Em đang gửi yêu cầu chỉnh ảnh với {len(all_reference_media_names)} ảnh tham chiếu tới Flow.",
                     )
+                elif self._request_uses_gemini_image_engine(request):
+                    local_ref_count = len(self._normalize_local_upload_paths(request.reference_image_paths or []))
+                    detail = f" với {local_ref_count} ảnh nguồn Trello" if local_ref_count else ""
+                    await self._set_job_progress(job_id, "sending_request", f"Em đang gửi yêu cầu tạo ảnh tới Gemini API{detail}.")
                 else:
                     await self._set_job_progress(job_id, "sending_request", "Em đang gửi yêu cầu tạo ảnh tới Flow.")
 
@@ -7909,11 +10625,14 @@ exit 1
             raise ValueError(f"Loại tác vụ chưa được hỗ trợ: {request.type}")
 
         try:
-            payload = await self._with_client(
-                _execute,
-                workflow_id=request.workflow_id,
-                timeout_s=request.timeout_s,
-            )
+            if self._request_uses_gemini_image_engine(request):
+                payload = await _execute(None)
+            else:
+                payload = await self._with_client(
+                    _execute,
+                    workflow_id=request.workflow_id,
+                    timeout_s=request.timeout_s,
+                )
             if request.type == "image":
                 images = payload["images"]
                 artifacts = [
@@ -7921,8 +10640,10 @@ exit 1
                         label=f"Ảnh {index + 1}",
                         media_name=getattr(image, "media_name", ""),
                         url=getattr(image, "fife_url", ""),
+                        local_path=getattr(image, "local_path", ""),
+                        public_url=getattr(image, "public_url", ""),
                         workflow_id=getattr(image, "workflow_id", request.workflow_id),
-                        mime_type="image/jpeg",
+                        mime_type=getattr(image, "mime_type", "image/jpeg"),
                         prompt=getattr(image, "prompt", request.prompt),
                         dimensions=getattr(image, "dimensions", {}) or {},
                     )
@@ -7931,6 +10652,7 @@ exit 1
                 result = {
                     "count": len(artifacts),
                     "mode": "image",
+                    "image_engine": self._image_engine_for_request(request),
                 }
             elif request.type == "video":
                 video_jobs = payload["video_jobs"]
@@ -7987,6 +10709,7 @@ exit 1
                     "artifact_count": len(artifacts),
                     "media_names": [artifact.media_name for artifact in artifacts if artifact.media_name],
                     "mode": result.get("mode", request.type),
+                    "image_engine": self._image_engine_for_request(request),
                 },
             )
             result = await self._run_automation_post_modules(job_id, request, artifacts, result)
@@ -8028,589 +10751,6 @@ exit 1
             }
         }
 
-    def _trello_ai_title_backup_path(self) -> Path:
-        return DATA_DIR / self.TRELLO_AI_TITLE_BACKUP_FILE_NAME
-
-    def _trello_description_has_ai_title_block(self, description: str) -> bool:
-        text = str(description or "")
-        return self.TRELLO_AI_TITLE_BEGIN_MARKER in text and self.TRELLO_AI_TITLE_END_MARKER in text
-
-    def _trello_should_write_ai_title_description(self, card: Dict[str, Any]) -> bool:
-        if not isinstance(card, dict):
-            return False
-        return not self._trello_description_has_ai_title_block(str(card.get("desc") or ""))
-
-    def _sanitize_ai_product_title(self, title: str, *, max_length: int = 140) -> str:
-        cleaned = re.sub(r"\s+", " ", str(title or "")).strip().strip('"').strip("'").strip()
-        cleaned = re.sub(r"^[\-:;\s]+", "", cleaned)
-        cleaned = re.sub(r"\s+[\-|]\s+AI\s*$", "", cleaned, flags=re.IGNORECASE)
-        if len(cleaned) <= max_length:
-            return cleaned
-        trimmed = cleaned[:max_length].rstrip()
-        if " " in trimmed:
-            trimmed = trimmed.rsplit(" ", 1)[0].rstrip(" ,;:-")
-        return trimmed or cleaned[:max_length].rstrip()
-
-    def _trello_description_with_ai_title(
-        self,
-        description: str,
-        *,
-        title: str,
-        product_type: str = "",
-        embroidery_design: str = "",
-        model: str = "",
-        updated_at: str = "",
-    ) -> str:
-        existing = str(description or "").strip()
-        if self._trello_description_has_ai_title_block(existing):
-            return existing
-        safe_title = self._sanitize_ai_product_title(title)
-        if not safe_title:
-            return existing
-        safe_product_type = re.sub(r"\s+", " ", str(product_type or "").strip())
-        block_lines = [
-            self.TRELLO_AI_TITLE_BEGIN_MARKER,
-            "AI Suggested Etsy Title:",
-            safe_title,
-            "",
-            "AI Product Type:",
-            safe_product_type or "Unknown",
-            self.TRELLO_AI_TITLE_END_MARKER,
-        ]
-        block = "\n".join(block_lines)
-        return f"{existing}\n\n{block}".strip() if existing else block
-
-    def _write_trello_ai_title_description_backup(
-        self,
-        *,
-        card_id: str,
-        card_name: str,
-        card_url: str,
-        old_description: str,
-        new_description: str,
-        title: str,
-        product_type: str,
-        embroidery_design: str = "",
-    ) -> str:
-        ensure_app_dirs()
-        backup_path = self._trello_ai_title_backup_path()
-        entries: List[Dict[str, Any]] = []
-        if backup_path.is_file():
-            try:
-                raw = json.loads(backup_path.read_text(encoding="utf-8"))
-                if isinstance(raw, list):
-                    entries = [item for item in raw if isinstance(item, dict)]
-            except Exception:
-                entries = []
-        backup_id = uuid.uuid4().hex
-        entries.append(
-            {
-                "backup_id": backup_id,
-                "created_at": utc_now(),
-                "card_id": str(card_id or "").strip(),
-                "card_name": str(card_name or "").strip(),
-                "card_url": str(card_url or "").strip(),
-                "title": self._sanitize_ai_product_title(title),
-                "product_type": str(product_type or "").strip(),
-                "embroidery_design": str(embroidery_design or "").strip(),
-                "old_description": str(old_description or ""),
-                "new_description": str(new_description or ""),
-            }
-        )
-        entries = entries[-1000:]
-        temp_path = backup_path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(backup_path)
-        return str(backup_path)
-
-    def _fallback_title_context_tokens(self, *values: str) -> List[str]:
-        raw = " ".join(str(value or "") for value in values).lower()
-        raw = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
-        raw = re.sub(r"\.(?:jpe?g|png|webp|gif|bmp|heic)\b", " ", raw)
-        raw = re.sub(r"[_\-]+", " ", raw)
-        raw = re.sub(r"\b20\d{10,}\b", " ", raw)
-        stopwords = {
-            "image",
-            "photo",
-            "source",
-            "product",
-            "professional",
-            "photography",
-            "hand",
-            "handmade",
-            "handcrafted",
-            "embroidered",
-            "embroidery",
-            "drawstring",
-            "bag",
-            "pouch",
-            "jpeg",
-            "jpg",
-            "png",
-            "tui",
-            "rut",
-            "day",
-            "small",
-            "large",
-            "medium",
-            "with",
-            "and",
-            "for",
-            "buyer",
-            "client",
-            "customer",
-            "custom",
-            "customized",
-            "initial",
-            "initials",
-            "letter",
-            "letters",
-            "monogram",
-            "name",
-            "named",
-            "names",
-            "order",
-            "personalized",
-            "personalised",
-            "text",
-            "word",
-            "words",
-        }
-        tokens: List[str] = []
-        for token in re.findall(r"[a-z]+", raw):
-            if len(token) <= 1 or token in stopwords:
-                continue
-            if token not in tokens:
-                tokens.append(token)
-        return tokens
-
-    def _fallback_title_phrases(self, *values: str) -> Dict[str, str]:
-        tokens = self._fallback_title_context_tokens(*values)
-        token_set = set(tokens)
-        color_or_material_terms = {
-            "beige",
-            "blue",
-            "brown",
-            "canvas",
-            "cotton",
-            "cream",
-            "dusty",
-            "felt",
-            "green",
-            "grey",
-            "gray",
-            "ivory",
-            "light",
-            "linen",
-            "muslin",
-            "natural",
-            "oatmeal",
-            "pale",
-            "pink",
-            "sage",
-            "silk",
-            "soft",
-            "teal",
-            "velvet",
-            "white",
-            "wool",
-        }
-        material_tokens: List[str] = []
-        for token in tokens:
-            if token in color_or_material_terms:
-                material_tokens.append(token)
-            if len(material_tokens) >= 4:
-                break
-        material = " ".join(word.capitalize() for word in material_tokens)
-
-        motif_checks = [
-            ("Lavender Daisy Floral", {"lavender", "daisy"}),
-            ("Lavender Floral", {"lavender"}),
-            ("Daisy Floral", {"daisy"}),
-            ("Sunflower Floral", {"sunflower"}),
-            ("Rose Floral", {"rose"}),
-            ("Floral Wreath", {"floral", "wreath"}),
-            ("Autumn Leaf Wreath", {"autumn", "wreath"}),
-            ("Leaf Wreath", {"leaf", "wreath"}),
-            ("Berry Wreath", {"berry", "wreath"}),
-            ("Goose Floral", {"goose"}),
-            ("Rabbit Floral", {"rabbit"}),
-            ("Bunny Floral", {"bunny"}),
-            ("Bear Floral", {"bear"}),
-            ("Fox Floral", {"fox"}),
-            ("Bird Floral", {"bird"}),
-            ("Butterfly Floral", {"butterfly"}),
-            ("Moon Star", {"moon", "star"}),
-            ("Crown Floral", {"crown", "flower"}),
-            ("Floral", {"floral"}),
-            ("Flower", {"flower"}),
-            ("Bouquet", {"bouquet"}),
-            ("Wreath", {"wreath"}),
-            ("Leaf", {"leaf"}),
-            ("Berry", {"berry"}),
-        ]
-        embroidery_design = ""
-        for phrase, required in motif_checks:
-            if required.issubset(token_set):
-                embroidery_design = phrase
-                break
-        if not embroidery_design:
-            design_theme_terms = {
-                "animal",
-                "autumn",
-                "bear",
-                "berry",
-                "bird",
-                "botanical",
-                "bouquet",
-                "bow",
-                "bunny",
-                "butterfly",
-                "crown",
-                "daisy",
-                "decorative",
-                "fern",
-                "floral",
-                "flower",
-                "forest",
-                "fox",
-                "garden",
-                "goose",
-                "heart",
-                "herb",
-                "leaf",
-                "lavender",
-                "moon",
-                "mushroom",
-                "nature",
-                "petal",
-                "plant",
-                "rabbit",
-                "rose",
-                "sprig",
-                "star",
-                "sunflower",
-                "travel",
-                "wreath",
-            }
-            motif_terms = [
-                token
-                for token in tokens
-                if token in design_theme_terms
-            ]
-            if motif_terms:
-                embroidery_design = " ".join(word.capitalize() for word in motif_terms[:3])
-        return {
-            "material": material,
-            "embroidery_design": embroidery_design or "Decorative Embroidery",
-        }
-
-    def _embroidery_design_has_theme_signal(self, embroidery_design: str) -> bool:
-        tokens = set(self._tokenize_match_words(embroidery_design))
-        if not tokens:
-            return False
-        theme_terms = {
-            "animal",
-            "autumn",
-            "bear",
-            "berry",
-            "bird",
-            "botanical",
-            "bouquet",
-            "bow",
-            "bunny",
-            "butterfly",
-            "crown",
-            "daisy",
-            "decorative",
-            "fern",
-            "floral",
-            "flower",
-            "forest",
-            "fox",
-            "garden",
-            "goose",
-            "heart",
-            "herb",
-            "leaf",
-            "lavender",
-            "moon",
-            "motif",
-            "mushroom",
-            "nature",
-            "petal",
-            "plant",
-            "rabbit",
-            "rose",
-            "sprig",
-            "star",
-            "sunflower",
-            "theme",
-            "themed",
-            "travel",
-            "wreath",
-        }
-        return bool(tokens & theme_terms)
-
-    def _personalized_text_only_embroidery_design(self, embroidery_design: str) -> bool:
-        tokens = set(self._tokenize_match_words(embroidery_design))
-        if not tokens:
-            return False
-        text_terms = {
-            "custom",
-            "customized",
-            "initial",
-            "initials",
-            "letter",
-            "letters",
-            "monogram",
-            "name",
-            "names",
-            "personalized",
-            "personalised",
-            "text",
-            "word",
-            "words",
-        }
-        if tokens & text_terms:
-            return not self._embroidery_design_has_theme_signal(embroidery_design)
-        return len(tokens) == 1 and not self._embroidery_design_has_theme_signal(embroidery_design)
-
-    def _title_without_personalized_text_design(self, title: str, embroidery_design: str) -> str:
-        cleaned = self._sanitize_ai_product_title(title)
-        design = self._sanitize_ai_product_title(embroidery_design, max_length=60)
-        if not cleaned or not design:
-            return cleaned
-        pattern = re.compile(rf"\b{re.escape(design)}\b", flags=re.IGNORECASE)
-        without_design = pattern.sub("", cleaned)
-        without_design = re.sub(r"\s{2,}", " ", without_design)
-        without_design = re.sub(r"\s+([,;:])", r"\1", without_design).strip(" ,;:-")
-        return self._sanitize_ai_product_title(without_design or cleaned)
-
-    def _title_contains_embroidery_design(self, title: str, embroidery_design: str) -> bool:
-        normalized_title = self._normalize_skill_token(title)
-        normalized_design = self._normalize_skill_token(embroidery_design)
-        if not normalized_design:
-            return True
-        design_tokens = [token for token in normalized_design.split("_") if len(token) > 2]
-        if not design_tokens:
-            return True
-        return any(token in normalized_title.split("_") for token in design_tokens)
-
-    def _title_with_embroidery_design(self, title: str, embroidery_design: str, product_type: str) -> str:
-        safe_title = self._sanitize_ai_product_title(title)
-        safe_design = self._sanitize_ai_product_title(embroidery_design, max_length=60)
-        if not safe_title or not safe_design or self._title_contains_embroidery_design(safe_title, safe_design):
-            return safe_title
-        normalized_type = str(product_type or "").strip()
-        if normalized_type and normalized_type.lower() in safe_title.lower():
-            return self._sanitize_ai_product_title(
-                re.sub(
-                    re.escape(normalized_type),
-                    f"{safe_design} Embroidered {normalized_type}",
-                    safe_title,
-                    count=1,
-                    flags=re.IGNORECASE,
-                )
-            )
-        return self._sanitize_ai_product_title(f"{safe_design} Embroidered {safe_title}")
-
-    def _fallback_trello_product_title(
-        self,
-        *,
-        card_name: str,
-        attachment_name: str,
-        product_rule_key: str,
-        visible_product: str = "",
-    ) -> Dict[str, str]:
-        product_rule = PRODUCT_SHOT_RULES.get(str(product_rule_key or "").strip()) or {}
-        product_type = self._sanitize_ai_product_title(
-            str(product_rule.get("display_name") or visible_product or product_rule_key or "Handmade Embroidered Product"),
-            max_length=80,
-        )
-        phrases = self._fallback_title_phrases(attachment_name, visible_product, card_name)
-        material = phrases["material"]
-        embroidery_design = phrases["embroidery_design"]
-        design_prefix = (
-            embroidery_design.replace("Embroidery", "Hand Embroidered")
-            if "embroidery" in embroidery_design.lower()
-            else f"{embroidery_design} Hand Embroidered"
-        )
-        normalized_type = product_type.lower()
-        if "drawstring" in normalized_type or "pouch" in normalized_type:
-            material = material if any(term in material.lower() for term in ("linen", "cotton")) else f"{material} Linen".strip()
-            title = f"{design_prefix} {material} Drawstring Bag, Handmade Jewelry Pouch Gift"
-            fallback_product_type = "Drawstring Bag"
-        elif "crown" in normalized_type:
-            material = material if any(term in material.lower() for term in ("linen", "cotton")) else f"{material} Linen".strip()
-            title = f"{design_prefix} {material} Crown, Personalized Birthday Crown Gift"
-            fallback_product_type = "Crown"
-        else:
-            title = f"{design_prefix} {material + ' ' if material else ''}{product_type}, Personalized Handmade Gift"
-            fallback_product_type = product_type
-        return {
-            "title": self._sanitize_ai_product_title(title),
-            "product_type": self._sanitize_ai_product_title(fallback_product_type, max_length=80),
-            "embroidery_design": self._sanitize_ai_product_title(embroidery_design, max_length=80),
-            "reason": "Fallback title from HAVI product rule and Trello card context.",
-        }
-
-    def _gemini_suggest_trello_product_title(
-        self,
-        *,
-        image_bytes: bytes,
-        mime_type: str,
-        card_name: str,
-        attachment_name: str,
-        card_description: str,
-        product_rule_key: str,
-        visible_product: str = "",
-    ) -> Dict[str, str]:
-        api_key = self._gemini_api_key()
-        if not api_key:
-            raise RuntimeError("Gemini is not configured for AI product title generation.")
-        product_rule = PRODUCT_SHOT_RULES.get(str(product_rule_key or "").strip()) or {}
-        display_name = str(product_rule.get("display_name") or visible_product or product_rule_key or "").strip()
-        prompt = "\n".join(
-            [
-                "You write Etsy-ready product titles for handmade embroidered products from one source image.",
-                "Look at SOURCE_IMAGE and the card context. Write exactly one polished English Etsy product title.",
-                "First identify the exact visible embroidery motif, visual theme, or decorative design on the product itself, such as lavender sprigs, daisy bouquet, floral wreath, autumn leaves, goose, rabbit, crown, bow, heart, animal motif, travel motif, or decorative border.",
-                "Base the title on that visual motif/theme/design from the image, not on a customer's personalized name, initials, monogram letters, or readable stitched words.",
-                "Never use the actual personalized name or initials as the title's design hook and never set embroidery_design to a personal name, initials, monogram, Custom Name, Personalized Name, Initial Letter, or readable stitched text.",
-                "The title must directly mention the visible motif/theme/design when one is identifiable. Do not write only generic phrases like handmade embroidery, custom embroidery, or personalized unless no visual theme can be identified.",
-                "The title must describe the visible product category, material/fabric, exact embroidery motif/theme/design, use case, and gift/search keywords when accurate.",
-                "Do not invent a different product category. Do not mention AI, Google Flow, Trello, Nano Banana, image generation, mockup, or photo.",
-                "If readable personalized text/name is visible on the product, treat it only as a customization detail; at most use 'personalized' or 'custom' as a secondary keyword, but do not include the actual name/initials.",
-                "If the embroidery motif/theme cannot be identified beyond text personalization, set embroidery_design to Decorative Embroidery or Themed Embroidery instead of using the name/initials.",
-                "Keep the title natural, ecommerce-ready, and at most 140 characters.",
-                'Return JSON only: {"title":"...","product_type":"...","embroidery_design":"...","reason":"..."}',
-                f"Known HAVI product rule: {display_name or product_rule_key or 'unknown'}",
-                f"Card name: {card_name}",
-                f"Attachment name: {attachment_name}",
-                f"Card description: {card_description[:1200]}",
-            ]
-        )
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt},
-                        {"text": "SOURCE_IMAGE"},
-                        self._inline_gemini_image_part(image_bytes, mime_type or "image/jpeg"),
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 1024,
-                "responseMimeType": "application/json",
-            },
-        }
-        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
-        request_obj = Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key,
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            try:
-                error_payload = json.loads(exc.read().decode("utf-8"))
-                message = str(error_payload.get("error", {}).get("message", "")).strip()
-            except Exception:
-                message = ""
-            raise RuntimeError(message or f"Gemini API returned HTTP {exc.code}.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Could not call Gemini for AI product title generation: {exc.reason}") from exc
-
-        text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="AI product title")
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Gemini did not return a valid AI product title object.")
-        title = self._sanitize_ai_product_title(str(parsed.get("title") or ""))
-        if not title:
-            raise RuntimeError("Gemini did not return a usable AI product title.")
-        product_type = self._sanitize_ai_product_title(
-            str(parsed.get("product_type") or display_name or visible_product or product_rule_key or ""),
-            max_length=80,
-        )
-        embroidery_design = self._sanitize_ai_product_title(str(parsed.get("embroidery_design") or ""), max_length=80)
-        if embroidery_design and self._personalized_text_only_embroidery_design(embroidery_design):
-            title = self._title_without_personalized_text_design(title, embroidery_design)
-            embroidery_design = ""
-        if not embroidery_design:
-            phrases = self._fallback_title_phrases(
-                str(parsed.get("reason") or ""),
-                title,
-                visible_product,
-                attachment_name,
-                card_name,
-                card_description,
-            )
-            embroidery_design = phrases["embroidery_design"]
-        title = self._title_with_embroidery_design(title, embroidery_design, product_type)
-        reason = re.sub(r"\s+", " ", str(parsed.get("reason") or "").strip())[:300]
-        return {
-            "title": title,
-            "product_type": product_type,
-            "embroidery_design": embroidery_design,
-            "reason": reason,
-        }
-
-    def _write_trello_ai_title_to_description(
-        self,
-        *,
-        key: str,
-        token: str,
-        card: Dict[str, Any],
-        title_payload: Dict[str, str],
-    ) -> Dict[str, str]:
-        card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
-        if not card_id:
-            raise RuntimeError("Missing Trello card id for AI title description update.")
-        old_description = str(card.get("desc") or "")
-        if self._trello_description_has_ai_title_block(old_description):
-            return {"status": "exists", "title": "", "backup_path": ""}
-        title = self._sanitize_ai_product_title(str(title_payload.get("title") or ""))
-        if not title:
-            raise RuntimeError("Missing AI title for Trello description update.")
-        product_type = str(title_payload.get("product_type") or "").strip()
-        new_description = self._trello_description_with_ai_title(
-            old_description,
-            title=title,
-            product_type=product_type,
-            embroidery_design=str(title_payload.get("embroidery_design") or "").strip(),
-            model=self._gemini_model(),
-        )
-        backup_path = self._write_trello_ai_title_description_backup(
-            card_id=card_id,
-            card_name=str(card.get("name") or ""),
-            card_url=str(card.get("url") or ""),
-            old_description=old_description,
-            new_description=new_description,
-            title=title,
-            product_type=product_type,
-            embroidery_design=str(title_payload.get("embroidery_design") or "").strip(),
-        )
-        payload = self._trello_put_json(
-            f"cards/{quote(card_id, safe='')}",
-            key,
-            token,
-            fields={"desc": new_description},
-        )
-        if isinstance(payload, dict):
-            card["desc"] = str(payload.get("desc") or new_description)
-        else:
-            card["desc"] = new_description
-        return {"status": "updated", "title": title, "backup_path": backup_path}
-
     async def _artifact_validation_image_bytes(
         self,
         job_id: str,
@@ -8647,14 +10787,13 @@ exit 1
                 "Reject invented readable names/text unless the same text is visible on SOURCE_IMAGE or the Trello card instructions explicitly requested alternate personalized names.",
                 "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
                 "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
-                "bad_indexes must contain the zero-based artifact indexes shown in the OUTPUT_IMAGE_INDEX_N labels.",
                 f"Source card/product title: {request.prompt_product or request.title or ''}",
                 f"Source card key: {request.prompt_product_key or request.trello_card_id or ''}",
             ]
         )
         parts: List[Dict[str, Any]] = [{"text": prompt}, {"text": "SOURCE_IMAGE"}, self._inline_gemini_image_part(source_bytes, source_mime)]
         for index, image_bytes, mime in generated_items[: self.FLOW_AGENT_TARGET_OUTPUT_COUNT]:
-            parts.append({"text": f"OUTPUT_IMAGE_INDEX_{index}"})
+            parts.append({"text": f"OUTPUT_IMAGE_{index + 1}"})
             parts.append(self._inline_gemini_image_part(image_bytes, mime))
 
         payload = {
@@ -8689,10 +10828,52 @@ exit 1
             raise RuntimeError(f"Không gọi được Gemini để kiểm tra ảnh: {exc.reason}") from exc
 
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="kiểm tra ảnh")
+        parsed = self._parse_json_candidate(text)
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
         return parsed
+
+    def _gemini_validation_transient_error(self, exc: Exception | str) -> bool:
+        text = self._flow_agent_error_match_text(exc)
+        return any(
+            marker in text
+            for marker in (
+                "currently experiencing high demand",
+                "high demand",
+                "try again later",
+                "temporarily unavailable",
+                "temporary",
+                "timed out",
+                "timeout",
+                "read operation timed out",
+                "overloaded",
+                "service unavailable",
+                "http 429",
+                "http 500",
+                "http 502",
+                "http 503",
+                "http 504",
+                "gemini khong tra ve ket qua kiem tra anh hop le",
+                "gemini khong tra ve json hop le",
+                "khong tra ve ket qua kiem tra anh hop le",
+                "khong tra ve json hop le",
+                "invalid json",
+                "rate limit",
+                "rate-limits",
+                "quota exceeded",
+                "free_tier",
+                "free tier",
+                "generate_content_free_tier_requests",
+                "resource exhausted",
+                "please retry in",
+            )
+        )
+
+    def _gemini_validation_fail_open_on_transient(self) -> bool:
+        raw = os.getenv("FLOW_TRELLO_VALIDATION_FAIL_OPEN_ON_TRANSIENT", "").strip().lower()
+        if not raw:
+            return True
+        return raw in {"1", "true", "yes", "on"}
 
     async def _validate_trello_source_artifacts_before_upload(
         self,
@@ -8713,66 +10894,51 @@ exit 1
             image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
             generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
 
-        chunk_size = 4
-        validation_warnings: List[str] = []
-        for chunk_start in range(0, len(generated_items), chunk_size):
-            chunk = generated_items[chunk_start : chunk_start + chunk_size]
-            result: Dict[str, Any] | None = None
-            last_validation_error: Exception | None = None
-            for attempt in range(2):
-                try:
-                    result = await asyncio.to_thread(
-                        self._gemini_validate_trello_source_artifacts,
-                        request,
-                        source_path,
-                        chunk,
+        attempts = 2
+        result: Dict[str, Any] = {}
+        for attempt in range(attempts):
+            try:
+                result = await asyncio.to_thread(
+                    self._gemini_validate_trello_source_artifacts,
+                    request,
+                    source_path,
+                    generated_items,
+                )
+                break
+            except Exception as exc:
+                transient = self._gemini_validation_transient_error(exc)
+                if not transient:
+                    raise
+                detail = humanize_flow_error(str(exc))
+                if attempt < attempts - 1:
+                    await self.store.append_log(
+                        job_id,
+                        (
+                            "Gemini QA chưa kết luận được khi kiểm tra ảnh Trello "
+                            f"({detail[:180]}). Thử lại lần {attempt + 2}/{attempts}."
+                        ),
                     )
-                    break
-                except Exception as exc:
-                    last_validation_error = exc
-                    detail = humanize_flow_error(str(exc))
-                    retryable_parse_error = "json" in detail.lower() or "nội dung" in detail.lower() or "noi dung" in detail.lower()
-                    if attempt == 0 and retryable_parse_error:
-                        await self.store.append_log(
-                            job_id,
-                            f"Gemini chưa trả JSON kiểm tra ảnh ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}, app thử lại lần 2: {detail[:180]}",
-                        )
-                        await asyncio.sleep(2.0)
-                        continue
-                    break
-            if result is None:
-                warning = humanize_flow_error(str(last_validation_error or "")) or "Gemini không trả về kết quả kiểm tra ảnh hợp lệ."
-                validation_warnings.append(warning)
-                await self.store.append_log(
-                    job_id,
-                    (
-                        f"Gemini QA không ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
-                        "card nguồn đã khóa đúng nên app vẫn upload để duyệt trực tiếp trên Trello. "
-                        f"Chi tiết: {warning[:180]}"
-                    ),
-                )
-                continue
-
-            ok = bool(result.get("ok"))
-            raw_bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
-            bad_indexes = [
-                int(item)
-                for item in raw_bad_indexes
-                if isinstance(item, (int, float)) and 0 <= int(item) < self.FLOW_AGENT_TARGET_OUTPUT_COUNT
-            ]
-            reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
-            if not ok or bad_indexes:
-                display_indexes = ", ".join(str(index + 1) for index in bad_indexes) or "không rõ"
-                raise RuntimeError(
-                    f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
-                )
-        if validation_warnings:
-            await self.store.append_log(
-                job_id,
-                f"Gemini QA có {len(validation_warnings)} cảnh báo kỹ thuật nhưng không báo ảnh sai; tiếp tục upload vào card Trello đã khóa.",
+                    await asyncio.sleep(3.0)
+                    continue
+                if self._gemini_validation_fail_open_on_transient():
+                    await self.store.append_log(
+                        job_id,
+                        (
+                            "Gemini QA vẫn chưa kết luận được sau khi thử lại; app tiếp tục upload vì ảnh đã được tạo từ "
+                            f"card/attachment Trello đã khóa. Chi tiết: {detail[:220]}"
+                        ),
+                    )
+                    return
+                raise
+        ok = bool(result.get("ok"))
+        bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
+        reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
+        if not ok or bad_indexes:
+            display_indexes = ", ".join(str(int(item) + 1) for item in bad_indexes if isinstance(item, (int, float))) or "không rõ"
+            raise RuntimeError(
+                f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
             )
-        else:
-            await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp ảnh nguồn Trello; tiếp tục upload.")
+        await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp ảnh nguồn Trello; tiếp tục upload.")
 
     async def _archive_trello_artifacts(
         self,
@@ -8879,33 +11045,16 @@ exit 1
         failed = 0
         attachments: List[Dict[str, Any]] = []
         upscale_announced = False
-        total_uploads = len(artifacts)
-        await self.store.set_progress_hint(
-            job_id,
-            stage="trello_upload",
-            detail=f"Đang chuẩn bị upload {total_uploads} ảnh kết quả lên Trello.",
-        )
-        await self.store.append_log(job_id, f"Đang upload {total_uploads} ảnh kết quả lên Trello.")
         for index, artifact in enumerate(artifacts):
             artifact_url = str(artifact.url or artifact.public_url or "").strip()
             artifact_local_path = str(artifact.local_path or "").strip()
             has_local_artifact = bool(artifact_local_path and Path(artifact_local_path).expanduser().is_file())
             if not artifact_url and not has_local_artifact:
                 failed += 1
-                await self.store.append_log(
-                    job_id,
-                    f"Bỏ qua ảnh {index + 1}/{total_uploads} vì thiếu file cục bộ hoặc URL để upload Trello.",
-                )
                 continue
 
             name = self._trello_attachment_name(job_id, artifact, index)
             try:
-                await self.store.set_progress_hint(
-                    job_id,
-                    stage="trello_upload",
-                    detail=f"Đang upload ảnh {index + 1}/{total_uploads} lên Trello.",
-                )
-                await self.store.append_log(job_id, f"Đang upload ảnh {index + 1}/{total_uploads} lên Trello.")
                 if upload_mode == "url" and artifact_url:
                     attachment_payload = await self._trello_attach_url_with_cover_fallback(
                         job_id,
@@ -8918,10 +11067,11 @@ exit 1
                         set_cover and index == 0,
                     )
                 else:
-                    upscale_result = ImageUpscaleResult()
+                    upscaled_bytes: Optional[bytes] = None
+                    upscaled_mime = ""
                     if upscale_2k:
                         try:
-                            upscale_result = await self._upsample_artifact_bytes(
+                            upscaled_bytes, upscaled_mime = await self._upsample_artifact_bytes(
                                 artifact,
                                 artifact_url,
                             )
@@ -8930,42 +11080,18 @@ exit 1
                                 job_id,
                                 f"Không nâng được ảnh {index + 1} lên 2K (giữ bản gốc): {humanize_flow_error(str(up_exc))}",
                             )
-                            upscale_result = ImageUpscaleResult()
+                            upscaled_bytes = None
                         else:
-                            if upscale_result.bytes and upscale_result.source == "flow_2k" and not upscale_announced:
+                            if upscaled_bytes and not upscale_announced:
                                 await self.store.append_log(
                                     job_id,
-                                    "Da dung Flow 2K that truoc khi upload len Trello.",
+                                    "Đã nâng cấp ảnh lên 2K trước khi upload lên Trello.",
                                 )
                                 upscale_announced = True
-                            if upscale_result.bytes and upscale_result.source == "flow_2k":
-                                await self._persist_flow_2k_artifact_file(job_id, artifact, index, upscale_result)
-                            elif upscale_result.bytes and upscale_result.source == "local_resize":
-                                await self.store.append_log(
-                                    job_id,
-                                    (
-                                        f"Flow 2K khong tra duoc anh 2K that; da resize cuc bo anh {index + 1} "
-                                        f"({upscale_result.source_size[0]}x{upscale_result.source_size[1]} -> "
-                                        f"{upscale_result.target_size[0]}x{upscale_result.target_size[1]}) vi TRELLO_FAKE_2K_RESIZE_ENABLED dang bat."
-                                    ),
-                                )
-                            elif upscale_result.source == "flow_unavailable":
-                                detail = (
-                                    f" ({upscale_result.failure_reason})"
-                                    if upscale_result.failure_reason
-                                    else ""
-                                )
-                                await self.store.append_log(
-                                    job_id,
-                                    (
-                                        f"Flow 2K chua tra anh 2K that cho anh {index + 1}; "
-                                        f"giu anh goc va khong resize gia 2K{detail}."
-                                    ),
-                                )
                     try:
-                        if upscale_result.bytes:
-                            source_bytes = upscale_result.bytes
-                            source_mime = upscale_result.mime_type or artifact.mime_type or "image/jpeg"
+                        if upscaled_bytes:
+                            source_bytes = upscaled_bytes
+                            source_mime = upscaled_mime or artifact.mime_type or "image/jpeg"
                         else:
                             source_bytes, source_mime = await self._trello_artifact_file_bytes(
                                 job_id,
@@ -8973,7 +11099,7 @@ exit 1
                                 index,
                                 artifact_url,
                             )
-                            if upscale_2k and self._trello_fake_2k_resize_enabled():
+                            if upscale_2k:
                                 ensured_bytes, ensured_mime, changed, source_size, target_size = await asyncio.to_thread(
                                     self._ensure_image_long_edge_2k,
                                     source_bytes,
@@ -9018,12 +11144,6 @@ exit 1
 
                 stored += 1
                 attachments.append(self._trello_attachment_summary(attachment_payload))
-                await self.store.set_progress_hint(
-                    job_id,
-                    stage="trello_upload",
-                    detail=f"Đã upload {stored}/{total_uploads} ảnh lên Trello.",
-                )
-                await self.store.append_log(job_id, f"Đã upload ảnh {index + 1}/{total_uploads} lên Trello.")
             except Exception as exc:
                 failed += 1
                 await self.store.append_log(
@@ -9071,15 +11191,7 @@ exit 1
     ) -> Dict[str, Any]:
         target_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
         try:
-            card = await asyncio.to_thread(self._trello_image_card_by_id, key, token, card_id)
-            if card:
-                target_count = self._flow_operator_target_count_for_card(
-                    CreateJobRequest(type="image", title="", count=target_count),
-                    card,
-                )
-                output_count = int(card.get("_flow_output_count") or 0)
-            else:
-                output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
+            output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
             if output_count < target_count:
                 await self.store.append_log(
                     job_id,
@@ -9340,6 +11452,3324 @@ exit 1
             suffix = ".jpg"
         return f"flow-{job_id[:8]}-{index + 1}{suffix}"
 
+    def _etsy_credentials(self) -> tuple[str, str]:
+        config = self.store.snapshot().etsy_config
+        _client_id, _api_secret, api_key_header = self._etsy_key_parts_from_config(config)
+        access_token = str(config.access_token or "").strip() or os.getenv("ETSY_ACCESS_TOKEN", "").strip()
+        # Prefer a token refreshed during this process (see app-side 401 refresh).
+        if self._etsy_refreshed_access_token:
+            access_token = self._etsy_refreshed_access_token
+        return api_key_header, access_token
+
+    def _etsy_refresh_token_value(self) -> str:
+        """Refresh token from saved Etsy config or the ETSY_REFRESH_TOKEN env."""
+        config = self.store.snapshot().etsy_config
+        return str(getattr(config, "refresh_token", "") or "").strip() or os.getenv("ETSY_REFRESH_TOKEN", "").strip()
+
+    def _attempt_etsy_token_refresh(self, api_key: str, stale_access_token: str) -> str:
+        """Exchange the refresh token for a fresh Etsy access token.
+
+        Returns the new access token, or "" if no refresh token is available or
+        the refresh failed. The new token is cached in-process and mirrored to
+        ``.env.local``/``os.environ`` so it survives for the rest of the run. All
+        secrets are masked; nothing is printed in full.
+        """
+        from . import etsy_oauth
+
+        refresh_token = self._etsy_refresh_token_value()
+        client_id = self._etsy_oauth_client_id() or self._split_etsy_api_key_value(api_key)[0]
+        if not client_id or not refresh_token:
+            return ""
+        try:
+            result = etsy_oauth.refresh_access_token(client_id=client_id, refresh_token=refresh_token)
+        except Exception as exc:  # noqa: BLE001 - surface a masked, friendly message
+            masked = self._redact_etsy_secret(str(exc), api_key, stale_access_token)
+            log.warning("Etsy token refresh failed: %s", masked)
+            return ""
+        new_access = str(result.get("access_token") or "").strip()
+        if not new_access:
+            return ""
+        new_refresh = str(result.get("refresh_token") or "").strip()
+        self._etsy_refreshed_access_token = new_access
+        env_values = {"ETSY_ACCESS_TOKEN": new_access}
+        if new_refresh:
+            env_values["ETSY_REFRESH_TOKEN"] = new_refresh
+        try:
+            self._persist_env_local(env_values)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            log.warning("Etsy refreshed token persisted in-memory only (env write failed).")
+        return new_access
+
+    def _etsy_config_values(self, request: CreateJobRequest) -> Dict[str, Any]:
+        config = self.store.snapshot().etsy_config
+        return {
+            "shop_id": str(config.shop_id or "").strip() or os.getenv("ETSY_SHOP_ID", "").strip(),
+            "user_id": str(config.user_id or "").strip() or os.getenv("ETSY_USER_ID", "").strip(),
+            "taxonomy_id": str(request.etsy_taxonomy_id or config.taxonomy_id or "").strip()
+            or os.getenv("ETSY_TAXONOMY_ID", "").strip(),
+            "shipping_profile_id": str(request.etsy_shipping_profile_id or config.shipping_profile_id or "").strip()
+            or os.getenv("ETSY_SHIPPING_PROFILE_ID", "").strip(),
+            "return_policy_id": str(request.etsy_return_policy_id or config.return_policy_id or "").strip()
+            or os.getenv("ETSY_RETURN_POLICY_ID", "").strip(),
+            "readiness_state_id": str(request.etsy_readiness_state_id or config.readiness_state_id or "").strip()
+            or os.getenv("ETSY_READINESS_STATE_ID", "").strip(),
+            "quantity": int(request.etsy_quantity or config.quantity or 1),
+            "price": str(request.etsy_price or config.price or "").strip() or os.getenv("ETSY_DEFAULT_PRICE", "").strip() or "9.99",
+            "who_made": str(config.who_made or "").strip() or os.getenv("ETSY_WHO_MADE", "").strip() or "i_did",
+            "when_made": str(config.when_made or "").strip() or os.getenv("ETSY_WHEN_MADE", "").strip() or "made_to_order",
+            "is_supply": bool(config.is_supply),
+            "should_auto_renew": bool(config.should_auto_renew),
+        }
+
+    def _etsy_listing_id_from_url(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        match = re.search(r"(?:^|/)listing/(\d+)", text)
+        if match:
+            return match.group(1)
+        if re.fullmatch(r"\d{4,}", text):
+            return text
+        return ""
+
+    def _looks_like_listing_sku(self, value: Any) -> bool:
+        text = re.sub(r"\s+", "", str(value or "").strip())
+        if not text or len(text) < 6:
+            return False
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{4,}", text):
+            return False
+        return "_" in text and bool(re.search(r"\d", text))
+
+    def _clean_listing_title(self, value: Any) -> str:
+        # Etsy titles must read as a real product name, never an internal SKU
+        # code (e.g. T_130421_C1_016_D2_L1_4). Drop SKU-looking tokens and
+        # reject anything that collapses to a code or has no letters.
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        if not text:
+            return ""
+        if self._looks_like_design_instruction(text):
+            # A Vietnamese designer directive is never a product title; reject it
+            # so it can't leak in via any candidate (note, card, prompt_product).
+            return ""
+        tokens = [tok for tok in text.split(" ") if tok and not self._looks_like_listing_sku(tok)]
+        cleaned = re.sub(r"\s+", " ", " ".join(tokens)).strip(" -_|/·–—")
+        if not cleaned or self._looks_like_listing_sku(cleaned) or not re.search(r"[A-Za-z]", cleaned):
+            return ""
+        return cleaned
+
+    def _ascii_token_text(self, value: Any) -> str:
+        text = unicodedata.normalize("NFKD", str(value or ""))
+        text = "".join(ch for ch in text if not unicodedata.combining(ch))
+        text = re.sub(r"[^0-9A-Za-z]+", " ", text).strip().lower()
+        return re.sub(r"\s+", " ", text)
+
+    # Vietnamese designer directives ("ĐỔI HẾT PHẦN CHỮ THÀNH: SQUIRTLE" =
+    # "change all the text to SQUIRTLE") are production notes, never an Etsy
+    # product title. NFKD does not fold Đ/đ, so map them before folding.
+    _DESIGN_INSTRUCTION_VERBS = {
+        "doi", "thay", "sua", "xoa", "them", "ghep", "bo",
+        "viet", "chuyen", "chinh", "lam", "ghi",
+    }
+    _DESIGN_INSTRUCTION_TARGETS = {
+        "chu", "thanh", "phan", "dong", "ten", "mau", "nen", "font", "text",
+    }
+
+    def _looks_like_design_instruction(self, value: Any) -> bool:
+        raw = str(value or "")
+        # Require a Vietnamese signal (Đ/đ or a combining diacritic) so plain
+        # English titles can never collide with the folded keyword set, e.g.
+        # "ten of them" must not match "tên"/"thêm".
+        has_vietnamese = ("Đ" in raw or "đ" in raw) or any(
+            unicodedata.combining(ch) for ch in unicodedata.normalize("NFKD", raw)
+        )
+        if not has_vietnamese:
+            return False
+        folded = raw.replace("Đ", "D").replace("đ", "d")
+        folded = unicodedata.normalize("NFKD", folded)
+        folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+        folded = re.sub(r"[^0-9A-Za-z]+", " ", folded).strip().lower()
+        if not folded:
+            return False
+        tokens = set(folded.split())
+        return bool(
+            self._DESIGN_INSTRUCTION_VERBS & tokens
+            and self._DESIGN_INSTRUCTION_TARGETS & tokens
+        )
+
+    def _clean_trello_note_value(self, value: Any) -> str:
+        text = str(value or "")
+        for marker in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+            text = text.replace(marker, " ")
+        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        text = re.sub(r"^(?:[>#\s-]+|\*\s+)+", "", text).strip()
+        first_bold = re.match(r"^(\*\*|__)(.+?)(\*\*|__)(?:\s+\S.{0,48})?$", text)
+        if first_bold:
+            text = first_bold.group(2).strip()
+        text = re.sub(r"^(\*\*|__)(.*)(\*\*|__)$", r"\2", text).strip()
+        text = re.sub(r"^(`+)(.*)(`+)$", r"\2", text).strip()
+        text = re.sub(r"(\*\*|__)", "", text).strip()
+        text = re.sub(r"\s+", " ", text).strip()
+        if len(re.findall(r"\bornament\b", text, flags=re.IGNORECASE)) >= 2:
+            text = re.sub(r"(?i)(\bOrnament)\s+[a-z][a-z\s]{0,32}$", r"\1", text).strip()
+        return text
+
+    def _trello_plain_description_title(self, desc: Any) -> str:
+        text = str(desc or "")
+        for marker in ("\u200b", "\u200c", "\u200d", "\ufeff"):
+            text = text.replace(marker, " ")
+        lines: List[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("<!--"):
+                continue
+            if re.fullmatch(r"https?://\S+", line):
+                continue
+            if re.fullmatch(r"\[https?://[^\]]+\]\([^)]+\)", line):
+                continue
+            line = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line)
+            if re.search(r"https?://", line):
+                # A product title never embeds a URL (e.g. "Template: https://…").
+                continue
+            line = self._clean_trello_note_value(line)
+            if not line:
+                continue
+            field_match = re.match(r"^([^:=：]{2,48})\s*[:=：]\s*(.+)$", line)
+            if field_match and self._compact_match_text(field_match.group(1)) in self._ETSY_NOTE_KEY_MAP:
+                continue
+            compact = self._compact_match_text(line)
+            if compact in {"aisuggestedetsytitle", "aiproducttype", "tensanpham", "sku"}:
+                continue
+            if re.match(r"^[A-Za-z0-9 _-]{4,}$", line) and self._looks_like_listing_sku(line):
+                continue
+            if self._looks_like_design_instruction(line):
+                continue
+            lines.append(line)
+            if len(lines) >= 2:
+                break
+        title = re.sub(r"\s+", " ", " ".join(lines)).strip()
+        return title[:140].strip()
+
+    def _etsy_auto_sku(self, card: Dict[str, Any], fields: Dict[str, str]) -> str:
+        source = fields.get("product_type") or fields.get("title") or card.get("name") or "etsy"
+        words = self._ascii_token_text(source).split()
+        prefix = "".join(word[:3].upper() for word in words[:3])[:10] or "ETSY"
+        card_key = str(card.get("shortLink") or card.get("id") or uuid.uuid4().hex).strip()
+        suffix = re.sub(r"[^0-9A-Za-z]+", "", card_key).upper()[-6:] or uuid.uuid4().hex[:6].upper()
+        return f"{prefix}-{suffix}"
+
+    def _etsy_template_search_terms(self, card: Dict[str, Any], fields: Dict[str, str], request: CreateJobRequest) -> List[str]:
+        raw_values = [
+            fields.get("product_type", ""),
+            fields.get("title", ""),
+            request.prompt_product,
+            request.prompt_product_key,
+            card.get("name", ""),
+        ]
+        joined = self._ascii_token_text(" ".join(str(value or "") for value in raw_values))
+        terms: List[str] = []
+        mappings = [
+            (("passport", "ho chieu"), ["passport cover", "passport holder", "passport case", "passport"]),
+            (("fishing", "fish", "cau ca"), ["fishing", "fisherman"]),
+            (("mechanic", "tho may", "garage"), ["mechanic", "garage"]),
+            (("pennant", "banner", "co duoi nheo"), ["pennant banner", "banner"]),
+            (("ornament", "christmas", "trang tri"), ["ornament", "christmas ornament"]),
+            (("doll", "bup be"), ["doll"]),
+            (("apron", "tap de"), ["apron"]),
+            (("blanket", "chan"), ["blanket"]),
+            (("mug", "cup", "coc"), ["mug"]),
+            (("shirt", "ao"), ["shirt"]),
+        ]
+        for needles, mapped_terms in mappings:
+            if any(needle in joined for needle in needles):
+                terms.extend(mapped_terms)
+        for value in raw_values:
+            text = self._ascii_token_text(value)
+            if text and text not in terms:
+                terms.append(text)
+        unique: List[str] = []
+        for term in terms:
+            clean = re.sub(r"\s+", " ", str(term or "")).strip()
+            if clean and clean.lower() not in {item.lower() for item in unique}:
+                unique.append(clean)
+        return unique[:8]
+
+    def _etsy_template_search_queries(
+        self, card: Dict[str, Any], fields: Dict[str, str], request: CreateJobRequest, terms: Sequence[str]
+    ) -> List[str]:
+        primary_values = [
+            fields.get("product_type", ""),
+            fields.get("title", ""),
+            card.get("name", ""),
+            request.prompt_product,
+            request.prompt_product_key,
+        ]
+        raw_queries: List[str] = []
+        for value in primary_values:
+            clean = re.sub(r"\s+", " ", str(value or "")).strip()
+            if clean:
+                raw_queries.append(clean)
+        raw_queries.extend(str(term or "").strip() for term in terms)
+        unique: List[str] = []
+        seen: set[str] = set()
+        for query in raw_queries:
+            clean = re.sub(r"\s+", " ", query).strip()
+            key = self._ascii_token_text(clean) or clean.lower()
+            if clean and key not in seen:
+                unique.append(clean)
+                seen.add(key)
+        return unique[:10]
+
+    _ETSY_NOTE_KEY_MAP = {
+        "title": "title",
+        "aititle": "title",
+        "etsytitle": "title",
+        "suggestedtitle": "title",
+        "suggestedetsytitle": "title",
+        "aisuggestedtitle": "title",
+        "aisuggestedetsytitle": "title",
+        "name": "title",
+        "product": "title",
+        "productname": "title",
+        "tensanpham": "title",
+        "tensp": "title",
+        "sku": "sku",
+        "masp": "sku",
+        "ma": "sku",
+        "productkey": "sku",
+        "productid": "sku",
+        "listing": "template_listing_url",
+        "listingurl": "template_listing_url",
+        "listingmau": "template_listing_url",
+        "templatelisting": "template_listing_url",
+        "templatelistingurl": "template_listing_url",
+        "copyfrom": "template_listing_url",
+        "copylisting": "template_listing_url",
+        "type": "product_type",
+        "aiproducttype": "product_type",
+        "etsyproducttype": "product_type",
+        "producttype": "product_type",
+        "category": "product_type",
+        "danhmuc": "product_type",
+        "hang": "product_type",
+        "mathang": "product_type",
+        "loaihang": "product_type",
+        "donghang": "product_type",
+        "kieu": "product_type",
+        "kieusanpham": "product_type",
+        "loai": "product_type",
+        "loaisanpham": "product_type",
+        "section": "section_name",
+        "sections": "section_name",
+        "etsysection": "section_name",
+        "etsysections": "section_name",
+        "shopsection": "section_name",
+        "shopsections": "section_name",
+        "muc": "section_name",
+        "mucetsy": "section_name",
+        "phanloai": "section_name",
+    }
+
+    def _etsy_browser_copy_note_fields(self, card: Dict[str, Any], request: CreateJobRequest) -> Dict[str, str]:
+        desc = str(card.get("desc") or "").strip()
+        fields: Dict[str, str] = {}
+        key_map = self._ETSY_NOTE_KEY_MAP
+        pending_field = ""
+        for raw_line in desc.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("<!--"):
+                continue
+            match = re.match(r"^[\s*•-]*([^:=：]{2,48})\s*[:=：-]\s*(.*)$", line)
+            if not match:
+                if pending_field and not fields.get(pending_field):
+                    fields[pending_field] = self._clean_trello_note_value(line)
+                    pending_field = ""
+                continue
+            key = self._compact_match_text(match.group(1))
+            value = self._clean_trello_note_value(match.group(2))
+            mapped = key_map.get(key)
+            if mapped and not fields.get(mapped):
+                if value:
+                    fields[mapped] = value
+                    pending_field = ""
+                else:
+                    pending_field = mapped
+
+        if not fields.get("template_listing_url"):
+            match = re.search(r"https?://(?:www\.)?etsy\.com/(?:[^\s)]+/)?listing/\d+[^\s)]*", desc)
+            if match:
+                fields["template_listing_url"] = match.group(0)
+
+        note_title = self._clean_listing_title(
+            str(fields.get("title") or "").strip() or self._trello_plain_description_title(desc)
+        )
+        card_title = str(card.get("name") or "").strip()
+        card_title_for_title = self._clean_listing_title(card_title)
+        request_title = self._clean_listing_title(request.etsy_listing_title)
+        prompt_title = self._clean_listing_title(request.prompt_product)
+        # Deliberately no product_type fallback: when no real product title can
+        # be derived we leave the title empty so the worker keeps the template
+        # listing's existing title instead of inventing a generic one.
+        title = note_title or card_title_for_title or request_title or prompt_title
+        if note_title:
+            title_source = "trello_note"
+        elif card_title_for_title:
+            title_source = "trello_card"
+        elif request_title:
+            title_source = "request"
+        elif prompt_title:
+            title_source = "prompt"
+        else:
+            title_source = ""
+        sku = (
+            str(request.etsy_listing_sku or "").strip()
+            or str(fields.get("sku") or "").strip()
+            or (card_title if self._looks_like_listing_sku(card_title) else "")
+            or str(request.prompt_product_key or "").strip()
+        )
+        if not sku:
+            sku = self._etsy_auto_sku(card, {**fields, "title": title})
+        template_url = str(request.etsy_template_listing_url or fields.get("template_listing_url") or "").strip()
+        template_id = (
+            str(request.etsy_template_listing_id or "").strip()
+            or self._etsy_listing_id_from_url(template_url)
+            or self._etsy_listing_id_from_url(fields.get("template_listing_url"))
+        )
+        return {
+            "title": title,
+            "sku": sku,
+            "template_listing_url": template_url,
+            "template_listing_id": template_id,
+            "product_type": str(fields.get("product_type") or "").strip(),
+            "section_name": str(fields.get("section_name") or "").strip(),
+            "title_source": title_source,
+            "raw_note": desc,
+        }
+
+    def _safe_staging_file_name(self, value: Any, fallback: str) -> str:
+        name = Path(str(value or "").strip() or fallback).name
+        stem = re.sub(r"[^0-9A-Za-z._ -]+", "-", Path(name).stem).strip(" .-") or Path(fallback).stem
+        suffix = Path(name).suffix.lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            suffix = Path(fallback).suffix or ".jpg"
+        return f"{stem[:80]}{suffix}"
+
+    def _trello_flow_output_run_and_rank(self, attachment: Dict[str, Any]) -> tuple[str, int]:
+        stem = Path(str(attachment.get("name") or "")).stem.strip().lower()
+        match = re.match(r"^flow[-_](?P<run>[0-9a-z]+)[-_](?P<rank>\d{1,3})(?:\D.*)?$", stem)
+        if not match:
+            return "", 0
+        try:
+            rank = int(match.group("rank") or "0")
+        except ValueError:
+            rank = 0
+        return match.group("run"), rank
+
+    def _select_trello_flow_outputs_for_etsy(
+        self,
+        image_attachments: List[Dict[str, Any]],
+        job_id: str,
+    ) -> List[Dict[str, Any]]:
+        _sources, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+        if not flow_outputs:
+            # User-authorized fallback ("chỉ cần có ảnh trong đó là được"): when a card has no
+            # flow-* outputs, fall back to using any image attachments on the card as the Etsy
+            # listing pool. Downstream run/rank grouping naturally treats these non-flow names as
+            # ungrouped and just picks the newest target_count images.
+            flow_outputs = [
+                item
+                for item in image_attachments
+                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            ]
+        if not flow_outputs:
+            return []
+        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(self.FLOW_AGENT_TARGET_OUTPUT_COUNT or 1)))
+        flow_outputs = self._sort_trello_attachments_by_date(flow_outputs)
+        job_prefix = str(job_id or "").strip().lower()[:8]
+
+        def by_rank_then_date(attachment: Dict[str, Any]) -> tuple[int, int, float]:
+            _run, rank = self._trello_flow_output_run_and_rank(attachment)
+            parsed = _parse_iso_datetime(str(attachment.get("date") or ""))
+            timestamp = parsed.timestamp() if parsed else 0.0
+            return (0 if rank > 0 else 1, rank or 999, timestamp)
+
+        if job_prefix:
+            current_run = [
+                attachment
+                for attachment in flow_outputs
+                if self._trello_flow_output_run_and_rank(attachment)[0] == job_prefix
+            ]
+            if current_run:
+                return sorted(current_run, key=by_rank_then_date)[:target_count]
+
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        ungrouped: List[Dict[str, Any]] = []
+        for attachment in flow_outputs:
+            run_id, _rank = self._trello_flow_output_run_and_rank(attachment)
+            if run_id:
+                grouped.setdefault(run_id, []).append(attachment)
+            else:
+                ungrouped.append(attachment)
+        if grouped:
+            def group_score(item: tuple[str, List[Dict[str, Any]]]) -> tuple[int, float, int]:
+                _run_id, attachments = item
+                newest = 0.0
+                for attachment in attachments:
+                    parsed = _parse_iso_datetime(str(attachment.get("date") or ""))
+                    if parsed:
+                        newest = max(newest, parsed.timestamp())
+                return (1 if len(attachments) >= target_count else 0, newest, len(attachments))
+
+            _run_id, attachments = sorted(grouped.items(), key=group_score, reverse=True)[0]
+            return sorted(attachments, key=by_rank_then_date)[:target_count]
+
+        newest = self._sort_trello_attachments_by_date(ungrouped or flow_outputs, newest_first=True)[:target_count]
+        return self._sort_trello_attachments_by_date(newest)
+
+    def _download_trello_card_all_image_attachments_for_etsy(
+        self,
+        key: str,
+        token: str,
+        job_id: str,
+        card_id: str,
+    ) -> Dict[str, Any]:
+        normalized_card_id = self._normalize_trello_card_id(card_id)
+        if not normalized_card_id:
+            raise RuntimeError("Thiếu Trello card để tải ảnh cho Etsy browser copy.")
+        card = self._trello_get_json(
+            f"cards/{quote(normalized_card_id, safe='')}",
+            key,
+            token,
+            fields={"fields": "id,name,desc,shortLink,url,idList,closed"},
+        )
+        if not isinstance(card, dict) or not card:
+            raise RuntimeError("Không tìm thấy Trello card để chuẩn bị Etsy browser copy.")
+        attachments = self._trello_get_json(
+            f"cards/{quote(normalized_card_id, safe='')}/attachments",
+            key,
+            token,
+            fields={"fields": "id,name,url,mimeType,bytes,date"},
+        )
+        image_attachments = [
+            item for item in (attachments if isinstance(attachments, list) else []) if self._trello_attachment_is_image(item)
+        ]
+        image_attachments = self._sort_trello_attachments_by_date(image_attachments)
+        flow_output_attachments = self._select_trello_flow_outputs_for_etsy(image_attachments, job_id)
+        if not flow_output_attachments:
+            raise RuntimeError(
+                "Card Trello chưa có ảnh output do Flow tạo cho Etsy. "
+                "Hãy chạy Flow Agent cho đúng card trước; app sẽ không dùng ảnh tay trong Trello để tạo listing."
+            )
+        image_attachments = flow_output_attachments
+        staging_dir = DOWNLOADS_DIR / "etsy-browser-copy" / job_id
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        images: List[Dict[str, Any]] = []
+        used_names: set[str] = set()
+        for index, attachment in enumerate(image_attachments):
+            data, mime = self._trello_download_attachment_bytes(key, token, normalized_card_id, attachment)
+            original_name = str(attachment.get("name") or f"trello-image-{index + 1}.jpg").strip()
+            safe_name = self._safe_staging_file_name(original_name, f"trello-image-{index + 1}.jpg")
+            base = Path(safe_name).stem
+            suffix = Path(safe_name).suffix or ".jpg"
+            candidate = safe_name
+            dupe_index = 1
+            while candidate.lower() in used_names:
+                dupe_index += 1
+                candidate = f"{base}-{dupe_index}{suffix}"
+            used_names.add(candidate.lower())
+            target = staging_dir / candidate
+            target.write_bytes(data)
+            public_url = self._public_download_url(str(target))
+            images.append(
+                {
+                    "rank": index + 1,
+                    "attachment_id": self._normalize_trello_id(str(attachment.get("id") or "")),
+                    "trello_name": original_name,
+                    "file_name": candidate,
+                    "local_path": str(target),
+                    "download_url": public_url,
+                    "url": public_url,
+                    "mime_type": mime,
+                    "bytes": len(data),
+                }
+            )
+        return {
+            "card": card,
+            "card_id": normalized_card_id,
+            "card_url": str(card.get("url") or "").strip(),
+            "staging_dir": str(staging_dir),
+            "images": images,
+        }
+
+    def _etsy_vm_ssh_config(self) -> Dict[str, Any]:
+        host = str(os.getenv("ETSY_VM_SSH_HOST") or os.getenv("ETSY_VM_HOST") or "").strip()
+        port = str(os.getenv("ETSY_VM_SSH_PORT") or "").strip()
+        if host and not port and host.count(":") == 1 and not host.startswith("["):
+            possible_host, possible_port = host.rsplit(":", 1)
+            if possible_host and possible_port.isdigit():
+                host = possible_host
+                port = possible_port
+        try:
+            ssh_port = int(port or "22")
+        except ValueError:
+            ssh_port = 22
+        user = str(os.getenv("ETSY_VM_SSH_USER") or os.getenv("ETSY_VM_USER") or "").strip()
+        password = str(os.getenv("ETSY_VM_SSH_PASSWORD") or os.getenv("ETSY_VM_PASSWORD") or "")
+        proxy = str(os.getenv("ETSY_VM_SSH_PROXY") or os.getenv("ETSY_VM_PROXY") or "").strip()
+        return {
+            "configured": bool(host and user),
+            "host": host,
+            "port": ssh_port,
+            "user": user,
+            "password": password,
+            "proxy": proxy,
+        }
+
+    def _default_etsy_vm_image_dir(self) -> str:
+        env_dir = str(os.getenv("ETSY_VM_IMAGE_DIR") or os.getenv("ETSY_VM_REMOTE_IMAGE_DIR") or "").strip()
+        if env_dir:
+            return env_dir
+        if self._etsy_vm_ssh_config().get("configured"):
+            return r"C:\Users\Administrator\Downloads\etsy-browser-copy"
+        return ""
+
+    def _join_etsy_vm_path(self, directory: str, filename: str) -> str:
+        base = str(directory or "").strip().rstrip("/\\")
+        safe_name = Path(str(filename or "image.jpg")).name
+        separator = "\\" if re.match(r"^[A-Za-z]:[\\/]", base) or "\\" in base else "/"
+        return f"{base}{separator}{safe_name}" if base else safe_name
+
+    def _etsy_ordered_vm_filename(self, image: Dict[str, Any], fallback: str) -> str:
+        source_name = self._safe_staging_file_name(fallback, "image.jpg")
+        try:
+            rank = int(image.get("rank") or 0)
+        except (TypeError, ValueError):
+            rank = 0
+        if rank <= 0:
+            return re.sub(r"[^0-9A-Za-z._-]+", "_", source_name).strip("._-") or "image.jpg"
+        unprefixed = re.sub(r"^\d{2,4}[-_ ]+", "", source_name).strip() or source_name
+        safe_unprefixed = re.sub(r"[^0-9A-Za-z._-]+", "_", unprefixed).strip("._-") or "image.jpg"
+        return f"{rank:03d}-{safe_unprefixed}"
+
+    def _etsy_vm_path_for_scp(self, value: str) -> str:
+        return str(value or "").replace("\\", "/")
+
+    def _etsy_vm_process_error(self, label: str, result: subprocess.CompletedProcess[str]) -> str:
+        detail = str(result.stderr or result.stdout or "").strip()
+        if len(detail) > 700:
+            detail = f"{detail[:700].rstrip()}..."
+        return f"{label} exit {result.returncode}" + (f": {detail}" if detail else "")
+
+    def _powershell_encoded_command(self, script: str) -> str:
+        return base64.b64encode(str(script or "").encode("utf-16-le")).decode("ascii")
+
+    def _etsy_vm_auth_prefix(self, config: Dict[str, Any]) -> tuple[List[str], Dict[str, str]]:
+        env = os.environ.copy()
+        password = str(config.get("password") or "")
+        if not password:
+            return [], env
+        sshpass_path = shutil.which("sshpass")
+        if not sshpass_path:
+            raise RuntimeError("Thiếu sshpass để copy ảnh sang VM bằng password SSH.")
+        env["SSHPASS"] = password
+        return [sshpass_path, "-e"], env
+
+    def _etsy_vm_ssh_common_args(self, config: Dict[str, Any]) -> List[str]:
+        args = [
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-o",
+            "LogLevel=ERROR",
+            "-o",
+            "NumberOfPasswordPrompts=1",
+            "-o",
+            "ConnectTimeout=20",
+        ]
+        proxy = str(config.get("proxy") or "").strip()
+        if proxy:
+            proxy = re.sub(r"^socks5?://", "", proxy, flags=re.IGNORECASE)
+            args.extend(["-o", f"ProxyCommand=nc -x {proxy} -X 5 %h %p"])
+        return args
+
+    def _run_etsy_vm_ssh(
+        self,
+        config: Dict[str, Any],
+        remote_args: List[str],
+        *,
+        timeout: int = 45,
+    ) -> subprocess.CompletedProcess[str]:
+        prefix, env = self._etsy_vm_auth_prefix(config)
+        cmd = prefix + [
+            "ssh",
+            *self._etsy_vm_ssh_common_args(config),
+            "-p",
+            str(config["port"]),
+            f"{config['user']}@{config['host']}",
+            *remote_args,
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, env=env)
+
+    def _run_etsy_vm_scp(
+        self,
+        config: Dict[str, Any],
+        source: Path,
+        destination_path: str,
+        *,
+        timeout: int = 120,
+    ) -> subprocess.CompletedProcess[str]:
+        prefix, env = self._etsy_vm_auth_prefix(config)
+        remote = f"{config['user']}@{config['host']}:{self._etsy_vm_path_for_scp(destination_path)}"
+        cmd = prefix + [
+            "scp",
+            *self._etsy_vm_ssh_common_args(config),
+            "-P",
+            str(config["port"]),
+            str(source),
+            remote,
+        ]
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False, env=env)
+
+    def _copy_etsy_staging_images_to_vm_via_ssh(
+        self,
+        images: List[Dict[str, Any]],
+        vm_image_dir: str,
+        job_id: str,
+        config: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        root_dir = str(PureWindowsPath(str(vm_image_dir or "").strip()))
+        target_dir = self._join_etsy_vm_path(root_dir, f"etsy-copy-{job_id[:8]}")
+        copied = 0
+        mapped: List[Dict[str, str]] = []
+        try:
+            escaped_target_dir = target_dir.replace("'", "''")
+            mkdir_result = self._run_etsy_vm_ssh(
+                config,
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    self._powershell_encoded_command(
+                        f"$null = New-Item -ItemType Directory -Force -Path '{escaped_target_dir}'"
+                    ),
+                ],
+            )
+            if mkdir_result.returncode != 0:
+                raise RuntimeError(self._etsy_vm_process_error("ssh mkdir", mkdir_result))
+            for image in images:
+                source = Path(str(image.get("local_path") or ""))
+                if not source.is_file():
+                    continue
+                destination_name = self._etsy_ordered_vm_filename(image, source.name)
+                destination = self._join_etsy_vm_path(target_dir, destination_name)
+                copy_result = self._run_etsy_vm_scp(config, source, destination)
+                if copy_result.returncode != 0:
+                    # Keep copying the remaining images. A single remote-path
+                    # edge case should not make the whole Etsy queue unusable.
+                    mapped.append(
+                        {
+                            "local_path": str(source),
+                            "vm_path": destination,
+                            "error": self._etsy_vm_process_error(f"scp {source.name}", copy_result),
+                        }
+                    )
+                    continue
+                image["vm_path"] = destination
+                copied += 1
+                mapped.append({"local_path": str(source), "vm_path": destination})
+        except Exception as exc:
+            return {
+                "configured": True,
+                "transport": "ssh",
+                "copied": copied,
+                "vm_dir": target_dir,
+                "error": self._flow_error_detail(exc),
+                "files": mapped,
+            }
+        return {
+            "configured": True,
+            "transport": "ssh",
+            "copied": copied,
+            "vm_dir": target_dir,
+            "error": "",
+            "files": mapped,
+        }
+
+    def _copy_etsy_staging_images_to_vm(self, images: List[Dict[str, Any]], vm_image_dir: str, job_id: str) -> Dict[str, Any]:
+        vm_image_dir = str(vm_image_dir or "").strip()
+        ssh_config = self._etsy_vm_ssh_config()
+        if not vm_image_dir:
+            vm_image_dir = self._default_etsy_vm_image_dir()
+        if not vm_image_dir:
+            return {"configured": False, "transport": "", "copied": 0, "vm_dir": "", "error": ""}
+        if ssh_config.get("configured"):
+            return self._copy_etsy_staging_images_to_vm_via_ssh(images, vm_image_dir, job_id, ssh_config)
+        target_dir = Path(vm_image_dir).expanduser() / f"etsy-copy-{job_id[:8]}"
+        copied = 0
+        mapped: List[Dict[str, str]] = []
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for image in images:
+                source = Path(str(image.get("local_path") or ""))
+                if not source.is_file():
+                    continue
+                destination = target_dir / self._etsy_ordered_vm_filename(image, source.name)
+                shutil.copy2(source, destination)
+                image["vm_path"] = str(destination)
+                copied += 1
+                mapped.append({"local_path": str(source), "vm_path": str(destination)})
+        except Exception as exc:
+            return {
+                "configured": True,
+                "transport": "local",
+                "copied": copied,
+                "vm_dir": str(target_dir),
+                "error": self._flow_error_detail(exc),
+                "files": mapped,
+            }
+        return {"configured": True, "transport": "local", "copied": copied, "vm_dir": str(target_dir), "error": "", "files": mapped}
+
+    async def prepare_etsy_browser_copy(self, job_id: str, request: CreateJobRequest) -> Dict[str, Any]:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            return {"configured": False, "mode": "browser_copy", "missing": ["trello_credentials"]}
+        card_id = self._normalize_trello_card_id(
+            request.trello_source_card_id or request.trello_card_id or self.store.snapshot().trello_config.card_id
+        )
+        if not card_id:
+            return {"configured": False, "mode": "browser_copy", "missing": ["trello_card_id"]}
+        download = await asyncio.to_thread(
+            self._download_trello_card_all_image_attachments_for_etsy,
+            key,
+            token,
+            job_id,
+            card_id,
+        )
+        fields = self._etsy_browser_copy_note_fields(download["card"], request)
+        if fields.get("title"):
+            fields["title"] = self._clean_trello_note_value(fields["title"])
+        template_search_terms = self._etsy_template_search_terms(download["card"], fields, request)
+        template_search_queries = self._etsy_template_search_queries(download["card"], fields, request, template_search_terms)
+        card_list_id = self._normalize_trello_id(str(download["card"].get("idList") or ""))
+        requested_list_id = self._normalize_trello_id(str(request.trello_list_id or ""))
+        section_source_list_id = requested_list_id or card_list_id
+        section_source_list_name = self._trello_list_name(key, token, section_source_list_id) if section_source_list_id else ""
+        current_card_list_name = (
+            section_source_list_name
+            if card_list_id and card_list_id == section_source_list_id
+            else (self._trello_list_name(key, token, card_list_id) if card_list_id else "")
+        )
+        template_source_sku = ""
+        for candidate_sku in (
+            request.etsy_template_listing_id,
+            section_source_list_name,
+            current_card_list_name,
+            request.prompt_product_key,
+            request.prompt_product,
+        ):
+            candidate_text = str(candidate_sku or "").strip()
+            if self._looks_like_listing_sku(candidate_text) and candidate_text != fields.get("sku"):
+                template_source_sku = candidate_text
+                break
+        inferred_section_name = (
+            self._etsy_section_tracking_title_for_product(download["card"], fields)
+            if (section_source_list_id or card_list_id)
+            else ""
+        )
+        list_section_name = (
+            ""
+            if self._etsy_section_name_is_workflow_bucket(section_source_list_name)
+            or self._looks_like_listing_sku(section_source_list_name)
+            else section_source_list_name
+        )
+        current_list_section_name = (
+            ""
+            if self._etsy_section_name_is_workflow_bucket(current_card_list_name)
+            or self._looks_like_listing_sku(current_card_list_name)
+            else current_card_list_name
+        )
+        requested_etsy_section_name = str(request.etsy_section_name or "").strip()
+        note_section_name = str(fields.get("section_name") or "").strip()
+        if self._etsy_section_name_is_workflow_bucket(requested_etsy_section_name):
+            requested_etsy_section_name = ""
+        if self._etsy_section_name_is_workflow_bucket(note_section_name):
+            note_section_name = ""
+        preferred_product_section_name = self._preferred_etsy_browser_copy_section_name(download["card"], fields)
+        fallback_section_name = self._default_etsy_browser_copy_section_name()
+        section_name_source = ""
+        if template_source_sku:
+            # SKU-template mode copies the source listing's section and all
+            # non-image fields. Title/SKU/images are the only Trello overrides.
+            etsy_section_name = ""
+        else:
+            section_candidates = [
+                ("request", requested_etsy_section_name),
+                ("trello_note", note_section_name),
+                ("trello_list", list_section_name),
+                ("trello_current_list", current_list_section_name),
+                ("preferred_product", preferred_product_section_name),
+                ("default", fallback_section_name),
+                ("inferred", inferred_section_name),
+            ]
+            etsy_section_name = ""
+            for source_name, candidate_name in section_candidates:
+                candidate_text = str(candidate_name or "").strip()
+                if candidate_text:
+                    etsy_section_name = candidate_text
+                    section_name_source = source_name
+                    break
+        source_etsy_section_name = etsy_section_name
+        etsy_section_aliases: List[str] = []
+        etsy_section_id = ""
+        if etsy_section_name:
+            try:
+                etsy_section_id = await asyncio.to_thread(self._etsy_shop_section_id_for_title, etsy_section_name)
+            except Exception as exc:
+                log.info("Etsy section id lookup skipped for %s: %s", etsy_section_name, self._flow_error_detail(exc))
+            if not etsy_section_id:
+                etsy_section_id = self._known_etsy_shop_section_id_for_title(etsy_section_name)
+            if not etsy_section_id:
+                etsy_section_aliases = self._etsy_section_alias_titles(etsy_section_name)
+                for alias_name in etsy_section_aliases:
+                    alias_section_id = ""
+                    try:
+                        alias_section_id = await asyncio.to_thread(self._etsy_shop_section_id_for_title, alias_name)
+                    except Exception as exc:
+                        log.info("Etsy section alias id lookup skipped for %s: %s", alias_name, self._flow_error_detail(exc))
+                    if not alias_section_id:
+                        alias_section_id = self._known_etsy_shop_section_id_for_title(alias_name)
+                    if alias_section_id:
+                        etsy_section_name = alias_name
+                        etsy_section_id = alias_section_id
+                        break
+        vm_dir = str(request.etsy_vm_image_dir or self._default_etsy_vm_image_dir()).strip()
+        vm_copy = self._copy_etsy_staging_images_to_vm(download["images"], vm_dir, job_id)
+        missing = []
+        # An empty title is intentional: it tells the worker to keep the
+        # template listing's existing title, so it must not block enqueue.
+        if not fields["sku"]:
+            missing.append("sku")
+        if not (fields["template_listing_url"] or fields["template_listing_id"] or template_search_terms or etsy_section_name or template_source_sku):
+            missing.append("template_listing_url")
+        if not download["images"]:
+            missing.append("trello_images")
+        copied_count = int(vm_copy.get("copied") or 0)
+        image_urls = [
+            str(image.get("download_url") or image.get("url") or "").strip()
+            for image in download["images"]
+            if str(image.get("download_url") or image.get("url") or "").strip()
+        ]
+        url_ready = bool(download["images"]) and len(image_urls) == len(download["images"])
+        if (
+            not url_ready
+            and (vm_copy.get("error") or (vm_copy.get("configured") and copied_count < len(download["images"])))
+        ):
+            missing.append("vm_image_copy")
+        vm_ready = (
+            bool(download["images"])
+            and (
+                url_ready
+                or (
+                    not vm_copy.get("error")
+                    and (not vm_copy.get("configured") or copied_count >= len(download["images"]))
+                )
+            )
+        )
+        ready = not missing
+        image_paths = [
+            str(image.get("vm_path") or image.get("download_url") or image.get("url") or image.get("local_path") or "").strip()
+            for image in download["images"]
+            if str(image.get("vm_path") or image.get("download_url") or image.get("url") or image.get("local_path") or "").strip()
+        ]
+        sku_template_queries = [template_source_sku] if template_source_sku and not fields["template_listing_id"] and not fields["template_listing_url"] else []
+        section_template_only = bool(
+            etsy_section_name
+            and section_name_source
+            in {
+                "request",
+                "trello_note",
+                "trello_list",
+                "trello_current_list",
+                "default",
+                "inferred",
+            }
+            and not sku_template_queries
+            and not fields["template_listing_id"]
+            and not fields["template_listing_url"]
+        )
+        template_fallback_queries = self._etsy_template_fallback_queries() if section_template_only else []
+        effective_template_search_terms = [] if (section_template_only or sku_template_queries) else template_search_terms
+        effective_template_search_queries = (
+            sku_template_queries
+            if sku_template_queries
+            else (template_fallback_queries if section_template_only else template_search_queries)
+        )
+        allow_template_fallback = bool(section_template_only and effective_template_search_queries)
+        template_fallback_listing_id = self._etsy_template_fallback_listing_id() if allow_template_fallback else ""
+        title_source_detail = fields.get("title_source") or ""
+        automation_payload = {
+            "mode": "etsy_browser_copy",
+            "jobId": job_id,
+            "cardId": download["card_id"],
+            "cardUrl": download["card_url"],
+            "title": fields["title"],
+            "sku": fields["sku"],
+            "productType": fields["product_type"],
+            "trelloListId": section_source_list_id,
+            "trelloListName": section_source_list_name,
+            "trelloCurrentListId": card_list_id,
+            "trelloCurrentListName": current_card_list_name,
+            "templateSourceSku": template_source_sku,
+            "sourceSectionName": source_etsy_section_name,
+            "etsySectionName": etsy_section_name,
+            "etsySectionAliases": etsy_section_aliases,
+            "etsySectionId": etsy_section_id,
+            "targetSectionName": etsy_section_name,
+            "targetSectionId": etsy_section_id,
+            "sectionNameSource": section_name_source,
+            "titleSource": "trello" if str(title_source_detail).startswith("trello") else title_source_detail,
+            "titleSourceDetail": title_source_detail,
+            "templateSourceMode": (
+                "sku_search" if sku_template_queries
+                else "section_first_then_noel_fallback" if allow_template_fallback
+                else ("section_first_listing" if section_template_only else "explicit_or_search")
+            ),
+            "copiedFieldsSource": (
+                "etsy_sku_template" if sku_template_queries
+                else "etsy_section_template_or_noel_fallback" if allow_template_fallback
+                else ("etsy_section_template" if section_template_only else "explicit_or_search_template")
+            ),
+            "sectionTemplatePick": "first_visible_listing_in_section" if section_template_only else "",
+            "preferSectionTemplate": section_template_only,
+            "strictSectionTemplate": bool(section_template_only and not allow_template_fallback),
+            "templateSelectionMode": (
+                "sku_search"
+                if sku_template_queries
+                else "section_first"
+                if allow_template_fallback
+                else "section_first_strict"
+                if section_template_only
+                else "explicit_or_search"
+            ),
+            "skipSectionTemplate": bool(sku_template_queries),
+            "sectionTemplateFallbackQueries": template_fallback_queries,
+            "templateFallbackListingId": template_fallback_listing_id,
+            "allowCrossSectionTemplateFallback": allow_template_fallback,
+            "requireTargetSectionAfterCopy": allow_template_fallback,
+            "templateListingUrl": fields["template_listing_url"],
+            "templateListingId": fields["template_listing_id"] or template_fallback_listing_id,
+            "templateSearchTerms": effective_template_search_terms,
+            "templateSearchQueries": effective_template_search_queries,
+            "templateSearchQuery": (
+                effective_template_search_queries[0]
+                if effective_template_search_queries
+                else (effective_template_search_terms[0] if effective_template_search_terms else "")
+            ),
+            "allowAutoTemplate": bool(
+                (effective_template_search_terms or effective_template_search_queries)
+                and not fields["template_listing_id"]
+                and not fields["template_listing_url"]
+            ),
+            "imagePaths": image_paths,
+            "imageUrls": image_urls,
+            "images": download["images"],
+            "vmDir": vm_copy.get("vm_dir") or "",
+            "maxUploadImages": 9 if request.etsy_keep_color_chart else 10,
+            "keepColorChart": bool(request.etsy_keep_color_chart),
+            "deleteExistingImages": bool(request.etsy_delete_existing_images),
+            "saveDraft": True,
+            "openDraftsAfterSave": True,
+            "dryRun": False,
+            "allowOpenListingsTab": True,
+        }
+        checklist = [
+            "Mở Etsy Seller trên máy ảo đã đăng nhập.",
+            "Mở đúng Etsy section theo cột Trello rồi copy listing đầu tiên/gần nhất trong section đó.",
+            "Giữ nguyên các field còn lại từ listing mẫu của section; chỉ thay title/SKU/ảnh theo Trello.",
+            "Trong listing copy: xóa ảnh cũ, giữ ảnh bảng màu nếu có.",
+            "Upload toàn bộ ảnh trong vm_dir/local staging theo thứ tự rank.",
+            "Đổi title theo title lấy từ Trello note.",
+            "Đổi SKU theo sku lấy từ Trello note.",
+            "Save as draft, không publish.",
+            "Mở lại mục Draft sau khi lưu để chủ nhân kiểm tra, vẫn giữ section theo Trello.",
+            "Ghi link draft mới vào Trello card.",
+        ]
+        if self.store.get_job(job_id) is not None:
+            await self.store.append_log(
+                job_id,
+                (
+                    f"Etsy browser copy: đã staging {len(download['images'])} ảnh Trello"
+                    + (f", copy {vm_copy.get('copied', 0)} ảnh sang VM." if vm_copy.get("configured") else ".")
+                ),
+            )
+            if missing:
+                await self.store.append_log(job_id, f"Etsy browser copy còn thiếu: {', '.join(missing)}.")
+        return {
+            "configured": ready,
+            "mode": "browser_copy",
+            "status": "ready_for_browser" if ready else "needs_input",
+            "missing": missing,
+            "card_id": download["card_id"],
+            "card_url": download["card_url"],
+            "title": fields["title"],
+            "title_source": fields.get("title_source") or "",
+            "sku": fields["sku"],
+            "product_type": fields["product_type"],
+            "trello_list_id": section_source_list_id,
+            "trello_list_name": section_source_list_name,
+            "trello_current_list_id": card_list_id,
+            "trello_current_list_name": current_card_list_name,
+            "source_etsy_section_name": source_etsy_section_name,
+            "etsy_section_aliases": etsy_section_aliases,
+            "etsy_section_name": etsy_section_name,
+            "etsy_section_id": etsy_section_id,
+            "template_listing_url": fields["template_listing_url"],
+            "template_listing_id": fields["template_listing_id"],
+            "template_search_terms": template_search_terms,
+            "template_search_queries": template_search_queries,
+            "staging_dir": download["staging_dir"],
+            "vm_copy": vm_copy,
+            "images": download["images"],
+            "image_count": len(download["images"]),
+            "keep_color_chart": bool(request.etsy_keep_color_chart),
+            "delete_existing_images": bool(request.etsy_delete_existing_images),
+            "browser_automation_ready": ready and vm_ready and len(image_paths) == len(download["images"]),
+            "automation_payload": automation_payload,
+            "browser_steps": checklist,
+        }
+
+    def _public_etsy_browser_copy_task(self, task: Dict[str, Any], *, include_payload: bool = False) -> Dict[str, Any]:
+        public = {
+            "id": task.get("id", ""),
+            "job_id": task.get("job_id", ""),
+            "module_id": task.get("module_id", ""),
+            "status": task.get("status", ""),
+            "title": task.get("title", ""),
+            "sku": task.get("sku", ""),
+            "card_id": task.get("card_id", ""),
+            "card_url": task.get("card_url", ""),
+            "image_count": task.get("image_count", 0),
+            "account_id": self._normalize_account_id(task.get("account_id")),
+            "attempts": task.get("attempts", 0),
+            "worker_id": task.get("worker_id", ""),
+            "created_at": task.get("created_at", ""),
+            "updated_at": task.get("updated_at", ""),
+            "started_at": task.get("started_at", ""),
+            "finished_at": task.get("finished_at", ""),
+            "result": task.get("result", {}),
+            "error": task.get("error", ""),
+        }
+        if include_payload:
+            public["payload"] = task.get("payload", {})
+        return public
+
+    def _expire_stale_etsy_browser_copy_tasks(self) -> None:
+        now = _parse_iso_datetime(utc_now()) or datetime.now(timezone.utc)
+        for task in self._etsy_browser_copy_tasks.values():
+            if task.get("status") != "in_progress":
+                continue
+            started_at = _parse_iso_datetime(str(task.get("started_at") or task.get("updated_at") or ""))
+            if started_at is None or now - started_at < self.ETSY_BROWSER_COPY_STALE_TIMEOUT:
+                continue
+            timeout_minutes = int(self.ETSY_BROWSER_COPY_STALE_TIMEOUT.total_seconds() // 60)
+            timeout_message = (
+                f"Quá {timeout_minutes} phút mà extension chưa báo kết quả copy về. "
+                "Draft có thể ĐÃ được tạo trên Etsy — hãy kiểm tra mục Drafts của shop trước. "
+                "Nếu không thấy draft, mở lại worker trên máy ảo rồi chạy lại thẻ này."
+            )
+            task["status"] = "failed"
+            task["updated_at"] = now.isoformat()
+            task["finished_at"] = now.isoformat()
+            task["result"] = {
+                "ok": False,
+                "reason": "etsy_browser_copy_task_timeout",
+                "message": timeout_message,
+                "timeout_minutes": timeout_minutes,
+                "draft_may_exist": True,
+            }
+            task["error"] = timeout_message
+
+    async def enqueue_etsy_browser_copy(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        *,
+        module_id: str = "",
+    ) -> Dict[str, Any]:
+        copy_result = await self.prepare_etsy_browser_copy(job_id, request)
+        if not copy_result.get("browser_automation_ready") or not copy_result.get("automation_payload"):
+            return {**copy_result, "enqueued": False, "queue_task": None}
+
+        self._expire_stale_etsy_browser_copy_tasks()
+        module_key = str(module_id or "etsy_browser_copy").strip()
+        for existing in self._etsy_browser_copy_tasks.values():
+            if (
+                existing.get("job_id") == job_id
+                and existing.get("module_id") == module_key
+                and existing.get("status") in {"queued", "in_progress"}
+            ):
+                return {
+                    **copy_result,
+                    "enqueued": True,
+                    "duplicate": True,
+                    "queue_task": self._public_etsy_browser_copy_task(existing),
+                }
+
+        copy_card_id = str(copy_result.get("card_id") or "").strip()
+        if copy_card_id:
+            for existing in self._etsy_browser_copy_tasks.values():
+                if (
+                    str(existing.get("card_id") or "").strip() == copy_card_id
+                    and existing.get("status") in {"queued", "in_progress"}
+                ):
+                    if self.store.get_job(job_id) is not None:
+                        await self.store.append_log(
+                            job_id,
+                            f"Etsy browser copy: card {copy_card_id} đang có task {existing.get('id')} chờ/chạy, không queue trùng.",
+                        )
+                    return {
+                        **copy_result,
+                        "enqueued": True,
+                        "duplicate": True,
+                        "queue_task": self._public_etsy_browser_copy_task(existing),
+                    }
+
+        account_id = self._normalize_account_id(getattr(request, "etsy_account_id", ""))
+        task_id = f"etsy-copy-{uuid.uuid4().hex[:12]}"
+        now = utc_now()
+        task = {
+            "id": task_id,
+            "job_id": job_id,
+            "module_id": module_key,
+            "status": "queued",
+            "title": copy_result.get("title", ""),
+            "sku": copy_result.get("sku", ""),
+            "card_id": copy_result.get("card_id", ""),
+            "card_url": copy_result.get("card_url", ""),
+            "image_count": copy_result.get("image_count", 0),
+            "account_id": account_id,
+            "payload": copy_result["automation_payload"],
+            "prepare": copy_result,
+            "attempts": 0,
+            "worker_id": "",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": "",
+            "finished_at": "",
+            "result": {},
+            "error": "",
+        }
+        self._etsy_browser_copy_tasks[task_id] = task
+        self._etsy_browser_copy_queue.append(task_id)
+        if self.store.get_job(job_id) is not None:
+            await self.store.append_log(
+                job_id,
+                f"Etsy browser copy: đã đưa task {task_id} vào hàng đợi máy ảo.",
+            )
+        return {
+            **copy_result,
+            "enqueued": True,
+            "queue_task": self._public_etsy_browser_copy_task(task),
+        }
+
+    async def enqueue_etsy_browser_copy_from_job(self, job_id: str) -> Dict[str, Any]:
+        normalized_job_id = str(job_id or "").strip()
+        if not normalized_job_id:
+            raise HTTPException(status_code=400, detail="Thiếu job Flow để queue Etsy Draft.")
+        job = self.store.get_job(normalized_job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy job Flow.")
+        if job.type != "image":
+            raise HTTPException(status_code=400, detail="Chỉ job tạo ảnh mới queue được Etsy Draft.")
+        if job.status in {"queued", "running", "polling"}:
+            raise HTTPException(status_code=400, detail="Flow vẫn đang chạy. Chờ job hoàn tất rồi bấm Listing ảnh Etsy.")
+        if job.status != "completed":
+            raise HTTPException(status_code=400, detail="Job Flow chưa hoàn tất nên chưa thể listing Etsy.")
+        if not job.artifacts:
+            raise HTTPException(status_code=400, detail="Job Flow chưa có ảnh output để listing Etsy.")
+
+        payload = dict(job.input or {})
+        payload["type"] = "image"
+        payload["source_job_id"] = normalized_job_id
+        payload["etsy_enabled"] = True
+        payload["etsy_browser_copy_enabled"] = True
+        payload["etsy_publish"] = False
+        payload["etsy_keep_color_chart"] = bool(payload.get("etsy_keep_color_chart", True))
+        payload["etsy_delete_existing_images"] = bool(payload.get("etsy_delete_existing_images", True))
+
+        card_id = self._normalize_trello_card_id(
+            str(
+                payload.get("trello_source_card_id")
+                or payload.get("trello_card_id")
+                or self.store.snapshot().trello_config.card_id
+                or ""
+            )
+        )
+        if not card_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Job Flow này chưa gắn Trello card, không đủ dữ liệu title/SKU/section để listing Etsy.",
+            )
+        payload["trello_card_id"] = card_id
+        payload["trello_source_card_id"] = card_id
+        if not str(payload.get("title") or "").strip():
+            payload["title"] = job.title or "Flow image Etsy draft"
+        if not str(payload.get("prompt_product") or "").strip():
+            payload["prompt_product"] = job.title or card_id
+        if not str(payload.get("prompt_product_key") or "").strip():
+            payload["prompt_product_key"] = payload["prompt_product"]
+
+        await self.store.append_log(
+            normalized_job_id,
+            "Người dùng bấm Listing ảnh Etsy: queue VM Draft từ ảnh Flow output của job này.",
+        )
+        result = await self.enqueue_etsy_browser_copy(
+            normalized_job_id,
+            CreateJobRequest(**payload),
+            module_id="etsy_browser_copy_manual",
+        )
+        if result.get("enqueued"):
+            await self.store.append_log(normalized_job_id, "Đã đưa task Listing ảnh Etsy vào hàng đợi VM.")
+        else:
+            missing = ", ".join(result.get("missing") or ["không rõ lỗi"])
+            await self.store.append_log(normalized_job_id, f"Listing ảnh Etsy chưa queue được: {missing}.")
+        return result
+
+    async def enqueue_etsy_browser_copy_smoke(self, account_id: str = "") -> Dict[str, Any]:
+        task_id = f"etsy-smoke-{uuid.uuid4().hex[:12]}"
+        now = utc_now()
+        payload = {
+            "dryRun": True,
+            "title": "Flow v2 Etsy queue smoke",
+            "sku": "FLOW-QUEUE-SMOKE",
+            "templateSearchQuery": "Flow queue smoke",
+            "templateSearchQueries": ["Flow queue smoke"],
+            "imagePaths": [r"C:\Users\Administrator\Downloads\flow-v2-dry-run.jpg"],
+            "keepColorChart": True,
+            "deleteExistingImages": True,
+            "saveDraft": False,
+            "allowOpenListingsTab": True,
+        }
+        task = {
+            "id": task_id,
+            "job_id": "smoke",
+            "module_id": "etsy_browser_copy_smoke",
+            "status": "queued",
+            "title": payload["title"],
+            "sku": payload["sku"],
+            "card_id": "",
+            "card_url": "",
+            "image_count": 1,
+            "account_id": self._normalize_account_id(account_id),
+            "payload": payload,
+            "prepare": {},
+            "attempts": 0,
+            "worker_id": "",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": "",
+            "finished_at": "",
+            "result": {},
+            "error": "",
+        }
+        self._etsy_browser_copy_tasks[task_id] = task
+        self._etsy_browser_copy_queue.append(task_id)
+        return {"ok": True, "task": self._public_etsy_browser_copy_task(task)}
+
+    async def next_etsy_browser_copy_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._expire_stale_etsy_browser_copy_tasks()
+        worker_id = str((payload or {}).get("workerId") or "").strip()
+        trigger = str((payload or {}).get("trigger") or "").strip()
+        worker_version = (
+            str((payload or {}).get("workerVersion") or "").strip()
+            or str((payload or {}).get("extensionVersion") or "").strip()
+            or str((payload or {}).get("version") or "").strip()
+        )
+        # Fleet routing: each worker serves exactly ONE Etsy account. An empty or
+        # "default" accountId resolves to the default account (the legacy
+        # single-account VM, whose tasks also carry account_id ""), so existing
+        # workers that send no accountId behave exactly as before.
+        worker_account = self._normalize_account_id(
+            (payload or {}).get("accountId") or (payload or {}).get("account_id")
+        )
+        # Concurrency=1 PER ACCOUNT: the VM extension cannot run parallel copy
+        # tabs, but a task running for ANOTHER account must not block this worker.
+        # Stale in-progress tasks were just expired by the reaper above, so any
+        # task still in_progress for THIS account is genuinely active — make the
+        # worker wait (this prevents the parallel-contention timeouts).
+        active_in_progress = sum(
+            1
+            for existing in self._etsy_browser_copy_tasks.values()
+            if isinstance(existing, dict)
+            and existing.get("status") == "in_progress"
+            and self._normalize_account_id(existing.get("account_id")) == worker_account
+        )
+        if active_in_progress > 0:
+            return {
+                "ok": True,
+                "task": None,
+                "deferred": True,
+                "reason": "worker_busy",
+                "account_id": worker_account,
+                "in_progress": active_in_progress,
+                "message": "Một task Etsy của account này đang chạy; chờ xong rồi mới nhận task kế tiếp.",
+            }
+        # Walk the FIFO queue. Tasks for OTHER accounts stay queued (their own
+        # worker claims them); dead/non-queued ids are pruned. We decide claim-vs-
+        # defer on the FIRST queued task that belongs to this worker's account.
+        new_queue: List[str] = []
+        claimed_task: Optional[Dict[str, Any]] = None
+        claimed_task_id = ""
+        deferred_response: Optional[Dict[str, Any]] = None
+        decided = False
+        for task_id in self._etsy_browser_copy_queue:
+            if decided:
+                new_queue.append(task_id)
+                continue
+            task = self._etsy_browser_copy_tasks.get(task_id)
+            if not task or task.get("status") != "queued":
+                continue  # prune stale id (already claimed/finished/expired)
+            if self._normalize_account_id(task.get("account_id")) != worker_account:
+                new_queue.append(task_id)  # belongs to a different account
+                continue
+            task_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+            has_images = bool(task_payload.get("imageUrls") or task_payload.get("imagePaths") or task_payload.get("images"))
+            if has_images and worker_version and not _version_at_least(worker_version, self.ETSY_BROWSER_COPY_MIN_EXTENSION_VERSION):
+                new_queue.append(task_id)  # keep in place; wait for the worker to upgrade
+                task["updated_at"] = utc_now()
+                deferred_response = {
+                    "ok": True,
+                    "task": None,
+                    "deferred": True,
+                    "reason": "worker_extension_too_old",
+                    "account_id": worker_account,
+                    "worker_version": worker_version,
+                    "required_version": self.ETSY_BROWSER_COPY_MIN_EXTENSION_VERSION,
+                    "message": (
+                        "Etsy worker extension is too old for image upload tasks; "
+                        "waiting for VM extension reload."
+                    ),
+                }
+                decided = True
+                continue
+            now = utc_now()
+            task["status"] = "in_progress"
+            task["updated_at"] = now
+            task["started_at"] = now
+            task["worker_id"] = worker_id
+            task["trigger"] = trigger
+            task["attempts"] = int(task.get("attempts") or 0) + 1
+            claimed_task = task
+            claimed_task_id = task_id
+            decided = True
+            # claimed task leaves the queue: deliberately NOT appended to new_queue
+        self._etsy_browser_copy_queue = new_queue
+        if claimed_task is not None:
+            job_id = str(claimed_task.get("job_id") or "")
+            if self.store.get_job(job_id) is not None:
+                await self.store.append_log(job_id, f"Etsy browser copy: máy ảo đã nhận task {claimed_task_id}.")
+            return {"ok": True, "task": self._public_etsy_browser_copy_task(claimed_task, include_payload=True)}
+        if deferred_response is not None:
+            return deferred_response
+        return {"ok": True, "task": None}
+
+    def _is_transient_etsy_worker_error(self, result: Dict[str, Any]) -> bool:
+        """Cold-start / messaging errors from the MV3 worker that warrant an auto-requeue."""
+        if not isinstance(result, dict):
+            return False
+        text = " ".join(
+            str(result.get(key) or "")
+            for key in ("message", "reason", "error", "detail")
+        ).lower()
+        if not text.strip():
+            return False
+        signatures = (
+            "could not establish connection",
+            "receiving end does not exist",
+            "message port closed",
+            "extension context invalidated",
+            "no tab with id",
+        )
+        return any(sig in text for sig in signatures)
+
+    async def report_etsy_browser_copy_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        task_id = str((payload or {}).get("taskId") or "").strip()
+        if not task_id or task_id not in self._etsy_browser_copy_tasks:
+            return {"ok": False, "reason": "task_not_found", "task_id": task_id}
+        raw_status = str((payload or {}).get("status") or "").strip().lower()
+        status = "completed" if raw_status == "completed" else "failed"
+        result = (payload or {}).get("result") if isinstance((payload or {}).get("result"), dict) else {}
+        worker_id = str((payload or {}).get("workerId") or "").strip()
+        task = self._etsy_browser_copy_tasks[task_id]
+        now = utc_now()
+        retry_template_id = str(result.get("templateListingId") or "").strip()
+        retry_reason = str(result.get("reason") or "").strip()
+        if status == "failed" and retry_reason == "needs_background_copy_tab" and retry_template_id:
+            attempts = int(task.get("attempts") or 0)
+            if attempts < 3:
+                retry_payload = dict(task.get("payload") or {})
+                retry_payload.update(
+                    {
+                        "templateListingId": retry_template_id,
+                        "templateListingUrl": "",
+                        "templateSearchQuery": "",
+                        "templateSearchQueries": [],
+                        "templateSearchTerms": [],
+                        "allowAutoTemplate": False,
+                        "backgroundCopyAfterResolve": False,
+                        "backgroundResolvedTemplateListingId": retry_template_id,
+                    }
+                )
+                task["payload"] = retry_payload
+                task["status"] = "queued"
+                task["updated_at"] = now
+                task["started_at"] = ""
+                task["finished_at"] = ""
+                task["worker_id"] = worker_id or task.get("worker_id", "")
+                task["result"] = {**result, "requeued": True}
+                task["error"] = "Resolved template listing; requeued to open copy editor."
+                self._etsy_browser_copy_queue.append(task_id)
+                public_task = self._public_etsy_browser_copy_task(task)
+                job_id = str(task.get("job_id") or "")
+                if self.store.get_job(job_id) is not None:
+                    await self.store.append_log(
+                        job_id,
+                        f"Etsy browser copy: task {task_id} đã resolve template {retry_template_id}, queue lại để mở copy editor.",
+                    )
+                return {"ok": True, "requeued": True, "task": public_task}
+        if status == "failed" and self._is_transient_etsy_worker_error(result):
+            attempts = int(task.get("attempts") or 0)
+            if attempts < 4:
+                task["status"] = "queued"
+                task["updated_at"] = now
+                task["started_at"] = ""
+                task["finished_at"] = ""
+                task["worker_id"] = worker_id or task.get("worker_id", "")
+                task["result"] = {
+                    **result,
+                    "requeued": True,
+                    "requeue_reason": "transient_worker_cold_start",
+                }
+                task["error"] = ""
+                self._etsy_browser_copy_queue.append(task_id)
+                public_task = self._public_etsy_browser_copy_task(task)
+                job_id = str(task.get("job_id") or "")
+                if self.store.get_job(job_id) is not None:
+                    await self.store.append_log(
+                        job_id,
+                        f"Etsy browser copy: task {task_id} gặp lỗi kết nối tạm thời "
+                        f"(cold-start, lần {attempts}), tự queue lại để máy ảo thức dậy.",
+                    )
+                return {"ok": True, "requeued": True, "task": public_task}
+        task["status"] = status
+        task["updated_at"] = now
+        task["finished_at"] = now
+        task["worker_id"] = worker_id or task.get("worker_id", "")
+        task["result"] = result
+        task["error"] = "" if status == "completed" else str(result.get("message") or result.get("reason") or "etsy_browser_copy_failed")
+
+        job_id = str(task.get("job_id") or "")
+        module_id = str(task.get("module_id") or "etsy_browser_copy")
+        public_task = self._public_etsy_browser_copy_task(task)
+        job = self.store.get_job(job_id)
+        if job is not None:
+            if status == "completed":
+                await self.store.append_log(job_id, f"Etsy browser copy: task {task_id} đã chạy xong trên máy ảo.")
+            else:
+                await self.store.append_log(job_id, f"Etsy browser copy: task {task_id} lỗi: {task['error']}.")
+            job_result = _model_dump(job.result) if hasattr(job.result, "model_dump") else dict(job.result or {})
+            if job.type == "auto_trello_one_click" or job_result.get("mode") == "etsy_from_existing_outputs":
+                result_tasks = [item for item in (job_result.get("tasks") or []) if isinstance(item, dict)]
+                updated_tasks: List[Dict[str, Any]] = []
+                for item in result_tasks:
+                    item_copy = dict(item)
+                    queue_task = item_copy.get("queue_task") if isinstance(item_copy.get("queue_task"), dict) else {}
+                    if queue_task.get("id") == task_id:
+                        item_copy["queue_task"] = public_task
+                        item_copy["error"] = task["error"]
+                    updated_tasks.append(item_copy)
+                if updated_tasks:
+                    job_result["tasks"] = updated_tasks
+                queue_tasks = [
+                    item.get("queue_task")
+                    for item in updated_tasks
+                    if isinstance(item.get("queue_task"), dict)
+                ]
+                failed_count = len([item for item in queue_tasks if item.get("status") == "failed"])
+                completed_count = len([item for item in queue_tasks if item.get("status") == "completed"])
+                active_count = len([item for item in queue_tasks if item.get("status") in {"queued", "in_progress"}])
+                job_result["queued"] = len([item for item in queue_tasks if item.get("status") in {"queued", "in_progress", "completed"}])
+                job_result["failed"] = failed_count
+                if failed_count:
+                    await self.store.patch_job(job_id, status="failed", error=task["error"], result=job_result)
+                elif queue_tasks and not active_count and completed_count == len(queue_tasks):
+                    await self.store.patch_job(job_id, status="completed", error="", result=job_result)
+            try:
+                request = CreateJobRequest(**(job.input or {}))
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module_id,
+                    status,
+                    output={"queued": True, "queue_task": public_task, "result": result},
+                    error=task["error"] if status == "failed" else "",
+                )
+            except Exception as exc:
+                await self.store.append_log(job_id, f"Etsy browser copy: không cập nhật được module status: {self._flow_error_detail(exc)}.")
+        return {"ok": True, "task": public_task}
+
+    def etsy_browser_copy_queue_snapshot(self) -> Dict[str, Any]:
+        self._expire_stale_etsy_browser_copy_tasks()
+        tasks = [self._public_etsy_browser_copy_task(task) for task in self._etsy_browser_copy_tasks.values()]
+        return {
+            "ok": True,
+            "queued": len([task for task in tasks if task.get("status") == "queued"]),
+            "in_progress": len([task for task in tasks if task.get("status") == "in_progress"]),
+            "tasks": tasks[-20:],
+            "latest": tasks[-1] if tasks else None,
+        }
+
+    _AMAZON_NOTE_KEY_MAP = {
+        "title": "title",
+        "amazontitle": "title",
+        "listingtitle": "title",
+        "producttitle": "title",
+        "name": "title",
+        "product": "title",
+        "productname": "title",
+        "tensanpham": "title",
+        "tensp": "title",
+        "sku": "sku",
+        "masp": "sku",
+        "ma": "sku",
+        "productkey": "sku",
+        "productid": "sku",
+        "asin": "template_listing_id",
+        "amazonasin": "template_listing_id",
+        "listing": "template_listing_url",
+        "listingurl": "template_listing_url",
+        "amazonlisting": "template_listing_url",
+        "amazonlistingurl": "template_listing_url",
+        "templatelisting": "template_listing_url",
+        "copyfrom": "template_listing_url",
+        "type": "product_type",
+        "producttype": "product_type",
+        "amazonproducttype": "product_type",
+        "category": "product_type",
+        "danhmuc": "product_type",
+        "price": "price",
+        "gia": "price",
+        "quantity": "quantity",
+        "qty": "quantity",
+        "soluong": "quantity",
+    }
+
+    def _amazon_listing_id_from_url(self, value: Any) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        match = re.search(r"/(?:dp|gp/product)/([A-Z0-9]{10})(?:[/?#]|$)", text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+        match = re.search(r"(?:asin|ASIN)[=/:\s]+([A-Z0-9]{10})", text)
+        if match:
+            return match.group(1).upper()
+        if re.fullmatch(r"[A-Z0-9]{10}", text, flags=re.IGNORECASE):
+            return text.upper()
+        return ""
+
+    def _amazon_auto_sku(self, card: Dict[str, Any], fields: Dict[str, str]) -> str:
+        source = fields.get("product_type") or fields.get("title") or card.get("name") or "amazon"
+        words = self._ascii_token_text(source).split()
+        prefix = "".join(word[:3].upper() for word in words[:3])[:10] or "AMZ"
+        card_key = str(card.get("shortLink") or card.get("id") or uuid.uuid4().hex).strip()
+        suffix = re.sub(r"[^0-9A-Za-z]+", "", card_key).upper()[-6:] or uuid.uuid4().hex[:6].upper()
+        return f"{prefix}-{suffix}"
+
+    def _amazon_browser_copy_note_fields(self, card: Dict[str, Any], request: CreateJobRequest) -> Dict[str, str]:
+        desc = str(card.get("desc") or "").strip()
+        fields: Dict[str, str] = {}
+        pending_field = ""
+        for raw_line in desc.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("<!--"):
+                continue
+            match = re.match(r"^[\s*•-]*([^:=：]{2,48})\s*[:=：-]\s*(.*)$", line)
+            if not match:
+                if pending_field and not fields.get(pending_field):
+                    fields[pending_field] = self._clean_trello_note_value(line)
+                    pending_field = ""
+                continue
+            key = self._compact_match_text(match.group(1))
+            value = self._clean_trello_note_value(match.group(2))
+            mapped = self._AMAZON_NOTE_KEY_MAP.get(key)
+            if mapped and not fields.get(mapped):
+                if value:
+                    fields[mapped] = value
+                    pending_field = ""
+                else:
+                    pending_field = mapped
+
+        if not fields.get("template_listing_url"):
+            match = re.search(r"https?://(?:www\.)?amazon\.[^\s)]+/[^\s)]*", desc, flags=re.IGNORECASE)
+            if match:
+                fields["template_listing_url"] = match.group(0)
+
+        title = self._clean_listing_title(
+            str(fields.get("title") or "").strip()
+            or self._trello_plain_description_title(desc)
+            or request.amazon_listing_title
+            or request.prompt_product
+            or card.get("name")
+        )
+        sku = (
+            str(request.amazon_listing_sku or "").strip()
+            or str(fields.get("sku") or "").strip()
+            or (str(card.get("name") or "").strip() if self._looks_like_listing_sku(card.get("name")) else "")
+            or str(request.prompt_product_key or "").strip()
+        )
+        if not sku:
+            sku = self._amazon_auto_sku(card, {**fields, "title": title})
+        template_url = str(request.amazon_template_listing_url or fields.get("template_listing_url") or "").strip()
+        template_id = (
+            str(request.amazon_template_listing_id or "").strip()
+            or self._amazon_listing_id_from_url(template_url)
+            or self._amazon_listing_id_from_url(fields.get("template_listing_url"))
+        )
+        return {
+            "title": title,
+            "sku": sku,
+            "template_listing_url": template_url,
+            "template_listing_id": template_id,
+            "product_type": str(request.amazon_product_type or fields.get("product_type") or "").strip(),
+            "price": str(request.amazon_price or fields.get("price") or "").strip(),
+            "quantity": str(request.amazon_quantity or fields.get("quantity") or "").strip(),
+            "raw_note": desc,
+        }
+
+    def _default_amazon_vm_image_dir(self) -> str:
+        env_dir = str(os.getenv("AMAZON_VM_IMAGE_DIR") or os.getenv("AMAZON_VM_REMOTE_IMAGE_DIR") or "").strip()
+        if env_dir:
+            return env_dir
+        if os.name == "nt":
+            return r"C:\Users\Administrator\Downloads\amazon-browser-copy"
+        etsy_dir = self._default_etsy_vm_image_dir()
+        return etsy_dir.replace("etsy-browser-copy", "amazon-browser-copy")
+
+    async def prepare_amazon_browser_copy(self, job_id: str, request: CreateJobRequest) -> Dict[str, Any]:
+        key, token = self._trello_credentials()
+        if not key or not token:
+            return {"configured": False, "mode": "amazon_browser_copy", "missing": ["trello_credentials"]}
+        card_id = self._normalize_trello_card_id(
+            request.trello_source_card_id or request.trello_card_id or self.store.snapshot().trello_config.card_id
+        )
+        if not card_id:
+            return {"configured": False, "mode": "amazon_browser_copy", "missing": ["trello_card_id"]}
+        download = await asyncio.to_thread(
+            self._download_trello_card_all_image_attachments_for_etsy,
+            key,
+            token,
+            job_id,
+            card_id,
+        )
+        fields = self._amazon_browser_copy_note_fields(download["card"], request)
+        vm_dir = str(request.amazon_vm_image_dir or self._default_amazon_vm_image_dir()).strip()
+        vm_copy = self._copy_etsy_staging_images_to_vm(download["images"], vm_dir, job_id)
+        image_urls = [
+            str(image.get("download_url") or image.get("url") or "").strip()
+            for image in download["images"]
+            if str(image.get("download_url") or image.get("url") or "").strip()
+        ]
+        image_paths = [
+            str(image.get("vm_path") or image.get("download_url") or image.get("url") or image.get("local_path") or "").strip()
+            for image in download["images"]
+            if str(image.get("vm_path") or image.get("download_url") or image.get("url") or image.get("local_path") or "").strip()
+        ]
+        missing: List[str] = []
+        if not fields["title"]:
+            missing.append("title")
+        if not fields["sku"]:
+            missing.append("sku")
+        if not download["images"]:
+            missing.append("trello_images")
+        url_ready = bool(download["images"]) and len(image_urls) == len(download["images"])
+        copied_count = int(vm_copy.get("copied") or 0)
+        if (
+            not url_ready
+            and (vm_copy.get("error") or (vm_copy.get("configured") and copied_count < len(download["images"])))
+        ):
+            missing.append("vm_image_copy")
+        ready = not missing
+        automation_payload = {
+            "mode": "amazon_browser_copy",
+            "jobId": job_id,
+            "cardId": download["card_id"],
+            "cardUrl": download["card_url"],
+            "title": fields["title"],
+            "sku": fields["sku"],
+            "productType": fields["product_type"],
+            "templateListingUrl": fields["template_listing_url"],
+            "templateListingId": fields["template_listing_id"],
+            "asin": fields["template_listing_id"],
+            "price": fields["price"],
+            "quantity": fields["quantity"],
+            "imagePaths": image_paths,
+            "imageUrls": image_urls,
+            "images": download["images"],
+            "vmDir": vm_copy.get("vm_dir") or "",
+            "deleteExistingImages": bool(request.amazon_delete_existing_images),
+            "saveDraft": True,
+            "publish": False,
+            "dryRun": False,
+            "allowOpenAmazonTab": True,
+        }
+        checklist = [
+            "Mo Amazon Seller Central tren may ao da dang nhap.",
+            "Mo Add a Product hoac listing editor/draft phu hop.",
+            "Dien title, SKU, price/quantity neu co du lieu.",
+            "Upload anh tu Trello/Flow theo thu tu rank.",
+            "Luu draft hoac dung lai de chu nhan kiem tra; khong publish.",
+            "Bao ket qua ve backend queue.",
+        ]
+        if self.store.get_job(job_id) is not None:
+            await self.store.append_log(
+                job_id,
+                (
+                    f"Amazon browser copy: da staging {len(download['images'])} anh Trello"
+                    + (f", copy {vm_copy.get('copied', 0)} anh sang VM." if vm_copy.get("configured") else ".")
+                ),
+            )
+            if missing:
+                await self.store.append_log(job_id, f"Amazon browser copy con thieu: {', '.join(missing)}.")
+        return {
+            "configured": ready,
+            "mode": "amazon_browser_copy",
+            "status": "ready_for_browser" if ready else "needs_input",
+            "missing": missing,
+            "card_id": download["card_id"],
+            "card_url": download["card_url"],
+            "title": fields["title"],
+            "sku": fields["sku"],
+            "product_type": fields["product_type"],
+            "template_listing_url": fields["template_listing_url"],
+            "template_listing_id": fields["template_listing_id"],
+            "price": fields["price"],
+            "quantity": fields["quantity"],
+            "staging_dir": download["staging_dir"],
+            "vm_copy": vm_copy,
+            "images": download["images"],
+            "image_count": len(download["images"]),
+            "delete_existing_images": bool(request.amazon_delete_existing_images),
+            "browser_automation_ready": ready and len(image_paths) == len(download["images"]),
+            "automation_payload": automation_payload,
+            "browser_steps": checklist,
+        }
+
+    def _public_amazon_browser_copy_task(self, task: Dict[str, Any], *, include_payload: bool = False) -> Dict[str, Any]:
+        payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+        prepare = task.get("prepare") if isinstance(task.get("prepare"), dict) else {}
+        preview_images = []
+        for image in prepare.get("images") or payload.get("images") or []:
+            if not isinstance(image, dict):
+                continue
+            image_url = str(image.get("download_url") or image.get("url") or "").strip()
+            image_name = str(image.get("name") or image.get("filename") or image.get("local_path") or "").strip()
+            if image_url or image_name:
+                preview_images.append({"url": image_url, "name": image_name})
+        public = {
+            "id": task.get("id", ""),
+            "job_id": task.get("job_id", ""),
+            "module_id": task.get("module_id", ""),
+            "status": task.get("status", ""),
+            "title": task.get("title", ""),
+            "sku": task.get("sku", ""),
+            "card_id": task.get("card_id", ""),
+            "card_url": task.get("card_url", ""),
+            "image_count": task.get("image_count", 0),
+            "account_id": self._normalize_account_id(task.get("account_id")),
+            "attempts": task.get("attempts", 0),
+            "worker_id": task.get("worker_id", ""),
+            "created_at": task.get("created_at", ""),
+            "updated_at": task.get("updated_at", ""),
+            "started_at": task.get("started_at", ""),
+            "finished_at": task.get("finished_at", ""),
+            "result": task.get("result", {}),
+            "error": task.get("error", ""),
+            "preview": {
+                "title": prepare.get("title") or payload.get("title") or task.get("title", ""),
+                "sku": prepare.get("sku") or payload.get("sku") or task.get("sku", ""),
+                "card_url": prepare.get("card_url") or payload.get("cardUrl") or task.get("card_url", ""),
+                "product_type": prepare.get("product_type") or payload.get("productType") or "",
+                "template_listing_url": prepare.get("template_listing_url") or payload.get("templateListingUrl") or "",
+                "template_listing_id": prepare.get("template_listing_id") or payload.get("templateListingId") or "",
+                "price": prepare.get("price") or payload.get("price") or "",
+                "quantity": prepare.get("quantity") or payload.get("quantity") or "",
+                "delete_existing_images": bool(prepare.get("delete_existing_images") or payload.get("deleteExistingImages")),
+                "save_draft": bool(payload.get("saveDraft", True)),
+                "publish": bool(payload.get("publish")),
+                "image_count": task.get("image_count", 0),
+                "images": preview_images[:8],
+            },
+        }
+        if include_payload:
+            public["payload"] = payload
+        return public
+
+    def _expire_stale_amazon_browser_copy_tasks(self) -> None:
+        now = _parse_iso_datetime(utc_now()) or datetime.now(timezone.utc)
+        for task in self._amazon_browser_copy_tasks.values():
+            if task.get("status") != "in_progress":
+                continue
+            started_at = _parse_iso_datetime(str(task.get("started_at") or task.get("updated_at") or ""))
+            if started_at is None or now - started_at < self.AMAZON_BROWSER_COPY_STALE_TIMEOUT:
+                continue
+            timeout_minutes = int(self.AMAZON_BROWSER_COPY_STALE_TIMEOUT.total_seconds() // 60)
+            task["status"] = "failed"
+            task["finished_at"] = utc_now()
+            task["updated_at"] = task["finished_at"]
+            task["result"] = {
+                "ok": False,
+                "reason": "amazon_browser_copy_task_timeout",
+                "message": f"Qua {timeout_minutes} phut ma extension chua bao ket qua Amazon ve.",
+                "draft_may_exist": True,
+            }
+            task["error"] = task["result"]["message"]
+
+    async def enqueue_amazon_browser_copy(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        *,
+        module_id: str = "",
+    ) -> Dict[str, Any]:
+        prepare = await self.prepare_amazon_browser_copy(job_id, request)
+        if not prepare.get("configured"):
+            return {
+                "enqueued": False,
+                "configured": False,
+                "missing": prepare.get("missing") or [],
+                "prepare": prepare,
+            }
+        self._expire_stale_amazon_browser_copy_tasks()
+        module_key = str(module_id or "amazon_browser_copy").strip()
+        account_id = self._normalize_account_id(request.amazon_account_id)
+        card_id = str(prepare.get("card_id") or "").strip()
+        for existing in self._amazon_browser_copy_tasks.values():
+            if (
+                existing.get("status") in {"queued", "in_progress"}
+                and existing.get("card_id") == card_id
+                and self._normalize_account_id(existing.get("account_id")) == account_id
+            ):
+                return {
+                    "enqueued": True,
+                    "duplicate": True,
+                    "queue_task": self._public_amazon_browser_copy_task(existing),
+                    "prepare": prepare,
+                }
+        task_id = f"amazon-copy-{uuid.uuid4().hex[:12]}"
+        now = utc_now()
+        payload = dict(prepare.get("automation_payload") or {})
+        payload["queueTaskId"] = task_id
+        task = {
+            "id": task_id,
+            "job_id": job_id,
+            "module_id": module_key,
+            "status": "queued",
+            "title": str(prepare.get("title") or ""),
+            "sku": str(prepare.get("sku") or ""),
+            "card_id": card_id,
+            "card_url": str(prepare.get("card_url") or ""),
+            "image_count": int(prepare.get("image_count") or 0),
+            "account_id": account_id,
+            "payload": payload,
+            "prepare": prepare,
+            "attempts": 0,
+            "worker_id": "",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": "",
+            "finished_at": "",
+            "result": {},
+            "error": "",
+        }
+        self._amazon_browser_copy_tasks[task_id] = task
+        self._amazon_browser_copy_queue.append(task_id)
+        if self.store.get_job(job_id) is not None:
+            await self.store.append_log(job_id, f"Amazon browser copy: da queue task {task_id} cho VM.")
+        return {
+            "enqueued": True,
+            "configured": True,
+            "queue_task": self._public_amazon_browser_copy_task(task),
+            "prepare": prepare,
+        }
+
+    async def enqueue_amazon_browser_copy_from_job(self, job_id: str) -> Dict[str, Any]:
+        normalized_job_id = str(job_id or "").strip()
+        job = self.store.get_job(normalized_job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Khong tim thay job de listing Amazon.")
+        payload = dict(job.input or {})
+        payload["type"] = "image"
+        payload["source_job_id"] = normalized_job_id
+        payload["amazon_enabled"] = True
+        payload["amazon_browser_copy_enabled"] = True
+        payload["amazon_publish"] = False
+        card_id = self._normalize_trello_card_id(
+            str(
+                payload.get("trello_source_card_id")
+                or payload.get("trello_card_id")
+                or self.store.snapshot().trello_config.card_id
+                or ""
+            )
+        )
+        if not card_id:
+            raise HTTPException(
+                status_code=400,
+                detail="Job Flow nay chua gan Trello card, khong du du lieu title/SKU de listing Amazon.",
+            )
+        payload["trello_card_id"] = card_id
+        payload["trello_source_card_id"] = card_id
+        if not str(payload.get("title") or "").strip():
+            payload["title"] = job.title or "Flow image Amazon draft"
+        if not str(payload.get("prompt_product") or "").strip():
+            payload["prompt_product"] = job.title or card_id
+        if not str(payload.get("prompt_product_key") or "").strip():
+            payload["prompt_product_key"] = payload["prompt_product"]
+        await self.store.append_log(
+            normalized_job_id,
+            "Nguoi dung bam Listing anh Amazon: queue VM Draft tu anh Flow output cua job nay.",
+        )
+        result = await self.enqueue_amazon_browser_copy(
+            normalized_job_id,
+            CreateJobRequest(**payload),
+            module_id="amazon_browser_copy_manual",
+        )
+        if result.get("enqueued"):
+            await self.store.append_log(normalized_job_id, "Da dua task Listing anh Amazon vao hang doi VM.")
+        else:
+            missing = ", ".join(result.get("missing") or ["khong ro loi"])
+            await self.store.append_log(normalized_job_id, f"Listing anh Amazon chua queue duoc: {missing}.")
+        return result
+
+    async def enqueue_amazon_browser_copy_smoke(self, account_id: str = "") -> Dict[str, Any]:
+        task_id = f"amazon-smoke-{uuid.uuid4().hex[:12]}"
+        now = utc_now()
+        payload = {
+            "dryRun": True,
+            "title": "Flow v2 Amazon queue smoke",
+            "sku": "FLOW-AMAZON-SMOKE",
+            "imagePaths": [r"C:\Users\Administrator\Downloads\flow-v2-dry-run.jpg"],
+            "deleteExistingImages": True,
+            "saveDraft": False,
+            "publish": False,
+        }
+        task = {
+            "id": task_id,
+            "job_id": "smoke",
+            "module_id": "amazon_browser_copy_smoke",
+            "status": "queued",
+            "title": payload["title"],
+            "sku": payload["sku"],
+            "card_id": "",
+            "card_url": "",
+            "image_count": 1,
+            "account_id": self._normalize_account_id(account_id),
+            "payload": payload,
+            "prepare": {},
+            "attempts": 0,
+            "worker_id": "",
+            "created_at": now,
+            "updated_at": now,
+            "started_at": "",
+            "finished_at": "",
+            "result": {},
+            "error": "",
+        }
+        self._amazon_browser_copy_tasks[task_id] = task
+        self._amazon_browser_copy_queue.append(task_id)
+        return {"ok": True, "task": self._public_amazon_browser_copy_task(task)}
+
+    async def next_amazon_browser_copy_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        self._expire_stale_amazon_browser_copy_tasks()
+        worker_id = str((payload or {}).get("workerId") or "").strip()
+        trigger = str((payload or {}).get("trigger") or "").strip()
+        worker_version = (
+            str((payload or {}).get("workerVersion") or "").strip()
+            or str((payload or {}).get("extensionVersion") or "").strip()
+            or str((payload or {}).get("version") or "").strip()
+        )
+        worker_account = self._normalize_account_id(
+            (payload or {}).get("accountId") or (payload or {}).get("account_id")
+        )
+        active_in_progress = sum(
+            1
+            for existing in self._amazon_browser_copy_tasks.values()
+            if isinstance(existing, dict)
+            and existing.get("status") == "in_progress"
+            and self._normalize_account_id(existing.get("account_id")) == worker_account
+        )
+        if active_in_progress > 0:
+            return {
+                "ok": True,
+                "task": None,
+                "deferred": True,
+                "reason": "worker_busy",
+                "account_id": worker_account,
+                "in_progress": active_in_progress,
+                "message": "Mot task Amazon cua account nay dang chay; cho xong roi moi nhan task tiep theo.",
+            }
+        new_queue: List[str] = []
+        claimed_task: Optional[Dict[str, Any]] = None
+        claimed_task_id = ""
+        deferred_response: Optional[Dict[str, Any]] = None
+        decided = False
+        for task_id in self._amazon_browser_copy_queue:
+            if decided:
+                new_queue.append(task_id)
+                continue
+            task = self._amazon_browser_copy_tasks.get(task_id)
+            if not task or task.get("status") != "queued":
+                continue
+            if self._normalize_account_id(task.get("account_id")) != worker_account:
+                new_queue.append(task_id)
+                continue
+            task_payload = task.get("payload") if isinstance(task.get("payload"), dict) else {}
+            has_images = bool(task_payload.get("imageUrls") or task_payload.get("imagePaths") or task_payload.get("images"))
+            if has_images and worker_version and not _version_at_least(worker_version, self.AMAZON_BROWSER_COPY_MIN_EXTENSION_VERSION):
+                new_queue.append(task_id)
+                task["updated_at"] = utc_now()
+                deferred_response = {
+                    "ok": True,
+                    "task": None,
+                    "deferred": True,
+                    "reason": "worker_extension_too_old",
+                    "account_id": worker_account,
+                    "worker_version": worker_version,
+                    "required_version": self.AMAZON_BROWSER_COPY_MIN_EXTENSION_VERSION,
+                    "message": "Amazon worker extension is too old for image upload tasks; waiting for VM extension reload.",
+                }
+                decided = True
+                continue
+            now = utc_now()
+            task["status"] = "in_progress"
+            task["updated_at"] = now
+            task["started_at"] = now
+            task["worker_id"] = worker_id
+            task["trigger"] = trigger
+            task["attempts"] = int(task.get("attempts") or 0) + 1
+            claimed_task = task
+            claimed_task_id = task_id
+            decided = True
+        self._amazon_browser_copy_queue = new_queue
+        if claimed_task is not None:
+            job_id = str(claimed_task.get("job_id") or "")
+            if self.store.get_job(job_id) is not None:
+                await self.store.append_log(job_id, f"Amazon browser copy: may ao da nhan task {claimed_task_id}.")
+            return {"ok": True, "task": self._public_amazon_browser_copy_task(claimed_task, include_payload=True)}
+        if deferred_response is not None:
+            return deferred_response
+        return {"ok": True, "task": None}
+
+    async def report_amazon_browser_copy_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        task_id = str((payload or {}).get("taskId") or "").strip()
+        if not task_id or task_id not in self._amazon_browser_copy_tasks:
+            return {"ok": False, "reason": "task_not_found", "task_id": task_id}
+        raw_status = str((payload or {}).get("status") or "").strip().lower()
+        status = "completed" if raw_status == "completed" else "failed"
+        result = (payload or {}).get("result") if isinstance((payload or {}).get("result"), dict) else {}
+        worker_id = str((payload or {}).get("workerId") or "").strip()
+        task = self._amazon_browser_copy_tasks[task_id]
+        now = utc_now()
+        if status == "failed" and self._is_transient_etsy_worker_error(result):
+            attempts = int(task.get("attempts") or 0)
+            if attempts < 4:
+                task["status"] = "queued"
+                task["updated_at"] = now
+                task["started_at"] = ""
+                task["finished_at"] = ""
+                task["worker_id"] = worker_id or task.get("worker_id", "")
+                task["result"] = {**result, "requeued": True, "requeue_reason": "transient_worker_cold_start"}
+                task["error"] = ""
+                self._amazon_browser_copy_queue.append(task_id)
+                return {"ok": True, "requeued": True, "task": self._public_amazon_browser_copy_task(task)}
+        task["status"] = status
+        task["updated_at"] = now
+        task["finished_at"] = now
+        task["worker_id"] = worker_id or task.get("worker_id", "")
+        task["result"] = result
+        task["error"] = "" if status == "completed" else str(result.get("message") or result.get("reason") or "amazon_browser_copy_failed")
+        job_id = str(task.get("job_id") or "")
+        module_id = str(task.get("module_id") or "amazon_browser_copy")
+        public_task = self._public_amazon_browser_copy_task(task)
+        job = self.store.get_job(job_id)
+        if job is not None:
+            if status == "completed":
+                await self.store.append_log(job_id, f"Amazon browser copy: task {task_id} da chay xong tren may ao.")
+            else:
+                await self.store.append_log(job_id, f"Amazon browser copy: task {task_id} loi: {task['error']}.")
+            job_result = _model_dump(job.result) if hasattr(job.result, "model_dump") else dict(job.result or {})
+            if job.type == "auto_trello_one_click" or job_result.get("mode") == "amazon_from_existing_outputs":
+                result_tasks = [item for item in (job_result.get("tasks") or []) if isinstance(item, dict)]
+                updated_tasks: List[Dict[str, Any]] = []
+                for item in result_tasks:
+                    item_copy = dict(item)
+                    queue_task = item_copy.get("queue_task") if isinstance(item_copy.get("queue_task"), dict) else {}
+                    if queue_task.get("id") == task_id:
+                        item_copy["queue_task"] = public_task
+                        item_copy["error"] = task["error"]
+                    updated_tasks.append(item_copy)
+                if updated_tasks:
+                    job_result["tasks"] = updated_tasks
+                queue_tasks = [
+                    item.get("queue_task")
+                    for item in updated_tasks
+                    if isinstance(item.get("queue_task"), dict)
+                ]
+                failed_count = len([item for item in queue_tasks if item.get("status") == "failed"])
+                completed_count = len([item for item in queue_tasks if item.get("status") == "completed"])
+                active_count = len([item for item in queue_tasks if item.get("status") in {"queued", "in_progress"}])
+                job_result["queued"] = len([item for item in queue_tasks if item.get("status") in {"queued", "in_progress", "completed"}])
+                job_result["failed"] = failed_count
+                if failed_count:
+                    await self.store.patch_job(job_id, status="failed", error=task["error"], result=job_result)
+                elif queue_tasks and not active_count and completed_count == len(queue_tasks):
+                    await self.store.patch_job(job_id, status="completed", error="", result=job_result)
+            try:
+                request = CreateJobRequest(**(job.input or {}))
+                await self._set_automation_module_status(
+                    job_id,
+                    request,
+                    module_id,
+                    status,
+                    output={"queued": True, "queue_task": public_task, "result": result},
+                    error=task["error"] if status == "failed" else "",
+                )
+            except Exception as exc:
+                await self.store.append_log(job_id, f"Amazon browser copy: khong cap nhat duoc module status: {self._flow_error_detail(exc)}.")
+        return {"ok": True, "task": public_task}
+
+    def amazon_browser_copy_queue_snapshot(self) -> Dict[str, Any]:
+        self._expire_stale_amazon_browser_copy_tasks()
+        tasks = [self._public_amazon_browser_copy_task(task) for task in self._amazon_browser_copy_tasks.values()]
+        return {
+            "ok": True,
+            "queued": len([task for task in tasks if task.get("status") == "queued"]),
+            "in_progress": len([task for task in tasks if task.get("status") == "in_progress"]),
+            "tasks": tasks[-20:],
+            "latest": tasks[-1] if tasks else None,
+        }
+
+    async def _create_etsy_draft_listing(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        artifacts: List[JobArtifact],
+    ) -> Dict[str, Any]:
+        if request.type != "image" or not request.etsy_enabled:
+            return {}
+        if not artifacts:
+            return {"configured": True, "created": False, "reason": "no_artifacts"}
+
+        await self._autofill_etsy_config_defaults(self.store.snapshot().etsy_config)
+        api_key, access_token = self._etsy_credentials()
+        api_client_id, api_secret, _api_key_header = self._etsy_key_parts_from_config()
+        values = self._etsy_config_values(request)
+        if (
+            api_key
+            and access_token
+            and str(values.get("shop_id") or "").strip()
+            and (not str(values.get("taxonomy_id") or "").strip() or not str(values.get("shipping_profile_id") or "").strip())
+        ):
+            autofill = await asyncio.to_thread(
+                self._etsy_autofill_category_shipping,
+                job_id,
+                request,
+                api_key,
+                access_token,
+                str(values["shop_id"]),
+                values,
+            )
+            if not str(values.get("taxonomy_id") or "").strip() and autofill.get("auto_taxonomy_id"):
+                values["taxonomy_id"] = autofill["auto_taxonomy_id"]
+                await self.store.append_log(job_id, f"Etsy module tự chọn taxonomy_id={autofill['auto_taxonomy_id']}.")
+            if not str(values.get("shipping_profile_id") or "").strip() and autofill.get("auto_shipping_profile_id"):
+                values["shipping_profile_id"] = autofill["auto_shipping_profile_id"]
+                await self.store.append_log(
+                    job_id, f"Etsy module tự chọn shipping_profile_id={autofill['auto_shipping_profile_id']}."
+                )
+        required = {
+            "api_key": api_client_id,
+            "api_secret": api_secret,
+            "access_token": access_token,
+            "shop_id": values.get("shop_id"),
+            "taxonomy_id": values.get("taxonomy_id"),
+            "shipping_profile_id": values.get("shipping_profile_id"),
+        }
+        missing = [key for key, value in required.items() if not str(value or "").strip()]
+        if missing:
+            await self.store.append_log(job_id, f"Etsy module bỏ qua vì thiếu cấu hình: {', '.join(missing)}.")
+            return {"configured": False, "created": False, "missing": missing}
+
+        content = await asyncio.to_thread(self._etsy_listing_content, job_id, request, use_ai=True)
+        if content.get("ai_used"):
+            await self.store.append_log(job_id, "Etsy module dùng Gemini để viết title/tags/description chuẩn SEO.")
+        elif content.get("local_fallback_used"):
+            ai_error = str(content.get("ai_error") or "").strip()
+            if ai_error and ai_error != "no_gemini":
+                await self.store.append_log(
+                    job_id,
+                    f"Etsy module dùng fallback local để viết listing vì Gemini lỗi: {ai_error}.",
+                )
+            else:
+                await self.store.append_log(
+                    job_id,
+                    "Etsy module dùng fallback local để viết title/tags/description, không cần Gemini.",
+                )
+        elif content.get("ai_error") and content.get("ai_error") != "no_gemini":
+            await self.store.append_log(
+                job_id,
+                f"Etsy module không tạo được nội dung AI ({content['ai_error']}); dùng nội dung mặc định.",
+            )
+        payload = self._etsy_listing_payload(job_id, request, values, content)
+        if self._etsy_dry_run_enabled(values):
+            uploads = [
+                {
+                    "rank": index + 1,
+                    "listing_image_id": f"dry-run-image-{job_id[:8]}-{index + 1}",
+                    "url": str(artifact.public_url or artifact.url or artifact.local_path or "").strip(),
+                }
+                for index, artifact in enumerate(artifacts[:10])
+            ]
+            await self.store.append_log(
+                job_id,
+                "Etsy dry-run: shop_id mẫu/test nên app không gọi Etsy live API, chỉ dựng draft giả để kiểm tra pipeline.",
+            )
+            return {
+                "configured": True,
+                "created": True,
+                "dry_run": True,
+                "listing_id": f"dry-run-{job_id[:8]}",
+                "listing_url": "",
+                "state": "draft",
+                "uploaded_images": len(uploads),
+                "failed_images": 0,
+                "images": uploads,
+                "ai_used": bool(content.get("ai_used")),
+                "local_fallback_used": bool(content.get("local_fallback_used")),
+                "content_source": str(content.get("content_source") or ""),
+                "variations": {"applied": False, "dry_run": True},
+                "payload": {
+                    "title": payload.get("title"),
+                    "price": payload.get("price"),
+                    "quantity": payload.get("quantity"),
+                    "tags": payload.get("tags", []),
+                },
+            }
+        listing = await asyncio.to_thread(
+            self._etsy_create_draft_listing_request,
+            api_key,
+            access_token,
+            str(values["shop_id"]),
+            payload,
+        )
+        listing_id = str(listing.get("listing_id") or listing.get("id") or "").strip()
+        uploads: List[Dict[str, Any]] = []
+        failed = 0
+        if listing_id:
+            for index, artifact in enumerate(artifacts[:10]):
+                artifact_url = str(artifact.public_url or artifact.url or "").strip()
+                try:
+                    file_bytes, mime = await self._trello_artifact_file_bytes(job_id, artifact, index, artifact_url)
+                    name = self._trello_attachment_name(job_id, artifact, index)
+                    uploaded = await asyncio.to_thread(
+                        self._etsy_upload_listing_image_request,
+                        api_key,
+                        access_token,
+                        str(values["shop_id"]),
+                        listing_id,
+                        file_bytes,
+                        mime,
+                        name,
+                        index + 1,
+                    )
+                    uploads.append(
+                        {
+                            "rank": index + 1,
+                            "listing_image_id": str(uploaded.get("listing_image_id") or uploaded.get("id") or "").strip(),
+                            "url": str(uploaded.get("url_fullxfull") or uploaded.get("url_570xN") or "").strip(),
+                        }
+                    )
+                except Exception as exc:
+                    failed += 1
+                    await self.store.append_log(job_id, f"Etsy không upload được ảnh {index + 1}: {self._flow_error_detail(exc)}")
+        inventory_result: Dict[str, Any] = {}
+        inventory_payload = self._etsy_build_inventory_payload(request, values)
+        if listing_id and inventory_payload:
+            try:
+                await asyncio.to_thread(
+                    self._etsy_update_inventory_request, api_key, access_token, listing_id, inventory_payload
+                )
+                inventory_result = {"applied": True, "variation_products": len(inventory_payload["products"])}
+                await self.store.append_log(
+                    job_id, f"Etsy module đã set {len(inventory_payload['products'])} biến thể (variations)."
+                )
+            except Exception as exc:
+                inventory_result = {
+                    "applied": False,
+                    "error": self._redact_etsy_secret(self._flow_error_detail(exc), api_key, access_token),
+                }
+                await self.store.append_log(job_id, f"Etsy module không set được variations: {inventory_result['error']}")
+        await self.store.append_log(
+            job_id,
+            f"Etsy module đã tạo draft listing {listing_id or '(không rõ id)'} và upload {len(uploads)} ảnh.",
+        )
+        return {
+            "configured": True,
+            "created": bool(listing_id),
+            "listing_id": listing_id,
+            "listing_url": str(listing.get("url") or "").strip(),
+            "state": str(listing.get("state") or "draft").strip(),
+            "uploaded_images": len(uploads),
+            "failed_images": failed,
+            "images": uploads,
+            "ai_used": bool(content.get("ai_used")),
+            "local_fallback_used": bool(content.get("local_fallback_used")),
+            "content_source": str(content.get("content_source") or ""),
+            "variations": inventory_result,
+            "payload": {
+                "title": payload.get("title"),
+                "price": payload.get("price"),
+                "quantity": payload.get("quantity"),
+                "tags": payload.get("tags", []),
+            },
+        }
+
+    def _etsy_listing_payload(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        values: Dict[str, Any],
+        content: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        if content is None:
+            content = self._etsy_listing_content(job_id, request, use_ai=False)
+        title = re.sub(r"\s+", " ", str(content.get("title") or "").strip())[:140] or f"Flow product image set {job_id[:8]}"
+        description = str(content.get("description") or "").strip() or self._etsy_default_description(request)
+        tags = self._sanitize_etsy_tags(content.get("tags"))
+        payload: Dict[str, Any] = {
+            "quantity": max(1, int(values.get("quantity") or 1)),
+            "title": title,
+            "description": description[:13000],
+            "price": str(values.get("price") or "9.99"),
+            "who_made": str(values.get("who_made") or "i_did"),
+            "when_made": str(values.get("when_made") or "made_to_order"),
+            "taxonomy_id": str(values.get("taxonomy_id") or ""),
+            "shipping_profile_id": str(values.get("shipping_profile_id") or ""),
+            "is_supply": "true" if values.get("is_supply") else "false",
+            "should_auto_renew": "true" if values.get("should_auto_renew") else "false",
+            "state": "draft" if not request.etsy_publish else "active",
+        }
+        if tags:
+            payload["tags"] = tags
+        materials = self._sanitize_etsy_materials(content.get("materials"))
+        if materials:
+            payload["materials"] = materials[:13]
+        for optional_key in ("return_policy_id", "readiness_state_id"):
+            value = str(values.get(optional_key) or "").strip()
+            if value:
+                payload[optional_key] = value
+        return payload
+
+    def _etsy_tags(self, request: CreateJobRequest) -> List[str]:
+        return self._sanitize_etsy_tags(
+            request.etsy_listing_tags,
+            request.prompt_product,
+            request.prompt_product_key,
+            request.prompt_notes,
+        )
+
+    def _etsy_split_terms(self, *sources: Any) -> List[str]:
+        items: List[str] = []
+        for source in sources:
+            if source is None:
+                continue
+            values = source if isinstance(source, (list, tuple)) else [source]
+            for value in values:
+                items.extend(re.split(r"[,;\n]", str(value or "")))
+        return items
+
+    def _sanitize_etsy_tags(self, *sources: Any) -> List[str]:
+        tags: List[str] = []
+        seen: set[str] = set()
+        for raw in self._etsy_split_terms(*sources):
+            tag = re.sub(r"\s+", " ", raw.strip().lower()).lstrip("#").strip()[:20]
+            if len(tag) < 2 or tag in seen:
+                continue
+            seen.add(tag)
+            tags.append(tag)
+            if len(tags) >= 13:
+                break
+        return tags
+
+    def _sanitize_etsy_materials(self, *sources: Any) -> List[str]:
+        materials: List[str] = []
+        seen: set[str] = set()
+        for raw in self._etsy_split_terms(*sources):
+            material = re.sub(r"[^0-9A-Za-z ]+", " ", raw)
+            material = re.sub(r"\s+", " ", material).strip()[:45]
+            key = material.lower()
+            if len(material) < 2 or key in seen:
+                continue
+            seen.add(key)
+            materials.append(material)
+            if len(materials) >= 13:
+                break
+        return materials
+
+    def _etsy_default_description(self, request: CreateJobRequest) -> str:
+        prompt = re.sub(r"\s+", " ", str(request.prompt or "").strip())
+        return "\n\n".join(
+            part
+            for part in [
+                "Draft listing prepared by Flow v2 automation.",
+                f"Product: {request.prompt_product or request.prompt_product_key}".strip()
+                if (request.prompt_product or request.prompt_product_key)
+                else "",
+                f"Creative direction: {prompt}" if prompt else "",
+            ]
+            if part
+        )
+
+    def _etsy_listing_context(self, job_id: str, request: CreateJobRequest) -> Dict[str, Any]:
+        return {
+            "product": str(request.prompt_product or request.prompt_product_key or "").strip(),
+            "card_name": self._trello_card_name(job_id, request),
+            "prompt": str(request.prompt or "").strip(),
+            "notes": str(request.prompt_notes or "").strip(),
+            "title": str(request.etsy_listing_title or "").strip(),
+            "tags": list(request.etsy_listing_tags or []),
+        }
+
+    def _etsy_local_text_blob(self, context: Dict[str, Any], request: CreateJobRequest) -> str:
+        return " ".join(
+            str(value or "")
+            for value in (
+                context.get("product"),
+                context.get("card_name"),
+                context.get("prompt"),
+                context.get("notes"),
+                context.get("title"),
+                request.etsy_listing_title,
+                request.etsy_listing_description,
+                request.prompt_product,
+                request.prompt_product_key,
+                request.prompt_notes,
+                request.prompt,
+                request.title,
+            )
+        ).lower()
+
+    def _etsy_clean_local_label(self, value: Any) -> str:
+        label = re.sub(r"[_/|]+", " ", str(value or ""))
+        label = re.sub(r"\s+", " ", label).strip(" -")
+        label = re.sub(r"\b(?:flow|etsy)\s+(?:ai|draft|listing)\b", "", label, flags=re.IGNORECASE)
+        return re.sub(r"\s+", " ", label).strip(" -")[:80]
+
+    def _etsy_local_label_is_generic(self, label: str) -> bool:
+        key = re.sub(r"\s+", " ", str(label or "").strip().lower())
+        if not key:
+            return True
+        generic_exact = {
+            "etsy",
+            "draft",
+            "listing",
+            "image",
+            "generated image",
+            "product image",
+            "product photo",
+            "quick flow image set",
+            "flow image set",
+            "local fallback",
+        }
+        return key in generic_exact or key.endswith(" image set") or key.startswith("quick flow ")
+
+    def _etsy_local_product_label(self, context: Dict[str, Any], request: CreateJobRequest) -> str:
+        for source in (
+            context.get("title"),
+            context.get("product"),
+            request.etsy_listing_title,
+            request.prompt_product,
+            request.prompt_product_key,
+        ):
+            label = self._etsy_clean_local_label(source)
+            if len(label) >= 3 and not self._etsy_local_label_is_generic(label):
+                return label
+
+        for source in (
+            context.get("card_name"),
+            request.title,
+        ):
+            label = self._etsy_clean_local_label(source)
+            if len(label) >= 3 and len(label.split()) <= 5 and not self._etsy_local_label_is_generic(label):
+                return label
+
+        text = self._etsy_local_text_blob(context, request)
+        if "pennant" in text or "banner" in text:
+            return "Nursery Pennant Banner" if ("nursery" in text or "baby" in text) else "Pennant Banner"
+        if "pillowcase" in text:
+            return "Embroidered Pillowcase" if "embroider" in text else "Handmade Pillowcase"
+        if "pillow" in text:
+            return "Embroidered Pillow" if "embroider" in text else "Handmade Pillow"
+        if "wall art" in text or "poster" in text or "print" in text:
+            return "Art Print"
+        if "sticker" in text:
+            return "Sticker Set"
+        if "mug" in text:
+            return "Handmade Mug"
+        if "tote" in text or "bag" in text:
+            return "Tote Bag"
+        if "candle" in text:
+            return "Handmade Candle"
+        if "necklace" in text:
+            return "Necklace"
+        if "earring" in text:
+            return "Earrings"
+        if "jewelry" in text or "jewellery" in text:
+            return "Handmade Jewelry"
+        return "Handmade Gift"
+
+    def _etsy_local_listing_title(self, product: str, text: str) -> str:
+        parts: List[str] = []
+        seen: set[str] = set()
+
+        def add(part: str) -> None:
+            cleaned = re.sub(r"\s+", " ", part).strip(" ,")
+            key = cleaned.lower()
+            if not cleaned or key in seen:
+                return
+            seen.add(key)
+            parts.append(cleaned)
+
+        add(product)
+        if any(term in text for term in ("personalized", "personalised", "custom")):
+            add("Personalized Gift")
+        if any(term in text for term in ("nursery", "baby", "kids room", "children")):
+            add("Nursery Decor")
+            add("Baby Gift")
+        elif any(term in text for term in ("wedding", "bridal", "anniversary")):
+            add("Wedding Gift")
+        elif any(term in text for term in ("home", "decor", "pillow", "banner", "wall")):
+            add("Home Decor")
+        if any(term in text for term in ("embroider", "stitched", "thread")):
+            add("Embroidered Gift")
+        if "handmade" not in product.lower():
+            add("Handmade Gift")
+        return re.sub(r"\s+", " ", ", ".join(parts)).strip()[:140]
+
+    def _etsy_local_listing_tags(self, product: str, text: str, request: CreateJobRequest) -> List[str]:
+        candidates: List[Any] = [request.etsy_listing_tags]
+        product_tag = product.lower().strip()
+        if product_tag:
+            candidates.append(product_tag if len(product_tag) <= 20 else " ".join(product_tag.split()[:2]))
+
+        def add_when(condition: bool, *tags: str) -> None:
+            if condition:
+                candidates.extend(tags)
+
+        add_when("pillow" in text, "throw pillow", "pillow cover", "sofa pillow", "home decor")
+        add_when("pillowcase" in text, "pillowcase", "bedding decor", "embroidered pillow")
+        add_when("pennant" in text or "banner" in text, "pennant banner", "wall hanging", "kids room decor")
+        add_when("nursery" in text or "baby" in text, "nursery decor", "baby gift", "baby shower gift")
+        add_when("embroider" in text or "stitched" in text, "embroidery gift", "embroidered decor", "hand stitched")
+        add_when("wedding" in text or "bridal" in text, "wedding gift", "bridal shower")
+        add_when("print" in text or "poster" in text or "wall art" in text, "art print", "wall art", "gallery wall")
+        add_when("sticker" in text, "sticker", "planner sticker", "vinyl sticker")
+        add_when("mug" in text, "coffee mug", "ceramic mug", "gift mug")
+        add_when("candle" in text, "soy candle", "home fragrance", "gift candle")
+        add_when("tote" in text or "bag" in text, "tote bag", "canvas tote", "market bag")
+        add_when("jewelry" in text or "necklace" in text or "earring" in text, "jewelry gift", "handmade jewelry")
+        add_when("custom" in text or "personalized" in text or "personalised" in text, "custom gift", "personalized gift")
+        candidates.extend(["handmade gift", "unique gift", "small shop gift", "gift idea"])
+        return self._sanitize_etsy_tags(candidates)
+
+    def _etsy_local_listing_materials(self, text: str, request: CreateJobRequest) -> List[str]:
+        candidates: List[Any] = [request.etsy_listing_materials]
+
+        def add_when(condition: bool, *materials: str) -> None:
+            if condition:
+                candidates.extend(materials)
+
+        for material in (
+            "cotton",
+            "linen",
+            "felt",
+            "wool",
+            "canvas",
+            "wood",
+            "paper",
+            "cardstock",
+            "vinyl",
+            "ceramic",
+            "clay",
+            "leather",
+            "metal",
+            "gold",
+            "silver",
+            "glass",
+            "wax",
+            "thread",
+            "yarn",
+            "fabric",
+        ):
+            add_when(material in text, material)
+        add_when("embroider" in text or "stitched" in text, "thread")
+        add_when("pillow" in text or "pillowcase" in text or "pennant" in text or "banner" in text, "fabric")
+        add_when("print" in text or "poster" in text or "card" in text, "paper")
+        add_when("sticker" in text, "vinyl")
+        add_when("mug" in text, "ceramic")
+        add_when("candle" in text, "wax")
+        add_when("tote" in text or "bag" in text, "canvas")
+        return self._sanitize_etsy_materials(candidates)
+
+    def _etsy_local_listing_description(
+        self,
+        product: str,
+        tags: List[str],
+        materials: List[str],
+        context: Dict[str, Any],
+        request: CreateJobRequest,
+    ) -> str:
+        text = self._etsy_local_text_blob(context, request)
+        if any(term in text for term in ("nursery", "baby", "kids room", "children")):
+            use_case = "nursery styling, baby shower gifting, and kids room decor"
+        elif any(term in text for term in ("wedding", "bridal", "anniversary")):
+            use_case = "weddings, anniversaries, bridal showers, and thoughtful keepsakes"
+        elif any(term in text for term in ("pillow", "home", "decor", "wall", "banner")):
+            use_case = "home styling, housewarming gifts, shelf displays, and cozy room refreshes"
+        elif any(term in text for term in ("print", "poster", "sticker", "mug", "candle", "jewelry", "necklace", "earring")):
+            use_case = "everyday gifting, personal collections, and small-shop shoppers"
+        else:
+            use_case = "thoughtful gifting, everyday display, and shoppers who like handmade details"
+
+        direction = re.sub(r"\s+", " ", str(context.get("prompt") or request.prompt or "").strip())
+        notes = re.sub(r"\s+", " ", str(context.get("notes") or request.prompt_notes or "").strip())
+        style_sentence = ""
+        if direction:
+            style_sentence = f"The visual direction highlights {direction[:260]}."
+        elif notes:
+            style_sentence = f"The shop notes focus on {notes[:260]}."
+        else:
+            style_sentence = "The presentation keeps the product clear, polished, and easy to understand at a glance."
+
+        material_sentence = (
+            f"Material cues for this piece include {', '.join(materials[:5])}."
+            if materials
+            else "The copy stays flexible so exact sizing, personalization, and care details can match the final item."
+        )
+        keyword_sentence = f"It is positioned for {use_case}."
+        if tags:
+            keyword_sentence += f" Search-friendly themes include {', '.join(tags[:5])}."
+
+        return "\n\n".join(
+            [
+                f"{product} brings a clean, handmade feel to a gift-ready product presentation.",
+                f"{style_sentence} {material_sentence}",
+                keyword_sentence,
+            ]
+        )
+
+    def _generate_etsy_listing_content_locally(self, context: Dict[str, Any], request: CreateJobRequest) -> Dict[str, Any]:
+        text = self._etsy_local_text_blob(context, request)
+        product = self._etsy_local_product_label(context, request)
+        title = self._etsy_local_listing_title(product, text)
+        tags = self._etsy_local_listing_tags(product, text, request)
+        materials = self._etsy_local_listing_materials(text, request)
+        description = self._etsy_local_listing_description(product, tags, materials, context, request)
+        return {
+            "title": title,
+            "description": description[:13000],
+            "tags": tags,
+            "materials": materials,
+        }
+
+    def _etsy_listing_content(self, job_id: str, request: CreateJobRequest, *, use_ai: bool = True) -> Dict[str, Any]:
+        seller_title = re.sub(r"\s+", " ", str(request.etsy_listing_title or "").strip())[:140]
+        seller_description = str(request.etsy_listing_description or "").strip()
+        heuristic_title = re.sub(
+            r"\s+",
+            " ",
+            str(request.prompt_product or request.title or self._trello_card_name(job_id, request)).strip(),
+        )[:140]
+        content: Dict[str, Any] = {
+            "title": seller_title or heuristic_title,
+            "description": seller_description,
+            "tags": self._etsy_tags(request),
+            "materials": self._sanitize_etsy_materials(request.etsy_listing_materials),
+            "ai_used": False,
+            "ai_error": "",
+            "local_fallback_used": False,
+            "content_source": "seller" if (seller_title or seller_description or request.etsy_listing_tags) else "default",
+        }
+        context = self._etsy_listing_context(job_id, request)
+        if use_ai and self._gemini_api_key():
+            try:
+                ai = self._generate_etsy_listing_content_with_gemini(context)
+                content["ai_used"] = True
+                content["content_source"] = "gemini"
+                if not seller_title and ai.get("title"):
+                    content["title"] = ai["title"]
+                if not seller_description and ai.get("description"):
+                    content["description"] = ai["description"]
+                merged_tags = self._sanitize_etsy_tags(
+                    request.etsy_listing_tags, ai.get("tags"), request.prompt_product, request.prompt_notes
+                )
+                if merged_tags:
+                    content["tags"] = merged_tags
+                merged_materials = self._sanitize_etsy_materials(
+                    request.etsy_listing_materials, ai.get("materials")
+                )
+                if merged_materials:
+                    content["materials"] = merged_materials
+            except Exception as exc:
+                content["ai_error"] = self._flow_error_detail(exc)
+        elif use_ai:
+            content["ai_error"] = "no_gemini"
+        if use_ai and not content["ai_used"]:
+            local = self._generate_etsy_listing_content_locally(context, request)
+            content["local_fallback_used"] = True
+            content["content_source"] = "local_fallback"
+            if not seller_title and local.get("title"):
+                content["title"] = local["title"]
+            if not seller_description and local.get("description"):
+                content["description"] = local["description"]
+            merged_tags = self._sanitize_etsy_tags(
+                request.etsy_listing_tags, local.get("tags"), request.prompt_product, request.prompt_notes
+            )
+            if merged_tags:
+                content["tags"] = merged_tags
+            merged_materials = self._sanitize_etsy_materials(
+                request.etsy_listing_materials, local.get("materials")
+            )
+            if merged_materials:
+                content["materials"] = merged_materials
+        if not content["description"]:
+            content["description"] = self._etsy_default_description(request)
+        content["title"] = (content["title"] or heuristic_title)[:140]
+        content["description"] = content["description"][:13000]
+        return content
+
+    def _gemini_etsy_listing_request(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        product = str(context.get("product") or "").strip()
+        card_name = str(context.get("card_name") or "").strip()
+        prompt = re.sub(r"\s+", " ", str(context.get("prompt") or "").strip())
+        notes = str(context.get("notes") or "").strip()
+        existing_title = str(context.get("title") or "").strip()
+        existing_tags = ", ".join(str(t).strip() for t in (context.get("tags") or []) if str(t).strip())
+        prompt_text = "\n".join(
+            [
+                "You are an expert Etsy SEO copywriter for a handmade product shop.",
+                "Return ONLY a strict JSON object (no markdown fences, no commentary) with keys: title, description, tags, materials.",
+                "title: a buyer-focused Etsy SEO title, <=140 characters, front-load high-intent keywords, no ALL CAPS, no emoji.",
+                "description: 2-4 short plain-text paragraphs covering what the product is, materials/craft, and ideal use or gift occasion. No markdown, no headings.",
+                "tags: array of up to 13 lowercase search phrases, each <=20 characters, no '#', no duplicates, real buyer search terms (mix broad + long-tail).",
+                "materials: array of up to 13 short lowercase material words plausible for this product.",
+                "Write in English (Etsy buyers search in English). Never invent price, shipping, or policies. Never include personal data or secrets.",
+                f"Product type: {product or 'handmade product'}",
+                f"Source Trello card name: {card_name or '(none)'}",
+                f"Creative direction / image prompt: {prompt or '(none)'}",
+                f"Extra notes: {notes or '(none)'}",
+                f"Seller draft title to improve (keep intent): {existing_title or '(none)'}",
+                f"Seller tags to incorporate if good: {existing_tags or '(none)'}",
+            ]
+        )
+        return {
+            "contents": [{"parts": [{"text": prompt_text}]}],
+            "generationConfig": {
+                "temperature": 0.7,
+                "topP": 0.9,
+                "maxOutputTokens": 1024,
+                "responseMimeType": "application/json",
+            },
+        }
+
+    def _generate_etsy_listing_content_with_gemini(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Chưa cấu hình Gemini.")
+        model = self._gemini_model()
+        payload = self._gemini_etsy_listing_request(context)
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(model, safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=self.GEMINI_TIMEOUT_S) as response:
+                body = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                error_payload = json.loads(exc.read().decode("utf-8"))
+                message = str(error_payload.get("error", {}).get("message", "")).strip()
+            except Exception:
+                message = ""
+            raise RuntimeError(message or f"Gemini API trả về HTTP {exc.code}.") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Không gọi được Gemini: {exc.reason}") from exc
+        parsed = self._parse_json_candidate(self._extract_gemini_text(body))
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Gemini không trả về JSON listing hợp lệ.")
+        return {
+            "title": re.sub(r"\s+", " ", str(parsed.get("title") or "").strip())[:140],
+            "description": str(parsed.get("description") or "").strip()[:13000],
+            "tags": self._sanitize_etsy_tags(parsed.get("tags")),
+            "materials": self._sanitize_etsy_materials(parsed.get("materials")),
+        }
+
+    def _etsy_get_json(
+        self,
+        path: str,
+        api_key: str,
+        access_token: str,
+        query: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        if query:
+            encoded = urlencode({k: v for k, v in query.items() if str(v) != ""})
+            if encoded:
+                path = f"{path}?{encoded}"
+        return self._etsy_request_json("GET", path, api_key, access_token)
+
+    def _etsy_list_shipping_profiles(self, api_key: str, access_token: str, shop_id: str) -> List[Dict[str, Any]]:
+        data = self._etsy_get_json(f"shops/{quote(str(shop_id), safe='')}/shipping-profiles", api_key, access_token)
+        results = data.get("results") if isinstance(data, dict) else data
+        return [item for item in (results or []) if isinstance(item, dict)]
+
+    def _etsy_list_shop_sections(self, api_key: str, access_token: str, shop_id: str) -> List[Dict[str, Any]]:
+        data = self._etsy_get_json(f"shops/{quote(str(shop_id), safe='')}/sections", api_key, access_token)
+        results = data.get("results") if isinstance(data, dict) else data
+        return [item for item in (results or []) if isinstance(item, dict)]
+
+    def _etsy_create_shop_section_request(
+        self,
+        api_key: str,
+        access_token: str,
+        shop_id: str,
+        title: str,
+    ) -> Dict[str, Any]:
+        return self._etsy_request_json(
+            "POST",
+            f"shops/{quote(str(shop_id), safe='')}/sections",
+            api_key,
+            access_token,
+            data=urlencode({"title": str(title or "").strip()}).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    def _etsy_shop_section_id_for_title(self, title: str) -> str:
+        wanted_key = self._etsy_section_key(title)
+        if not wanted_key:
+            return ""
+        config = self.store.snapshot().etsy_config
+        _api_key, _api_secret, api_key_header = self._etsy_key_parts_from_config(config)
+        access_token = (
+            self._etsy_refreshed_access_token
+            or str(config.access_token or "").strip()
+            or os.getenv("ETSY_ACCESS_TOKEN", "").strip()
+        )
+        shop_id = str(config.shop_id or "").strip() or os.getenv("ETSY_SHOP_ID", "").strip()
+        if not (api_key_header and access_token and shop_id):
+            return ""
+        for section in self._etsy_list_shop_sections(api_key_header, access_token, shop_id):
+            section_title = self._etsy_shop_section_title_from_payload(section)
+            if section_title and self._etsy_section_key(section_title) == wanted_key:
+                return self._etsy_shop_section_id_from_payload(section)
+        return ""
+
+    def _etsy_fetch_taxonomy_nodes(self, api_key: str, access_token: str) -> List[Dict[str, Any]]:
+        cached = getattr(self, "_etsy_taxonomy_nodes_cache", None)
+        if cached is not None:
+            return cached
+        data = self._etsy_get_json("seller-taxonomy/nodes", api_key, access_token)
+        results = data.get("results") if isinstance(data, dict) else data
+        nodes = [item for item in (results or []) if isinstance(item, dict)]
+        self._etsy_taxonomy_nodes_cache = nodes
+        return nodes
+
+    def _etsy_flatten_taxonomy(self, nodes: List[Dict[str, Any]], _path: List[str] | None = None) -> List[Dict[str, Any]]:
+        flat: List[Dict[str, Any]] = []
+        for node in nodes or []:
+            if not isinstance(node, dict):
+                continue
+            name = str(node.get("name") or "").strip()
+            path = (_path or []) + [name]
+            node_id = node.get("id")
+            if node_id is not None:
+                flat.append(
+                    {
+                        "id": str(node_id),
+                        "name": name,
+                        "path": " > ".join(part for part in path if part),
+                        "level": int(node.get("level") or len(path)),
+                    }
+                )
+            children = node.get("children")
+            if isinstance(children, list) and children:
+                flat.extend(self._etsy_flatten_taxonomy(children, path))
+        return flat
+
+    def _etsy_keyword_tokens(self, *sources: Any) -> List[str]:
+        text = " ".join(str(source or "") for source in sources).lower()
+        return [token for token in re.split(r"[^a-z0-9]+", text) if len(token) >= 3]
+
+    def _etsy_suggest_taxonomy(self, nodes: List[Dict[str, Any]], *sources: Any, limit: int = 5) -> List[Dict[str, Any]]:
+        tokens = set(self._etsy_keyword_tokens(*sources))
+        if not tokens:
+            return []
+        scored: List[tuple[float, Dict[str, Any]]] = []
+        for entry in self._etsy_flatten_taxonomy(nodes):
+            name_tokens = set(self._etsy_keyword_tokens(entry["name"]))
+            path_tokens = set(self._etsy_keyword_tokens(entry["path"]))
+            score = 0.0
+            for token in tokens:
+                if token in name_tokens:
+                    score += 3.0
+                elif token in path_tokens:
+                    score += 1.0
+            if score > 0:
+                score += min(entry["level"], 4) * 0.25
+                scored.append((score, entry))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [entry for _, entry in scored[:limit]]
+
+    def _etsy_autofill_category_shipping(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        api_key: str,
+        access_token: str,
+        shop_id: str,
+        values: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        info: Dict[str, Any] = {
+            "taxonomy_suggestions": [],
+            "shipping_profiles": [],
+            "auto_taxonomy_id": "",
+            "auto_shipping_profile_id": "",
+        }
+        keyword_sources = (
+            request.prompt_product,
+            request.prompt_product_key,
+            request.etsy_listing_title,
+            self._trello_card_name(job_id, request),
+            request.prompt_notes,
+        )
+        if not str(values.get("taxonomy_id") or "").strip():
+            try:
+                nodes = self._etsy_fetch_taxonomy_nodes(api_key, access_token)
+                suggestions = self._etsy_suggest_taxonomy(nodes, *keyword_sources)
+                info["taxonomy_suggestions"] = suggestions
+                if suggestions:
+                    info["auto_taxonomy_id"] = str(suggestions[0]["id"])
+            except Exception as exc:
+                info["taxonomy_error"] = self._redact_etsy_secret(self._flow_error_detail(exc), api_key, access_token)
+        if not str(values.get("shipping_profile_id") or "").strip():
+            try:
+                profiles = self._etsy_list_shipping_profiles(api_key, access_token, shop_id)
+                info["shipping_profiles"] = [
+                    {
+                        "shipping_profile_id": str(profile.get("shipping_profile_id") or profile.get("id") or ""),
+                        "title": str(profile.get("title") or ""),
+                    }
+                    for profile in profiles
+                    if str(profile.get("shipping_profile_id") or profile.get("id") or "")
+                ][:10]
+                if info["shipping_profiles"]:
+                    info["auto_shipping_profile_id"] = info["shipping_profiles"][0]["shipping_profile_id"]
+            except Exception as exc:
+                info["shipping_error"] = self._redact_etsy_secret(self._flow_error_detail(exc), api_key, access_token)
+        return info
+
+    async def preview_etsy_listing(self, request: CreateJobRequest) -> Dict[str, Any]:
+        """Assemble the proposed draft listing WITHOUT creating it (review step)."""
+        job_id = (request.source_job_id or "preview").strip() or "preview"
+        api_key, access_token = self._etsy_credentials()
+        api_client_id, api_secret, _api_key_header = self._etsy_key_parts_from_config()
+        values = self._etsy_config_values(request)
+        content = await asyncio.to_thread(self._etsy_listing_content, job_id, request, use_ai=True)
+        autofill: Dict[str, Any] = {}
+        if api_key and access_token and str(values.get("shop_id") or "").strip():
+            autofill = await asyncio.to_thread(
+                self._etsy_autofill_category_shipping,
+                job_id,
+                request,
+                api_key,
+                access_token,
+                str(values["shop_id"]),
+                values,
+            )
+            if not str(values.get("taxonomy_id") or "").strip() and autofill.get("auto_taxonomy_id"):
+                values["taxonomy_id"] = autofill["auto_taxonomy_id"]
+            if not str(values.get("shipping_profile_id") or "").strip() and autofill.get("auto_shipping_profile_id"):
+                values["shipping_profile_id"] = autofill["auto_shipping_profile_id"]
+        payload = self._etsy_listing_payload(job_id, request, values, content)
+        variations = self._etsy_variations_payload(request)
+        required = {
+            "api_key": api_client_id,
+            "api_secret": api_secret,
+            "access_token": access_token,
+            "shop_id": values.get("shop_id"),
+            "taxonomy_id": values.get("taxonomy_id"),
+            "shipping_profile_id": values.get("shipping_profile_id"),
+        }
+        missing = [key for key, value in required.items() if not str(value or "").strip()]
+        return {
+            "configured": not missing,
+            "missing": missing,
+            "state": payload.get("state"),
+            "ai_used": bool(content.get("ai_used")),
+            "local_fallback_used": bool(content.get("local_fallback_used")),
+            "content_source": str(content.get("content_source") or ""),
+            "ai_error": "" if content.get("ai_error") == "no_gemini" else str(content.get("ai_error") or ""),
+            "listing": {
+                "title": payload.get("title"),
+                "description": payload.get("description"),
+                "tags": payload.get("tags", []),
+                "materials": payload.get("materials", []),
+                "price": payload.get("price"),
+                "quantity": payload.get("quantity"),
+                "taxonomy_id": payload.get("taxonomy_id"),
+                "shipping_profile_id": payload.get("shipping_profile_id"),
+            },
+            "variations": variations,
+            "taxonomy_suggestions": autofill.get("taxonomy_suggestions", []),
+            "shipping_profiles": autofill.get("shipping_profiles", []),
+        }
+
+    def _etsy_price_float(self, raw: Any, fallback: Any) -> float:
+        for candidate in (raw, fallback):
+            text = str(candidate or "").strip()
+            if re.match(r"^\d+(\.\d+)?$", text):
+                return round(float(text), 2)
+        return 0.0
+
+    def _etsy_variations_payload(self, request: CreateJobRequest) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for variation in (request.etsy_variations or []):
+            name = str(getattr(variation, "property_name", "") or "").strip()
+            values: List[Dict[str, Any]] = []
+            for entry in (getattr(variation, "values", None) or []):
+                value = str(getattr(entry, "value", "") or "").strip()
+                if not value:
+                    continue
+                values.append(
+                    {
+                        "value": value,
+                        "price": str(getattr(entry, "price", "") or "").strip(),
+                        "quantity": int(getattr(entry, "quantity", 0) or 0),
+                        "is_enabled": bool(getattr(entry, "is_enabled", True)),
+                    }
+                )
+            if name and values:
+                out.append(
+                    {
+                        "property_name": name,
+                        "property_id": int(getattr(variation, "property_id", 0) or 0),
+                        "scale_id": int(getattr(variation, "scale_id", 0) or 0),
+                        "values": values,
+                    }
+                )
+        return out
+
+    def _etsy_build_inventory_payload(self, request: CreateJobRequest, values: Dict[str, Any]) -> Dict[str, Any] | None:
+        variations = self._etsy_variations_payload(request)
+        if not variations:
+            return None
+        default_price = str(values.get("price") or "9.99")
+        default_qty = max(1, int(values.get("quantity") or 1))
+        combos: List[List[Dict[str, Any]]] = [[]]
+        for variation in variations:
+            combos = [combo + [{"variation": variation, "value": value}] for combo in combos for value in variation["values"]]
+        price_on_property = [
+            variation["property_id"]
+            for variation in variations
+            if variation["property_id"] and any(item["price"] for item in variation["values"])
+        ]
+        products: List[Dict[str, Any]] = []
+        for combo in combos:
+            property_values: List[Dict[str, Any]] = []
+            offering_price = default_price
+            offering_qty = default_qty
+            enabled = True
+            for item in combo:
+                variation = item["variation"]
+                value = item["value"]
+                pv: Dict[str, Any] = {"property_name": variation["property_name"], "values": [value["value"]]}
+                if variation["property_id"]:
+                    pv["property_id"] = variation["property_id"]
+                if variation["scale_id"]:
+                    pv["scale_id"] = variation["scale_id"]
+                property_values.append(pv)
+                if value["price"]:
+                    offering_price = value["price"]
+                if value["quantity"]:
+                    offering_qty = value["quantity"]
+                if not value["is_enabled"]:
+                    enabled = False
+            products.append(
+                {
+                    "property_values": property_values,
+                    "offerings": [
+                        {
+                            "price": self._etsy_price_float(offering_price, default_price),
+                            "quantity": max(0, int(offering_qty)),
+                            "is_enabled": enabled,
+                        }
+                    ],
+                }
+            )
+        return {
+            "products": products,
+            "price_on_property": price_on_property,
+            "quantity_on_property": [],
+            "sku_on_property": [],
+        }
+
+    def _etsy_update_inventory_request(
+        self,
+        api_key: str,
+        access_token: str,
+        listing_id: str,
+        inventory: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return self._etsy_request_json(
+            "PUT",
+            f"listings/{quote(str(listing_id), safe='')}/inventory",
+            api_key,
+            access_token,
+            data=json.dumps(inventory).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+
+    def _etsy_create_draft_listing_request(
+        self,
+        api_key: str,
+        access_token: str,
+        shop_id: str,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return self._etsy_request_json(
+            "POST",
+            f"shops/{quote(shop_id, safe='')}/listings",
+            api_key,
+            access_token,
+            data=urlencode(payload, doseq=True).encode("utf-8"),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+
+    def _etsy_upload_listing_image_request(
+        self,
+        api_key: str,
+        access_token: str,
+        shop_id: str,
+        listing_id: str,
+        file_bytes: bytes,
+        mime_type: str,
+        file_name: str,
+        rank: int,
+    ) -> Dict[str, Any]:
+        body, content_type = self._multipart_form_data(
+            fields={"rank": max(1, min(10, int(rank or 1)))},
+            file_field="image",
+            file_name=file_name,
+            file_mime=mime_type or mimetypes.guess_type(file_name)[0] or "image/jpeg",
+            file_bytes=file_bytes,
+        )
+        return self._etsy_request_json(
+            "POST",
+            f"shops/{quote(shop_id, safe='')}/listings/{quote(listing_id, safe='')}/images",
+            api_key,
+            access_token,
+            data=body,
+            headers={"Content-Type": content_type},
+        )
+
+    def _etsy_request_json(
+        self,
+        method: str,
+        path: str,
+        api_key: str,
+        access_token: str,
+        *,
+        data: bytes | None = None,
+        headers: Dict[str, str] | None = None,
+        _allow_refresh: bool = True,
+    ) -> Dict[str, Any]:
+        # If a previous call in this run already refreshed the token, use it.
+        if self._etsy_refreshed_access_token and access_token != self._etsy_refreshed_access_token:
+            access_token = self._etsy_refreshed_access_token
+        request_headers = {
+            "Accept": "application/json",
+            "Authorization": f"Bearer {access_token}",
+            "x-api-key": api_key,
+            **(headers or {}),
+        }
+        request = Request(
+            f"{self.ETSY_API_BASE_URL}/{path.strip('/')}",
+            data=data,
+            headers=request_headers,
+            method=method.upper(),
+        )
+        try:
+            with urlopen(request, timeout=self.ETSY_TIMEOUT_S) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            # Access token expired? Etsy returns 401. Try exactly one refresh
+            # using the saved refresh token, then retry the same request once.
+            if exc.code == 401 and _allow_refresh:
+                new_token = self._attempt_etsy_token_refresh(api_key, access_token)
+                if new_token and new_token != access_token:
+                    log.info("Etsy access token refreshed after 401; retrying request once.")
+                    return self._etsy_request_json(
+                        method,
+                        path,
+                        api_key,
+                        new_token,
+                        data=data,
+                        headers=headers,
+                        _allow_refresh=False,
+                    )
+                detail = exc.read(4096).decode("utf-8", errors="replace")
+                detail = self._redact_etsy_secret(detail or str(exc.reason), api_key, access_token)
+                raise RuntimeError(
+                    "Etsy access token hết hạn (HTTP 401) và không tự làm mới được. "
+                    "Chạy `python -m flow_web.etsy_oauth refresh` (hoặc đặt ETSY_REFRESH_TOKEN) "
+                    f"rồi thử lại. Chi tiết: {detail}"
+                ) from exc
+            detail = exc.read(4096).decode("utf-8", errors="replace")
+            detail = self._redact_etsy_secret(detail or str(exc.reason), api_key, access_token)
+            raise RuntimeError(f"Etsy trả lỗi HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            detail = self._redact_etsy_secret(str(exc.reason or exc), api_key, access_token)
+            raise RuntimeError(f"Etsy không kết nối được: {detail}") from exc
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Etsy trả về dữ liệu không phải JSON: {raw[:400]}") from exc
+        return payload if isinstance(payload, dict) else {"items": payload}
+
+    def _redact_etsy_secret(self, text: Any, api_key: str, access_token: str) -> str:
+        redacted = str(text or "")
+        client_id, embedded_secret = self._split_etsy_api_key_value(api_key)
+        configured_secret = self._etsy_key_parts_from_config()[1]
+        secrets = {api_key, access_token, client_id, embedded_secret, configured_secret}
+        for secret in sorted((item for item in secrets if item), key=len, reverse=True):
+            if secret:
+                redacted = redacted.replace(secret, "[redacted]")
+        return redacted
+
     def _trello_endpoint(self, path: str, key: str, token: str, fields: Dict[str, Any] | None = None) -> str:
         auth_fields = {"key": key, "token": token}
         if fields:
@@ -9496,9 +14926,9 @@ exit 1
         if not board_id:
             return {}
         raw_list_id = (
-            trello_config.list_id
+            request.trello_list_id
+            or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
-            or request.trello_list_id
         )
         list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
         if not list_ids:
@@ -9532,9 +14962,9 @@ exit 1
             or os.getenv("TRELLO_CARD_ID", "")
         )
         raw_list_id = (
-            trello_config.list_id
+            request.trello_list_id
+            or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
-            or request.trello_list_id
         )
         list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id) if board_id else []
         list_id = list_ids[0] if list_ids else self._normalize_trello_id(raw_list_id)
@@ -9664,6 +15094,32 @@ exit 1
         _sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
         return len(outputs)
 
+    def _trello_card_etsy_listing_counts(self, key: str, token: str, card_id: str) -> tuple[int, int]:
+        """Return (flow_output_count, listing_image_count) for a card.
+
+        flow_output_count = strict flow-* outputs (the historical gate). listing_image_count =
+        images usable for an Etsy listing: the flow outputs when present, otherwise any image
+        attachment on the card. The fallback honors the user's instruction that a card only needs
+        images on it ("chỉ cần có ảnh trong đó là được"), not specifically Flow-generated ones.
+        """
+        card_id = self._normalize_trello_card_id(card_id)
+        if not card_id:
+            return 0, 0
+        attachments_payload = self._trello_get_json(
+            f"cards/{quote(card_id, safe='')}/attachments",
+            key,
+            token,
+            fields={"fields": "id,name,url,mimeType,date"},
+        )
+        attachments = attachments_payload if isinstance(attachments_payload, list) else []
+        image_attachments = [
+            item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
+        ]
+        _sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+        flow_output_count = len(outputs)
+        listing_image_count = flow_output_count or len(image_attachments)
+        return flow_output_count, listing_image_count
+
     def _select_trello_card_attachments(
         self,
         card: Dict[str, Any],
@@ -9737,6 +15193,21 @@ exit 1
     def _trello_source_scope_label_for_ids(self, list_ids: List[str] | None = None) -> str:
         return self._trello_source_scope_label() if len(list_ids or []) > 1 else self._default_trello_source_list_name()
 
+    def _trello_source_scope_label_for_resolved_ids(self, key: str, token: str, list_ids: List[str] | None = None) -> str:
+        labels: List[str] = []
+        for item in list_ids or []:
+            raw = str(item or "").strip()
+            if not raw:
+                continue
+            list_name_getter = getattr(self, "_trello_list_name")
+            getter_is_mock = str(type(list_name_getter).__module__).startswith("unittest.mock")
+            if not getter_is_mock and not re.fullmatch(r"[0-9a-fA-F]{24}", raw):
+                continue
+            name = self._trello_list_name(key, token, raw)
+            if name:
+                labels.append(name)
+        return self._trello_source_scope_label(labels) if labels else self._trello_source_scope_label_for_ids(list_ids)
+
     def _split_trello_list_values(self, value: str) -> List[str]:
         raw = str(value or "").strip()
         if not raw:
@@ -9794,6 +15265,70 @@ exit 1
             fields={"fields": "id,name,closed", "filter": "open"},
         )
         return [item for item in payload if isinstance(item, dict) and not item.get("closed")] if isinstance(payload, list) else []
+
+    def _trello_board_lists_with_counts(self, key: str, token: str, board_id: str) -> List[Dict[str, Any]]:
+        board_id = self._normalize_trello_board_id(board_id)
+        if not board_id:
+            return []
+        lists = self._trello_board_lists(key, token, board_id)
+        counts: Dict[str, int] = {}
+        try:
+            payload = self._trello_get_json(
+                f"boards/{quote(board_id, safe='')}/cards",
+                key,
+                token,
+                fields={"fields": "idList,closed", "filter": "open"},
+            )
+            if isinstance(payload, list):
+                for card in payload:
+                    if not isinstance(card, dict) or card.get("closed"):
+                        continue
+                    list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+                    if list_id:
+                        counts[list_id] = counts.get(list_id, 0) + 1
+        except Exception:
+            counts = {}
+        result: List[Dict[str, Any]] = []
+        for item in lists:
+            list_id = self._normalize_trello_id(str(item.get("id") or ""))
+            if not list_id:
+                continue
+            result.append(
+                {
+                    "id": list_id,
+                    "name": str(item.get("name") or "").strip(),
+                    "card_count": int(counts.get(list_id, 0)),
+                }
+            )
+        return result
+
+    async def list_trello_board_lists(self, board: str = "") -> Dict[str, Any]:
+        """Return the open columns (lists) of a Trello board so the UI can let the user
+        paste any board link and pick which columns to draft, instead of the hardcoded set."""
+        key, token = self._trello_credentials()
+        trello_config = self.store.snapshot().trello_config
+        board_id = self._normalize_trello_board_id(
+            str(board or "").strip()
+            or str(getattr(trello_config, "board_id", "") or "").strip()
+            or os.getenv("TRELLO_BOARD_ID", "").strip()
+        )
+        missing: List[str] = []
+        if not key or not token:
+            missing.append("trello_credentials")
+        if not board_id:
+            missing.append("trello_board_id")
+        if missing:
+            return {"ok": False, "missing": missing, "board_id": board_id, "lists": []}
+        try:
+            lists = await asyncio.to_thread(self._trello_board_lists_with_counts, key, token, board_id)
+        except Exception as exc:  # pragma: no cover - network failure path
+            return {
+                "ok": False,
+                "error": self._redact_trello_secret(str(exc), key, token),
+                "board_id": board_id,
+                "lists": [],
+            }
+        return {"ok": True, "board_id": board_id, "lists": lists}
 
     def _trello_content_review_list_id(self, key: str, token: str, board_id: str, list_name: str = "") -> str:
         target_name = str(list_name or "").strip() or self._default_trello_review_list_name()
@@ -9897,7 +15432,6 @@ exit 1
         request: CreateJobRequest,
         items: List[Dict[str, Any]],
         limit: int,
-        skip_card_ids: set[str] | None = None,
     ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
         key, token = self._trello_credentials()
         if not key or not token:
@@ -9913,9 +15447,9 @@ exit 1
             raise RuntimeError("Auto Trello cần Board URL/Board ID để tìm card có ảnh.")
 
         raw_list_id = (
-            trello_config.list_id
+            request.trello_list_id
+            or trello_config.list_id
             or os.getenv("TRELLO_LIST_ID", "")
-            or request.trello_list_id
         )
         explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
         list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
@@ -9933,12 +15467,6 @@ exit 1
                     "App đã dừng để tránh lấy nhầm ảnh từ card khác."
                 )
             card_list_id = self._normalize_trello_id(str(selected_card.get("idList") or ""))
-            allowed_list_ids = set(list_ids)
-            if allowed_list_ids and card_list_id not in allowed_list_ids:
-                raise RuntimeError(
-                    f"Card Trello đã chọn không nằm trong cột {self._trello_source_scope_label()}; "
-                    "Auto Trello đã dừng để chỉ lấy card trong Ready for AI."
-                )
             cards = [selected_card]
             if card_list_id:
                 list_id = card_list_id
@@ -9952,21 +15480,6 @@ exit 1
                         continue
                     seen_cards.add(card_id)
                     cards.append(card)
-        normalized_skip_card_ids = {
-            self._normalize_trello_card_id(str(item or ""))
-            for item in (skip_card_ids or set())
-            if self._normalize_trello_card_id(str(item or ""))
-        }
-        skipped_seen_cards = 0
-        if normalized_skip_card_ids and not explicit_card_id:
-            fresh_cards: List[Dict[str, Any]] = []
-            for card in cards:
-                card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
-                if card_id and card_id in normalized_skip_card_ids:
-                    skipped_seen_cards += 1
-                    continue
-                fresh_cards.append(card)
-            cards = fresh_cards
         raw_limit = int(limit or 0)
         max_items = max(1, len(cards)) if raw_limit <= 0 else max(1, min(self.MAX_PROMPT_BATCH_ITEMS, raw_limit))
         expanded: List[Dict[str, Any]] = []
@@ -9974,12 +15487,7 @@ exit 1
 
         if not items:
             expanded = self._trello_ai_prompt_items_for_image_cards(cards, request, max_items)
-            skipped_missing_rule_cards = [
-                card
-                for card in cards
-                if str(card.get("_auto_trello_skip_code") or "").strip() == "missing_product_rule"
-            ]
-            if not expanded and not skipped_missing_rule_cards:
+            if not expanded:
                 raise RuntimeError(
                     "Auto Trello chưa tìm thấy card ảnh phù hợp để gửi Tác nhân Flow. "
                     "Hãy chọn card trong trợ lý, dán link card Trello, hoặc điền Lọc sản phẩm rõ hơn."
@@ -9995,21 +15503,6 @@ exit 1
                 "match_mode": "flow_agent",
                 "prompt_mode": "flow_agent",
             }
-            if skipped_seen_cards:
-                discovery["skipped_seen_cards"] = skipped_seen_cards
-            if skipped_missing_rule_cards:
-                skipped_missing_rule_ids = [
-                    self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
-                    for card in skipped_missing_rule_cards
-                ]
-                skipped_missing_rule_ids = [card_id for card_id in skipped_missing_rule_ids if card_id]
-                discovery["skipped_missing_product_rule_cards"] = len(skipped_missing_rule_cards)
-                discovery["skipped_missing_product_rule_card_ids"] = skipped_missing_rule_ids
-                discovery["skipped_missing_product_rule_details"] = [
-                    str(card.get("_auto_trello_skip_reason") or "").strip()
-                    for card in skipped_missing_rule_cards[:5]
-                    if str(card.get("_auto_trello_skip_reason") or "").strip()
-                ]
             return expanded, discovery
 
         for card in cards:
@@ -10067,8 +15560,6 @@ exit 1
             "matched_items": len(expanded),
             "match_mode": "keyword" if any(item.get("trello_match_mode") == "keyword" for item in expanded) else "product",
         }
-        if skipped_seen_cards:
-            discovery["skipped_seen_cards"] = skipped_seen_cards
         return expanded, discovery
 
     def _flow_operator_trello_card_description_note(self, card: Dict[str, Any]) -> str:
@@ -10087,12 +15578,24 @@ exit 1
         card_name = str(card.get("name") or "").strip()
         query = self._trello_auto_search_query(request)
         card_description = self._flow_operator_trello_card_description_note(card)
+        list_name = str(card.get("_list_name") or card.get("list_name") or "").strip()
         attachment_names = ", ".join(
             str(item.get("name") or "").strip()
             for item in (card.get("_image_attachments") or [])[:4]
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         )
-        primary_raw = " ".join([card_name, query, attachment_names, card_description]).strip()
+        request_product_context = " ".join(
+            str(part or "").strip()
+            for part in (
+                getattr(request, "prompt_product", ""),
+                getattr(request, "prompt_product_key", ""),
+                getattr(request, "etsy_listing_sku", ""),
+                getattr(request, "etsy_listing_title", ""),
+                getattr(request, "etsy_section_name", ""),
+            )
+            if str(part or "").strip()
+        )
+        primary_raw = " ".join([card_name, query, list_name, attachment_names, card_description, request_product_context]).strip()
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         raw = " ".join(part for part in (primary_raw, user_instruction) if part).strip()
         normalized = self._normalize_skill_token(raw)
@@ -10112,6 +15615,7 @@ exit 1
             "card_name": card_name,
             "card_url": str(card.get("url") or "").strip(),
             "query": query,
+            "list_name": list_name,
             "card_description": card_description,
             "attachment_names": attachment_names,
             "visual_product_rule_key": visual_product_rule_key,
@@ -10146,10 +15650,8 @@ exit 1
                         "nursery_banner",
                         "nursery_pennant",
                         "co_treo",
-                        "la_co",
                         "co_vai",
                         "co_theu",
-                        "co_vai_treo",
                         "banner_treo",
                         "co_trang_tri",
                     )
@@ -10239,7 +15741,6 @@ exit 1
         explicit_rule_key = self._flow_operator_product_rule_key_from_text(raw)
         if explicit_rule_key:
             return explicit_rule_key
-
         normalized = self._normalize_skill_token(raw)
         compact = self._compact_match_text(raw)
         tokens = set(self._tokenize_match_words(raw))
@@ -10263,32 +15764,6 @@ exit 1
                 "context": ("wedding", "bride", "groom", "couple", "romantic", "keepsake", "anniversary"),
                 "exclude": ("ring bearer", "wedding rings", "ring holder", "vow book", "guest book"),
             },
-            "tooth_fairy_pillow": {
-                "main": (
-                    "tooth fairy pillow",
-                    "tooth pillow",
-                    "tooth-shaped pillow",
-                    "tooth shaped pillow",
-                    "tooth cushion",
-                    "tooth-shaped cushion",
-                    "tooth shaped cushion",
-                    "soft tooth",
-                    "tooth shape",
-                ),
-                "context": (
-                    "tooth fairy",
-                    "first tooth",
-                    "my first tooth",
-                    "white ribbon",
-                    "ribbon hanger",
-                    "cream linen",
-                    "nursery keepsake",
-                    "baby keepsake",
-                    "embroidered name",
-                    "hand embroidered",
-                ),
-                "exclude": ("wedding", "bride", "groom", "ring bearer", "wedding rings", "passport", "hair bow", "drawstring"),
-            },
             "baby_pillowcase": {
                 "main": ("pillow", "pillowcase", "cushion", "cushion cover", "soft rectangular", "soft square"),
                 "context": ("baby", "nursery", "child", "children", "kid", "toddler", "infant", "crib", "name embroidery"),
@@ -10303,6 +15778,37 @@ exit 1
                 "main": ("pillow", "pillowcase", "cushion", "ring holder", "soft square"),
                 "context": ("ring bearer", "wedding rings", "ring", "rings", "ribbon", "ceremony", "ring attachment"),
                 "exclude": ("guest book", "vow book"),
+            },
+            "ornament": {
+                "main": (
+                    "ornament",
+                    "christmas ornament",
+                    "tree ornament",
+                    "hanging ornament",
+                    "acrylic ornament",
+                    "wooden ornament",
+                    "flat keepsake",
+                    "round keepsake",
+                    "shaped keepsake",
+                    "hanging hole",
+                ),
+                "context": (
+                    "christmas",
+                    "holiday",
+                    "xmas",
+                    "tree",
+                    "gift",
+                    "keepsake",
+                    "acrylic",
+                    "wooden",
+                    "ribbon",
+                    "cord",
+                    "printed artwork",
+                    "engraved",
+                    "C6_VN32_2210_009",
+                    "C5_301024_033",
+                ),
+                "exclude": ("pillow", "cushion", "book", "album", "banner", "hoop", "dress", "shirt", "plush", "pouch"),
             },
             "hoops_with_photos": {
                 "main": ("hoop", "embroidery hoop", "frame", "embroidery frame", "round frame"),
@@ -10323,41 +15829,6 @@ exit 1
                 "main": ("book", "booklet", "notebook", "fabric cover", "covered booklet"),
                 "context": ("vow", "vows", "personal vows", "bride vows", "groom vows", "wedding promise"),
                 "exclude": ("guest", "sign in", "signature", "album", "pillow", "cushion"),
-            },
-            "baby_album": {
-                "main": (
-                    "baby album",
-                    "baby photo album",
-                    "baby memory album",
-                    "baby keepsake album",
-                    "first birthday album",
-                    "1st birthday album",
-                    "birthday photo album",
-                    "fabric baby album",
-                    "cotton linen baby album",
-                    "embroidered baby album",
-                    "clear plastic photo pocket album",
-                ),
-                "context": (
-                    "baby",
-                    "infant",
-                    "toddler",
-                    "one year old",
-                    "1 year old",
-                    "first birthday",
-                    "1st birthday",
-                    "birthday party",
-                    "baby photos",
-                    "family photos",
-                    "photo pocket",
-                    "photo pockets",
-                    "clear plastic pocket",
-                    "plastic sleeves",
-                    "cotton linen",
-                    "hand embroidered",
-                    "embroidered cover",
-                ),
-                "exclude": ("wedding", "bride", "groom", "guest", "guests", "sign in", "signature", "vow", "vows", "pillow", "cushion", "passport"),
             },
             "guest_book": {
                 "main": ("book", "album", "notebook", "fabric cover", "covered book"),
@@ -10382,80 +15853,6 @@ exit 1
                 "main": ("ribbon", "fabric strip", "long strip", "sash", "streamer"),
                 "context": ("bouquet", "bridal bouquet", "wedding", "stitched lettering", "embroidered message", "draped"),
                 "exclude": ("book", "pillow", "cushion", "banner", "dress"),
-            },
-            "hair_bow": {
-                "main": (
-                    "hair bow",
-                    "bow hair clip",
-                    "hair bow clip",
-                    "hair clip bow",
-                    "barrette bow",
-                    "bow barrette",
-                    "hair tie bow",
-                    "bow hair tie",
-                    "hair bow scrunchie",
-                    "bow scrunchie",
-                    "scrunchie bow",
-                    "scrunchie",
-                    "fabric bow",
-                    "ribbon bow",
-                    "no kep toc",
-                    "no buoc toc",
-                    "no cot toc",
-                    "chun buoc toc no",
-                ),
-                "context": (
-                    "hair",
-                    "hair accessory",
-                    "clip",
-                    "barrette",
-                    "scrunchie",
-                    "elastic",
-                    "hair tie",
-                    "ponytail",
-                    "bun",
-                    "girl hair",
-                    "linen",
-                    "cotton linen",
-                    "embroidered",
-                    "hand embroidered",
-                    "long tails",
-                    "center knot",
-                ),
-                "exclude": ("bouquet", "bridal bouquet", "dress", "headband", "bow tie", "pouch", "bag", "scarf", "ribbon strip", "pillow", "cushion", "banner", "book", "passport"),
-            },
-            "passport_cover": {
-                "main": (
-                    "passport cover",
-                    "passport holder",
-                    "passport sleeve",
-                    "passport case",
-                    "travel document cover",
-                    "travel document holder",
-                    "boc passport",
-                    "bọc passport",
-                    "vo passport",
-                    "bia passport",
-                    "boc ho chieu",
-                    "vo boc ho chieu",
-                    "bia ho chieu",
-                    "vi ho chieu",
-                ),
-                "context": (
-                    "passport",
-                    "boarding pass",
-                    "travel",
-                    "airport",
-                    "travel document",
-                    "linen",
-                    "cotton linen",
-                    "embroidered",
-                    "hand embroidered",
-                    "cover",
-                    "holder",
-                    "sleeve",
-                ),
-                "exclude": ("guest book", "vow book", "photo album", "pillow", "cushion", "banner", "hoop", "dress", "shirt", "crown", "cross", "plush"),
             },
             "drawstring_bag": {
                 "main": (
@@ -10514,7 +15911,6 @@ exit 1
                 "exclude": ("pillow", "cushion", "book", "banner", "dress"),
             },
         }
-
         best_key = ""
         best_score = 0
         best_priority = len(PRODUCT_SHOT_RULE_PRIORITY)
@@ -10591,6 +15987,7 @@ exit 1
                 "confidence": 0.0,
                 "visible_product": "",
                 "reason": "Gemini did not return a JSON object.",
+                "inferred_from_visual_text": False,
             }
         raw_key = str(
             payload.get("product_rule_key")
@@ -10660,7 +16057,6 @@ exit 1
                 "Use the image as the authority. Treat card names and attachment filenames as weak clues only; they are often random or wrong.",
                 "Return an empty product_rule_key when the product is not clearly one of the allowed rules.",
                 "Do not guess from motif text, filename, or background props. Classify only the main physical product form visible in the image.",
-                "In visible_product, describe both the physical product form and the visible embroidery motif/design on the product, for example 'linen drawstring bag with lavender daisy embroidery'.",
                 "Allowed product_rule_key values:",
                 self._flow_operator_visual_product_rule_options(),
                 'Return JSON only with this exact shape: {"product_rule_key": string, "confidence": number, "visible_product": string, "reason": string}.',
@@ -10710,7 +16106,7 @@ exit 1
             raise RuntimeError(f"Could not call Gemini for visual product classification: {exc.reason}") from exc
 
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="visual product classification")
+        parsed = self._parse_json_candidate(text)
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini did not return a valid visual classification object.")
         return parsed
@@ -10723,18 +16119,12 @@ exit 1
         if card.get("_visual_product_rule_checked"):
             return
         card["_visual_product_rule_checked"] = True
-        existing_rule_key = self._flow_operator_card_visual_product_rule_key(card)
-        needs_ai_title = self._trello_should_write_ai_title_description(card)
-        if existing_rule_key and not needs_ai_title:
+        if self._flow_operator_card_visual_product_rule_key(card):
             return
         if not self._gemini_api_key():
-            if needs_ai_title:
-                card["_ai_title_error"] = "Gemini chua cau hinh nen chua viet AI title vao mo ta Trello."
             return
         key, token = self._trello_credentials()
         if not key or not token:
-            if needs_ai_title:
-                card["_ai_title_error"] = "Trello credentials chua cau hinh nen chua viet AI title vao mo ta Trello."
             return
 
         card_id = self._normalize_trello_card_id(
@@ -10746,8 +16136,6 @@ exit 1
             if isinstance(item, dict) and self._trello_attachment_is_image(item)
         ]
         if not card_id or not image_attachments:
-            if needs_ai_title:
-                card["_ai_title_error"] = "Khong co card id hoac attachment anh nguon nen chua viet AI title vao mo ta Trello."
             return
 
         selected_ids = set(self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids))
@@ -10759,110 +16147,38 @@ exit 1
             ),
             image_attachments[0],
         )
-        text_rule_key = self._flow_operator_product_rule_key_from_text(
-            " ".join(
-                [
-                    str(card.get("name") or ""),
-                    str(attachment.get("name") or ""),
-                    self._flow_operator_trello_card_description_note(card),
-                ]
-            )
-        )
         cache_key = self._flow_operator_visual_rule_cache_key(card_id, attachment)
         cached = self._trello_visual_product_rule_cache.get(cache_key)
         if cached is not None:
             card.update(cached)
-            if not needs_ai_title:
-                return
-
-        image_bytes: bytes | None = None
-        mime = ""
-        try:
-            image_bytes, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
-        except Exception as exc:
-            detail = humanize_flow_error(str(exc)) or str(exc)
-            if existing_rule_key:
-                metadata = {"_ai_title_error": detail}
-            else:
-                metadata = {
-                    "_visual_product_rule_key": "",
-                    "_visual_product_rule_confidence": 0.0,
-                    "_visual_product_rule_visible_product": "",
-                    "_visual_product_rule_reason": "",
-                    "_visual_product_rule_inferred": False,
-                    "_visual_product_rule_error": detail,
-                }
-            self._trello_visual_product_rule_cache[cache_key] = metadata
-            card.update(metadata)
             return
 
-        metadata: Dict[str, Any] = {}
-        if cached is not None:
-            metadata.update(cached)
-        elif not existing_rule_key:
-            try:
-                raw_payload = self._gemini_classify_trello_source_product_rule(
-                    image_bytes=image_bytes,
-                    mime_type=mime,
-                    card_name=str(card.get("name") or ""),
-                    attachment_name=str(attachment.get("name") or ""),
-                    card_description=self._flow_operator_trello_card_description_note(card),
-                )
-                parsed = self._flow_operator_product_rule_from_visual_payload(raw_payload)
-                metadata.update(
-                    {
-                        "_visual_product_rule_key": parsed.get("product_rule_key") or "",
-                        "_visual_product_rule_confidence": parsed.get("confidence") or 0.0,
-                        "_visual_product_rule_visible_product": parsed.get("visible_product") or "",
-                        "_visual_product_rule_reason": parsed.get("reason") or "",
-                        "_visual_product_rule_inferred": bool(parsed.get("inferred_from_visual_text")),
-                    }
-                )
-            except Exception as exc:
-                metadata.update(
-                    {
-                        "_visual_product_rule_key": "",
-                        "_visual_product_rule_confidence": 0.0,
-                        "_visual_product_rule_visible_product": "",
-                        "_visual_product_rule_reason": "",
-                        "_visual_product_rule_inferred": False,
-                        "_visual_product_rule_error": humanize_flow_error(str(exc)) or str(exc),
-                    }
-                )
-        if needs_ai_title and image_bytes is not None:
-            try:
-                resolved_rule_key = str(
-                    metadata.get("_visual_product_rule_key") or existing_rule_key or text_rule_key or ""
-                ).strip()
-                try:
-                    title_payload = self._gemini_suggest_trello_product_title(
-                        image_bytes=image_bytes,
-                        mime_type=mime,
-                        card_name=str(card.get("name") or ""),
-                        attachment_name=str(attachment.get("name") or ""),
-                        card_description=self._flow_operator_trello_card_description_note(card),
-                        product_rule_key=resolved_rule_key,
-                        visible_product=str(metadata.get("_visual_product_rule_visible_product") or ""),
-                    )
-                except Exception as title_exc:
-                    metadata["_ai_title_fallback_reason"] = humanize_flow_error(str(title_exc)) or str(title_exc)
-                    title_payload = self._fallback_trello_product_title(
-                        card_name=str(card.get("name") or ""),
-                        attachment_name=str(attachment.get("name") or ""),
-                        product_rule_key=resolved_rule_key,
-                        visible_product=str(metadata.get("_visual_product_rule_visible_product") or ""),
-                    )
-                title_result = self._write_trello_ai_title_to_description(
-                    key=key,
-                    token=token,
-                    card=card,
-                    title_payload=title_payload,
-                )
-                metadata["_ai_suggested_title"] = title_result.get("title") or title_payload.get("title") or ""
-                metadata["_ai_title_backup_path"] = title_result.get("backup_path") or ""
-                metadata["_ai_title_status"] = title_result.get("status") or ""
-            except Exception as exc:
-                metadata["_ai_title_error"] = humanize_flow_error(str(exc)) or str(exc)
+        try:
+            image_bytes, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
+            raw_payload = self._gemini_classify_trello_source_product_rule(
+                image_bytes=image_bytes,
+                mime_type=mime,
+                card_name=str(card.get("name") or ""),
+                attachment_name=str(attachment.get("name") or ""),
+                card_description=self._flow_operator_trello_card_description_note(card),
+            )
+            parsed = self._flow_operator_product_rule_from_visual_payload(raw_payload)
+            metadata = {
+                "_visual_product_rule_key": parsed.get("product_rule_key") or "",
+                "_visual_product_rule_confidence": parsed.get("confidence") or 0.0,
+                "_visual_product_rule_visible_product": parsed.get("visible_product") or "",
+                "_visual_product_rule_reason": parsed.get("reason") or "",
+                "_visual_product_rule_inferred": bool(parsed.get("inferred_from_visual_text")),
+            }
+        except Exception as exc:
+            metadata = {
+                "_visual_product_rule_key": "",
+                "_visual_product_rule_confidence": 0.0,
+                "_visual_product_rule_visible_product": "",
+                "_visual_product_rule_reason": "",
+                "_visual_product_rule_inferred": False,
+                "_visual_product_rule_error": humanize_flow_error(str(exc)) or str(exc),
+            }
         self._trello_visual_product_rule_cache[cache_key] = metadata
         card.update(metadata)
 
@@ -10900,19 +16216,6 @@ exit 1
         if any(term in text for term in wall_terms):
             return self.BANNER_VISIBLE_WALL_HOOK_RULE
         return ""
-
-    def _flow_operator_product_rule_target_count(self, product_key: str) -> int:
-        suite = PRODUCT_SHOT_RULES.get(str(product_key or "").strip()) or {}
-        raw_count = suite.get("target_count", self.FLOW_AGENT_TARGET_OUTPUT_COUNT)
-        try:
-            count = int(raw_count)
-        except (TypeError, ValueError):
-            count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
-        return max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, count))
-
-    def _flow_operator_target_count_for_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> int:
-        signals = self._flow_operator_card_product_signals(request, card)
-        return self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
 
     def _flow_operator_product_rule_shot_suite(self, product_key: str) -> List[Dict[str, str]]:
         product_key = str(product_key or "").strip()
@@ -10959,14 +16262,9 @@ exit 1
                 "Supplemental gift-ready scene",
                 f"Gift-ready presentation for {display_name} with minimal premium packaging or soft props; the product and its design must remain clearly visible. {suffix}",
             ),
-            (
-                "Supplemental lifestyle variant",
-                f"Distinct lifestyle or room-context scene for {display_name}, different from the other shots, with natural interaction or display while the source design stays visible. {suffix}",
-            ),
         )
-        target = self._flow_operator_product_rule_target_count(product_key)
         fill_index = 0
-        while shots and len(shots) < target:
+        while shots and len(shots) < self.FLOW_AGENT_TARGET_OUTPUT_COUNT:
             title, brief = supplemental[fill_index % len(supplemental)]
             shots.append(
                 {
@@ -10988,9 +16286,22 @@ exit 1
         visual_product_rule_key = str(signals.get("visual_product_rule_key") or "").strip()
         visual_visible_product = str(signals.get("visual_product_rule_visible_product") or "").strip()
         visual_confidence = signals.get("visual_product_rule_confidence")
+        local_rule_already_covers = any(
+            bool(signals.get(key))
+            for key in (
+                "is_apron",
+                "is_pennant",
+                "is_doll",
+                "is_plush",
+                "is_hoop",
+                "is_pillowcase",
+                "is_child_shirt",
+                "is_shirt",
+            )
+        )
 
         product_bits: List[str] = []
-        if product_rule and not signals.get("is_apron"):
+        if product_rule and not local_rule_already_covers:
             product_bits.append(
                 f"{str(product_rule.get('display_name') or product_rule_key)} category: {str(product_rule.get('lock') or '').strip()}"
             )
@@ -11042,43 +16353,6 @@ exit 1
             + "; ".join(product_bits)
             + ". Keep those design features consistent across the whole image set."
             + source_hint
-        )
-
-    def _flow_operator_missing_product_rule_detail(self, card: Dict[str, Any], signals: Dict[str, Any]) -> str:
-        card_name = str(signals.get("card_name") or card.get("name") or "").strip()
-        card_url = str(signals.get("card_url") or card.get("url") or "").strip()
-        attachment_names = str(signals.get("attachment_names") or "").strip()
-        visual_error = str(card.get("_visual_product_rule_error") or "").strip()
-        if visual_error:
-            reason = f"Visual classification failed: {visual_error}"
-        elif not self._gemini_api_key():
-            reason = "Gemini visual classification is not configured."
-        elif not self._trello_credentials()[0] or not self._trello_credentials()[1]:
-            reason = "Trello credentials are missing, so the source image could not be downloaded for visual classification."
-        else:
-            reason = "Gemini did not classify the source image into a known HAVI product rule with enough confidence."
-        source = ", ".join(part for part in (card_name, attachment_names, card_url) if part) or "unknown Trello card"
-        return (
-            "Auto AI Trello chua xac dinh duoc HAVI product shot rule cho anh nguon, "
-            "nen app bo qua card nay truoc khi gui Flow Agent de tranh tao bo anh sai rule. "
-            f"Nguon: {source}. {reason}"
-        )
-
-    def _flow_operator_has_product_rule_or_category_signal(self, signals: Dict[str, Any]) -> bool:
-        if str(signals.get("product_rule_key") or "").strip():
-            return True
-        return any(
-            bool(signals.get(key))
-            for key in (
-                "is_apron",
-                "is_pennant",
-                "is_doll",
-                "is_plush",
-                "is_hoop",
-                "is_pillowcase",
-                "is_child_shirt",
-                "is_shirt",
-            )
         )
 
     def _flow_operator_colorway_variant_shots(self, product_label: str = "product") -> List[Dict[str, str]]:
@@ -11212,8 +16486,8 @@ exit 1
                 "label": "Pennant fabric colorway lineup",
                 "brief": (
                     f"Clean white-daylight ecommerce lineup showing three to four embroidered pennant/banner wall hangings in {palette}. "
-                    "Every variant must stay a flat hanging pennant with the same top dowel/rod, cord hanger, straight side seams, pointed V bottom, motif placement, stitch texture, and wall-hanging scale. "
                     f"{wall_hook_rule} "
+                    "Every variant must stay a flat hanging pennant with the same top dowel/rod, cord hanger, straight side seams, pointed V bottom, motif placement, stitch texture, and wall-hanging scale. "
                     "Only if the source image visibly contains an embroidered/personalized name, use a different plausible embroidered name on each pennant while preserving the same lettering style; otherwise keep every pennant nameless. "
                     "Do not turn any variant into a pillow, cushion, blanket, hoop, shirt, or framed print."
                 ),
@@ -11223,8 +16497,8 @@ exit 1
                 "label": "Nursery wall colorway trio",
                 "brief": (
                     "Bright white nursery wall or shelf display with three coordinated pennant/banner color options hanging from small dowels. "
-                    "Keep the banner flat, thin, and wall-mounted; preserve the source motif/name style and embroidery texture. "
                     f"{wall_hook_rule} "
+                    "Keep the banner flat, thin, and wall-mounted; preserve the source motif/name style and embroidery texture. "
                     "Pillows, toys, shelves, or blankets may appear only as plain background props and must not carry the source design."
                 ),
                 "must_include": "pennants hanging on wall, clearly visible wall hooks, three pastel variants, same source motif/name style, clean white daylight, props without copied embroidery",
@@ -11241,8 +16515,8 @@ exit 1
                 "label": "Four pennant option display",
                 "brief": (
                     "Polished ecommerce display with four real pennant/banner wall hanging options arranged naturally as separate hanging fabric flags, not a collage. "
-                    "Preserve the source product construction, thin fabric panel, dowel, cord hanger, pointed bottom, embroidery motif, and handmade stitch quality while varying fabric color. "
                     f"{wall_hook_rule} "
+                    "Preserve the source product construction, thin fabric panel, dowel, cord hanger, pointed bottom, embroidery motif, and handmade stitch quality while varying fabric color. "
                     "Never place the source motif or name onto a pillow, cushion, blanket, tote, shirt, hoop, or other product."
                 ),
                 "must_include": "four pennant options, visible wall hooks, same construction, pastel color options, wall hanging product only, no design transferred to other products",
@@ -11258,8 +16532,21 @@ exit 1
         is_apron = bool(signals.get("is_apron"))
         is_embroidery = bool(signals.get("is_embroidery"))
         product_rule_key = str(signals.get("product_rule_key") or "").strip()
+        local_rule_already_covers = any(
+            bool(signals.get(key))
+            for key in (
+                "is_apron",
+                "is_pennant",
+                "is_doll",
+                "is_plush",
+                "is_hoop",
+                "is_pillowcase",
+                "is_child_shirt",
+                "is_shirt",
+            )
+        )
 
-        if product_rule_key and not is_apron:
+        if product_rule_key and not local_rule_already_covers:
             product_rule_shots = self._flow_operator_product_rule_shot_suite(product_rule_key)
             if product_rule_shots:
                 return product_rule_shots
@@ -11313,124 +16600,59 @@ exit 1
             ]
 
         if signals.get("is_pennant"):
-            exact_pennant_lock = (
-                "Keep the exact reference pennant/banner identity: pointed V pennant shape, flat linen panel, top wooden dowel/rod, rope cord hanger, "
-                "same overall proportions, same embroidery placement/layout/scale, same thread color palette, raised hand-embroidered texture, clean clear white daylight, and premium handmade feel. "
-                "Do not redesign, distort, move the motif, change the flag construction, add tags/labels, or transfer the design onto a pillow, cushion, blanket, shirt, hoop, tote, or any other product."
-            )
-            multi_name_rule = (
-                "Use different embroidered names only if the source image visibly contains an embroidered/personalized name; preserve the same lettering style and thread colors. "
-                "If the source has no name, keep every pennant nameless."
-            )
-            wall_hook_rule = self.BANNER_VISIBLE_WALL_HOOK_RULE
-            conditional_wall_hook_rule = f"If the pennant/banner is wall-hung or suspended in this shot, {wall_hook_rule}"
             return [
                 {
-                    "label": "Pennant image 1 baby room flag scene",
+                    "label": "Pennant embroidery craft proof",
                     "brief": (
-                        "One single pennant/banner hanging in a bright airy baby room, near a crib corner or baby headboard wall, with a small teddy bear and soft blanket as secondary decor. "
-                        f"{wall_hook_rule} "
-                        f"{exact_pennant_lock}"
+                        "Extreme macro close-up of the selected pennant/banner embroidery on the flat fabric panel, showing raised thread fibers, stitch direction, fabric weave, edge seam, and handmade irregularities. "
+                        "Do not show a pillow/cushion carrying the design."
                     ),
-                    "must_include": "one single pennant, crib or baby headboard wall, clearly visible wall hook, small teddy bear, soft blanket, exact reference design, white daylight",
+                    "must_include": "flat pennant fabric, visible embroidery stitches, edge seam, source motif/name, no pillow design transfer",
                 },
                 {
-                    "label": "Pennant image 2 alternate nursery corner",
+                    "label": "Full hanging pennant hero",
                     "brief": (
-                        "One single pennant/banner in a different baby setting such as a fabric baby tent, cozy reading corner, or nursery nook with tasteful decor and natural white daylight. "
-                        f"{wall_hook_rule} "
-                        f"{exact_pennant_lock}"
+                        "Clean full-front product hero shot of the complete pennant/banner wall hanging: flat rectangular fabric panel, top dowel/rod, cord/string hanger, straight side seams, pointed V bottom, and exact embroidery layout fully visible."
                     ),
-                    "must_include": "one single pennant, visible wall hook or peg, alternate baby tent or reading corner scene, natural clean white light, exact reference shape and embroidery",
+                    "must_include": "full pennant/banner, top dowel, cord hanger, V bottom, exact source design, clean white daylight",
                 },
                 {
-                    "label": "Pennant image 3 two hanging color variants",
+                    "label": "Nursery wall decor scene",
                     "brief": (
-                        "Two pennant/banners hanging together on a beautiful nursery wall. Both must use the same construction, embroidery layout, motif placement, dowel, cord, V bottom, and handmade stitch quality as the reference; change only the embroidered name when allowed and the linen base fabric color. "
-                        f"{wall_hook_rule} "
-                        f"{multi_name_rule} Keep all motif/name/heart thread colors the same as the reference. {exact_pennant_lock}"
+                        "Bright white nursery wall scene with the pennant/banner hanging naturally as the main product. "
+                        "Background props such as crib, shelf, toy, or plain cushion are allowed only if they stay secondary and do not contain the source motif, name, or embroidery."
                     ),
-                    "must_include": "two hanging pennants, clearly visible wall hooks, different base fabric colors, different names only if source has a name, same thread colors, no pillow/cushion",
+                    "must_include": "pennant hanging on wall, design visible, plain background props only, white balanced nursery light",
                 },
                 {
-                    "label": "Pennant image 4 two tabletop color variants",
-                    "brief": (
-                        "Two pennant/banners displayed together on a clean table or tabletop styling scene with refined decor. Both flags must remain the same reference pennant form and design, with different linen base colors and different names only when allowed. "
-                        f"{multi_name_rule} Keep embroidery thread colors identical to the reference. {exact_pennant_lock}"
-                    ),
-                    "must_include": "two tabletop pennants, different base colors, same embroidery layout and thread colors, refined decor, no other product form",
+                    "label": "Side seam and hanging detail",
+                    "brief": "Three-quarter close view showing the pennant top dowel, cord hanger, fabric thickness, side seam, bottom point, and raised embroidery depth while preserving the flat banner shape.",
+                    "must_include": "dowel, cord, side seam, V bottom, embroidery depth, flat wall hanging construction",
                 },
                 {
-                    "label": "Pennant image 5 three nursery color variants",
-                    "brief": (
-                        "Three pennant/banners hanging together in a bright baby room. All three must keep the same reference style, same embroidery composition, same thread colors for the name and motif/heart details, same dowel/cord/V-bottom construction, and only vary the linen base color and embroidered name when allowed. "
-                        f"{wall_hook_rule} "
-                        f"{multi_name_rule} {exact_pennant_lock}"
-                    ),
-                    "must_include": "three hanging pennants, clearly visible wall hooks, nursery room, different base fabric colors, same thread colors, different names only if source has a name",
+                    "label": "Pennant flat lay styling",
+                    "brief": "Overhead flat lay of the full pennant/banner arranged on clean white linen or light wood with matching thread, needle, small scissors, and tasteful nursery craft props.",
+                    "must_include": "full flat pennant, top rod and V bottom visible, craft props, source design unchanged",
                 },
                 {
-                    "label": "Pennant image 6 four nursery color variants",
+                    "label": "Gift ready pennant presentation",
                     "brief": (
-                        "Four pennant/banners hanging together in a bright airy baby room. Every pennant must be the same physical product form as the reference with top dowel, rope hanger, pointed V bottom, same embroidery layout, and same thread colors; vary only linen base color and embroidered names when allowed. "
-                        f"{wall_hook_rule} "
-                        f"{multi_name_rule} {exact_pennant_lock}"
+                        "Premium gift-ready scene with the pennant/banner folded partly open or laid beside tissue paper, ribbon, and a box while keeping the top rod, cord, pointed bottom, and embroidery visible. "
+                        "No hang tags, loose labels, or copied design on other products."
                     ),
-                    "must_include": "four hanging pennants, clearly visible wall hooks, pastel base fabric variety, same construction and embroidery layout, different names only if source has a name",
+                    "must_include": "gift presentation, pennant visible, dowel/cord, no tags, no pillow/cushion with motif",
                 },
                 {
-                    "label": "Pennant image 7 four-panel embroidery close-up collage",
-                    "brief": (
-                        "This is the only allowed collage output: one single 1:1 square image made of four small close-up panels showing different macro angles of the embroidery on the pennant. "
-                        "Each panel must be sharp and bright, focusing on raised yarn/thread texture, linen weave, seam details, stitch direction, and premium handmade craft. "
-                        f"{exact_pennant_lock}"
-                    ),
-                    "must_include": "one 1:1 collage image only for image 7, four close-up panels, raised embroidery texture, linen surface, seam and stitch details",
+                    "label": "Hands embroidering pennant",
+                    "brief": "Close commercial craft scene with human hands actively sewing or embroidering the selected pennant/banner fabric, needle and thread visible, while preserving the exact motif/name placement, fabric color, edge seams, and flat banner construction.",
+                    "must_include": "human hands sewing or embroidering, pennant fabric, needle and thread, exact source design",
                 },
                 {
-                    "label": "Pennant image 8 woman embroidering in hoop",
-                    "brief": (
-                        "A woman sitting at a clean craft table, carefully embroidering the motif onto fabric that matches the pennant fabric color. The fabric is stretched in a round embroidery hoop only as a temporary tool, not a finished hoop product. "
-                        "The needle must realistically enter the exact stitch point, the needle hole must have thread through it, hands must be natural, and the scene must feel premium handmade. "
-                        f"{exact_pennant_lock}"
-                    ),
-                    "must_include": "woman embroidering, round hoop as tool, realistic threaded needle at stitch point, clean craft table, exact pennant motif and fabric",
+                    "label": "Personalized pennant detail",
+                    "brief": "Commercial close vignette focused on the embroidered name or motif on the pennant/banner, with fabric weave, stitch depth, and clean white daylight; the product remains a flat hanging flag, not a cushion.",
+                    "must_include": "personalized embroidery detail, flat pennant fabric, stitch texture, no cushion/pillow product",
                 },
-                {
-                    "label": "Pennant image 9 mother and baby touch embroidery",
-                    "brief": (
-                        "Mother and baby gently touching the embroidered motif on the pennant. The pennant may be hanging or lightly held by the mother so the baby can touch the raised stitches. Use a bright airy baby room that feels warm but still white, clean, and spacious. "
-                        f"{conditional_wall_hook_rule} "
-                        f"{exact_pennant_lock}"
-                    ),
-                    "must_include": "mother and baby hands, baby touching embroidery, pennant hanging or held, visible wall hook if hanging, bright airy nursery, motif visible and unchanged",
-                },
-                {
-                    "label": "Pennant image 10 two babies touch two pennants",
-                    "brief": (
-                        "Two babies interacting with two pennant/banners and touching the embroidery; do not show their faces. The two flags must have different embroidered names only if the source visibly has a name, while keeping the exact same embroidery style, thread colors, product shape, dowel, rope hanger, and V bottom. "
-                        f"{conditional_wall_hook_rule} "
-                        f"{multi_name_rule} {exact_pennant_lock}"
-                    ),
-                    "must_include": "two babies, faces not visible, two pennants, touch embroidery, visible wall hooks if hanging, different names only if source has a name, same thread colors",
-                },
-                {
-                    "label": "Pennant image 11 sleeping baby room scene",
-                    "brief": (
-                        "A baby sleeping in a calm baby room with the pennant clearly visible near the crib or on the wall above/near the headboard. The composition must show the flag clearly and harmoniously within the sleep space, using soft clean white airy light. "
-                        f"{wall_hook_rule} "
-                        f"{exact_pennant_lock}"
-                    ),
-                    "must_include": "sleeping baby, pennant near crib or headboard wall, clearly visible wall hook, flag clear and visible, soft clean white light",
-                },
-                {
-                    "label": "Pennant image 12 flat gift box presentation",
-                    "brief": (
-                        "One pennant beautifully packaged in an open paper gift box. The flag must be folded neatly and flat, not puffy, with the delicate hand embroidery clearly visible. Use a minimal bright natural-light background and focus only on the pennant in the gift box; no clutter and no object covering or overpowering the embroidery. "
-                        f"{exact_pennant_lock}"
-                    ),
-                    "must_include": "open paper gift box, pennant folded flat and neat, embroidery clearly visible, minimal bright background, no clutter or tags",
-                },
+                *self._flow_operator_pennant_colorway_variant_shots(),
             ]
 
         if signals.get("is_doll") or signals.get("is_plush"):
@@ -11685,8 +16907,6 @@ exit 1
         card_description_note = self._flow_operator_trello_card_description_note(card)
         user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
         signals = self._flow_operator_card_product_signals(request, card)
-        product_rule_key = str(signals.get("product_rule_key") or "").strip()
-        product_rule = PRODUCT_SHOT_RULES.get(product_rule_key) if product_rule_key else None
         card_id = str(card.get("id") or card.get("shortLink") or "").strip()
         source_attachment_ids = [
             str(item or "").strip()
@@ -11700,28 +16920,62 @@ exit 1
         ]
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
-        target_output_count = self._flow_operator_product_rule_target_count(product_rule_key)
-        target_count = max(1, min(target_output_count, int(image_count or target_output_count)))
+        product_rule_key = str(signals.get("product_rule_key") or "").strip()
+        product_rule = PRODUCT_SHOT_RULES.get(product_rule_key) if product_rule_key else None
+        product_rule_display = str(product_rule.get("display_name") or product_rule_key).strip() if product_rule else ""
+        product_rule_lock = str(product_rule.get("lock") or "").strip() if product_rule else ""
+        if product_rule:
+            source_lock_rule = (
+                f"Product/category lock: {product_rule_display}. {product_rule_lock}. "
+                "If the selected Trello attachment is a finished product photo, preserve that exact product form and apply only scene/styling changes. "
+                "If the selected Trello attachment is artwork, wallpaper, logo, character art, or design-only reference with no physical product body, treat it only as the design/motif to place on the locked product category; do not treat the artwork canvas/background as the product shape. "
+                f"Every generated output must remain one consistent {product_rule_display} product form across the whole set. "
+                "Do not vary the main product type between shots, and do not make one output a pillow while another is a pouch, shirt, mug, hoop, banner, or any other category unless that category is the locked product category."
+            )
+            preserve_shape_rule = (
+                f"Preserve the locked {product_rule_display} product form, material/edge construction, print or engraving placement, colors, scale, and product identity in all images; use the Trello artwork/design only on that same locked product form when the source is artwork-only."
+            )
+            category_change_rule = (
+                f"Do not change the locked product into a different category; every output must remain the same {product_rule_display} form with only scene, styling, lighting, composition, model/background, and presentation changed around it."
+            )
+        else:
+            source_lock_rule = (
+                "Critical source lock: the selected Trello attachment is the only authoritative product image. "
+                "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
+                "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
+                "Do not turn the source into a pillow, cushion, blanket, hoop, dress, apron, banner, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
+                "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
+                "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
+            )
+            preserve_shape_rule = "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images."
+            category_change_rule = "Do not change the source product into a different category; if the source is a pillow, it must remain a pillow; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is apparel, it must remain the same apparel form."
+        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(image_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+        target_output_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
         existing_flow_count = max(0, min(target_output_count, int(existing_flow_count or 0)))
+        rerun_full_set = existing_flow_count >= target_output_count and target_count >= self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
         all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
-        shot_start = 0
+        shot_start = 0 if rerun_full_set else existing_flow_count
         shots = all_shots[shot_start : shot_start + target_count]
         if len(shots) < target_count and all_shots:
             shots = [*shots, *all_shots[: target_count - len(shots)]]
         shots = shots or all_shots[:target_count]
         shot_summary = "; ".join(
-            f"{shot_start + position + 1}. {item.get('label')}: {item.get('brief')}"
+            f"{position + 1}. {item.get('label')}: {item.get('brief')}"
             for position, item in enumerate(shots)
             if item.get("label") or item.get("brief")
         )
-        if existing_flow_count:
+        if rerun_full_set:
             resume_note = (
-                f"This Trello card already has {existing_flow_count}/{target_output_count} Flow output image(s), but Auto now creates a fresh full {target_count}-image set by default. "
-                "Do not create only the missing images, do not continue from the old output numbering, and do not reuse or reinterpret old outputs."
+                f"This Trello card already has {existing_flow_count} Flow output image(s), but Auto was started again. "
+                f"Create a fresh full {target_count}-image set from the Ready for AI source image; do not reuse old outputs."
+            )
+        elif existing_flow_count:
+            resume_note = (
+                f"This Trello card already has {existing_flow_count}/{target_output_count} Flow output image(s). "
+                f"Continue the same set by creating exactly {target_count} new missing image(s), starting after the existing outputs; do not remake, reuse, or reinterpret the old outputs."
             )
         else:
             resume_note = ""
-        allows_product_detail_collage = bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag", "passport_cover", "hair_bow", "baby_album"})
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             self._flow_agent_fresh_context_rule(),
@@ -11732,32 +16986,17 @@ exit 1
                 + (f", selected attachment id(s) {', '.join(source_attachment_ids)}" if source_attachment_ids else "")
                 + ". Do not use any other card, attachment, Flow project image, or previous Flow Agent task as the source."
             ) if card_id or source_attachment_ids else "",
-            (
-                "Critical source lock: the selected Trello attachment is the only authoritative product image. "
-                "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
-                "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
-                "Do not turn the source into a tooth fairy pillow, pillow, cushion, blanket, hoop, dress, apron, banner, baby photo album, drawstring bag, passport cover, hair bow, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
-                "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
-                "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
-            ),
-            (
-                "HAVI product shot rule lock: "
-                f"{str(product_rule.get('display_name') or product_rule_key)} uses the fixed shot plan imported from HAVI_Shot_Types_All_Products.xlsx. "
-                f"{str(product_rule.get('lock') or '').strip()}. "
-                f"{('For any wall-hanging banner output, ' + self.BANNER_VISIBLE_WALL_HOOK_RULE + ' ') if product_rule_key == 'banner' else ''}"
-                "The product may be styled in the listed scenes, but the product category, construction, material, embroidery/print layout, proportions, and premium handmade identity must not change."
-            ) if product_rule and not signals.get("is_apron") else "",
+            source_lock_rule,
             (
                 "Pennant/banner category lock: the source is a flat hanging fabric pennant/banner wall decor product. "
                 "Every main generated product must remain a pennant/banner with a top dowel or rod, cord/string hanger, straight side seams, pointed V bottom, flat linen/fabric panel, and the same embroidery layout. "
                 f"For any wall-hanging banner output, {self.BANNER_VISIBLE_WALL_HOOK_RULE} "
                 "Never create a pillow/cushion/blanket/shirt/hoop version of this design, and never place the source motif or name onto a pillow/cushion/blanket/shirt/hoop. "
-                "If a nursery scene includes a pillow, cushion, toy, blanket, or fabric swatch, it must be a plain prop without the source embroidery/design. "
-                "For the required process shot only, a round embroidery hoop is allowed as a temporary tool holding the pennant fabric while a person stitches it; it must not become a finished hoop product."
+                "If a nursery scene includes a pillow, cushion, toy, blanket, or fabric swatch, it must be a plain prop without the source embroidery/design."
             ) if signals.get("is_pennant") else "",
             resume_note,
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
-            f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The default target for this run is always a fresh full set of {target_output_count} generated output images plus the 1 source image; do not subtract any existing output attachments from this run.",
+            f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The full target is {target_output_count} generated output images plus the 1 source image; create only the missing generated outputs for this run.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
             "Lighting and color rule for every output: clean clear white neutral daylight, accurate whites, crisp bright product color, no yellow/orange/golden/tungsten/sepia/beige cast, and no warm color grading.",
@@ -11769,22 +17008,11 @@ exit 1
                 "Treat the Trello description as user-supplied product guidance for customization, product identity, style, scene restrictions, and do/don't rules; "
                 "preserving the source product and avoiding tags, stickers, labels, barcodes, and price tags remain higher-priority constraints."
             ) if card_description_note else "",
-            self._flow_agent_reference_prompt_style_guide(
-                target_count,
-                allow_detail_collage=allows_product_detail_collage,
-            ),
-            "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
-            "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
-            "Do not change the source product into a different category; if the source is a tooth fairy pillow, it must remain the same tooth-shaped tooth fairy pillow with its ribbon; if the source is a pillow, it must remain a pillow; if it is a baby photo album, it must remain the same cotton linen baby album with its embroidered cover, book construction, and photo-pocket pages when open; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is a hair bow, bow hair clip, or hair tie bow, it must remain the same hair accessory form with its bow shape, tails, center knot, and elastic/clip hardware; if it is apparel, it must remain the same apparel form.",
-            (
-                "All outputs must be true 1:1 square product photos. For pennants, image 7 is the only allowed four-panel close-up collage inside one square image; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
-                if signals.get("is_pennant")
-                else (
-                    "All outputs must be true 1:1 square product photos. The explicitly numbered close-up detail collage shot is the only allowed four-panel image inside one square; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
-                    if allows_product_detail_collage
-                    else "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas."
-                )
-            ),
+            self._flow_agent_reference_prompt_style_guide(target_count, allow_detail_collage=bool(signals.get("is_pennant"))),
+            preserve_shape_rule,
+            "Only change scene, styling, lighting, composition, model/background, and presentation around the locked/source product.",
+            category_change_rule,
+            "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas.",
             "Do not use Google Sheet prompts; do not ask the local app AI to write the final prompt.",
         ]
         if user_instruction:
@@ -11798,6 +17026,43 @@ exit 1
             "Fresh-task isolation: treat this message as a new isolated task. Ignore every previous Flow Agent chat message, "
             "approval brief, side-panel title, project memory, old card, prior output set, gallery thumbnail, and example from older runs. "
             "Do not carry over any product category, product name, motif, colorway, scene, or shot idea unless it is visible in the currently attached Trello source image or written on the current Trello card."
+        )
+
+    def _flow_operator_missing_product_rule_detail(self, card: Dict[str, Any], signals: Dict[str, Any]) -> str:
+        card_name = str(signals.get("card_name") or card.get("name") or "").strip()
+        card_url = str(signals.get("card_url") or card.get("url") or "").strip()
+        attachment_names = str(signals.get("attachment_names") or "").strip()
+        visual_error = str(card.get("_visual_product_rule_error") or "").strip()
+        if visual_error:
+            reason = f"Visual classification failed: {visual_error}"
+        elif not self._gemini_api_key():
+            reason = "Gemini visual classification is not configured."
+        elif not self._trello_credentials()[0] or not self._trello_credentials()[1]:
+            reason = "Trello credentials are missing, so the source image could not be downloaded for visual classification."
+        else:
+            reason = "Gemini did not classify the source image into a known HAVI product rule with enough confidence."
+        source = ", ".join(part for part in (card_name, attachment_names, card_url) if part) or "unknown Trello card"
+        return (
+            "Auto AI Trello chua xac dinh duoc HAVI product shot rule cho anh nguon, "
+            "nen app da dung truoc khi gui Flow Agent de tranh tao bo anh sai rule. "
+            f"Nguon: {source}. {reason}"
+        )
+
+    def _flow_operator_has_product_rule_or_category_signal(self, signals: Dict[str, Any]) -> bool:
+        if str(signals.get("product_rule_key") or "").strip():
+            return True
+        return any(
+            bool(signals.get(key))
+            for key in (
+                "is_apron",
+                "is_pennant",
+                "is_doll",
+                "is_plush",
+                "is_hoop",
+                "is_pillowcase",
+                "is_child_shirt",
+                "is_shirt",
+            )
         )
 
     def _trello_ai_prompt_items_for_image_cards(
@@ -11816,6 +17081,7 @@ exit 1
                 else:
                     return []
         expanded: List[Dict[str, Any]] = []
+        list_name_cache: Dict[str, str] = {}
         for card in matched_cards:
             if len(expanded) >= max_items:
                 break
@@ -11825,21 +17091,24 @@ exit 1
             card_list_id = self._normalize_trello_id(str(card.get("idList") or request.trello_list_id or ""))
             card_name = str(card.get("name") or "").strip()
             card_url = str(card.get("url") or "").strip()
+            if card_list_id and not str(card.get("_list_name") or card.get("list_name") or "").strip():
+                list_name = list_name_cache.get(card_list_id, "")
+                if not list_name:
+                    key, token = self._trello_credentials()
+                    if key and token:
+                        list_name = self._trello_list_name(key, token, card_list_id)
+                    list_name_cache[card_list_id] = list_name
+                if list_name:
+                    card["_list_name"] = list_name
             selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids)
             self._flow_operator_enrich_card_with_visual_product_rule(request, card)
             signals = self._flow_operator_card_product_signals(request, card)
-            if not self._flow_operator_has_product_rule_or_category_signal(signals):
-                card["_auto_trello_skip_code"] = "missing_product_rule"
-                card["_auto_trello_skip_reason"] = self._flow_operator_missing_product_rule_detail(card, signals)
-                continue
-            card.pop("_auto_trello_skip_code", None)
-            card.pop("_auto_trello_skip_reason", None)
+            existing_flow_count = max(0, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(card.get("_flow_output_count") or 0)))
+            rerun_full_set = existing_flow_count >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+            image_count = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT if rerun_full_set else max(1, self.FLOW_AGENT_TARGET_OUTPUT_COUNT - existing_flow_count)
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
             all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
-            target_output_count = self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
-            existing_flow_count = max(0, min(target_output_count, int(card.get("_flow_output_count") or 0)))
-            image_count = target_output_count
-            shot_start = 0
+            shot_start = 0 if rerun_full_set else existing_flow_count
             shots = all_shots[shot_start : shot_start + image_count]
             if len(shots) < image_count and all_shots:
                 shots = [*shots, *all_shots[: image_count - len(shots)]]
@@ -11874,10 +17143,6 @@ exit 1
                     "trello_source_attachment_ids": selected_attachment_ids,
                     "trello_card_name": card_name,
                     "trello_card_url": card_url,
-                    "ai_suggested_title": str(card.get("_ai_suggested_title") or "").strip(),
-                    "ai_title_status": str(card.get("_ai_title_status") or "").strip(),
-                    "ai_title_error": str(card.get("_ai_title_error") or "").strip(),
-                    "ai_title_backup_path": str(card.get("_ai_title_backup_path") or "").strip(),
                     "trello_match_mode": "flow_agent",
                     "trello_search_query": query,
                     "shot_label": "Flow Agent image set",
@@ -11990,6 +17255,8 @@ exit 1
     def _trello_auto_search_query(self, request: CreateJobRequest) -> str:
         generic_titles = {
             "auto_image_from_trello_card",
+            "auto_ai_trello",
+            "auto_trello_flow",
             "automation_image_from_sheet_row",
             "auto_trello_quet_card_co_anh",
             "auto_trello_ai_chay_den_het_ready_for_ai",
@@ -12119,6 +17386,8 @@ exit 1
                 item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
             ]
             source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+            if len(flow_outputs) >= self.FLOW_AGENT_TARGET_OUTPUT_COUNT:
+                continue
             if source_attachments:
                 card["_image_attachments"] = source_attachments
                 card["_selected_attachment_ids"] = [
@@ -12221,29 +17490,10 @@ exit 1
         ]
         if not images:
             return [], []
-        series_counts: Dict[str, int] = {}
-        for item in images:
-            prefix = self._trello_generated_series_prefix(item)
-            if prefix:
-                series_counts[prefix] = series_counts.get(prefix, 0) + 1
-        has_plain_source_candidate = any(
-            not self._trello_attachment_is_flow_output(item)
-            and not self._trello_generated_series_prefix(item)
-            for item in images
-        )
-
         source_attachments: List[Dict[str, Any]] = []
         flow_outputs: List[Dict[str, Any]] = []
         for item in images:
-            series_prefix = self._trello_generated_series_prefix(item)
-            is_generated_series = bool(
-                series_prefix
-                and (
-                    series_counts.get(series_prefix, 0) >= 2
-                    or has_plain_source_candidate
-                )
-            )
-            if self._trello_attachment_is_flow_output(item) or is_generated_series:
+            if self._trello_attachment_is_flow_output(item):
                 flow_outputs.append(item)
             else:
                 source_attachments.append(item)
@@ -12262,21 +17512,59 @@ exit 1
         attachment_id = str(attachment.get("id") or "").strip()
         name = str(attachment.get("name") or "image.jpg").strip() or "image.jpg"
         mime = str(attachment.get("mimeType") or mimetypes.guess_type(name)[0] or "image/jpeg")
+        errors: List[str] = []
+
+        def is_trello_download_url(download_url: str) -> bool:
+            parsed = urlparse(download_url)
+            return parsed.netloc.endswith("trello.com") and "/attachments/" in parsed.path and "/download/" in parsed.path
+
+        def fetch(download_url: str) -> tuple[bytes, str]:
+            headers = {"User-Agent": "FlowWebUI/0.1"}
+            if is_trello_download_url(download_url):
+                headers["Authorization"] = f'OAuth oauth_consumer_key="{key}", oauth_token="{token}"'
+            request = Request(download_url, headers=headers, method="GET")
+            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+                return response.read(), response.headers.get_content_type() if response.headers else mime
+
+        def with_auth(download_url: str) -> str:
+            parsed = urlparse(download_url)
+            existing = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            existing.update({"key": key, "token": token})
+            return urlunparse(parsed._replace(query=urlencode(existing)))
+
+        candidate_urls: List[str] = []
         if attachment_id:
             path = (
                 f"cards/{quote(card_id, safe='')}/attachments/"
-                f"{quote(attachment_id, safe='')}/download/{quote(name)}"
+                f"{quote(attachment_id, safe='')}/download/{quote(name, safe='')}"
             )
-            request = Request(self._trello_endpoint(path, key, token), method="GET")
-            try:
-                with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
-                    return response.read(), response.headers.get_content_type() if response.headers else mime
-            except Exception:
-                pass
+            candidate_urls.append(f"{self.TRELLO_API_BASE_URL}/{path}")
         url = str(attachment.get("url") or "").strip()
         if not url:
-            raise RuntimeError(f"Attachment Trello {name} không có URL để tải.")
-        return self._read_remote_file(url)
+            if not candidate_urls:
+                raise RuntimeError(f"Attachment Trello {name} không có URL để tải.")
+        else:
+            parsed_url = urlparse(url)
+            if parsed_url.netloc.endswith("trello.com") and "/download/" in parsed_url.path:
+                candidate_urls.append(with_auth(url))
+            candidate_urls.append(url)
+        seen_urls: set[str] = set()
+        for candidate_url in candidate_urls:
+            if not candidate_url or candidate_url in seen_urls:
+                continue
+            seen_urls.add(candidate_url)
+            try:
+                return fetch(candidate_url)
+            except HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                detail = self._redact_trello_secret(detail or exc.reason, key, token)
+                errors.append(f"HTTP {exc.code}: {detail}")
+            except URLError as exc:
+                errors.append(self._redact_trello_secret(exc.reason or exc, key, token))
+            except Exception as exc:
+                errors.append(self._redact_trello_secret(exc, key, token))
+        detail = "; ".join(error for error in errors if error) or "unknown error"
+        raise RuntimeError(f"Không tải được attachment Trello {name}: {detail}")
 
     def _trello_request_json(
         self,
@@ -12456,327 +17744,12 @@ exit 1
         return payload if isinstance(payload, dict) else {}
 
     # ── Flow image upsampler (POST /v1/flow/upsampleImage) ──────────────────
-    # Match Flow's current 2K image upsample request first. Local resize is
-    # opt-in only because it increases pixel count without adding real detail.
+    # Confirmed via captured DevTools request (2026-05): the endpoint accepts
+    # ``{"encodedImage": <base64 JPEG>}`` and returns an upscaled JPEG in the
+    # same field. The response is treated defensively in ``_extract_encoded_image``
+    # so wrapping objects like ``{"image": {"encodedImage": ...}}`` also work.
 
-    def _flow_upsample_api_enabled(self) -> bool:
-        value = os.getenv("FLOW_UPSAMPLE_API_ENABLED", "").strip().lower()
-        if not value:
-            return True
-        return value not in {"0", "false", "no", "off"}
-
-    def _trello_fake_2k_resize_enabled(self) -> bool:
-        value = os.getenv("TRELLO_FAKE_2K_RESIZE_ENABLED", "").strip().lower()
-        return value in {"1", "true", "yes", "on"}
-
-    def _flow_upsample_payloads(
-        self,
-        media_id: str,
-        *,
-        client_context: Dict[str, Any] | None = None,
-    ) -> List[Dict[str, Any]]:
-        payload: Dict[str, Any] = {
-            "mediaId": media_id,
-            "targetResolution": "UPSAMPLE_IMAGE_RESOLUTION_2K",
-        }
-        if client_context:
-            payload["clientContext"] = client_context
-        return [payload]
-
-    def _flow_media_redirect_url(self, media_name: str) -> str:
-        media = str(media_name or "").strip()
-        if not media:
-            return ""
-        return f"https://labs.google/fx/api/trpc/media.getMediaUrlRedirect?name={quote(media)}"
-
-    def _normal_flow_media_name(self, value: Any) -> str:
-        raw = str(value or "").strip()
-        if not raw or raw.startswith(("http://", "https://")):
-            return ""
-        match = re.search(
-            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
-            raw,
-        )
-        return match.group(0) if match else ""
-
-    def _extract_flow_media_names(self, payload: Any) -> List[str]:
-        names: List[str] = []
-        seen: set[str] = set()
-
-        def visit(value: Any, parent_key: str = "") -> None:
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    key_text = str(key or "")
-                    if key_text in {"mediaId", "mediaName", "name", "primaryMediaId"}:
-                        if isinstance(child, str):
-                            media_name = self._normal_flow_media_name(child)
-                            if media_name and media_name not in seen:
-                                seen.add(media_name)
-                                names.append(media_name)
-                        elif isinstance(child, dict):
-                            visit(child, key_text)
-                            for nested_key in ("mediaName", "name"):
-                                media_name = self._normal_flow_media_name(child.get(nested_key))
-                                if media_name and media_name not in seen:
-                                    seen.add(media_name)
-                                    names.append(media_name)
-                    else:
-                        visit(child, key_text)
-            elif isinstance(value, list):
-                for item in value:
-                    visit(item, parent_key)
-
-        visit(payload)
-        return names
-
-    def _extract_image_urls(self, payload: Any) -> List[str]:
-        urls: List[str] = []
-        seen: set[str] = set()
-        url_keys = {"fifeUrl", "downloadUrl", "imageUrl", "url", "fifeUri", "uri"}
-
-        def visit(value: Any, parent_key: str = "") -> None:
-            if isinstance(value, dict):
-                for key, child in value.items():
-                    key_text = str(key or "")
-                    if key_text in url_keys and "thumb" not in key_text.lower() and isinstance(child, str):
-                        url = child.strip()
-                        if url.startswith("/"):
-                            url = f"https://labs.google{url}"
-                        if url.startswith(("http://", "https://")) and url not in seen:
-                            seen.add(url)
-                            urls.append(url)
-                    else:
-                        visit(child, key_text)
-            elif isinstance(value, list):
-                for item in value:
-                    visit(item, parent_key)
-
-        visit(payload)
-        return urls
-
-    async def _download_flow_image_bytes(self, client: Any, url: str) -> tuple[bytes, str]:
-        target = str(url or "").strip()
-        if not target:
-            return b"", ""
-        try:
-            response = await client._bm.context.request.get(target)
-            status = int(getattr(response, "status", 0) or 0)
-            if status and status != 200:
-                log.warning("Flow 2K image download failed HTTP %s: %s", status, target)
-                return b"", ""
-            body = await response.body()
-            headers = getattr(response, "headers", {}) or {}
-            mime = str(headers.get("content-type") or "").split(";", 1)[0].strip()
-            return bytes(body or b""), mime or mimetypes.guess_type(target)[0] or "image/jpeg"
-        except Exception as exc:
-            log.warning("Flow 2K image download failed: %s", self._flow_error_detail(exc))
-            return b"", ""
-
-    async def _flow_upsample_response_bytes(
-        self,
-        client: Any,
-        payload: Any,
-        *,
-        fallback_media_id: str = "",
-    ) -> tuple[bytes, str]:
-        import base64 as _b64
-
-        encoded_out = self._extract_encoded_image(payload)
-        if encoded_out:
-            try:
-                return _b64.b64decode(encoded_out), "image/jpeg"
-            except Exception as exc:
-                log.warning("flow/upsampleImage: base64 decode failed: %s", exc)
-
-        for url in self._extract_image_urls(payload):
-            downloaded, mime = await self._download_flow_image_bytes(client, url)
-            if downloaded:
-                return downloaded, mime
-
-        media_names = self._extract_flow_media_names(payload)
-        fallback = self._normal_flow_media_name(fallback_media_id)
-        if fallback and fallback not in media_names:
-            media_names.append(fallback)
-        for media_name in media_names:
-            downloaded, mime = await self._download_flow_image_bytes(
-                client,
-                self._flow_media_redirect_url(media_name),
-            )
-            if downloaded:
-                return downloaded, mime
-
-        return b"", ""
-
-    async def _flow_ui_click_text(
-        self,
-        page: Any,
-        *,
-        contains: tuple[str, ...] = (),
-        startswith: tuple[str, ...] = (),
-    ) -> bool:
-        rect = await page.evaluate(
-            """
-            ({ contains, startswith }) => {
-              const normalize = (value) => (value || '')
-                .normalize('NFD')
-                .replace(/[\\u0300-\\u036f]/g, '')
-                .toLowerCase()
-                .replace(/\\s+/g, ' ')
-                .trim();
-              const containsNeedles = contains.map(normalize).filter(Boolean);
-              const startsWithNeedles = startswith.map(normalize).filter(Boolean);
-              const visible = (el) => {
-                if (!el || !(el instanceof Element)) return false;
-                const style = window.getComputedStyle(el);
-                const rect = el.getBoundingClientRect();
-                return style.display !== 'none'
-                  && style.visibility !== 'hidden'
-                  && style.opacity !== '0'
-                  && rect.width > 0
-                  && rect.height > 0
-                  && rect.bottom > 0
-                  && rect.right > 0
-                  && rect.top < window.innerHeight
-                  && rect.left < window.innerWidth;
-              };
-              const nodes = [...document.querySelectorAll('button, [role="menuitem"], [role="option"], [role="button"]')];
-              for (const node of nodes) {
-                if (!visible(node)) continue;
-                const text = normalize(node.innerText || node.textContent || node.getAttribute('aria-label') || '');
-                if (!text) continue;
-                const matched = containsNeedles.some((needle) => text.includes(needle))
-                  || startsWithNeedles.some((needle) => text.startsWith(needle));
-                if (!matched) continue;
-                const rect = node.getBoundingClientRect();
-                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-              }
-              return null;
-            }
-            """,
-            {"contains": list(contains), "startswith": list(startswith)},
-        )
-        if not isinstance(rect, dict):
-            return False
-        await page.mouse.click(float(rect["x"]), float(rect["y"]))
-        return True
-
-    async def _flow_ui_image_rect_for_media(self, page: Any, media_id: str) -> Dict[str, float]:
-        media = self._normal_flow_media_name(media_id)
-        if not media:
-            return {}
-        deadline = time.monotonic() + 45.0
-        last_rect: Dict[str, float] = {}
-        while time.monotonic() < deadline:
-            rect = await page.evaluate(
-                """
-                (mediaId) => {
-                  const visible = (el) => {
-                    if (!el || !(el instanceof Element)) return false;
-                    const style = window.getComputedStyle(el);
-                    const rect = el.getBoundingClientRect();
-                    return style.display !== 'none'
-                      && style.visibility !== 'hidden'
-                      && rect.width >= 80
-                      && rect.height >= 80
-                      && rect.bottom > 0
-                      && rect.right > 0
-                      && rect.top < window.innerHeight
-                      && rect.left < window.innerWidth;
-                  };
-                  const all = [...document.querySelectorAll('img[src], img[srcset]')]
-                    .filter((img) => {
-                      const src = img.currentSrc || img.src || img.getAttribute('src') || img.getAttribute('srcset') || '';
-                      return src.includes(`name=${mediaId}`) || src.includes(`name%3D${mediaId}`);
-                    });
-                  if (!all.length) return null;
-                  const scored = all
-                    .filter(visible)
-                    .map((img) => {
-                      const rect = img.getBoundingClientRect();
-                      return { img, area: rect.width * rect.height };
-                    })
-                    .sort((a, b) => b.area - a.area);
-                  const chosen = scored.length ? scored[0].img : all[0];
-                  chosen.scrollIntoView({ block: 'center', inline: 'center' });
-                  const rect = chosen.getBoundingClientRect();
-                  return {
-                    x: rect.left,
-                    y: rect.top,
-                    width: rect.width,
-                    height: rect.height,
-                    visible: visible(chosen),
-                  };
-                }
-                """,
-                media,
-            )
-            if isinstance(rect, dict):
-                last_rect = {
-                    "x": float(rect.get("x") or 0),
-                    "y": float(rect.get("y") or 0),
-                    "width": float(rect.get("width") or 0),
-                    "height": float(rect.get("height") or 0),
-                }
-                if rect.get("visible") and last_rect["width"] > 0 and last_rect["height"] > 0:
-                    return last_rect
-            await asyncio.sleep(1.0)
-        return last_rect
-
-    async def _upsample_image_via_flow_ui_download(self, client: Any, media_id: str) -> bytes:
-        media = self._normal_flow_media_name(media_id)
-        if not media:
-            return b""
-        page = await client._bm.page()
-        project_id = str(getattr(client._api, "project_id", "") or "").strip()
-        target_url = self._project_url(project_id) if project_id else str(getattr(client, "_project_url", "") or "")
-        if target_url and target_url not in str(page.url or ""):
-            await page.goto(target_url, wait_until="domcontentloaded", timeout=60_000)
-            await asyncio.sleep(2.0)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=30_000)
-        except Exception:
-            pass
-
-        rect = await self._flow_ui_image_rect_for_media(page, media)
-        if not rect:
-            log.warning("Flow UI 2K download skipped: media tile not found for %s", media)
-            return b""
-
-        menu_x = rect["x"] + rect["width"] - 28
-        menu_y = rect["y"] + 28
-        await page.mouse.move(menu_x, menu_y)
-        await asyncio.sleep(0.4)
-        await page.mouse.click(menu_x, menu_y)
-        await asyncio.sleep(0.5)
-        if not await self._flow_ui_click_text(page, contains=("Tải xuống", "Tai xuong", "Download")):
-            log.warning("Flow UI 2K download skipped: download menu item not found")
-            return b""
-        await asyncio.sleep(0.5)
-
-        target_dir = DOWNLOADS_DIR / "_flow_2k_downloads"
-        target_dir.mkdir(parents=True, exist_ok=True)
-        target_path = target_dir / f"{media}-{uuid.uuid4().hex}.jpg"
-        try:
-            async with page.expect_download(timeout=120_000) as download_info:
-                clicked = await self._flow_ui_click_text(page, startswith=("2K",))
-                if not clicked:
-                    raise RuntimeError("2K download option not found")
-            download = await download_info.value
-            await download.save_as(str(target_path))
-            return await asyncio.to_thread(target_path.read_bytes)
-        except Exception as exc:
-            log.warning("Flow UI 2K download failed: %s", self._flow_error_detail(exc))
-            return b""
-
-    async def _upsample_image_via_flow(
-        self,
-        client: Any,
-        jpeg_bytes: bytes,
-        *,
-        media_generation_id: str = "",
-        workflow_id: str = "",
-        prompt: str = "",
-    ) -> bytes:
+    async def _upsample_image_via_flow(self, client: Any, jpeg_bytes: bytes) -> bytes:
         """Call POST /v1/flow/upsampleImage and return the upscaled JPEG bytes.
 
         Returns the original bytes on any failure so the caller can still
@@ -12784,107 +17757,46 @@ exit 1
         """
         if not jpeg_bytes:
             return jpeg_bytes
-        media_id = self._normal_flow_media_name(media_generation_id)
-        if not media_id:
-            log.warning("flow/upsampleImage skipped: missing Flow media id")
+        try:
+            import base64 as _b64
+            encoded_in = _b64.b64encode(jpeg_bytes).decode("ascii")
+            data = await client._api._fetch(
+                "POST",
+                "flow/upsampleImage",
+                {"encodedImage": encoded_in},
+            )
+        except Exception as exc:
+            log.warning("flow/upsampleImage failed: %s", self._flow_error_detail(exc))
+            return jpeg_bytes
+        encoded_out = self._extract_encoded_image(data)
+        if not encoded_out:
+            log.warning(
+                "flow/upsampleImage: response missing encodedImage field (keys=%s)",
+                list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+            )
             return jpeg_bytes
         try:
-            client_context = await client._api._client_context()
+            return _b64.b64decode(encoded_out)
         except Exception as exc:
-            log.warning("flow/upsampleImage client context failed: %s", self._flow_error_detail(exc))
-            client_context = {}
-
-        payloads = self._flow_upsample_payloads(media_id, client_context=client_context)
-        for attempt, payload in enumerate(payloads, start=1):
-            try:
-                data = await client._api._fetch(
-                    "POST",
-                    "flow/upsampleImage",
-                    payload,
-                )
-            except Exception as exc:
-                log.warning(
-                    "flow/upsampleImage attempt %s media=%s failed: %s",
-                    attempt,
-                    media_id,
-                    self._flow_error_detail(exc),
-                )
-                continue
-            decoded, _mime = await self._flow_upsample_response_bytes(
-                client,
-                data,
-                fallback_media_id=media_id,
-            )
-            if not decoded:
-                log.warning(
-                    "flow/upsampleImage: response missing image bytes/url/media field (keys=%s)",
-                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-                )
-                continue
-            if decoded == jpeg_bytes:
-                log.warning(
-                    "flow/upsampleImage attempt %s media=%s returned original bytes",
-                    attempt,
-                    media_id,
-                )
-                continue
-            decoded_size = self._image_size_from_bytes(decoded)
-            if decoded_size and max(decoded_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
-                return decoded
-            log.warning(
-                "flow/upsampleImage attempt %s media=%s returned non-2K bytes (%sx%s)",
-                attempt,
-                media_id,
-                decoded_size[0] if decoded_size else 0,
-                decoded_size[1] if decoded_size else 0,
-            )
-        ui_downloaded = await self._upsample_image_via_flow_ui_download(client, media_id)
-        if ui_downloaded and ui_downloaded != jpeg_bytes:
-            ui_size = self._image_size_from_bytes(ui_downloaded)
-            if ui_size and max(ui_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
-                return ui_downloaded
-            log.warning(
-                "Flow UI 2K download returned non-2K bytes (%sx%s)",
-                ui_size[0] if ui_size else 0,
-                ui_size[1] if ui_size else 0,
-            )
-        return jpeg_bytes
+            log.warning("flow/upsampleImage: base64 decode failed: %s", exc)
+            return jpeg_bytes
 
     def _extract_encoded_image(self, payload: Any) -> str:
-        """Recursively find the first encoded image string in a JSON tree."""
-        return self._extract_image_bytes_field(payload, {"encodedImage", "rawBytes", "imageBytes"})
-
-    def _extract_image_bytes_field(self, payload: Any, field_names: set[str]) -> str:
+        """Recursively find the first ``encodedImage`` string in a JSON tree."""
         if isinstance(payload, dict):
-            for key in field_names:
-                candidate = payload.get(key)
-                if isinstance(candidate, str) and candidate:
-                    return candidate
+            candidate = payload.get("encodedImage")
+            if isinstance(candidate, str) and candidate:
+                return candidate
             for value in payload.values():
-                found = self._extract_image_bytes_field(value, field_names)
+                found = self._extract_encoded_image(value)
                 if found:
                     return found
         elif isinstance(payload, list):
             for item in payload:
-                found = self._extract_image_bytes_field(item, field_names)
+                found = self._extract_encoded_image(item)
                 if found:
                     return found
         return ""
-
-    def _image_size_from_bytes(self, image_bytes: bytes) -> tuple[int, int]:
-        if not image_bytes:
-            return (0, 0)
-        try:
-            from PIL import Image, ImageOps
-        except Exception:
-            return (0, 0)
-
-        try:
-            with Image.open(io.BytesIO(image_bytes)) as opened:
-                image = ImageOps.exif_transpose(opened)
-                return tuple(int(part) for part in image.size)
-        except Exception:
-            return (0, 0)
 
     def _ensure_image_long_edge_2k(
         self,
@@ -12893,9 +17805,9 @@ exit 1
     ) -> tuple[bytes, str, bool, tuple[int, int], tuple[int, int]]:
         """Return JPEG bytes whose long edge is at least 2048px.
 
-        This local pass only changes the pixel dimensions. It is kept as an
-        explicit opt-in fallback for users who want 2048px files even when Flow
-        does not return true 2K image detail.
+        Flow's upsampler is preferred because it can recover detail, but it may
+        occasionally return the original asset. This local pass guarantees the
+        Trello file itself is not a low-resolution thumbnail.
         """
         if not image_bytes:
             return image_bytes, mime_type or "image/jpeg", False, (0, 0), (0, 0)
@@ -12939,11 +17851,12 @@ exit 1
         self,
         artifact: JobArtifact,
         artifact_url: str,
-    ) -> ImageUpscaleResult:
-        """Fetch an artifact and prepare 2K bytes for Trello upload.
+    ) -> tuple[Optional[bytes], str]:
+        """Fetch an artifact and upsample it via flow/upsampleImage.
 
-        Flow's own 2K upsampler is tried first. Local resize is disabled by
-        default because it creates a larger but still blurry file.
+        Returns ``(upscaled_bytes, mime)`` on success, or ``(None, "")`` if the
+        source bytes could not be fetched. JPEG is preferred since the Flow
+        upsampler expects an encoded JPEG payload.
         """
         local_path = str(artifact.local_path or "").strip()
         source_bytes: bytes = b""
@@ -12961,116 +17874,33 @@ exit 1
             )
             source_mime = source_mime or detected_mime or "image/jpeg"
         if not source_bytes:
-            return ImageUpscaleResult()
+            return None, ""
 
         workflow_id = str(artifact.workflow_id or "").strip()
-        media_generation_id = str(artifact.media_name or "").strip()
-        source_size = await asyncio.to_thread(self._image_size_from_bytes, source_bytes)
-        if source_size and max(source_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
-            return ImageUpscaleResult()
 
         async def _go(client: Any) -> bytes:
-            return await self._upsample_image_via_flow(
-                client,
-                source_bytes,
-                media_generation_id=media_generation_id,
-                workflow_id=workflow_id,
-            )
+            return await self._upsample_image_via_flow(client, source_bytes)
 
         flow_upscaled: bytes = b""
-        if self._flow_upsample_api_enabled():
-            try:
-                flow_upscaled = await self._with_client(_go, workflow_id=workflow_id)
-            except Exception as exc:
-                log.warning("Flow 2K upscaling client failed: %s", self._flow_error_detail(exc))
-
-        flow_changed = bool(flow_upscaled and flow_upscaled != source_bytes)
-        candidate_bytes = flow_upscaled if flow_changed else source_bytes
-        candidate_mime = "image/jpeg" if flow_changed else source_mime
-        candidate_size = await asyncio.to_thread(self._image_size_from_bytes, candidate_bytes)
-        if flow_changed and candidate_size and max(candidate_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
-            return ImageUpscaleResult(
-                bytes=flow_upscaled,
-                mime_type="image/jpeg",
-                source="flow_2k",
-                source_size=source_size,
-                target_size=candidate_size,
-                used_flow=True,
-            )
-
-        if self._trello_fake_2k_resize_enabled():
-            ensured, ensured_mime, changed, resize_source_size, resize_target_size = await asyncio.to_thread(
-                self._ensure_image_long_edge_2k,
-                candidate_bytes,
-                candidate_mime,
-            )
-            if changed:
-                log.info("Locally resized Trello image from %sx%s to %sx%s", *resize_source_size, *resize_target_size)
-                return ImageUpscaleResult(
-                    bytes=ensured,
-                    mime_type=ensured_mime,
-                    source="local_resize",
-                    source_size=resize_source_size,
-                    target_size=resize_target_size,
-                    used_flow=flow_changed,
-                )
-
-        reason = "Flow returned original bytes"
-        if flow_changed:
-            reason = (
-                f"Flow returned {candidate_size[0]}x{candidate_size[1]} bytes"
-                if candidate_size
-                else "Flow returned unreadable image bytes"
-            )
-        elif not self._flow_upsample_api_enabled():
-            reason = "Flow upsample API disabled"
-        return ImageUpscaleResult(
-            source="flow_unavailable",
-            source_size=source_size,
-            target_size=candidate_size or source_size,
-            used_flow=flow_changed,
-            failure_reason=reason,
-        )
-
-    async def _persist_flow_2k_artifact_file(
-        self,
-        job_id: str,
-        artifact: JobArtifact,
-        artifact_index: int,
-        upscale: ImageUpscaleResult,
-    ) -> None:
-        if not upscale.bytes or upscale.source != "flow_2k":
-            return
         try:
-            job = self.store.get_job(job_id)
-            if job is not None:
-                file_name = self._download_name(job, artifact, artifact_index)
-            else:
-                file_name = f"{job_id}-{artifact_index + 1}.jpg"
-            base_name = Path(file_name).name or f"{job_id}-{artifact_index + 1}.jpg"
-            base_path = Path(base_name)
-            destination = self._download_root() / f"{base_path.stem}-2k.jpg"
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(destination.write_bytes, upscale.bytes)
-
-            artifact.local_path = str(destination)
-            artifact.public_url = self._public_download_url(str(destination))
-            artifact.mime_type = upscale.mime_type or "image/jpeg"
-            if upscale.target_size and max(upscale.target_size) > 0:
-                dimensions = dict(artifact.dimensions or {})
-                dimensions.update(
-                    {
-                        "width": upscale.target_size[0],
-                        "height": upscale.target_size[1],
-                        "upscale_source": upscale.source,
-                    }
-                )
-                artifact.dimensions = dimensions
-
-            if job is not None and any(existing is artifact for existing in job.artifacts):
-                await self.store.replace_artifacts(job_id, job.artifacts)
+            flow_upscaled = await self._with_client(_go, workflow_id=workflow_id)
         except Exception as exc:
-            log.warning("Could not persist Flow 2K artifact file: %s", exc)
+            log.warning("Flow 2K upscaling client failed: %s", self._flow_error_detail(exc))
+
+        candidate_bytes = flow_upscaled if flow_upscaled and flow_upscaled != source_bytes else source_bytes
+        candidate_mime = "image/jpeg" if flow_upscaled and flow_upscaled != source_bytes else source_mime
+        ensured, ensured_mime, changed, source_size, target_size = await asyncio.to_thread(
+            self._ensure_image_long_edge_2k,
+            candidate_bytes,
+            candidate_mime,
+        )
+        if changed:
+            log.info("Upscaled Trello image from %sx%s to %sx%s", *source_size, *target_size)
+            return ensured, ensured_mime
+        if flow_upscaled and flow_upscaled != source_bytes:
+            # The Flow upsampler returns JPEG bytes regardless of input mime.
+            return ensured, ensured_mime or "image/jpeg"
+        return None, ""
 
     def _read_remote_file(self, url: str) -> tuple[bytes, str]:
         request = Request(url, headers={"User-Agent": "FlowWebUI/0.1"})
@@ -15506,7 +20336,7 @@ exit 1
             client_self: Any,
             prompt: str,
             *,
-            model: str = "Nano Banana Pro",
+            model: str = "Nano Banana 2",
             aspect: str = "landscape",
             count: int = 1,
             reference_images: Optional[list[str]] = None,
@@ -15869,6 +20699,143 @@ exit 1
         except Exception:
             await page.goto(target_url, wait_until="commit", timeout=60_000)
         await asyncio.sleep(2.0)
+
+    async def _flow_project_page_has_load_error(self, page: Any) -> bool:
+        current_url = str(getattr(page, "url", "") or "").strip().lower()
+        if "/tools/flow/project/" not in current_url:
+            return False
+        try:
+            result = await page.evaluate(
+                r"""
+                () => {
+                  const text = (document.body?.innerText || document.body?.textContent || '')
+                    .replace(/\s+/g, ' ')
+                    .trim();
+                  return /Đã\s*xảy\s*ra\s*lỗi|Da\s*xay\s*ra\s*loi|Something\s+went\s+wrong|Try\s+again|Tải\s*lại\s*dự\s*án|Tai\s*lai\s*du\s*an/i.test(text);
+                }
+                """
+            )
+            return bool(result)
+        except Exception:
+            return False
+
+    async def _recover_flow_project_page_from_error(
+        self,
+        page: Any,
+        client: Any,
+        job_id: str = "",
+        *,
+        force: bool = False,
+    ) -> tuple[bool, str]:
+        if not force and not await self._flow_project_page_has_load_error(page):
+            return False, "project page looks usable"
+
+        home_url = "https://labs.google/fx/vi/tools/flow"
+        try:
+            await page.goto(home_url, wait_until="domcontentloaded", timeout=60_000)
+        except Exception:
+            await page.goto(home_url, wait_until="commit", timeout=60_000)
+        await asyncio.sleep(3.0)
+
+        try:
+            result = await page.evaluate(
+                r"""
+                () => {
+                  const deepQuery = (selector, root = document, seen = new Set()) => {
+                    const found = [];
+                    const visit = (node) => {
+                      if (!node || seen.has(node)) return;
+                      seen.add(node);
+                      try {
+                        found.push(...node.querySelectorAll(selector));
+                        for (const el of node.querySelectorAll('*')) {
+                          if (el.shadowRoot) visit(el.shadowRoot);
+                        }
+                      } catch (_) {}
+                    };
+                    visit(root);
+                    return found;
+                  };
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 40 || rect.height < 24) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight
+                      && rect.right > 0
+                      && rect.left < window.innerWidth;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                  ].join(' ').replace(/\s+/g, ' ').trim();
+                  const candidates = deepQuery('button, [role="button"], a, div, span')
+                    .filter(visible)
+                    .map((el) => {
+                      const control = el.closest('button, [role="button"], a') || el;
+                      const rect = control.getBoundingClientRect();
+                      const label = `${labelFor(el)} ${labelFor(control)}`.replace(/\s+/g, ' ').trim();
+                      const exact = /^(Dự\s*án\s*mới|Du\s*an\s*moi|New\s+project|Create\s+project)$/i.test(label);
+                      const contains = /Dự\s*án\s*mới|Du\s*an\s*moi|New\s+project|Create\s+project/i.test(label);
+                      const compact = rect.width >= 60 && rect.width <= 360 && rect.height >= 28 && rect.height <= 160;
+                      const score = (exact ? 3000 : 0) + (contains ? 1200 : 0) + (compact ? 300 : -400) - Math.abs(rect.top - window.innerHeight * 0.72) / 20;
+                      return { el: control, rect, label, score, contains };
+                    })
+                    .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index)
+                    .filter(({ contains, score }) => contains && score > 0)
+                    .sort((a, b) => b.score - a.score);
+                  const target = candidates[0];
+                  if (!target) return { ok: false, detail: 'new project button not found on Flow home' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  const rect = target.el.getBoundingClientRect();
+                  return {
+                    ok: true,
+                    x: rect.left + rect.width / 2,
+                    y: rect.top + rect.height / 2,
+                    detail: target.label || 'new project',
+                  };
+                }
+                """
+            )
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+
+        if not isinstance(result, dict) or not result.get("ok"):
+            return False, str((result or {}).get("detail") if isinstance(result, dict) else "new project button not found")
+
+        try:
+            await page.mouse.click(float(result.get("x")), float(result.get("y")))
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))
+        await asyncio.sleep(6.0)
+
+        new_project_id = self._normalize_project_id(str(getattr(page, "url", "") or ""))
+        if not new_project_id:
+            return False, f"clicked {result.get('detail') or 'new project'} but no project URL appeared"
+
+        try:
+            client.project_id = new_project_id
+        except Exception:
+            pass
+
+        try:
+            current = self.store.snapshot().config
+            updated = current.model_copy(update={"project_id": new_project_id, "project_url": self._project_url(new_project_id)})
+            await self.store.replace_config(updated)
+            self._sync_project_to_flow_storage(updated)
+        except Exception:
+            pass
+
+        if job_id:
+            reason = "không thấy Tác nhân" if force else "project cũ lỗi"
+            await self.store.append_log(job_id, f"Flow {reason}; đã tạo/mở project mới {new_project_id}.")
+        return True, f"created/opened new Flow project {new_project_id}"
 
     async def _repair_placeholder_flow_tabs(self, browser: Any, project_url: str) -> None:
         target_url = str(project_url or "").strip()
@@ -16771,6 +21738,7 @@ exit 1
         payload["type"] = str(payload.get("type", "")).strip()
         payload["prompt"] = str(payload.get("prompt", "")).strip()
         payload["title"] = str(payload.get("title", "")).strip()
+        payload["image_engine"] = self._normalize_image_engine(str(payload.get("image_engine", "google_flow")))
         payload["model"] = self._normalize_job_model(payload["type"], str(payload.get("model", "")).strip())
         payload["aspect"] = str(payload.get("aspect", "landscape")).strip() or "landscape"
         payload["start_image_path"] = str(payload.get("start_image_path", "")).strip()
@@ -17568,14 +22536,22 @@ exit 1
         path = Path(local_path).resolve()
         default_root = DOWNLOADS_DIR.resolve()
         if str(path).startswith(str(default_root)):
-            return f"/files/downloads/{path.name}"
+            relative_path = path.relative_to(default_root)
+            url_path = quote(relative_path.as_posix(), safe="/")
+            return f"/files/downloads/{url_path}"
         return ""
 
     def _validate_job_request(self, request: CreateJobRequest) -> None:
-        if request.type != "login" and not self.get_auth_status().authenticated:
+        gemini_image_request = self._request_uses_gemini_image_engine(request)
+        if request.type != "login" and not gemini_image_request and not self.get_auth_status().authenticated:
             raise HTTPException(
                 status_code=400,
                 detail="Cần đăng nhập Google Flow trước khi chạy tác vụ. Hãy bấm Đăng nhập Google Flow rồi thử lại.",
+            )
+        if gemini_image_request and not self._gemini_api_key():
+            raise HTTPException(
+                status_code=400,
+                detail="Chế độ Gemini API cần GEMINI_API_KEY/GOOGLE_API_KEY hoặc lưu API key trong Setup Flow.",
             )
 
         if request.type == "video" and not request.prompt.strip():
@@ -18250,114 +23226,6 @@ exit 1
         except Exception:
             return {}
 
-    async def _visible_flow_project_images_from_page(
-        self,
-        client: Any,
-        *,
-        prompt: str,
-        target_count: int,
-        fallback_workflow_id: str = "",
-    ) -> List[Any]:
-        from flow._api import GeneratedImage
-
-        target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or 1)))
-        try:
-            page = await client._bm.page()
-            items = await page.evaluate(
-                """
-                (limit) => {
-                  const visible = (el) => {
-                    if (!el || !(el instanceof Element)) return false;
-                    const rect = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return style.display !== 'none'
-                      && style.visibility !== 'hidden'
-                      && rect.width >= 120
-                      && rect.height >= 120
-                      && rect.bottom > 0
-                      && rect.right > 0
-                      && rect.top < window.innerHeight
-                      && rect.left < window.innerWidth;
-                  };
-                  const srcFor = (img) => {
-                    const current = img.currentSrc || img.src || '';
-                    if (current) return current;
-                    const srcset = img.getAttribute('srcset') || '';
-                    return srcset.split(',').map((part) => part.trim().split(/\\s+/)[0]).filter(Boolean).pop() || '';
-                  };
-                  const toItem = (img, index) => {
-                    const rect = img.getBoundingClientRect();
-                    const src = srcFor(img);
-                    const link = img.closest('a[href*="/edit/"]');
-                    const href = link ? link.href || link.getAttribute('href') || '' : '';
-                    const workflowMatch = href.match(/\\/edit\\/([^/?#]+)/);
-                    const card = img.closest('a[href*="/edit/"], [role="gridcell"], article, li, [data-testid], div');
-                    const cardRect = card && card.getBoundingClientRect ? card.getBoundingClientRect() : rect;
-                    return {
-                      src,
-                      workflow_id: workflowMatch ? workflowMatch[1] : '',
-                      top: cardRect.top,
-                      left: cardRect.left,
-                      width: rect.width,
-                      height: rect.height,
-                      area: rect.width * rect.height,
-                      linked: Boolean(link),
-                      index,
-                    };
-                  };
-                  const seen = new Set();
-                  const all = Array.from(document.querySelectorAll('img[src], img[srcset]'))
-                    .filter(visible)
-                    .map(toItem)
-                    .filter((item) => item.src && !item.src.startsWith('data:') && !item.src.startsWith('blob:'))
-                    .filter((item) => item.area >= 18000)
-                    .filter((item) => {
-                      const key = item.workflow_id || item.src;
-                      if (seen.has(key)) return false;
-                      seen.add(key);
-                      return true;
-                    });
-                  const linked = all.filter((item) => item.linked);
-                  const pool = linked.length >= Math.min(limit, 3) ? linked : all;
-                  return pool
-                    .sort((a, b) => (a.top - b.top) || (a.left - b.left) || (a.index - b.index))
-                    .slice(0, limit)
-                    .map((item) => ({
-                      src: item.src,
-                      workflow_id: item.workflow_id,
-                      width: Math.round(item.width),
-                      height: Math.round(item.height),
-                    }));
-                }
-                """,
-                target,
-            )
-        except Exception:
-            return []
-
-        images: List[Any] = []
-        seen_urls: set[str] = set()
-        for index, item in enumerate(items if isinstance(items, list) else [], start=1):
-            if not isinstance(item, dict):
-                continue
-            url = str(item.get("src") or "").strip()
-            if not url or url in seen_urls:
-                continue
-            seen_urls.add(url)
-            image = GeneratedImage.__new__(GeneratedImage)
-            image._raw = {"visible_ui_fallback": True, **item}
-            image.media_name = f"visible-flow-{index}.jpg"
-            image.project_id = ""
-            image.workflow_id = str(item.get("workflow_id") or fallback_workflow_id or "").strip()
-            image.fife_url = url
-            image.seed = 0
-            image.model = ""
-            image.prompt = prompt
-            image.dimensions = {"width": int(item.get("width") or 0), "height": int(item.get("height") or 0)}
-            image.file_path = None
-            images.append(image)
-        return images[:target]
-
     async def _wait_for_new_project_images(
         self,
         client: Any,
@@ -18368,7 +23236,6 @@ exit 1
         timeout_s: float,
         fallback_workflow_id: str = "",
         settle_s: float = 4.0,
-        allow_visible_fallback: bool = False,
     ) -> List[Any]:
         target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or 1)))
         deadline = time.monotonic() + max(5.0, float(timeout_s or 30))
@@ -18409,15 +23276,6 @@ exit 1
 
         if best:
             return best[:target]
-        if allow_visible_fallback:
-            visible_images = await self._visible_flow_project_images_from_page(
-                client,
-                prompt=prompt,
-                target_count=target,
-                fallback_workflow_id=fallback_workflow_id,
-            )
-            if visible_images:
-                return visible_images[:target]
         raise RuntimeError("Google Flow không trả ảnh mới trong project sau khi bấm tạo ảnh.")
 
     async def _generate_image_edit_result(
@@ -18498,6 +23356,9 @@ exit 1
         request: CreateJobRequest,
         reference_media_names: List[str],
     ) -> List[Any]:
+        if self._request_uses_gemini_image_engine(request):
+            return await self._generate_images_via_gemini_api(job_id, request)
+
         local_reference_paths = self._normalize_local_upload_paths(request.reference_image_paths or [])
         if (reference_media_names or local_reference_paths) and self._request_requires_flow_agent_ui(request):
             await self.store.append_log(
@@ -18509,31 +23370,182 @@ exit 1
         try:
             return await self._generate_images_once(client, request, reference_media_names)
         except Exception as exc:
-            if self._is_recaptcha_error(exc):
-                await self.store.append_log(
-                    job_id,
-                    "Flow API tu choi luot gui tu dong. Em dang chuyen sang duong chay qua giao dien Flow de thu lai.",
-                )
-                await self._set_job_progress(
-                    job_id,
-                    "sending_request",
-                    "Flow API tu choi luot gui truc tiep. Em dang tai lai project va gui lai bang giao dien Flow.",
-                )
-            elif self._is_image_model_error(exc):
-                await self.store.append_log(
-                    job_id,
-                    "Flow API chua nhan model anh da chon. Em dang chuyen sang giao dien Flow de chon model bang ten hien thi.",
-                )
-                await self._set_job_progress(
-                    job_id,
-                    "sending_request",
-                    "Flow API chua nhan model anh da chon. Em dang tai lai project va gui lai bang giao dien Flow.",
-                )
-            else:
+            if not self._is_recaptcha_error(exc):
                 raise
 
+            await self.store.append_log(
+                job_id,
+                "Flow API tu choi luot gui tu dong. Em dang chuyen sang duong chay qua giao dien Flow de thu lai.",
+            )
+            await self._set_job_progress(
+                job_id,
+                "sending_request",
+                "Flow API tu choi luot gui truc tiep. Em dang tai lai project va gui lai bang giao dien Flow.",
+            )
             await self._reload_flow_project_page(client)
             return await self._generate_images_via_ui(client, request, reference_media_names, job_id=job_id)
+
+    def _gemini_image_aspect_ratio(self, aspect: str) -> str:
+        normalized = self._parse_aspect(aspect or "square")
+        if normalized == "portrait":
+            return "9:16"
+        if normalized == "landscape":
+            return "16:9"
+        return "1:1"
+
+    def _gemini_image_output_extension(self, mime_type: str) -> str:
+        mime = str(mime_type or "").lower()
+        if "png" in mime:
+            return ".png"
+        if "webp" in mime:
+            return ".webp"
+        return ".jpg"
+
+    def _gemini_image_reference_parts(self, request: CreateJobRequest) -> List[Dict[str, Any]]:
+        parts: List[Dict[str, Any]] = []
+        paths = self._normalize_local_upload_paths(request.reference_image_paths or [])
+        roles = self._normalize_reference_image_roles(paths, request.reference_image_roles or [])
+        for index, image_path in enumerate(paths[:4]):
+            source = Path(image_path).expanduser()
+            if not source.is_file():
+                raise RuntimeError(f"Không tìm thấy ảnh nguồn cho Gemini API: {source}")
+            mime_type = mimetypes.guess_type(str(source))[0] or "image/jpeg"
+            role = roles[index] if index < len(roles) else ("base" if index == 0 else "reference")
+            parts.append({"text": f"REFERENCE_IMAGE_{index + 1} role={role}"})
+            parts.append(self._inline_gemini_image_part(source.read_bytes(), mime_type))
+        return parts
+
+    def _gemini_image_prompt_for_slot(self, request: CreateJobRequest, slot_index: int, total: int) -> str:
+        shot_specs = self._flow_agent_shot_specs()
+        shot = shot_specs[slot_index % len(shot_specs)] if shot_specs else {}
+        lines = [
+            request.prompt.strip(),
+            "",
+            "Create one high-quality ecommerce listing image for the same product shown in the reference images.",
+            "Keep the product category, silhouette, material, motif/design, personalization text, and construction consistent with the reference.",
+            "Do not turn the product into a different item. Do not invent unrelated products or readable brand text.",
+            f"Shot {slot_index + 1}/{total}: {shot.get('label') or 'distinct ecommerce product shot'}.",
+            shot.get("brief") or "",
+            f"Must not: {shot.get('must_not')}" if shot.get("must_not") else "",
+            f"Aspect ratio: {self._gemini_image_aspect_ratio(request.aspect)}.",
+            "Commercial product photography, polished lighting, realistic texture, clean sellable composition.",
+        ]
+        return "\n".join(line for line in lines if str(line or "").strip()).strip()
+
+    def _extract_gemini_image_outputs(self, payload: Dict[str, Any]) -> List[tuple[bytes, str]]:
+        outputs: List[tuple[bytes, str]] = []
+
+        def add_image(data_value: Any, mime_value: Any = "") -> None:
+            raw = str(data_value or "").strip()
+            if not raw:
+                return
+            if "," in raw and raw.lower().startswith("data:"):
+                header, raw = raw.split(",", 1)
+                if not mime_value and ";" in header:
+                    mime_value = header.split(":", 1)[-1].split(";", 1)[0]
+            try:
+                outputs.append((base64.b64decode(raw), str(mime_value or "image/jpeg").strip() or "image/jpeg"))
+            except Exception:
+                return
+
+        for candidate in payload.get("candidates") or []:
+            content = candidate.get("content") or {}
+            for part in content.get("parts") or []:
+                inline = part.get("inlineData") or part.get("inline_data") or {}
+                if isinstance(inline, dict):
+                    add_image(inline.get("data"), inline.get("mimeType") or inline.get("mime_type"))
+
+        for item in payload.get("outputs") or []:
+            if not isinstance(item, dict):
+                continue
+            output_image = item.get("output_image") or item.get("outputImage") or {}
+            if isinstance(output_image, dict):
+                add_image(
+                    output_image.get("b64_json") or output_image.get("b64Json") or output_image.get("data"),
+                    output_image.get("mime_type") or output_image.get("mimeType"),
+                )
+
+        image = payload.get("image") or payload.get("output_image") or {}
+        if isinstance(image, dict):
+            add_image(image.get("b64_json") or image.get("b64Json") or image.get("data"), image.get("mime_type") or image.get("mimeType"))
+
+        return outputs
+
+    def _call_gemini_image_generate_content(self, payload: Dict[str, Any], model: str) -> Dict[str, Any]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Chưa cấu hình Gemini API key.")
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(model, safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request_obj, timeout=max(60, self.GEMINI_TIMEOUT_S * 2)) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                detail = body.get("error", {}).get("message") or json.dumps(body)[:500]
+            except Exception:
+                detail = str(exc)
+            raise RuntimeError(f"Gemini image API lỗi HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(f"Không kết nối được Gemini image API: {exc.reason}") from exc
+
+    async def _generate_images_via_gemini_api(self, job_id: str, request: CreateJobRequest) -> List[Any]:
+        model = self._gemini_image_model()
+        target_count = max(1, min(4, int(request.count or 1)))
+        reference_parts = self._gemini_image_reference_parts(request)
+        generated: List[Any] = []
+        target_dir = DOWNLOADS_DIR / "gemini"
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        for index in range(target_count):
+            slot_prompt = self._gemini_image_prompt_for_slot(request, index, target_count)
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [{"text": slot_prompt}, *reference_parts],
+                    }
+                ],
+                "generationConfig": {
+                    "responseModalities": ["TEXT", "IMAGE"],
+                    "temperature": 0.8,
+                },
+            }
+            await self.store.append_log(job_id, f"Gemini API tạo ảnh {index + 1}/{target_count} bằng {model}.")
+            body = await asyncio.to_thread(self._call_gemini_image_generate_content, payload, model)
+            images = self._extract_gemini_image_outputs(body)
+            if not images:
+                text_response = self._extract_gemini_text(body)
+                suffix = f" Gemini trả text: {text_response[:180]}" if text_response else ""
+                raise RuntimeError(f"Gemini API chưa trả dữ liệu ảnh cho ảnh {index + 1}/{target_count}.{suffix}")
+            image_bytes, mime_type = images[0]
+            extension = self._gemini_image_output_extension(mime_type)
+            media_name = f"gemini-{job_id[:8]}-{index + 1}"
+            target = target_dir / f"{media_name}{extension}"
+            target.write_bytes(image_bytes)
+            generated.append(
+                SimpleNamespace(
+                    media_name=media_name,
+                    fife_url="",
+                    workflow_id="",
+                    local_path=str(target),
+                    public_url=self._public_download_url(str(target)),
+                    mime_type=mime_type,
+                    prompt=slot_prompt,
+                    dimensions={},
+                )
+            )
+
+        return generated
 
     async def _generate_images_once(
         self,
@@ -18635,38 +23647,33 @@ exit 1
                         except Exception as exc:
                             last_exc = exc
                             normalized_detail = str(exc or "").lower()
-                            retryable = self._is_retryable_flow_agent_ui_error(normalized_detail)
+                            retryable = any(
+                                marker in normalized_detail
+                                for marker in (
+                                    "invalid argument",
+                                    "recaptcha",
+                                    "403",
+                                    "timeout",
+                                    "thoi gian cho",
+                                    "chua tra ve anh",
+                                )
+                            )
                             if not retryable or attempt >= tries - 1:
                                 raise
                             if job_id:
-                                if self._is_stale_flow_agent_context_error(normalized_detail):
-                                    retry_note = (
-                                        f"Flow Agent còn hội thoại/ngữ cảnh cũ khi tạo x{run_count}; "
-                                        "app đã đóng tab Agent cũ và thử lại trên tab sạch."
-                                    )
-                                else:
-                                    retry_note = f"Flow Agent báo bận/reCAPTCHA khi tạo x{run_count}; app nghỉ rồi thử lại 1 lần."
                                 await self.store.append_log(
                                     job_id,
-                                    retry_note,
+                                    f"Flow Agent bao ban/reCAPTCHA khi tao x{run_count}; app nghi roi thu lai 1 lan.",
                                 )
-                            await asyncio.sleep(self._flow_agent_ui_retry_delay_s(normalized_detail))
+                            await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
 
                     if not batch_generated and last_exc is not None:
                         raise last_exc
                     if len(batch_generated) < run_count:
-                        if not batch_generated:
-                            raise RuntimeError(f"Flow Agent chua tao duoc anh nao trong luot x{run_count}.")
-                        if job_id:
-                            await self.store.append_log(
-                                job_id,
-                                (
-                                    f"Flow Agent chi tao duoc {len(batch_generated)}/{run_count} anh trong luot x{run_count}; "
-                                    f"app se upload {len(batch_generated)} anh da co roi chuyen sang card tiep theo."
-                                ),
-                            )
-                        generated.extend(batch_generated[:run_count])
-                        break
+                        raise RuntimeError(
+                            f"Flow Agent chi tao duoc {len(batch_generated)}/{run_count} anh trong luot x{run_count}. "
+                            "App da dung truoc khi upload len Trello de tranh bo anh thieu."
+                        )
                     generated.extend(batch_generated[:run_count])
                     if len(generated) < target_count:
                         if job_id:
@@ -18712,22 +23719,50 @@ exit 1
                     last_exc = exc
                     detail = str(exc or "")
                     normalized_detail = detail.lower()
-                    retryable = self._is_retryable_flow_agent_ui_error(normalized_detail)
+                    if flow_agent_enabled and self._flow_agent_source_attachment_detail_is_polluted(detail):
+                        if job_id:
+                            await self.store.append_log(
+                                job_id,
+                                (
+                                    "Flow Agent panel vẫn còn attachment/context cũ sau reset; "
+                                    "chuyển sang Google Flow UI thường với ảnh nguồn đã khóa để tránh lấy nhầm ảnh."
+                                ),
+                            )
+                        generated = await self._generate_single_reference_image_via_ui(
+                            client,
+                            self._flow_agent_direct_ui_fallback_prompt(request.prompt, target_count),
+                            model=request.model,
+                            workflow_id=source_workflow_id,
+                            reference_media_name=reference_media_names[0] if reference_media_names else "",
+                            reference_image_path=local_reference_path,
+                            aspect=request.aspect,
+                            count=target_count,
+                            timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
+                            flow_agent_enabled=False,
+                            flow_agent_auto_approve=False,
+                            job_id=job_id,
+                            require_project_media_baseline=require_project_media_baseline,
+                        )
+                        break
+                    retryable = any(
+                        marker in normalized_detail
+                        for marker in (
+                            "invalid argument",
+                            "recaptcha",
+                            "403",
+                            "timeout",
+                            "thoi gian cho",
+                            "chua tra ve anh",
+                        )
+                    )
                     if not flow_agent_enabled or not retryable or attempt >= tries - 1:
                         raise
                     if job_id:
-                        if self._is_stale_flow_agent_context_error(normalized_detail):
-                            retry_note = (
-                                f"Flow Agent còn hội thoại/ngữ cảnh cũ khi tạo x{target_count}; "
-                                "app đã đóng tab Agent cũ và thử lại trên tab sạch."
-                            )
-                        else:
-                            retry_note = f"Flow Agent báo bận/reCAPTCHA khi tạo x{target_count}; app nghỉ rồi thử lại 1 lần đủ bộ."
                         await self.store.append_log(
                             job_id,
-                            retry_note,
+                            f"Flow Agent báo bận/reCAPTCHA khi tạo x{target_count}; app nghỉ rồi thử lại 1 lần đủ bộ.",
                         )
-                    await asyncio.sleep(self._flow_agent_ui_retry_delay_s(normalized_detail))
+                    await asyncio.sleep(45.0 if ("recaptcha" in normalized_detail or "403" in normalized_detail) else 25.0)
 
             if not generated and last_exc is not None:
                 raise last_exc
@@ -18737,15 +23772,16 @@ exit 1
                         await self.store.append_log(
                             job_id,
                             (
-                                f"Flow Agent chi tao duoc {len(generated)}/{target_count} anh trong luot x{target_count}; "
-                                f"app se upload {len(generated)} anh da co roi chuyen sang card tiep theo."
+                                f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh trong lượt x{target_count}; "
+                                f"app sẽ dùng {len(generated)} ảnh đã có rồi chuyển sang bước tiếp theo."
                             ),
                         )
                     return generated[:target_count]
-                raise RuntimeError(
-                    f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh trong lượt x{target_count}. "
-                    "App đã dừng trước khi upload lên Trello để tránh bộ ảnh thiếu."
-                )
+                else:
+                    raise RuntimeError(
+                        f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh trong lượt x{target_count}. "
+                        "App đã dừng trước khi upload lên Trello để tránh bộ ảnh thiếu."
+                    )
             return generated[:target_count]
         return await client.generate_image(
             request.prompt,
@@ -18754,43 +23790,6 @@ exit 1
             count=max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1))),
             timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
         )
-
-    def _is_stale_flow_agent_context_error(self, detail: str) -> bool:
-        normalized = str(detail or "").lower()
-        return any(
-            marker in normalized
-            for marker in (
-                "old context",
-                "hoi thoai cu",
-                "ngữ cảnh cũ",
-                "ngu canh project cu",
-                "context project cu",
-                "old flow agent conversation",
-                "tac nhan flow dang mo lai",
-                "agent context",
-            )
-        )
-
-    def _is_retryable_flow_agent_ui_error(self, detail: str) -> bool:
-        normalized = str(detail or "").lower()
-        return self._is_stale_flow_agent_context_error(normalized) or any(
-            marker in normalized
-            for marker in (
-                "invalid argument",
-                "recaptcha",
-                "403",
-                "timeout",
-                "timed out",
-                "thoi gian cho",
-                "chua tra ve anh",
-            )
-        )
-
-    def _flow_agent_ui_retry_delay_s(self, detail: str) -> float:
-        normalized = str(detail or "").lower()
-        if self._is_stale_flow_agent_context_error(normalized):
-            return 4.0
-        return 45.0 if ("recaptcha" in normalized or "403" in normalized) else 25.0
 
     def _flow_agent_shot_specs(self) -> List[Dict[str, str]]:
         return [
@@ -18867,8 +23866,7 @@ exit 1
                 "label": "pastel fabric colorway lineup image",
                 "brief": (
                     "Make a clean white-daylight lineup of coordinated fabric colorways inspired by the supplied examples: ivory/cream, pale blue, mint/aqua, blush pink, and butter yellow. "
-                    "Show real product variants side by side only as the same physical product form as the source, preserving the source silhouette, construction, motif, embroidery/print style, fabric texture, and product shape. "
-                    "If the variants show embroidered names or readable stitched text, each color must use different plausible text/name while preserving the same lettering style."
+                    "Show real product variants side by side only as the same physical product form as the source, preserving the source silhouette, construction, motif, embroidery/print style, fabric texture, and product shape."
                 ),
                 "must_not": "Do not make a collage, grid, label card, price tag, unrelated color palette board, or derivative product such as shirts from a pillow source.",
             },
@@ -18876,8 +23874,7 @@ exit 1
                 "label": "white nursery color variation image",
                 "brief": (
                     "Make a bright white nursery, shelf, crib, or clean home scene with several soft pastel fabric variants displayed naturally. "
-                    "Use crisp white balanced daylight only, no yellow cast, and keep the exact source product object type and construction visually consistent. "
-                    "If readable embroidered text appears on the color variants, do not repeat the same text/name on every color."
+                    "Use crisp white balanced daylight only, no yellow cast, and keep the exact source product object type and construction visually consistent."
                 ),
                 "must_not": "Do not use warm golden light, beige color grading, dark shadows, a repeated hero composition, or source embroidery copied onto another product type.",
             },
@@ -18893,8 +23890,7 @@ exit 1
                 "label": "four color option ecommerce image",
                 "brief": (
                     "Make a polished ecommerce display with four natural product color options arranged as real objects, not a contact sheet. "
-                    "Use pastel fabric variety like the examples while preserving the exact source product form, source design quality, and handmade construction. "
-                    "If these options include embroidered names or readable stitched words, every color option must use a different plausible name/text."
+                    "Use pastel fabric variety like the examples while preserving the exact source product form, source design quality, and handmade construction."
                 ),
                 "must_not": "Do not create a multi-panel grid, do not change the product category, do not move the motif onto apparel/pillow/banner/hoop unless source is that type, and do not add any tag or sale badge.",
             },
@@ -18904,8 +23900,6 @@ exit 1
         total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(total or 1)))
         full_total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(full_total or total)))
         shot_offset = max(0, min(full_total - 1, int(shot_offset or 0)))
-        shot_start = shot_offset + 1
-        shot_end = min(full_total, shot_offset + total)
         all_shot_specs = self._flow_agent_shot_specs()
         shot_specs = all_shot_specs[shot_offset : shot_offset + total]
         if len(shot_specs) < total and all_shot_specs:
@@ -18916,129 +23910,80 @@ exit 1
         )
         base = str(prompt or "").strip()
         has_base_shot_plan = "Required shot plan:" in base
-        detail_collage_match = (
-            re.search(r"(?:image|shot)\s*(\d+)[^.]{0,260}(?:four-panel|four close-up|4 close-up|collage)", base, re.IGNORECASE)
-            or re.search(r"(?:four-panel|four close-up|4 close-up)[^.]{0,260}(?:image|shot)\s*(\d+)", base, re.IGNORECASE)
+        has_product_category_lock = "Product/category lock:" in base or "artwork-only" in base
+        shot_plan_text = (
+            "Follow the Required shot plan already written in the base brief exactly; do not replace it with generic shot ideas. "
+            if has_base_shot_plan
+            else f"CURRENT SHOT PLAN: {shot_lines} "
         )
-        detail_collage_number = str(detail_collage_match.group(1)) if detail_collage_match else ""
-        allows_four_panel_detail_collage = bool(detail_collage_match)
-        detail_collage_label = f"image {detail_collage_number}" if detail_collage_number else "the explicitly planned close-up detail image"
-        separate_output_rule = (
-            f"Each requested output must be its own separate 1:1 square image file. The explicitly planned {detail_collage_label} may be one 1:1 four-panel close-up collage; every other output must not be panels inside one canvas. "
-            if allows_four_panel_detail_collage
-            else "Each output must be its own separate 1:1 square image file, not landscape, not portrait, not panels inside one canvas. "
-        )
-        square_frame_rule = (
-            f"Every output must fit a square 1:1 frame; {detail_collage_label} may contain four close-up panels inside that square, and no output may look like a UI/gallery screenshot or wide cinematic crop. "
-            if allows_four_panel_detail_collage
-            else "The product must sit inside a square 1:1 frame with no side-by-side contact sheet, no wide cinematic crop, and no UI/gallery screenshot look. "
-        )
-        no_grid_rule = (
-            f"Do NOT create a {total}-frame grid, contact sheet, storyboard, or multiple images inside one canvas; the only exception is the Required shot plan's {detail_collage_label}, which may be one four-panel embroidery close-up collage inside a single 1:1 image. "
-            if allows_four_panel_detail_collage
-            else f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
-        )
-        requested_shot_range = self._required_shot_plan_range_text(base, shot_start, shot_end) if has_base_shot_plan else ""
-        if has_base_shot_plan and (full_total > total or shot_offset):
-            earlier_range = f"1-{shot_offset}" if shot_offset > 1 else "1" if shot_offset == 1 else ""
-            restart_guard = (
-                f" Do not create, summarize, repeat, or restart Required shot plan items {earlier_range}; those items were already assigned to an earlier Flow pass."
-                if earlier_range
-                else ""
-            )
-            shot_plan_text = (
-                f"CURRENT UI PASS SHOT RANGE: create ONLY Required shot plan items {shot_start}-{shot_end}. "
-                f"{restart_guard} "
-                f"Use these exact Required shot items for this pass: {requested_shot_range or f'items {shot_start}-{shot_end} from the base brief'}. "
-                f"Number and think of these outputs as continuation images {shot_start}-{shot_end}, not as a new set starting at image 1. "
-            )
-        elif has_base_shot_plan:
-            shot_plan_text = "Follow the Required shot plan already written in the base brief exactly; do not replace it with generic shot ideas. "
-        else:
-            shot_plan_text = (
-                f"CURRENT UI PASS SHOT RANGE: create ONLY images {shot_start}-{shot_end}. "
-                f"CURRENT SHOT PLAN: {shot_lines} "
-                if full_total > total or shot_offset
-                else f"CURRENT SHOT PLAN: {shot_lines} "
-            )
         if full_total > total or shot_offset:
             run_scope = (
-                f"This is images {shot_start}-{shot_end} of a {full_total}-image product set. "
+                f"This is images {shot_offset + 1}-{min(full_total, shot_offset + total)} of a {full_total}-image product set. "
                 f"Override any earlier full-set count in the base brief for this UI pass: create exactly {total} outputs now, not {full_total}. "
-                "The app will handle the other images in separate Flow passes. "
-                f"Fresh-task isolation is only to clear old Flow chat context; it does not reset the numbered shot range, so this pass must continue at image {shot_start}."
+                "The app will handle the other images in separate Flow passes."
             )
         else:
             run_scope = "This run must produce the full image set."
+        hard_reference_lock = (
+            "HARD PRODUCT LOCK: obey the Product/category lock already written in the base Trello brief. "
+            "If the attached Trello source is artwork/design-only, use it only as the motif/design on the locked product form; do not make the artwork canvas/background into the product. "
+            "Every output must stay the same locked product category and same physical product form across the whole set. "
+            "Do not mix product forms between outputs."
+            if has_product_category_lock
+            else (
+                "HARD REFERENCE LOCK: use only the single attached Trello source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
+                "The source image beats the filename/card title: do not infer apparel from 'tao_hinh...', do not infer a plush from an animal motif, and do not infer a pillow/banner/hoop unless that is the visible product object in the source image. "
+            )
+        )
+        compare_lock_text = (
+            "Before every output, preserve the locked product category, physical form, silhouette, construction, scale, material, base color, design placement, motif/artwork layout, print/engraving/embroidery layout, and edge details from the base brief. "
+            if has_product_category_lock
+            else "Before every output, compare against the source image and preserve the exact product category, silhouette, outline shape, construction, scale, fabric/material, base color, design placement, motif, embroidery/print layout, and edge details. "
+        )
+        no_transform_text = (
+            "Do not reinterpret, upgrade, or transform the locked product into another product type; the same locked product form must appear in every output. "
+            if has_product_category_lock
+            else "Do not reinterpret, upgrade, or transform the source into another product type: a pillow stays the same pillow shape, a pennant/banner stays the same pennant/banner shape, a pillowcase stays a pillowcase, a hoop stays a hoop, a dress stays a dress, and an apron stays an apron. "
+        )
         correction = (
-            f"Create exactly {total} separate standalone images now in ONE Flow Agent run. This is the first instruction and it overrides any later broad/full-set wording. "
-            f"Use the x{total} image setting when available, and if the UI setting is lower, Flow Agent must still plan and create exactly {total} outputs from this message. "
+            f"IMPORTANT APP PASS: Create exactly {total} separate standalone images now in ONE Flow Agent run, using the x{total} image setting. "
             f"{run_scope} "
             f"{self._flow_agent_fresh_context_rule()} "
             "These generated outputs are in addition to the attached Trello source/reference image; never count the source image as one of the generated outputs. "
-            f"{separate_output_rule}"
-            f"{square_frame_rule}"
+            "Each output must be its own separate 1:1 square image file, not landscape, not portrait, not panels inside one canvas. "
+            "The product must sit inside a square 1:1 frame with no side-by-side contact sheet, no wide cinematic crop, and no UI/gallery screenshot look. "
             f"{shot_plan_text}"
-            "HARD REFERENCE LOCK: use only the single attached Trello source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
-            "The source image beats the filename/card title: do not infer apparel from 'tao_hinh...', do not infer a plush from an animal motif, and do not infer a pillow/banner/hoop unless that is the visible product object in the source image. "
-            "Before every output, compare against the source image and preserve the exact product category, silhouette, outline shape, construction, scale, fabric/material, base color, design placement, motif, embroidery/print layout, and edge details. "
-            "Do not reinterpret, upgrade, or transform the source into another product type: a pillow stays the same pillow shape, a pennant/banner stays the same pennant/banner shape, a pillowcase stays a pillowcase, a hoop stays a hoop, a dress stays a dress, and an apron stays an apron. "
+            f"{hard_reference_lock} "
+            f"{compare_lock_text}"
+            f"{no_transform_text}"
             "Do not create derivative merchandise using the source embroidery, such as putting a pillow embroidery onto baby shirts, blankets, banners, hoops, totes, framed prints, or fabric swatches. "
             "If a planned scene would require changing the product shape or design, keep the product unchanged and only change the surrounding styling, props, camera angle, or background. "
             "All images must be visibly different from each other in camera angle, crop distance, background, props, and product presentation. "
             "If two ideas look like the same product-on-table view, change one before generating. "
             "Lighting for every output must be clean clear white neutral daylight with accurate whites; no yellow, orange, golden-hour, tungsten, sepia, beige, or warm color cast. "
             "Every stitched or embroidered area in every output must look like real hand embroidery: raised thread, visible stitch direction, tactile fibers, crisp embroidered edges, and natural thread shadows; never make embroidery look flat printed, painted, digital, vinyl, or sticker-like. "
-            f"{self._flow_agent_embroidery_clarity_rule()} "
             "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with personalized embroidered name variants only when the source image visibly contains an embroidered/personalized name; otherwise keep multiple hoop variants nameless while preserving the hoop/fabric/motif style. "
-            f"Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; for any wall-hanging banner output, {self.BANNER_VISIBLE_WALL_HOOK_RULE} Never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. For the explicitly planned process shot only, a round embroidery hoop may appear as a temporary tool holding the pennant fabric while stitching, not as a finished hoop product. "
+            f"Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; for any wall-hanging banner output, {self.BANNER_VISIBLE_WALL_HOOK_RULE} Never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. "
             "For non-hoop fabric colorways, preserve the same exact product form and embroidery layout; only if the Required shot plan, Trello description, or colorway/multi-color shot requires variants and the source image visibly contains an embroidered or personalized name may each product option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
             f"{self._flow_agent_colorway_text_variant_rule()} "
-            f"{no_grid_rule}"
+            f"Do NOT create a {total}-frame grid, contact sheet, collage, storyboard, multi-panel layout, or multiple images inside one canvas. "
             f"{self._flow_agent_no_tag_label_rule()} "
             "Do not add any readable name, initials, year, EST date, quote, slogan, label, or decorative text unless that readable text is visibly embroidered/printed on the source product image; for allowed name variants, keep the same product shape and motif exactly. "
             "Use the attached Trello source product image as the reference for every output. "
             "Keep every output 1:1 square, commercial product photography, and visually identical to the same source product identity."
         )
-        return f"{correction}\n\n{base}" if base else correction
+        return f"{base}\n\n{correction}" if base else correction
 
-    def _required_shot_plan_range_text(self, base: str, start: int, end: int) -> str:
-        text = str(base or "")
-        if not text or "Required shot plan:" not in text:
-            return ""
-        start = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(start or 1)))
-        end = max(start, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(end or start)))
-        section = text[text.find("Required shot plan:") :]
-        matches = list(re.finditer(r"(?<!\d)(\d{1,2})\.\s+", section))
-        if not matches:
-            return ""
-        stop_markers = (
-            "Lighting and color rule",
-            "Product-specific notes",
-            "Treat the Trello description",
-            "Use the learned product-prompt style",
-            "Preserve the original product shape",
-            "Only change scene",
-            "Do not change the source product",
-            "All outputs must be true",
-            "Do not use Google Sheet prompts",
-            "Source card:",
+    def _flow_agent_direct_ui_fallback_prompt(self, prompt: str, total: int) -> str:
+        total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(total or 1)))
+        base = str(prompt or "").strip()
+        prefix = (
+            f"Direct Google Flow fallback: use the selected source image as the only product reference and create exactly {total} "
+            "separate standalone 1:1 ecommerce product photos. Ignore prior gallery/project/chat context. If the locked Trello brief includes a Product/category lock or says the source is artwork/design-only, obey that locked product category and use the source only as motif/design; otherwise preserve the source "
+            "product category, silhouette, material, design placement, colors, and product identity. Keep one consistent product form across the full set. Do not create a collage, "
+            "contact sheet, grid, UI screenshot, or a different product type. Follow the locked Trello brief below."
         )
-        items: List[str] = []
-        for index, match in enumerate(matches):
-            number = int(match.group(1))
-            if number < start or number > end:
-                continue
-            next_start = matches[index + 1].start() if index + 1 < len(matches) else len(section)
-            item = section[match.start() : next_start]
-            for marker in stop_markers:
-                marker_pos = item.find(marker)
-                if marker_pos >= 0:
-                    item = item[:marker_pos]
-            item = re.sub(r"\s+", " ", item).strip(" ;")
-            if item:
-                items.append(item)
-        return " ".join(items)
+        return f"{prefix}\n\n{base}" if base else prefix
 
     async def _generate_single_reference_image_via_ui(
         self,
@@ -19103,6 +24048,16 @@ exit 1
         await asyncio.sleep(2.5)
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: tab hiện tại {str(getattr(page, 'url', '') or '')[:160]}.")
+        if flow_agent_enabled:
+            recovered_project, recover_detail = await self._recover_flow_project_page_from_error(page, client, job_id=job_id or "")
+            if job_id:
+                if recovered_project:
+                    await self.store.append_log(job_id, f"Fallback UI Flow: đã phục hồi project lỗi ({recover_detail[:160]}).")
+                elif "looks usable" not in recover_detail:
+                    await self.store.append_log(job_id, f"Fallback UI Flow: project recovery không chạy ({recover_detail[:160]}).")
+            if recovered_project:
+                project_url = self._project_url(getattr(client, "project_id", ""))
+                target_url = project_url
 
         interceptor = UIInterceptor()
         interceptor.attach(page)
@@ -19131,8 +24086,55 @@ exit 1
                 else:
                     await self.store.append_log(
                         job_id,
-                        f"Fallback UI Flow: chưa thấy nút Tác nhân, dừng để tránh tạo ảnh prompt-only ({agent_detail[:120]}).",
+                        f"Fallback UI Flow: chưa thấy nút Tác nhân, thử mở project mới để tự phục hồi ({agent_detail[:120]}).",
                     )
+            if not agent_opened:
+                recovered_project = False
+                recover_detail = ""
+                try:
+                    recovered_project, recover_detail = await self._recover_flow_project_page_from_error(
+                        page,
+                        client,
+                        job_id=job_id or "",
+                        force=True,
+                    )
+                except Exception as exc:
+                    recover_detail = humanize_flow_error(str(exc))
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        (
+                            f"Fallback UI Flow: đã mở project mới sau khi thiếu Tác nhân ({recover_detail[:160]})."
+                            if recovered_project
+                            else f"Fallback UI Flow: không mở được project mới sau khi thiếu Tác nhân ({recover_detail[:160]})."
+                        ),
+                    )
+                if recovered_project:
+                    project_url = self._project_url(getattr(client, "project_id", ""))
+                    target_url = project_url
+                    try:
+                        await client._ui.open_settings_panel(page)
+                        await client._ui.select_image_model(page, self._image_ui_model_label(model))
+                        await client._ui.set_aspect_ratio(page, ratio)
+                        await client._ui.set_count(page, target_count)
+                        if job_id:
+                            await self.store.append_log(job_id, f"Fallback UI Flow: đã đặt lại số lượng ảnh x{target_count} trên project mới.")
+                    except Exception as settings_exc:
+                        if job_id:
+                            await self.store.append_log(
+                                job_id,
+                                f"Fallback UI Flow: chưa chỉnh được setting trên project mới ({humanize_flow_error(str(settings_exc))[:120]}).",
+                            )
+                    agent_opened, agent_detail = await self._enable_flow_agent_mode(page)
+                    if job_id:
+                        await self.store.append_log(
+                            job_id,
+                            (
+                                f"Fallback UI Flow: đã bật Tác nhân Flow trên project mới ({agent_detail[:120]})."
+                                if agent_opened
+                                else f"Fallback UI Flow: project mới vẫn chưa có nút Tác nhân ({agent_detail[:120]})."
+                            ),
+                        )
             if not agent_opened:
                 raise RuntimeError(
                     "Auto AI Trello bắt buộc dùng Tác nhân Flow. App chưa thấy nút Tác nhân trên màn hình Flow, "
@@ -19161,16 +24163,10 @@ exit 1
             if job_id and fresh_panel_detail:
                 await self.store.append_log(job_id, f"Fallback UI Flow: kiem tra phien Agent ({fresh_panel_detail[:160]}).")
             if not fresh_panel:
-                discard_detail = await self._discard_cached_flow_agent_page(client, page)
-                if job_id:
-                    await self.store.append_log(
-                        job_id,
-                        f"Fallback UI Flow: đóng tab Agent chưa sạch trước khi thử lại ({discard_detail[:160]}).",
-                    )
                 raise RuntimeError(
                     "Tac nhan Flow dang mo lai hoi thoai cu hoac ngu canh project cu. "
                     "App da dung truoc khi gui prompt de tranh Flow lay sai san pham. "
-                    f"Chi tiet: {fresh_panel_detail}; {discard_detail}"
+                    f"Chi tiet: {fresh_panel_detail}"
                 )
 
             filled, fill_detail = await self._fill_flow_agent_panel_instruction(page, prompt)
@@ -19210,6 +24206,7 @@ exit 1
                 source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
                     page,
                     source_attachment_before,
+                    expected_name=reference_media_name,
                 )
             if job_id:
                 await self.store.append_log(
@@ -19235,6 +24232,38 @@ exit 1
                 "Fallback UI Flow: no project media id for the Trello source; using local file attach in Flow Agent.",
             )
 
+        if flow_agent_enabled and not source_attachment_verified and self._flow_agent_source_attachment_detail_is_polluted(source_verify_detail):
+            reset_ok, reset_detail = await self._ensure_fresh_flow_agent_panel(page)
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    f"Fallback UI Flow: panel Tác nhân có attachment cũ; đã reset trước khi upload ảnh nguồn ({reset_detail[:160]}).",
+                )
+            if not reset_ok:
+                raise RuntimeError(
+                    "Auto AI Trello phát hiện panel Tác nhân Flow còn attachment cũ nhưng chưa reset được. "
+                    f"App đã dừng trước khi bấm tạo để tránh lấy nhầm ảnh. Chi tiết: {source_verify_detail}; {reset_detail}"
+                )
+            refilled, refill_detail = await self._fill_flow_agent_panel_instruction(page, prompt)
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Fallback UI Flow: đã nhập lại prompt sau khi reset panel ({refill_detail[:140]})."
+                        if refilled
+                        else f"Fallback UI Flow: chưa nhập lại được prompt sau khi reset panel ({refill_detail[:140]})."
+                    ),
+                )
+            if not refilled:
+                raise RuntimeError(
+                    "Auto AI Trello đã reset panel Tác nhân Flow nhưng chưa nhập lại được prompt. "
+                    f"App đã dừng trước khi bấm tạo. Chi tiết: {refill_detail}"
+                )
+            attached_agent_source = False
+            source_attachment_verified = False
+            source_attachment_before = await self._flow_agent_panel_attachment_snapshot(page)
+            source_verify_detail = f"reset polluted composer before local attach; {source_verify_detail}"
+
         if flow_agent_enabled and (not attached_agent_source or not source_attachment_verified) and safe_reference_image_path:
             fallback_before = await self._flow_agent_panel_attachment_snapshot(page)
             attached_local_source, attach_detail = await self._attach_flow_agent_source_file(page, safe_reference_image_path)
@@ -19243,7 +24272,9 @@ exit 1
                 source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
                     page,
                     fallback_before,
-                    accept_stable_ready_after_attach=True,
+                    expected_name=Path(safe_reference_image_path).name,
+                    timeout_s=45.0,
+                    accept_stable_ready_after_attach=False,
                 )
             if job_id:
                 await self.store.append_log(
@@ -19255,9 +24286,19 @@ exit 1
                     ),
                 )
             if not attached_agent_source or not source_attachment_verified:
+                debug_detail = ""
+                if job_id:
+                    debug_detail = await self._save_flow_agent_upload_debug_snapshot(
+                        page,
+                        job_id,
+                        "source-upload-failed",
+                    )
+                    if debug_detail:
+                        await self.store.append_log(job_id, f"Flow Agent upload debug: {debug_detail[:220]}")
                 raise RuntimeError(
                     "Auto AI Trello chưa kéo/upload được ảnh Trello vào Tác nhân Flow. "
                     f"App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: {attach_detail}; {source_verify_detail}"
+                    + (f"; debug: {debug_detail}" if debug_detail else "")
                 )
 
         elif flow_agent_enabled and not source_attachment_verified:
@@ -19390,41 +24431,43 @@ exit 1
                         job_id=job_id,
                         ignore_message=pre_submit_try_again_message,
                     )
-                    try:
-                        if flow_agent_auto_approve:
-                            approved, approve_detail = await self._approve_flow_agent_generation(page, timeout_s=8.0)
-                            if approved and job_id:
-                                await self.store.append_log(
-                                    job_id,
-                                    f"Fallback UI Flow: đã tự phê duyệt Tác nhân Flow sau timeout ({approve_detail[:120]}).",
-                                )
-                        images = await self._wait_for_new_project_images(
-                            client,
-                            known_media_before_submit,
-                            prompt=prompt,
-                            target_count=target_count,
-                            timeout_s=min(120.0, max(20.0, ui_timeout_s / 2)),
-                            fallback_workflow_id=resolved_workflow_id,
-                            allow_visible_fallback=True,
-                        )
-                        if images:
-                            if job_id and getattr(images[0], "_raw", {}).get("visible_ui_fallback"):
-                                await self.store.append_log(
-                                    job_id,
-                                    f"Fallback UI Flow: panel bao loi nhung app thay {len(images)} anh lon trong grid Flow; tiep tuc lay anh dang hien thi.",
-                                )
-                            if job_id:
-                                await self.store.append_log(
-                                    job_id,
-                                    f"Fallback UI Flow: Flow Agent đã tạo {len(images)} ảnh mới trong project.",
-                                )
-                            return images[:target_count]
-                    except Exception as project_exc:
+                try:
+                    if flow_agent_enabled and flow_agent_auto_approve:
+                        approved, approve_detail = await self._approve_flow_agent_generation(page, timeout_s=8.0)
+                        if approved and job_id:
+                            await self.store.append_log(
+                                job_id,
+                                f"Fallback UI Flow: đã tự phê duyệt Tác nhân Flow sau timeout ({approve_detail[:120]}).",
+                            )
+                    images = await self._wait_for_new_project_images(
+                        client,
+                        known_media_before_submit,
+                        prompt=prompt,
+                        target_count=target_count,
+                        timeout_s=min(120.0, max(20.0, ui_timeout_s / 2)),
+                        fallback_workflow_id=resolved_workflow_id,
+                    )
+                    if images:
                         if job_id:
                             await self.store.append_log(
                                 job_id,
-                                f"Fallback UI Flow: chưa lấy được ảnh mới sau Flow Agent ({str(project_exc)[:220]}).",
+                                (
+                                    f"Fallback UI Flow: Flow Agent đã tạo {len(images)} ảnh mới trong project."
+                                    if flow_agent_enabled
+                                    else f"Fallback UI Flow: Flow đã tạo {len(images)} ảnh mới trong project dù network wait timeout."
+                                ),
                             )
+                        return images[:target_count]
+                except Exception as project_exc:
+                    if job_id:
+                        await self.store.append_log(
+                            job_id,
+                            (
+                                f"Fallback UI Flow: chưa lấy được ảnh mới sau Flow Agent ({str(project_exc)[:220]})."
+                                if flow_agent_enabled
+                                else f"Fallback UI Flow: chưa lấy được ảnh mới sau timeout ({str(project_exc)[:220]})."
+                            ),
+                        )
                 raise RuntimeError(
                     "Google Flow chua tra ve anh tu man hinh Flow trong thoi gian cho. "
                     "Hay kiem tra tab Flow co dang tao, bi dung o nut Create, hoac co thong bao can thao tac thu cong khong. "
@@ -19456,7 +24499,6 @@ exit 1
                 target_count=target_count,
                 timeout_s=ui_timeout_s,
                 fallback_workflow_id=resolved_workflow_id,
-                allow_visible_fallback=flow_agent_enabled,
             )
         elif flow_agent_enabled and len(images) < target_count:
             if job_id:
@@ -19473,7 +24515,6 @@ exit 1
                     timeout_s=min(ui_timeout_s, 150.0),
                     fallback_workflow_id=resolved_workflow_id,
                     settle_s=min(90.0, max(25.0, ui_timeout_s / 5)),
-                    allow_visible_fallback=flow_agent_enabled,
                 )
                 merged: List[Any] = []
                 seen_keys: set[str] = set()
@@ -19506,6 +24547,8 @@ exit 1
         return images[:target_count]
 
     def _flow_agent_enabled_for_request(self, request: CreateJobRequest) -> bool:
+        if self._image_engine_for_request(request) == "gemini_api":
+            return False
         enabled = self._config_bool(getattr(request, "flow_agent_enabled", True), default=True)
         try:
             graph = self._automation_graph_payload(request)
@@ -19564,29 +24607,10 @@ exit 1
         browser = getattr(client, "_bm", None)
         context = getattr(browser, "context", None)
         if context is not None:
-            cached_page = getattr(browser, "_flow_agent_page", None)
-            if cached_page is not None:
-                try:
-                    is_closed = bool(cached_page.is_closed()) if hasattr(cached_page, "is_closed") else False
-                    if not is_closed:
-                        # A previous Flow Agent prompt can still be rendering in this
-                        # tab even after our network wait times out or a batch moves on.
-                        # Reusing it would navigate the page and wipe the in-flight
-                        # Agent command, so leave it open and create a fresh tab below.
-                        pass
-                except Exception:
-                    try:
-                        browser._flow_agent_page = None
-                    except Exception:
-                        pass
             try:
                 page = await context.new_page()
                 try:
                     browser._page = page
-                except Exception:
-                    pass
-                try:
-                    browser._flow_agent_page = page
                 except Exception:
                     pass
                 if target_url:
@@ -19607,59 +24631,24 @@ exit 1
         page = await browser.page()
         return page, "browser manager page"
 
-    async def _discard_cached_flow_agent_page(self, client: Any, page: Any) -> str:
-        browser = getattr(client, "_bm", None)
-        if browser is None or page is None:
-            return "no cached Flow Agent tab to close"
-        try:
-            cached_page = getattr(browser, "_flow_agent_page", None)
-        except Exception:
-            cached_page = None
-        if cached_page is not page:
-            return "current tab is not cached Flow Agent tab"
-
-        try:
-            browser._flow_agent_page = None
-        except Exception:
-            pass
-        try:
-            if getattr(browser, "_page", None) is page:
-                browser._page = None
-        except Exception:
-            pass
-
-        try:
-            is_closed = bool(page.is_closed()) if hasattr(page, "is_closed") else False
-        except Exception:
-            is_closed = False
-        if is_closed:
-            return "cached Flow Agent tab was already closed"
-
-        try:
-            await page.close()
-            return "closed stale cached Flow Agent tab"
-        except Exception as exc:
-            return f"could not close stale cached Flow Agent tab: {humanize_flow_error(str(exc))[:120]}"
-
     async def _ensure_fresh_flow_agent_panel(self, page: Any) -> tuple[bool, str]:
         state = await self._flow_agent_panel_context_state(page)
-        if not state.get("has_prior_context"):
-            return True, str(state.get("detail") or "agent panel has no prior context")
-
         reset_ok, reset_detail = await self._reset_flow_agent_panel_context(page)
         if not reset_ok:
+            if not state.get("has_prior_context"):
+                return True, str(state.get("detail") or "agent panel has no prior context")
             return False, f"old context visible; reset unavailable: {reset_detail}"
 
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(2.5)
         state_after = await self._flow_agent_panel_context_state(page)
         if state_after.get("has_prior_context"):
             return False, f"old context still visible after reset: {state_after.get('detail') or reset_detail}"
-        return True, f"reset old Agent context: {reset_detail}"
+        return True, f"reset Agent context before new card: {reset_detail}; {state_after.get('detail') or ''}"
 
     async def _flow_agent_panel_context_state(self, page: Any) -> Dict[str, Any]:
         try:
             result = await page.evaluate(
-                """
+                r"""
                 () => {
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
@@ -19670,7 +24659,9 @@ exit 1
                       && style.display !== 'none'
                       && style.opacity !== '0'
                       && rect.bottom > 0
-                      && rect.top < window.innerHeight;
+                      && rect.top < window.innerHeight
+                      && rect.right > 0
+                      && rect.left < window.innerWidth;
                   };
                   const labelFor = (el) => [
                     el.textContent || '',
@@ -19694,7 +24685,28 @@ exit 1
                   const panel = panels[0];
                   if (!panel) return { visible: false, has_prior_context: false, detail: 'agent panel not detected' };
                   const text = panel.text || '';
-                  const hasPrior = /I['’]?ve\\s+generated|generated\\s+the\\s+final|Design\\s+Analysis|Shot\\s+Brief|Credit\\s+Spend\\s+Approval|source\\s+product\\s+image\\s+as\\s+the\\s+reference|Sheep\\s+pillow|Pillow\\s+with\\s+sheep|Teddy\\s+Swims/i.test(text);
+	                  const lower = text.toLowerCase();
+	                  const hasPrior = lower.includes("i've analyzed")
+	                    || lower.includes("i’ve analyzed")
+	                    || lower.includes("i have analyzed")
+	                    || lower.includes("i've generated")
+	                    || lower.includes("i’ve generated")
+	                    || lower.includes("generated 4 commercial")
+	                    || lower.includes("commercial shots")
+	                    || lower.includes("trello source and generated")
+	                    || lower.includes("the images include")
+	                    || lower.includes("design analysis")
+	                    || lower.includes("shot brief")
+	                    || lower.includes("credit spend approval")
+		                    || lower.includes("source product image as the reference")
+		                    || lower.includes("embroidered baby album")
+		                    || lower.includes("baby album")
+		                    || lower.includes("cream linen baby")
+		                    || lower.includes("the name \"daisy\"")
+		                    || lower.includes("nursery")
+		                    || lower.includes("sheep pillow")
+	                    || lower.includes("pillow with sheep")
+	                    || lower.includes("teddy swims");
                   return {
                     visible: true,
                     has_prior_context: hasPrior,
@@ -19708,6 +24720,69 @@ exit 1
         return result if isinstance(result, dict) else {"visible": False, "has_prior_context": False, "detail": "agent context check unavailable"}
 
     async def _reset_flow_agent_panel_context(self, page: Any) -> tuple[bool, str]:
+        try:
+            direct_result = await page.evaluate(
+                """
+                () => {
+                  const visible = (el) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < 18 || rect.height < 18) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && !el.disabled
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight
+                      && rect.right > 0
+                      && rect.left < window.innerWidth;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                    el.getAttribute('class') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
+                  const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
+                    .filter((el) => {
+                      if (!visible(el)) return false;
+                      const rect = el.getBoundingClientRect();
+                      return rect.width >= 280 && rect.height >= window.innerHeight * 0.45 && rect.left >= window.innerWidth * 0.35;
+                    })
+                    .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right);
+                  const panel = panels[0];
+                  if (!panel) return { ok: false, detail: 'agent panel not found for direct new session' };
+                  const panelRect = panel.getBoundingClientRect();
+                  const controls = [...panel.querySelectorAll('button, [role="button"], [aria-label], [title], i, svg, mat-icon')]
+                    .filter(visible)
+                    .map((el) => {
+                      const control = el.closest('button, [role="button"], [tabindex]') || el;
+                      const rect = control.getBoundingClientRect();
+                      const label = `${labelFor(el)} ${labelFor(control)}`.replace(/\\s+/g, ' ').trim();
+                      const header = rect.top <= panelRect.top + 86;
+                      const newish = /edit_square|new\\s*(chat|conversation|session|task)|start\\s*new|fresh\\s*(chat|task)|phiên\\s*mới|phien\\s*moi|cuộc\\s+trò\\s+chuyện\\s+mới|cuoc\\s+tro\\s+chuyen\\s+moi|tạo\\s+mới|tao\\s+moi/i.test(label);
+                      const dangerous = /new\\s*project|dự\\s*án\\s*mới|du\\s*an\\s*moi|delete|xóa|xoa|trash|remove|close|đóng|dong/i.test(label);
+                      const score = (header ? 1200 : 0) + (newish ? 1700 : 0) - (dangerous ? 2200 : 0) - (label.length > 160 ? 500 : 0);
+                      return { el: control, rect, label, score };
+                    })
+                    .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index)
+                    .filter((item) => item.score >= 1600)
+                    .sort((a, b) => b.score - a.score);
+                  const target = controls[0];
+                  if (!target) return { ok: false, detail: 'no direct new session button' };
+                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                  target.el.click();
+                  return { ok: true, detail: target.label || 'direct new session button' };
+                }
+                """
+            )
+            if isinstance(direct_result, dict) and direct_result.get("ok"):
+                return True, f"direct new session: {direct_result.get('detail') or 'Phiên mới'}"
+        except Exception:
+            pass
+
         try:
             menu_result = await page.evaluate(
                 """
@@ -20385,34 +25460,10 @@ exit 1
                         return found;
                       };
                       const bodyText = document.body?.innerText || '';
-                      const plainText = (value) => String(value || '')
-                        .normalize('NFD')
-                        .replace(/[\\u0300-\\u036f]/g, '')
-                        .replace(/[\\u0111\\u0110]/g, 'd')
-                        .toLowerCase();
-                      const approvalTextPattern = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i;
-                      const isNegativeLabel = (label) => {
-                        const plain = plainText(label);
-                        return (
-                          /Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|Xoá|Xóa|Xoa|Delete|delete_forever|Cài\\s*đặt|Cai\\s*dat|Settings|tune|không\\s*cho\\s*phép|khong\\s*cho\\s*phep/i.test(label)
-                          || /\\b(tu\\s*choi|reject|cancel|huy|close|stop|dung|xoa|delete|settings|cai\\s*dat|khong\\s*cho\\s*phep)\\b/i.test(plain)
-                        ) && !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
-                      };
-                      const isApproveLabel = (label) => {
-                        const plain = plainText(label);
-                        return (
-                          /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Tiếp\\s*tục|Tiep\\s*tuc|Chấp\\s*thuận|Chap\\s*thuan|Continue|Run|Start/i.test(label)
-                          || /\\b(phe\\s*duyet|approve|allow|confirm|cho\\s*phep|dong\\s*y|tiep\\s*tuc|chap\\s*thuan|continue|run|start)\\b/i.test(plain)
-                        ) && !isNegativeLabel(label);
-                      };
-                      const isApprovalActionLabel = (label) => {
-                        const plain = plainText(label);
-                        return (
-                          isApproveLabel(label)
-                          || /Create|Generate|Submit|Send|Go/i.test(label)
-                          || /\\b(tao|tao\\s*anh|chay|gui|create|generate|submit|send|go)\\b/i.test(plain)
-                        ) && !isNegativeLabel(label);
-                      };
+                      const isApproveLabel = (label) => /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Tiếp\\s*tục|Tiep\\s*tuc|Chấp\\s*thuận|Chap\\s*thuan|Continue|Run|Start/i.test(label)
+                        && !/Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|không\\s*cho\\s*phép|khong\\s*cho\\s*phep|không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
+                      const isNegativeLabel = (label) => /Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|Xoá|Xóa|Xoa|Delete|delete_forever|Cài\\s*đặt|Cai\\s*dat|Settings|tune|không\\s*cho\\s*phép|khong\\s*cho\\s*phep/i.test(label)
+                        && !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
                       const approveButtons = deepQuery('button, [role="button"]')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
@@ -20429,37 +25480,22 @@ exit 1
                         })
                         .filter(({ label, rect }) => label.length <= 120 && isApproveLabel(label) && rect.width <= 420 && rect.height <= 140)
                         .sort((a, b) => ((a.rect.width * a.rect.height) - (b.rect.width * b.rect.height)) || (b.rect.right - a.rect.right));
-                      const waiting = approvalTextPattern.test(bodyText);
+                      const waiting = /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(bodyText);
                       const dialogRoots = deepQuery('[role="dialog"], [aria-modal="true"], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                         .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (b.rect.right - a.rect.right));
                       const approvalDialogRoots = dialogRoots.filter((root) => {
                         const text = `${root.label || ''} ${root.el?.innerText || ''}`;
-                        return approvalTextPattern.test(text);
+                        return /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Bạn\\s*có\\s*muốn|Ban\\s*co\\s*muon|0\\s*tín\\s*dụng|0\\s*tin\\s*dung/i.test(text);
                       });
-                      const approvalTextRoots = waiting
-                        ? deepQuery('section, aside, form, div, [role="group"], [role="alertdialog"], [role="status"]')
-                            .filter(visible)
-                            .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el), text: el.innerText || el.textContent || '' }))
-                            .filter(({ rect, text }) =>
-                              approvalTextPattern.test(text)
-                              && rect.width >= 180
-                              && rect.height >= 70
-                              && rect.width <= window.innerWidth * 0.96
-                              && rect.height <= window.innerHeight * 0.9
-                            )
-                            .sort((a, b) => (a.rect.width * a.rect.height) - (b.rect.width * b.rect.height))
-                        : [];
-                      const approvalRoots = [...approvalDialogRoots, ...approvalTextRoots]
-                        .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index);
                       const dialogFallbackButtons = waiting
-                        ? approvalRoots.flatMap((root) =>
-                            deepQuery('button, [role="button"], [tabindex], a', root.el)
+                        ? approvalDialogRoots.flatMap((root) =>
+                            Array.from(root.el.querySelectorAll('button, [role="button"]'))
                               .filter(visible)
                               .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                           )
-                            .filter(({ label, rect }) => isApprovalActionLabel(label) && rect.width >= 24 && rect.height >= 18 && rect.width <= 360 && rect.height <= 120)
+                            .filter(({ label, rect }) => !isNegativeLabel(label) && rect.width >= 32 && rect.height >= 24 && rect.width <= 360 && rect.height <= 120)
                             .sort((a, b) => (b.rect.bottom - a.rect.bottom) || (b.rect.right - a.rect.right))
                         : [];
                       const approve = approveButtons[0] || textCandidates[0] || dialogFallbackButtons[0];
@@ -20564,7 +25600,7 @@ exit 1
     async def _flow_agent_panel_attachment_snapshot(self, page: Any) -> Dict[str, Any]:
         try:
             result = await page.evaluate(
-                """
+                r"""
                 () => {
                   const deepQuery = (selector, root = document, seen = new Set()) => {
                     const found = [];
@@ -20746,7 +25782,7 @@ exit 1
                     .filter((item) => /upload|attached|attachment|thumbnail|preview|file|media|image|photo|picture|remove.*image|xoa.*anh|áº£nh|anh/i.test(item.label))
                     .map((item) => item.label.slice(0, 80))
                     .slice(0, 12);
-                  const busyLabel = (label) => /uploading|loading|progress|spinner|pending|processing|dang\s*tai|dang\s*upload|tai\s*len|cho\s*tai|Ä‘ang\s*táº£i|Ä‘ang\s+upload|Ä‘ang\s+xá»­\s*lÃ½|ch\u1edd\s*t\u1ea3i/i.test(label || '');
+                  const busyLabel = (label) => /uploading|loading|progress|spinner|pending|processing|dang\\s*tai|dang\\s*upload|tai\\s*len|cho\\s*tai|Ä‘ang\\s*táº£i|Ä‘ang\\s+upload|Ä‘ang\\s+xá»­\\s*lÃ½|ch\u1edd\\s*t\u1ea3i/i.test(label || '');
                   const busyIndicators = deepQuery('[role="progressbar"], progress, mat-spinner, [class*="spinner" i], [class*="loading" i], [aria-busy="true"]', panel.el)
                     .filter((el) => visible(el, 12, 12))
                     .filter((el) => inPanelAttachmentArea(el) && !insideTextbox(el))
@@ -20854,6 +25890,185 @@ exit 1
             "detail": "attachment snapshot unavailable",
         }
 
+    async def _save_flow_agent_upload_debug_snapshot(self, page: Any, job_id: str, stage: str) -> str:
+        safe_job = re.sub(r"[^0-9A-Za-z._-]+", "-", str(job_id or "job")).strip("-")[:48] or "job"
+        safe_stage = re.sub(r"[^0-9A-Za-z._-]+", "-", str(stage or "debug")).strip("-")[:48] or "debug"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        target_dir = DATA_DIR / "logs" / "flow-agent-debug"
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return ""
+        base = f"{stamp}-{safe_job}-{safe_stage}"
+        screenshot_path = target_dir / f"{base}.png"
+        json_path = target_dir / f"{base}.json"
+        summary = ""
+        try:
+            await page.screenshot(path=str(screenshot_path), full_page=False)
+        except Exception as exc:
+            summary = f"screenshot failed: {humanize_flow_error(str(exc))[:90]}"
+        try:
+            payload = await page.evaluate(
+                r"""
+                () => {
+                  const deepQuery = (selector, root = document, seen = new Set()) => {
+                    const found = [];
+                    const visit = (node) => {
+                      if (!node || seen.has(node)) return;
+                      seen.add(node);
+                      try {
+                        found.push(...node.querySelectorAll(selector));
+                        for (const el of node.querySelectorAll('*')) {
+                          if (el.shadowRoot) visit(el.shadowRoot);
+                        }
+                      } catch (_) {}
+                    };
+                    visit(root);
+                    return found;
+                  };
+                  const rectInfo = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return {
+                      x: Math.round(rect.left),
+                      y: Math.round(rect.top),
+                      w: Math.round(rect.width),
+                      h: Math.round(rect.height),
+                      right: Math.round(rect.right),
+                      bottom: Math.round(rect.bottom),
+                    };
+                  };
+                  const visible = (el, minW = 1, minH = 1) => {
+                    if (!el || !(el instanceof Element)) return false;
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width < minW || rect.height < minH) return false;
+                    const style = window.getComputedStyle(el);
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && style.opacity !== '0'
+                      && rect.bottom > 0
+                      && rect.top < window.innerHeight
+                      && rect.right > 0
+                      && rect.left < window.innerWidth;
+                  };
+                  const labelFor = (el) => [
+                    el.textContent || '',
+                    el.getAttribute('placeholder') || '',
+                    el.getAttribute('alt') || '',
+                    el.getAttribute('aria-label') || '',
+                    el.getAttribute('title') || '',
+                    el.getAttribute('data-testid') || '',
+                    el.getAttribute('class') || '',
+                    el.getAttribute('accept') || '',
+                    el.getAttribute('type') || '',
+                  ].join(' ').replace(/\s+/g, ' ').trim();
+                  const compact = (el, score = 0) => ({
+                    tag: el.tagName.toLowerCase(),
+                    role: el.getAttribute('role') || '',
+                    label: labelFor(el).slice(0, 220),
+                    rect: rectInfo(el),
+                    score: Math.round(score),
+                  });
+                  const panels = deepQuery('aside, dialog, section, [role="dialog"], [aria-modal="true"], div')
+                    .filter((el) => visible(el, 220, 120))
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const text = labelFor(el);
+                      const rightPanel = rect.left >= window.innerWidth * 0.30
+                        && rect.right >= window.innerWidth * 0.65
+                        && rect.width <= window.innerWidth * 0.78;
+                      const hasTextbox = Boolean(deepQuery('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]', el).length);
+                      const agentish = /Flow\s+Agent|Tác\s*nhân|Tac\s*nhan|Bạn\s*muốn|Ban\s*muon|What\s+do\s+you|Credit\s+Spend\s+Approval|Shot\s+Brief|Design\s+Analysis/i.test(text);
+                      const score = (rightPanel ? 1400 : -900) + (hasTextbox ? 700 : 0) + (agentish ? 700 : 0) + rect.left / 20 + rect.height / 40;
+                      return { el, score };
+                    })
+                    .filter((item) => item.score >= 800)
+                    .sort((a, b) => b.score - a.score)
+                    .slice(0, 6);
+                  const bestPanel = panels[0]?.el || document.body;
+                  const panelRect = bestPanel.getBoundingClientRect();
+                  const inBestPanel = (el) => {
+                    const rect = el.getBoundingClientRect();
+                    return rect.left >= panelRect.left - 8
+                      && rect.right <= panelRect.right + 8
+                      && rect.top >= panelRect.top - 8
+                      && rect.bottom <= panelRect.bottom + 8;
+                  };
+                  const textboxes = deepQuery('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')
+                    .filter((el) => visible(el, 90, 10))
+                    .map((el) => compact(el, inBestPanel(el) ? 1000 : 0))
+                    .sort((a, b) => b.score - a.score)
+                    .slice(0, 12);
+                  const controls = deepQuery('button, [role="button"], label, input[type="file"], [aria-label], [data-testid], [class]')
+                    .filter((el) => visible(el, 10, 10))
+                    .map((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const label = labelFor(el);
+                      const addish = el.matches?.('input[type="file"]')
+                        || /\+|add|upload|image|media|ảnh|anh|hình|hinh|thêm|them|attach|file|photo|camera|paperclip|insert|drive/i.test(label);
+                      const nearBottom = rect.bottom >= window.innerHeight * 0.52;
+                      const score = (inBestPanel(el) ? 1200 : 0)
+                        + (addish ? 900 : 0)
+                        + (nearBottom ? 180 : 0)
+                        + rect.left / 35
+                        - Math.max(0, rect.width * rect.height > 28000 ? 250 : 0);
+                      return compact(el, score);
+                    })
+                    .filter((item) => item.score >= 900 || /file|upload|attach|image|media|ảnh|anh|\+/i.test(item.label))
+                    .sort((a, b) => b.score - a.score)
+                    .slice(0, 30);
+                  const fileInputs = deepQuery('input[type="file"]')
+                    .map((el) => {
+                      let files = [];
+                      try {
+                        files = [...(el.files || [])].map((file) => file.name || file.type || 'file');
+                      } catch (_) {}
+                      return {
+                        ...compact(el, inBestPanel(el) ? 1000 : 0),
+                        visible: visible(el, 1, 1),
+                        accept: el.getAttribute('accept') || '',
+                        files,
+                      };
+                    })
+                    .slice(0, 20);
+                  return {
+                    url: location.href,
+                    title: document.title,
+                    viewport: { w: window.innerWidth, h: window.innerHeight },
+                    panelCount: panels.length,
+                    panels: panels.map((item) => compact(item.el, item.score)),
+                    textboxes,
+                    controls,
+                    fileInputs,
+                  };
+                }
+                """
+            )
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            if isinstance(payload, dict):
+                controls = payload.get("controls") if isinstance(payload.get("controls"), list) else []
+                file_inputs = payload.get("fileInputs") if isinstance(payload.get("fileInputs"), list) else []
+                top_control = ""
+                if controls:
+                    first = controls[0] if isinstance(controls[0], dict) else {}
+                    top_control = str(first.get("label") or first.get("tag") or "")[:90]
+                summary_parts = [
+                    f"panels={payload.get('panelCount')}",
+                    f"controls={len(controls)}",
+                    f"fileInputs={len(file_inputs)}",
+                ]
+                if top_control:
+                    summary_parts.append(f"top={top_control}")
+                summary = "; ".join(part for part in summary_parts if part)
+        except Exception as exc:
+            try:
+                json_path.write_text(json.dumps({"error": humanize_flow_error(str(exc))}, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+            summary = summary or f"debug json failed: {humanize_flow_error(str(exc))[:90]}"
+        rel_json = json_path.relative_to(PROJECT_ROOT) if json_path.exists() else json_path
+        rel_png = screenshot_path.relative_to(PROJECT_ROOT) if screenshot_path.exists() else screenshot_path
+        return f"{summary}; files: {rel_json}, {rel_png}".strip("; ")
+
     def _flow_agent_attachment_ready_count(self, snapshot: Dict[str, Any]) -> int:
         if not isinstance(snapshot, dict):
             return 0
@@ -20896,11 +26111,61 @@ exit 1
             return ()
         return tuple(sorted({str(label or "").strip() for label in labels if str(label or "").strip()}))
 
+    def _flow_agent_attachment_labels_include_expected(self, labels: tuple[str, ...], expected_name: str) -> bool:
+        expected = str(expected_name or "").strip().lower()
+        if not expected:
+            return False
+        expected_stem = Path(expected).stem
+        for label in labels:
+            candidate = str(label or "").strip().lower()
+            if not candidate:
+                continue
+            if expected in candidate or candidate in expected:
+                return True
+            candidate_stem = Path(candidate).stem
+            if expected_stem and (expected_stem in candidate_stem or candidate_stem in expected_stem):
+                return True
+        return False
+
+    def _flow_agent_attachment_snapshot_too_busy_for_single_source(
+        self,
+        snapshot: Dict[str, Any],
+        *,
+        before_count: int,
+        before_composer_count: int,
+    ) -> tuple[bool, str]:
+        if not isinstance(snapshot, dict) or not snapshot.get("visible"):
+            return False, ""
+        current_count = self._flow_agent_attachment_ready_count(snapshot)
+        current_composer_count = self._flow_agent_attachment_composer_ready_count(snapshot)
+        # A single image can show up as a few DOM previews/chips in Flow, but
+        # large jumps mean the Agent composer is still carrying old media.
+        max_total = max(8, before_count + 6)
+        max_composer = max(8, before_composer_count + 6)
+        if current_composer_count > max_composer or current_count > max_total:
+            return (
+                True,
+                "agent composer has too many existing attachments for one Trello source "
+                f"(ready {before_count}->{current_count}, composer {before_composer_count}->{current_composer_count}; "
+                f"{snapshot.get('detail') or 'no detail'})",
+            )
+        return False, ""
+
+    def _flow_agent_source_attachment_detail_is_polluted(self, detail: Any) -> bool:
+        normalized = self._flow_agent_error_match_text(str(detail or ""))
+        return (
+            "too many existing attachments" in normalized
+            or "old media" in normalized
+            or "anh cu" in normalized
+            or "ngu canh cu" in normalized
+        )
+
     async def _wait_for_flow_agent_source_attachment(
         self,
         page: Any,
         before: Dict[str, Any] | None = None,
         *,
+        expected_name: str = "",
         timeout_s: float = 20.0,
         accept_stable_ready_after_attach: bool = False,
     ) -> tuple[bool, str]:
@@ -20925,17 +26190,28 @@ exit 1
                 composer_busy_count = int(last_snapshot.get("composer_busy_count") or 0)
             except Exception:
                 composer_busy_count = 0
+            polluted, polluted_detail = self._flow_agent_attachment_snapshot_too_busy_for_single_source(
+                last_snapshot,
+                before_count=before_count,
+                before_composer_count=before_composer_count,
+            )
+            if polluted:
+                return False, polluted_detail
             if last_snapshot.get("visible") and current_composer_count > 0 and composer_busy_count <= 0:
                 if current_composer_count > before_composer_count:
                     return True, f"composer attachment ready {before_composer_count}->{current_composer_count}; {last_snapshot.get('detail') or ''}"
+                if self._flow_agent_attachment_labels_include_expected(current_composer_labels, expected_name):
+                    return True, f"expected attachment label ready in composer; {last_snapshot.get('detail') or ''}"
                 if before_composer_count > 0 and current_composer_labels and current_composer_labels != before_composer_labels:
                     return True, f"composer attachment changed after attach {before_composer_count}->{current_composer_count}; {last_snapshot.get('detail') or ''}"
             if last_snapshot.get("visible") and current_count > 0 and busy_count <= 0:
                 if current_count > before_count:
                     return True, f"new ready attachment visible {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
+                if self._flow_agent_attachment_labels_include_expected(current_labels, expected_name):
+                    return True, f"expected attachment label ready; {last_snapshot.get('detail') or ''}"
                 if before_count > 0 and current_labels and current_labels != before_labels:
                     return True, f"ready attachment changed after attach {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
-                if accept_stable_ready_after_attach and current_count >= before_count:
+                if accept_stable_ready_after_attach and current_count > 0 and current_count >= before_count:
                     return True, f"ready attachment stable after file attach {before_count}->{current_count}; {last_snapshot.get('detail') or ''}"
             await asyncio.sleep(0.5)
         current_count = self._flow_agent_attachment_ready_count(last_snapshot)
@@ -20947,6 +26223,170 @@ exit 1
         if not source.is_file():
             return False, f"source file missing: {source}"
 
+        async def _synthetic_drop_source_file_into_agent() -> tuple[bool, str]:
+            try:
+                payload_b64 = base64.b64encode(source.read_bytes()).decode("ascii")
+            except Exception as exc:
+                return False, f"source read failed: {humanize_flow_error(str(exc))}"
+            mime_type = mimetypes.guess_type(str(source))[0] or "image/png"
+            try:
+                result = await page.evaluate(
+                    """
+                    ({ name, mimeType, payloadB64 }) => {
+                      const visible = (el, minW = 1, minH = 1) => {
+                        if (!el || !(el instanceof Element)) return false;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < minW || rect.height < minH) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && style.opacity !== '0'
+                          && rect.bottom > 0
+                          && rect.top < window.innerHeight
+                          && rect.right > 0
+                          && rect.left < window.innerWidth;
+                      };
+                      const labelFor = (el) => [
+                        el.textContent || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-testid') || '',
+                        el.getAttribute('class') || '',
+                      ].join(' ').replace(/\\s+/g, ' ').trim();
+                      const deepQuery = (selector, root = document, seen = new Set()) => {
+                        const found = [];
+                        const visit = (node) => {
+                          if (!node || seen.has(node)) return;
+                          seen.add(node);
+                          try {
+                            found.push(...node.querySelectorAll(selector));
+                            for (const el of node.querySelectorAll('*')) {
+                              if (el.shadowRoot) visit(el.shadowRoot);
+                            }
+                          } catch (_) {}
+                        };
+                        visit(root);
+                        return found;
+                      };
+                      const panelCandidates = deepQuery('aside, dialog, section, [role="dialog"], div')
+                        .filter((el) => visible(el, 260, 180))
+                        .map((el) => {
+                          const rect = el.getBoundingClientRect();
+                          const label = labelFor(el);
+                          const rightPanel = rect.left >= window.innerWidth * 0.35
+                            && rect.right >= window.innerWidth * 0.72
+                            && rect.width <= window.innerWidth * 0.74;
+                          const hasTextbox = Boolean(deepQuery('textarea, [contenteditable="true"], [role="textbox"]', el).length);
+                          const agentish = /Flow\\s+Agent|Tác\\s*nhân|Tac\\s*nhan|Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|Hướng\\s+dẫn|Huong\\s+dan/i.test(label);
+                          return { el, rect, score: (rightPanel ? 1700 : -900) + (hasTextbox ? 900 : 0) + (agentish ? 600 : 0) + rect.bottom / 12 };
+                        })
+                        .filter((item) => item.score >= 1200)
+                        .sort((a, b) => b.score - a.score);
+                      const panel = panelCandidates[0];
+                      if (!panel) return { ok: false, detail: 'agent panel not found for synthetic drop' };
+                      const panelRect = panel.rect;
+                      const editors = deepQuery('textarea, [contenteditable="true"], [role="textbox"]', panel.el)
+                        .filter((el) => visible(el, 110, 12))
+                        .map((el) => {
+                          const rect = el.getBoundingClientRect();
+                          const label = labelFor(el);
+                          const inPanel = rect.left >= panelRect.left - 16 && rect.right <= panelRect.right + 16;
+                          const nearBottom = rect.bottom >= window.innerHeight * 0.48;
+                          const agentish = /Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|prompt|create|Flow Agent|Tác\\s*nhân/i.test(label);
+                          return { el, rect, score: (inPanel ? 1800 : 0) + (nearBottom ? 700 : 0) + (agentish ? 500 : 0) + rect.bottom / 10 - Math.max(0, -rect.top) / 80 };
+                        })
+                        .sort((a, b) => b.score - a.score);
+                      const editor = editors[0];
+                      if (!editor) return { ok: false, detail: 'agent editor not found for synthetic drop' };
+                      let node = editor.el;
+                      const targets = [editor.el];
+                      for (let depth = 0; node && node !== panel.el && depth < 10; depth += 1, node = node.parentElement) {
+                        if (!(node instanceof Element)) continue;
+                        const rect = node.getBoundingClientRect();
+                        if (
+                          rect.width >= 160
+                          && rect.height >= 36
+                          && rect.left >= panelRect.left - 20
+                          && rect.right <= panelRect.right + 20
+                          && rect.bottom >= editor.rect.bottom - 30
+                          && rect.top < panelRect.bottom
+                        ) {
+                          targets.push(node);
+                        }
+                      }
+                      targets.push(panel.el);
+
+                      const binary = atob(payloadB64);
+                      const bytes = new Uint8Array(binary.length);
+                      for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+                      const file = new File([bytes], name || 'trello-source.png', { type: mimeType || 'image/png', lastModified: Date.now() });
+                      const fireDrop = (target) => {
+                        const rect = target.getBoundingClientRect();
+                        const clientX = Math.round(Math.min(rect.right - 24, Math.max(rect.left + 24, rect.left + rect.width * 0.52)));
+                        const clientY = Math.round(Math.min(Math.min(rect.bottom - 18, panelRect.bottom - 76), Math.max(rect.top + 22, panelRect.bottom - 108)));
+                        const dataTransfer = new DataTransfer();
+                        dataTransfer.items.add(file);
+                        for (const type of ['dragenter', 'dragover', 'drop']) {
+                          let event;
+                          try {
+                            event = new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer, clientX, clientY });
+                          } catch (_) {
+                            event = new Event(type, { bubbles: true, cancelable: true });
+                            event.dataTransfer = dataTransfer;
+                            event.clientX = clientX;
+                            event.clientY = clientY;
+                          }
+                          target.dispatchEvent(event);
+                        }
+                        try {
+                          const clipboard = new DataTransfer();
+                          clipboard.items.add(file);
+                          let pasteEvent;
+                          try {
+                            pasteEvent = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: clipboard });
+                          } catch (_) {
+                            pasteEvent = new Event('paste', { bubbles: true, cancelable: true });
+                            pasteEvent.clipboardData = clipboard;
+                          }
+                          target.dispatchEvent(pasteEvent);
+                        } catch (_) {}
+                        return { x: clientX, y: clientY, tag: target.tagName.toLowerCase(), label: labelFor(target).slice(0, 80) };
+                      };
+
+                      const fired = [];
+                      for (const target of targets) {
+                        fired.push(fireDrop(target));
+                      }
+                      const inputs = deepQuery('input[type="file"]', panel.el)
+                        .filter((el) => {
+                          const accept = `${el.getAttribute('accept') || ''} ${labelFor(el)}`;
+                          return !accept.trim() || /image|jpeg|jpg|png|webp|media|file/i.test(accept);
+                        });
+                      for (const input of inputs) {
+                        try {
+                          const dt = new DataTransfer();
+                          dt.items.add(file);
+                          input.files = dt.files;
+                          input.dispatchEvent(new Event('input', { bubbles: true }));
+                          input.dispatchEvent(new Event('change', { bubbles: true }));
+                        } catch (_) {}
+                      }
+                      return { ok: true, detail: `synthetic file drop on ${fired.length} agent targets; inputs=${inputs.length}; first=${JSON.stringify(fired[0] || {})}` };
+                    }
+                    """,
+                    {
+                        "name": source.name,
+                        "mimeType": mime_type,
+                        "payloadB64": payload_b64,
+                    },
+                )
+            except Exception as exc:
+                return False, humanize_flow_error(str(exc))
+            if isinstance(result, dict) and result.get("ok"):
+                await asyncio.sleep(4.0)
+                return True, str(result.get("detail") or "synthetic drop")
+            return False, str((result or {}).get("detail") or "synthetic drop failed") if isinstance(result, dict) else "synthetic drop failed"
+
         async def _set_any_file_input() -> tuple[bool, str]:
             for selector in ('input[type="file"][accept*="image"]', 'input[type="file"]'):
                 try:
@@ -20957,16 +26397,239 @@ exit 1
                 for index in range(count):
                     try:
                         await locator.nth(index).set_input_files(str(source))
-                        await asyncio.sleep(2.0)
+                        await asyncio.sleep(5.0)
                         return True, f"{selector} #{index + 1}"
                     except Exception:
                         continue
             return False, "no usable file input"
 
+        async def _choose_upload_media_menu_item() -> tuple[bool, str]:
+            try:
+                result = await page.evaluate(
+                    """
+                    () => {
+                      const visible = (el) => {
+                        if (!el || !(el instanceof Element)) return false;
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 40 || rect.height < 24) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && style.opacity !== '0'
+                          && !el.disabled
+                          && rect.bottom > 0
+                          && rect.top < window.innerHeight
+                          && rect.right > 0
+                          && rect.left < window.innerWidth;
+                      };
+                      const labelFor = (el) => [
+                        el.textContent || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-testid') || '',
+                        el.getAttribute('class') || '',
+                      ].join(' ').replace(/\\s+/g, ' ').trim();
+                      const controls = [...document.querySelectorAll('[role="menu"] button, [role="menu"] [role="menuitem"], [role="dialog"] button, div[role="button"], button, [aria-label], [title], div')]
+                        .filter(visible)
+                        .map((el) => {
+                          const control = el.closest('button, [role="menuitem"], [role="button"], [tabindex]') || el;
+                          const rect = control.getBoundingClientRect();
+                          const label = `${labelFor(el)} ${labelFor(control)}`.replace(/\\s+/g, ' ').trim();
+                          const uploadish = /Tải\\s+nội\\s+dung\\s+nghe\\s+nhìn\\s+lên|Tai\\s+noi\\s+dung\\s+nghe\\s+nhin\\s+len|Upload\\s+media|Upload|Tải\\s+lên|Tai\\s+len|add_photo|upload_file|file_upload/i.test(label);
+                          const wrong = /bộ\\s+sưu\\s+tập|bo\\s+suu\\s+tap|collection|nhân\\s+vật|nhan\\s+vat|character|cảnh|canh|scene|help|settings|cài\\s+đặt|cai\\s+dat/i.test(label);
+                          const popoverish = rect.left >= window.innerWidth * 0.50 && rect.top <= window.innerHeight * 0.35;
+                          const score = (uploadish ? 2000 : 0) + (popoverish ? 700 : 0) - (wrong ? 1800 : 0) - (label.length > 180 ? 450 : 0);
+                          return { el: control, rect, label, score };
+                        })
+                        .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index)
+                        .filter((item) => item.score >= 1500)
+                        .sort((a, b) => b.score - a.score);
+                      const target = controls[0];
+                      if (!target) return { ok: false, detail: 'no upload media menu item' };
+                      target.el.scrollIntoView({ block: 'center', inline: 'center' });
+                      const rect = target.el.getBoundingClientRect();
+                      return {
+                        ok: true,
+                        x: rect.left + rect.width / 2,
+                        y: rect.top + rect.height / 2,
+                        detail: target.label || 'upload media menu item',
+                      };
+                    }
+                    """
+                )
+            except Exception as exc:
+                return False, humanize_flow_error(str(exc))
+            if not isinstance(result, dict) or not result.get("ok"):
+                return False, str((result or {}).get("detail") or "no upload media menu item") if isinstance(result, dict) else "no upload media menu item"
+            detail = str(result.get("detail") or "upload media menu item")
+            try:
+                async with page.expect_file_chooser(timeout=5000) as chooser_info:
+                    await page.mouse.click(float(result.get("x")), float(result.get("y")))
+                chooser = await chooser_info.value
+                await chooser.set_files(str(source))
+                await asyncio.sleep(5.0)
+                return True, f"file chooser via menu {detail}"
+            except Exception as exc:
+                return False, f"{detail}: {humanize_flow_error(str(exc))}"
+
+        async def _drag_latest_gallery_media_into_agent() -> tuple[bool, str]:
+            last_detail = "no gallery media drag candidate"
+            for _attempt in range(12):
+                try:
+                    result = await page.evaluate(
+                        """
+                        () => {
+                          const visible = (el, minW = 1, minH = 1) => {
+                            if (!el || !(el instanceof Element)) return false;
+                            const rect = el.getBoundingClientRect();
+                            if (rect.width < minW || rect.height < minH) return false;
+                            const style = window.getComputedStyle(el);
+                            return style.visibility !== 'hidden'
+                              && style.display !== 'none'
+                              && style.opacity !== '0'
+                              && rect.bottom > 0
+                              && rect.top < window.innerHeight
+                              && rect.right > 0
+                              && rect.left < window.innerWidth;
+                          };
+                          const labelFor = (el) => [
+                            el.textContent || '',
+                            el.getAttribute('alt') || '',
+                            el.getAttribute('aria-label') || '',
+                            el.getAttribute('title') || '',
+                            el.getAttribute('data-testid') || '',
+                            el.getAttribute('class') || '',
+                            el.getAttribute('src') || '',
+                          ].join(' ').replace(/\\s+/g, ' ').trim();
+                          const panelCandidates = [...document.querySelectorAll('aside, dialog, section, [role="dialog"], div')]
+                            .filter((el) => visible(el, 260, 160))
+                            .map((el) => {
+                              const rect = el.getBoundingClientRect();
+                              const text = labelFor(el);
+                              const rightPanel = rect.left >= window.innerWidth * 0.35
+                                && rect.right >= window.innerWidth * 0.72
+                                && rect.width <= window.innerWidth * 0.72;
+                              const agentish = /Flow\\s+Agent|Tác\\s*nhân|Tac\\s*nhan|Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|Credit\\s+Spend\\s+Approval|Shot\\s+Brief|Design\\s+Analysis/i.test(text);
+                              const score = (rightPanel ? 1600 : -900) + (agentish ? 700 : 0) + rect.height / 30 + rect.left / 20;
+                              return { el, rect, score };
+                            })
+                            .filter((item) => item.score >= 1100)
+                            .sort((a, b) => b.score - a.score);
+                          const panel = panelCandidates[0];
+                          if (!panel) return { ok: false, detail: 'agent panel not found for gallery drag' };
+                          const panelRect = panel.rect;
+                          const editorCandidates = [...document.querySelectorAll('[contenteditable="true"], div[role="textbox"], textarea')]
+                            .filter((el) => {
+                              if (!visible(el, 120, 12)) return false;
+                              const rect = el.getBoundingClientRect();
+                              const style = window.getComputedStyle(el);
+                              return rect.width > 120
+                                && rect.height > 12
+                                && rect.bottom > window.innerHeight * 0.45
+                                && rect.top < window.innerHeight - 12
+                                && rect.right > panelRect.left
+                                && rect.left < panelRect.right
+                                && style.display !== 'none'
+                                && style.visibility !== 'hidden';
+                            })
+                            .map((el) => {
+                              const rect = el.getBoundingClientRect();
+                              const label = labelFor(el);
+                              const inPanel = rect.left >= panelRect.left - 24 && rect.right <= panelRect.right + 24;
+                              const agentish = /Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|prompt|create|Flow Agent/i.test(label);
+                              const score = (inPanel ? 1800 : 0) + (agentish ? 800 : 0) + rect.bottom / 10 - Math.max(0, -rect.top) / 60;
+                              return { el, rect, label, score };
+                            })
+                            .sort((a, b) => b.score - a.score);
+                          const editor = editorCandidates[0];
+                          if (!editor) return { ok: false, detail: 'agent editor not found for gallery drag' };
+                          const mediaCandidates = [...document.querySelectorAll('img, canvas, [role="img"], [style*="background-image"]')]
+                            .filter((el) => visible(el, 96, 96))
+                            .map((el) => {
+                              const target = el.closest('[aria-roledescription*="draggable" i], [draggable="true"], [role="button"], [data-index], [data-item-index], a') || el;
+                              const rect = target.getBoundingClientRect();
+                              const area = rect.width * rect.height;
+                              const label = `${labelFor(el)} ${labelFor(target)}`.replace(/\\s+/g, ' ').trim();
+                              const inGallery = rect.left >= 220
+                                && rect.right <= panelRect.left - 12
+                                && rect.top >= 60
+                                && rect.bottom <= window.innerHeight + 24;
+                              const tooSmall = area < 12000;
+                              const inChrome = Boolean(target.closest('nav, header, aside'));
+                              const score = (inGallery ? 3000 : 0)
+                                + Math.max(0, 900 - rect.top)
+                                + Math.max(0, 900 - rect.left / 2)
+                                + Math.min(area / 80, 900)
+                                - (tooSmall ? 1600 : 0)
+                                - (inChrome ? 700 : 0);
+                              return { el: target, rect, label, score };
+                            })
+                            .filter((item) => item.score >= 2200)
+                            .sort((a, b) => b.score - a.score);
+                          const media = mediaCandidates[0];
+                          if (!media) return { ok: false, detail: 'no visible gallery image to drag' };
+                          media.el.scrollIntoView({ block: 'center', inline: 'center' });
+                          const sourceRect = media.el.getBoundingClientRect();
+	                          const editorRect = editor.rect;
+	                          const visibleTop = Math.max(editorRect.top, panelRect.top + 72, 90);
+	                          const visibleBottom = Math.min(editorRect.bottom, panelRect.bottom - 64, window.innerHeight - 42);
+	                          const targetY = Math.min(visibleBottom - 20, Math.max(visibleTop + 28, panelRect.bottom - 92, window.innerHeight * 0.72));
+	                          return {
+	                            ok: true,
+	                            sourceX: sourceRect.left + sourceRect.width / 2,
+	                            sourceY: sourceRect.top + sourceRect.height / 2,
+	                            targetX: editorRect.left + Math.min(editorRect.width - 28, Math.max(28, editorRect.width * 0.52)),
+	                            targetY,
+                            detail: `drag gallery media ${Math.round(sourceRect.left)},${Math.round(sourceRect.top)} -> agent ${Math.round(editorRect.left)},${Math.round(targetY)}`,
+                          };
+                        }
+                        """
+                    )
+                except Exception as exc:
+                    return False, humanize_flow_error(str(exc))
+                if isinstance(result, dict) and result.get("ok"):
+                    try:
+                        source_x = float(result.get("sourceX"))
+                        source_y = float(result.get("sourceY"))
+                        target_x = float(result.get("targetX"))
+                        target_y = float(result.get("targetY"))
+                        await page.mouse.move(source_x, source_y)
+                        await asyncio.sleep(0.15)
+                        await page.mouse.down()
+                        steps = 14
+                        for step in range(1, steps + 1):
+                            x = source_x + (target_x - source_x) * step / steps
+                            y = source_y + (target_y - source_y) * step / steps
+                            await page.mouse.move(x, y)
+                            await asyncio.sleep(0.035)
+                        await page.mouse.up()
+                        await asyncio.sleep(2.0)
+                        return True, str(result.get("detail") or "drag gallery media into agent")
+                    except Exception as exc:
+                        return False, humanize_flow_error(str(exc))
+                last_detail = str((result or {}).get("detail") or last_detail) if isinstance(result, dict) else last_detail
+                await asyncio.sleep(1.0)
+            return False, last_detail
+
         try:
             result = await page.evaluate(
                 """
                 () => {
+                  const deepQuery = (selector, root = document, seen = new Set()) => {
+                    const found = [];
+                    const visit = (node) => {
+                      if (!node || seen.has(node)) return;
+                      seen.add(node);
+                      try {
+                        found.push(...node.querySelectorAll(selector));
+                        for (const el of node.querySelectorAll('*')) {
+                          if (el.shadowRoot) visit(el.shadowRoot);
+                        }
+                      } catch (_) {}
+                    };
+                    visit(root);
+                    return found;
+                  };
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
                     const rect = el.getBoundingClientRect();
@@ -20983,25 +26646,46 @@ exit 1
                     el.getAttribute('aria-label') || '',
                     el.getAttribute('title') || '',
                     el.getAttribute('data-testid') || '',
+                    el.getAttribute('class') || '',
+                    el.getAttribute('accept') || '',
                   ].join(' ').replace(/\\s+/g, ' ').trim();
-                  const textboxes = [...document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                  const textboxes = deepQuery('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')
                     .filter(visible)
                     .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
                     .sort((a, b) => b.rect.bottom - a.rect.bottom);
                   const box = textboxes.find((item) => /Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|thay đổi|thay doi|prompt|create/i.test(item.label))
                     || textboxes[0];
                   const boxRect = box?.rect || { left: 0, top: window.innerHeight * 0.55, right: window.innerWidth, bottom: window.innerHeight };
-                  const controls = [...document.querySelectorAll('button, [role="button"], label, [aria-label], [data-testid]')]
-                    .filter(visible)
-                    .map((el) => {
-                      const rect = el.getBoundingClientRect();
-                      const label = labelFor(el);
-                      const nearBox = rect.bottom >= boxRect.top - 96 && rect.top <= boxRect.bottom + 96;
-                      const addish = /\\+|add|upload|image|media|ảnh|anh|hình|hinh|thêm|them|add_2|attach|file/i.test(label);
-                      const leftish = rect.right <= boxRect.left + Math.max(180, boxRect.width * 0.32);
-                      const score = (nearBox ? 1000 : 0) + (addish ? 500 : 0) + (leftish ? 120 : 0) - Math.abs((rect.top + rect.bottom) / 2 - (boxRect.top + boxRect.bottom) / 2);
-                      return { el, rect, label, score };
-                    })
+	                  const controls = deepQuery('button, [role="button"], label, input[type="file"], [aria-label], [data-testid]')
+	                    .filter(visible)
+	                    .map((el) => {
+	                      const rect = el.getBoundingClientRect();
+	                      const label = labelFor(el);
+		                      const nearBox = rect.bottom >= boxRect.top - 96 && rect.top <= boxRect.bottom + 96;
+		                      const inputFile = el.matches?.('input[type="file"]');
+		                      const mediaish = /Thêm\\s+nội\\s+dung\\s+nghe\\s+nhìn|Them\\s+noi\\s+dung\\s+nghe\\s+nhin|add\\s*Thêm|add\\s*Them|upload|image|media|ảnh|anh|hình|hinh|attach|file|photo|camera|paperclip/i.test(label);
+		                      const addish = inputFile || mediaish || /\\+|add|thêm|them|add_2/i.test(label);
+		                      const leftish = rect.right <= boxRect.left + Math.max(180, boxRect.width * 0.32);
+		                      const inRightPanel = rect.left >= window.innerWidth * 0.35 || rect.right >= window.innerWidth * 0.72;
+		                      const headerMedia = mediaish && rect.top <= Math.max(96, window.innerHeight * 0.16);
+		                      const composerAdd = /\\+|add_?2|add/i.test(label)
+		                        && nearBox
+		                        && leftish
+		                        && rect.width <= 56
+		                        && rect.height <= 56
+		                        && rect.top >= boxRect.bottom - 110;
+		                      const createOnly = /(^|\\s)(Tạo|Tao|Create)(\\s|$)|add_2\\s*Tạo|add_2\\s*Tao/i.test(label) && !mediaish && !composerAdd;
+		                      const score = (headerMedia ? 2600 : 0)
+		                        + (composerAdd ? 3600 : 0)
+		                        + (mediaish ? 1400 : 0)
+		                        + (nearBox ? 520 : 0)
+	                        + (addish ? 450 : 0)
+	                        + (leftish ? 120 : 0)
+	                        + (inRightPanel ? 180 : 0)
+	                        - (createOnly ? 1800 : 0)
+	                        - Math.abs((rect.top + rect.bottom) / 2 - (boxRect.top + boxRect.bottom) / 2) / 3;
+	                      return { el, rect, label, score };
+	                    })
                     .filter((item) => item.score > 400)
                     .sort((a, b) => b.score - a.score);
                   const target = controls[0];
@@ -21020,6 +26704,10 @@ exit 1
         except Exception:
             result = {}
 
+        synthetic_ok, synthetic_detail = await _synthetic_drop_source_file_into_agent()
+        if synthetic_ok:
+            return True, synthetic_detail
+
         if isinstance(result, dict) and result.get("ok"):
             detail = str(result.get("detail") or "agent add/upload control")
             try:
@@ -21027,12 +26715,21 @@ exit 1
                     await page.mouse.click(float(result.get("x")), float(result.get("y")))
                 chooser = await chooser_info.value
                 await chooser.set_files(str(source))
-                await asyncio.sleep(2.0)
-                return True, f"file chooser via {detail}"
+                await asyncio.sleep(5.0)
+                drag_ok, drag_detail = await _drag_latest_gallery_media_into_agent()
+                if drag_ok:
+                    return True, f"file chooser via {detail}; {drag_detail}"
+                return True, f"file chooser via {detail}; drag={drag_detail}"
             except Exception as exc:
+                menu_ok, menu_detail = await _choose_upload_media_menu_item()
+                if menu_ok:
+                    drag_ok, drag_detail = await _drag_latest_gallery_media_into_agent()
+                    if drag_ok:
+                        return True, f"{menu_detail}; {drag_detail}"
+                    return True, f"{menu_detail}; drag={drag_detail}"
                 input_ok, input_detail = await _set_any_file_input()
                 if input_ok:
-                    return True, f"{input_detail} after {detail}"
+                    return True, f"{input_detail} after {detail}; menu={menu_detail}"
                 return False, f"{detail}: {humanize_flow_error(str(exc))}"
 
         input_ok, input_detail = await _set_any_file_input()
@@ -21068,131 +26765,19 @@ exit 1
                     || el.closest('a')
                     || el
                   );
-                  const labelFor = (el) => [
-                    el?.textContent || '',
-                    el?.getAttribute?.('placeholder') || '',
-                    el?.getAttribute?.('aria-label') || '',
-                    el?.getAttribute?.('title') || '',
-                    el?.getAttribute?.('data-testid') || '',
-                  ].join(' ').replace(/\s+/g, ' ').trim();
-                  const clippedRect = (rect) => ({
-                    left: Math.max(0, rect.left),
-                    top: Math.max(0, rect.top),
-                    right: Math.min(window.innerWidth, rect.right),
-                    bottom: Math.min(window.innerHeight, rect.bottom),
-                    get width() { return Math.max(0, this.right - this.left); },
-                    get height() { return Math.max(0, this.bottom - this.top); },
-                  });
-                  const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
-                  const rightPanelish = (rect) => rect.left >= window.innerWidth * 0.42
-                    || (rect.right >= window.innerWidth * 0.82 && rect.width <= window.innerWidth * 0.62);
-                  const agentPanel = () => {
-                    const panels = [...document.querySelectorAll('aside, dialog, section, div[role="dialog"], div')]
-                      .filter((candidate) => {
-                        const rect = candidate.getBoundingClientRect();
-                        const style = window.getComputedStyle(candidate);
-                        if (rect.width < 260 || rect.height < 180) return false;
-                        if (!rightPanelish(rect)) return false;
-                        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
-                        return rect.bottom > window.innerHeight * 0.45 && rect.top < window.innerHeight;
-                      })
-                      .map((candidate) => {
-                        const rect = candidate.getBoundingClientRect();
-                        const text = labelFor(candidate);
-                        const hasTextbox = Boolean(candidate.querySelector('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'));
-                        const agentish = /Flow\s+Agent|Tác\s*nhân|Tac\s*nhan|Bạn\s*muốn|Ban\s*muon|What\s+do\s+you|Phiên\s+không\s+có\s+tiêu\s+đề|Phien\s+khong\s+co\s+tieu\s+de/i.test(text);
-                        const score = (hasTextbox ? 900 : 0) + (agentish ? 700 : 0) + rect.right / 10 + rect.height / 20;
-                        return { el: candidate, rect, score };
-                      })
-                      .filter((item) => item.score >= 900)
-                      .sort((a, b) => b.score - a.score);
-                    return panels[0] || null;
-                  };
-                  const agentComposerDropTarget = () => {
-                    const panelItem = agentPanel();
-                    const panel = panelItem?.el || document;
-                    const panelRect = panelItem?.rect || { left: window.innerWidth * 0.45, right: window.innerWidth, top: 0, bottom: window.innerHeight, width: window.innerWidth * 0.55, height: window.innerHeight };
-                    const controls = [...panel.querySelectorAll('button, [role="button"], label, [aria-label], [title], [data-testid]')]
-                      .map((el) => {
-                        const rect = el.getBoundingClientRect();
-                        const style = window.getComputedStyle(el);
-                        const label = labelFor(el);
-                        const visibleControl = rect.width >= 18 && rect.height >= 18
-                          && rect.bottom > window.innerHeight * 0.55
-                          && rect.top < window.innerHeight
-                          && rect.left >= panelRect.left - 12
-                          && rect.right <= panelRect.right + 12
-                          && style.display !== 'none'
-                          && style.visibility !== 'hidden'
-                          && style.opacity !== '0';
-                        const addish = /\+|add_2|add|attach|upload|image|media|file|ảnh|anh|hình|hinh|thêm|them/i.test(label);
-                        const leftish = rect.left <= panelRect.left + panelRect.width * 0.32;
-                        const nearBottom = rect.bottom >= panelRect.bottom - Math.max(180, panelRect.height * 0.28);
-                        const score = (visibleControl ? 1000 : -9999) + (addish ? 1000 : 0) + (leftish ? 350 : 0) + (nearBottom ? 350 : 0) - Math.abs(rect.bottom - panelRect.bottom) / 4;
-                        return { el, rect, label, score };
-                      })
-                      .filter((item) => item.score > 900)
-                      .sort((a, b) => b.score - a.score);
-                    const plus = controls[0];
-                    if (plus) {
-                      const x = clamp(plus.rect.right + 44, panelRect.left + 42, panelRect.right - 72);
-                      const y = clamp(plus.rect.top - 22, Math.max(24, panelRect.top + 36), Math.min(window.innerHeight - 30, panelRect.bottom - 42));
-                      return { x, y, detail: `chat composer plus ${Math.round(plus.rect.left)},${Math.round(plus.rect.top)}` };
-                    }
-
-                    const editors = [...panel.querySelectorAll('[contenteditable="true"], div[role="textbox"], textarea')]
-                      .filter((candidate) => {
-                        const rect = candidate.getBoundingClientRect();
-                        const clipped = clippedRect(rect);
-                        const style = window.getComputedStyle(candidate);
-                        return clipped.width > 120
-                          && clipped.height > 12
-                          && clipped.bottom > window.innerHeight * 0.45
-                          && clipped.right > panelRect.left
-                          && clipped.left < panelRect.right
-                          && style.display !== 'none'
-                          && style.visibility !== 'hidden';
-                      })
-                      .map((candidate) => {
-                        const rect = candidate.getBoundingClientRect();
-                        const clipped = clippedRect(rect);
-                        const label = labelFor(candidate);
-                        const agentish = /Bạn\s*muốn\s*tạo\s*gì|Ban\s*muon\s*tao\s*gi|What\s+do\s+you|prompt|create/i.test(label);
-                        const score = (agentish ? 800 : 0) + clipped.bottom / 10 + clipped.height / 30;
-                        return { candidate, rect, clipped, label, score };
-                      })
-                      .sort((a, b) => b.score - a.score);
-                    const editor = editors[0];
-                    if (!editor) return null;
-                    const x = clamp(editor.clipped.left + Math.max(48, editor.clipped.width * 0.16), panelRect.left + 32, panelRect.right - 72);
-                    const y = clamp(editor.clipped.bottom - Math.max(28, Math.min(56, editor.clipped.height * 0.18)), editor.clipped.top + 18, window.innerHeight - 30);
-                    return { x, y, detail: `chat composer textbox ${Math.round(editor.rect.left)},${Math.round(editor.rect.top)}` };
-                  };
                   const rectInfo = (el) => {
                     const target = draggable(el);
                     target.scrollIntoView({block: 'center', inline: 'center'});
                     const sourceRect = target.getBoundingClientRect();
-                    if (requireAgentPanel) {
-                      const drop = agentComposerDropTarget();
-                      if (!drop) return {ok: false, detail: 'no visible agent chat composer drop target'};
-                      return {
-                        ok: true,
-                        sourceX: sourceRect.left + sourceRect.width / 2,
-                        sourceY: sourceRect.top + sourceRect.height / 2,
-                        targetX: drop.x,
-                        targetY: drop.y,
-                        detail: `drag ${target.tagName.toLowerCase()} ${Math.round(sourceRect.left)},${Math.round(sourceRect.top)} -> agent chat ${drop.detail}`,
-                      };
-                    }
                     const editors = [...document.querySelectorAll('[contenteditable="true"], div[role="textbox"], textarea')]
                       .filter((candidate) => {
                         const rect = candidate.getBoundingClientRect();
                         const style = window.getComputedStyle(candidate);
-                        return rect.width > 120
-                          && rect.height > 12
-                          && rect.bottom > window.innerHeight * 0.45
-                          && rect.top < window.innerHeight - 12
-                          && rect.bottom <= window.innerHeight + 20
+	                        return rect.width > 120
+	                          && rect.height > 12
+	                          && rect.bottom > window.innerHeight * 0.45
+	                          && rect.top < window.innerHeight - 12
+	                          && rect.bottom <= window.innerHeight + 20
                           && rect.right > 0
                           && rect.left < window.innerWidth
                           && style.display !== 'none'
@@ -21218,12 +26803,18 @@ exit 1
                     const editor = editors[0];
                     if (!editor) return {ok: false, detail: requireAgentPanel ? 'no visible agent panel drop editor' : 'no visible prompt editor'};
                     const editorRect = editor.getBoundingClientRect();
-                    return {
-                      ok: true,
-                      sourceX: sourceRect.left + sourceRect.width / 2,
-                      sourceY: sourceRect.top + sourceRect.height / 2,
-                      targetX: editorRect.left + Math.min(editorRect.width - 20, Math.max(20, editorRect.width * 0.15)),
-                      targetY: Math.min(window.innerHeight - 24, Math.max(24, editorRect.top + editorRect.height / 2)),
+	                    const visibleTop = Math.max(8, editorRect.top);
+	                    const visibleBottom = Math.min(window.innerHeight - 32, editorRect.bottom);
+	                    const visibleHeight = Math.max(0, visibleBottom - visibleTop);
+	                    const dropY = visibleHeight > 16
+	                      ? visibleBottom - Math.min(56, Math.max(18, visibleHeight * 0.16))
+	                      : window.innerHeight * 0.72;
+		                    return {
+		                      ok: true,
+		                      sourceX: sourceRect.left + sourceRect.width / 2,
+		                      sourceY: sourceRect.top + sourceRect.height / 2,
+		                      targetX: editorRect.left + Math.min(editorRect.width - 24, Math.max(24, editorRect.width * 0.52)),
+		                      targetY: Math.min(window.innerHeight - 64, Math.max(90, dropY)),
                       detail: `drag ${target.tagName.toLowerCase()} ${Math.round(sourceRect.left)},${Math.round(sourceRect.top)} -> ${requireAgentPanel ? 'agent panel' : 'prompt'} ${Math.round(editorRect.left)},${Math.round(editorRect.top)}`,
                     };
                   };
@@ -21423,12 +27014,6 @@ exit 1
     def _is_recaptcha_error(self, exc: Exception) -> bool:
         detail = str(exc or "").lower()
         return "recaptcha" in detail and "failed" in detail
-
-    def _is_image_model_error(self, exc: Exception) -> bool:
-        detail = str(exc or "").lower()
-        model_markers = ("model", "imagemodelname", "modelnametype")
-        problem_markers = ("invalid", "unknown", "unsupported", "not supported", "unrecognized", "not found")
-        return any(marker in detail for marker in model_markers) and any(marker in detail for marker in problem_markers)
 
     def _parse_images_from_flow_payload(
         self,

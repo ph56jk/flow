@@ -1,6149 +1,1977 @@
-const ACTIVE_STATUSES = new Set(["queued", "running", "polling"]);
-const EDIT_JOB_TYPES = new Set(["extend", "upscale", "camera_motion", "camera_position", "insert", "remove"]);
-const FALLBACK_VIDEO_MODELS = [
-  { value: "Veo 3.1 - Fast", label: "Veo 3.1 - Fast" },
-  { value: "Veo 3.1 - Quality", label: "Veo 3.1 - Quality" },
-  { value: "Veo 2 - Fast", label: "Veo 2 - Fast" },
-  { value: "Veo 2 - Quality", label: "Veo 2 - Quality" },
-];
-const FALLBACK_IMAGE_MODELS = [
-  { value: "GEMINI_3_PRO_IMAGE", label: "Nano Banana Pro" },
-  { value: "NARWHAL", label: "Nano Banana 2" },
-  { value: "IMAGEN_3", label: "Imagen 3" },
-];
-const REFERENCE_ROLE_OPTIONS = [
-  { value: "base", label: "Ảnh chính", detail: "Ảnh người mẫu hoặc ảnh gốc cần giữ lại." },
-  { value: "logo", label: "Logo", detail: "Logo, hoạ tiết, nhãn hiệu hoặc chi tiết brand." },
-  { value: "product", label: "Sản phẩm", detail: "Ảnh sản phẩm, quần áo, phụ kiện, vật thể chính." },
-  { value: "reference", label: "Tham chiếu", detail: "Ảnh phụ để lấy màu, chất liệu, bố cục hoặc vibe." },
-];
-const AUTOMATION_STORAGE_KEY = "flow-web-automation-dashboard-v1";
-const AUTOMATION_CONFIG_VERSION = 1;
-const DEFAULT_PROMPT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1I8J4jkj2p_H2hsbDgh-kzc0WqUFWtmqR0gYqbE9Zp4U/edit?gid=2137274733#gid=2137274733";
-const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
-const DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7";
-const DEFAULT_TRELLO_SOURCE_SCOPE_LABEL = "Ready for AI";
-const FLOW_AI_SOURCE_TYPE = "flow_ai";
-const FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12;
-const FLOW_AGENT_TARGET_OUTPUT_COUNT = 12;
-const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "review_hold", "log", "telegram"];
-const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
-const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
-const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
-let promptSourceAutoPreviewStarted = false;
-let automationSubmitInFlight = false;
-const AUTOMATION_MODULE_TYPE_CONFIG = {
-  source: {
-    label: "Flow Agent",
-    title: "Flow Agent Request",
-    detail: "Yêu cầu cho Tác nhân Flow",
-    icon: "T",
-    iconClass: "node-icon-trello",
-  },
-  trello_source: {
-    label: "Trello source",
-    title: "Trello Image Source",
-    detail: "Lấy ảnh gốc từ đúng card Trello",
-    icon: "TS",
-    iconClass: "node-icon-trello",
-  },
-  normalize: {
-    label: "Prepare",
-    title: "Prepare Request",
-    detail: "Chuẩn hóa lệnh cho Flow Agent",
-    icon: "S",
-    iconClass: "node-icon-sheet",
-  },
-  flow: {
-    label: "Google Flow",
-    title: "Google Flow",
-    detail: "Tác nhân Flow tạo ảnh",
-    icon: "F",
-    iconClass: "node-icon-flow",
-  },
-  telegram: {
-    label: "Telegram",
-    title: "Telegram Optional",
-    detail: "Gửi thêm khi cần",
-    icon: "TG",
-    iconClass: "node-icon-telegram",
-  },
-  trello: {
-    label: "Trello",
-    title: "Trello Archive",
-    detail: "Lưu ảnh vào card/list Trello",
-    icon: "L",
-    iconClass: "node-icon-log",
-  },
-  approval: {
-    label: "Review",
-    title: "Trello Review",
-    detail: "Duyệt trực tiếp trên card Trello",
-    icon: "A",
-    iconClass: "node-icon-log",
-  },
-  custom: {
-    label: "Custom",
-    title: "Custom Module",
-    detail: "Cục tự định nghĩa",
-    icon: "C",
-    iconClass: "node-icon-custom",
-  },
-};
-const AUTOMATION_STEP_DEFAULTS = {
-  source: {
-    title: "Flow Agent Request",
-    detail: "Yêu cầu cho Tác nhân Flow",
-  },
-  trello_source: {
-    title: "Trello Image Source",
-    detail: "Lấy ảnh sản phẩm gốc từ card Trello",
-  },
-  normalize: {
-    title: "Prepare Request",
-    detail: "Chuẩn hóa lệnh cho Flow Agent",
-  },
-  flow: {
-    title: "Google Flow",
-    detail: "Tác nhân Flow tạo ảnh",
-  },
-  telegram: {
-    title: "Telegram Optional",
-    detail: "Gửi thêm nếu cần",
-  },
-  log: {
-    title: "Trello Archive",
-    detail: "Lưu ảnh vào card/list Trello",
-  },
-  review_hold: {
-    title: "Trello Review",
-    detail: "Ảnh lên đúng card để duyệt trực tiếp",
-  },
-};
-const ASPECT_DETAILS = {
-  landscape: { title: "Ngang 16:9", detail: "YouTube, cảnh ngang, widescreen" },
-  portrait: { title: "Dọc 9:16", detail: "Reels, Shorts, TikTok" },
-  square: { title: "Vuông 1:1", detail: "Feed, poster vuông, thumbnail" },
-};
-const POLICY_MINOR_TERMS = [
-  "tre vi thanh nien",
-  "vi thanh nien",
-  "tre em",
-  "em be",
-  "be gai",
-  "be trai",
-  "thieu nien",
-  "tuoi teen",
-  "teen",
-  "hoc sinh",
-  "minor",
-  "underage",
-  "child",
-  "kid",
-  "young girl",
-  "young boy",
-  "schoolgirl",
-  "school boy",
-];
-const POLICY_APPEARANCE_TERMS = [
-  "dep trai hon",
-  "dep gai hon",
-  "dep hon",
-  "lam dep",
-  "fashion",
-  "nguoi mau",
-  "model",
-  "sexy",
-  "goi cam",
-  "nong bong",
-  "makeup",
-  "trang diem",
-  "body",
-  "than hinh",
-  "bo kinh",
-  "thay do",
-  "mac do",
-  "mac ao",
-  "thu do",
-];
-const POLICY_APPAREL_TERMS = [
-  "ao",
-  "logo",
-  "dong phuc",
-  "quan ao",
-  "quan",
-  "vay",
-  "thoi trang",
-  "outfit",
-  "shirt",
-  "dress",
-  "clothing",
-  "fashion",
-];
-const VIDEO_INPUT_MODE_CONFIG = {
-  prompt: {
-    note: "Chỉ cần mô tả cảnh. App sẽ tạo video trực tiếp từ prompt.",
-    hint: "Nhập mô tả cảnh muốn quay rồi bấm chạy.",
-    placeholder: "Ví dụ: một chú mèo nhìn ra cửa sổ, cinematic, gentle motion, ánh sáng buổi sáng",
-    readyText: "Sẵn sàng tạo video từ prompt.",
-  },
-  start: {
-    note: "Dùng khi đã có một khung hình đầu tiên và muốn app animate từ chính ảnh đó.",
-    hint: "Tải một ảnh đầu vào rồi mô tả chuyển động, góc máy hoặc diễn biến tiếp theo.",
-    placeholder: "Ví dụ: nhân vật quay đầu sang trái, tóc bay nhẹ, camera tiến gần, cinematic premium visual treatment",
-    readyText: "Sẵn sàng tạo video từ ảnh đầu vào.",
-  },
-  reference: {
-    note: "Dùng khi chỉ có ảnh áo, logo hoặc sản phẩm. App sẽ tự dựng một khung đầu có người mẫu hoặc bố cục phù hợp, rồi mới tạo video.",
-    hint: "Tải ảnh sản phẩm hoặc logo vào đây. App sẽ tự dựng người mẫu hoặc keyframe phù hợp rồi tạo video trong một lượt.",
-    placeholder: "Ví dụ: người mẫu bước ra trong studio, khoe rõ chiếc áo, ánh sáng premium, camera dolly in, cảm giác quảng cáo cao cấp",
-    readyText: "Sẵn sàng dựng khung đầu rồi tạo video.",
+const $ = (selector) => document.querySelector(selector);
+const ETSY_SHOP_MANAGER_URL = "https://www.etsy.com/your/shops/me/tools/listings/stats:true";
+// Live board "ETSY - VN32" (shortLink). The old 2025 board (gpy5eAiG) and the "2026" board
+// (I2ti3PbI) were retired, so their hardcoded C5/C6/Ready/Idea source options were removed —
+// a stale click used to 404. Any other column/board is added at runtime via "Load cột".
+const DEFAULT_TRELLO_BOARD_ID = "mZJYmYJi";
+const DEFAULT_TRELLO_VN32_LIST_ID = "6a41f0dd41358bebf0229283";
+const LAST_FLOW_RUN_STORAGE_KEY = "flow-last-flow-run-v1";
+const TOOL_MODE = detectToolMode();
+const TRELLO_SOURCE_OPTIONS = {
+  // Single default column on the live board. product:"" = whole-column run. Extra columns are
+  // registered dynamically by renderBoardColumns() after "Load cột", keyed by their list id.
+  c6: {
+    label: "C6 VN32",
+    product: "",
+    boardId: DEFAULT_TRELLO_BOARD_ID,
+    listId: DEFAULT_TRELLO_VN32_LIST_ID,
   },
 };
 
-const MODE_CONFIG = {
-  video: {
-    title: "Bạn muốn tạo video gì?",
-    hint: "Nhập mô tả ngắn gọn rồi bấm chạy.",
-    promptLabel: "Mô tả video",
-    placeholder: "Ví dụ: Một video cinematic về con mèo đi bộ trong phòng khách đầy nắng",
-    promptAiLabel: "Bạn muốn video như thế nào?",
-    promptAiPlaceholder: "Ví dụ: video quảng cáo đàn piano sang trọng, có người chơi trong phòng tối và ánh sáng ấm",
-    submitLabel: "Tạo video",
-    resultsTitle: "Kết quả video gần đây",
-    runsTitle: "Lượt chạy video gần đây",
-    readyText: "Sẵn sàng tạo video.",
-    emptyResult: "Chưa có video nào gần đây.",
-    emptyRun: "Chưa có lượt chạy video nào.",
-    defaultAspect: "landscape",
-    defaultCount: 1,
-    showStartImage: true,
-    showPromptAi: true,
-    promptRequired: true,
-  },
-  image: {
-    title: "Bạn muốn tạo ảnh gì?",
-    hint: "Nhập mô tả ngắn gọn hoặc ghép ảnh tham chiếu rồi bấm chạy.",
-    promptLabel: "Mô tả ảnh",
-    placeholder: "Ví dụ: ghép logo này lên áo của người mẫu, giữ nếp vải thật và ánh sáng đồng nhất",
-    promptAiLabel: "Bạn muốn ảnh như thế nào?",
-    promptAiPlaceholder: "Ví dụ: ghép logo áo vào ảnh người mẫu, nhìn như ảnh chụp thật trong studio",
-    submitLabel: "Tạo ảnh",
-    resultsTitle: "Kết quả ảnh gần đây",
-    runsTitle: "Lượt chạy ảnh gần đây",
-    readyText: "Sẵn sàng tạo ảnh.",
-    emptyResult: "Chưa có ảnh nào gần đây.",
-    emptyRun: "Chưa có lượt chạy ảnh nào.",
-    defaultAspect: "square",
-    defaultCount: 2,
-    showStartImage: false,
-    showPromptAi: true,
-    promptRequired: true,
-  },
-  edit: {
-    title: "Bạn muốn chỉnh video như thế nào?",
-    hint: "Chọn một video đã có sẵn, chọn thao tác cần sửa, rồi bấm chạy.",
-    promptLabel: "Mô tả chỉnh sửa",
-    placeholder: "Ví dụ: kéo dài thêm 5 giây với chuyển động tự nhiên",
-    submitLabel: "Chạy thao tác",
-    resultsTitle: "Kết quả chỉnh video gần đây",
-    runsTitle: "Lượt chỉnh video gần đây",
-    readyText: "Sẵn sàng chỉnh video.",
-    emptyResult: "Chưa có kết quả chỉnh video nào.",
-    emptyRun: "Chưa có lượt chỉnh video nào.",
-    defaultAspect: "landscape",
-    defaultCount: 1,
-    showStartImage: false,
-    showPromptAi: false,
-    promptRequired: false,
-  },
+const els = {
+  healthPill: $("#healthPill"),
+  flowPill: $("#flowPill"),
+  etsyPill: $("#etsyPill"),
+  refreshButton: $("#refreshButton"),
+  flowState: $("#flowState"),
+  flowDetail: $("#flowDetail"),
+  etsyState: $("#etsyState"),
+  etsyDetail: $("#etsyDetail"),
+  extensionState: $("#extensionState"),
+  extensionDetail: $("#extensionDetail"),
+  jobState: $("#jobState"),
+  jobDetail: $("#jobDetail"),
+  flowStatusButton: $("#flowStatusButton"),
+  etsyStatusButton: $("#etsyStatusButton"),
+  extensionStatusButton: $("#extensionStatusButton"),
+  jobsStatusButton: $("#jobsStatusButton"),
+  flowDrawer: $("#flowDrawer"),
+  etsyDrawer: $("#etsyDrawer"),
+  jobsDrawer: $("#jobsDrawer"),
+  consoleDrawer: $("#consoleDrawer"),
+  flowSetupStatus: $("#flowSetupStatus"),
+  flowProjectId: $("#flowProjectId"),
+  flowProjectName: $("#flowProjectName"),
+  flowTimeout: $("#flowTimeout"),
+  flowCdpUrl: $("#flowCdpUrl"),
+  geminiApiKey: $("#geminiApiKey"),
+  geminiModel: $("#geminiModel"),
+  imageEngineSelect: $("#imageEngineSelect"),
+  saveFlowButton: $("#saveFlowButton"),
+  saveGeminiButton: $("#saveGeminiButton"),
+  openFlowFromSetupButton: $("#openFlowFromSetupButton"),
+  flowBadge: $("#flowBadge"),
+  etsyBadge: $("#etsyBadge"),
+  trelloBadge: $("#trelloBadge"),
+  openFlowButton: $("#openFlowButton"),
+  openLoginButton: $("#openLoginButton"),
+  preflightButton: $("#preflightButton"),
+  quickPrompt: $("#quickPrompt"),
+  imageCount: $("#imageCount"),
+  aspectSelect: $("#aspectSelect"),
+  quickTrelloEnabled: $("#quickTrelloEnabled"),
+  quickEtsyEnabled: $("#quickEtsyEnabled"),
+  runQuickJobButton: $("#runQuickJobButton"),
+  etsyWarning: $("#etsyWarning"),
+  etsyShopId: $("#etsyShopId"),
+  etsyUserId: $("#etsyUserId"),
+  etsyApiKey: $("#etsyApiKey"),
+  etsyApiSecret: $("#etsyApiSecret"),
+  etsyTaxonomyId: $("#etsyTaxonomyId"),
+  etsyShippingProfileId: $("#etsyShippingProfileId"),
+  etsyPrice: $("#etsyPrice"),
+  etsyQuantity: $("#etsyQuantity"),
+  saveEtsyButton: $("#saveEtsyButton"),
+  saveEtsyShortcutButton: $("#saveEtsyShortcutButton"),
+  etsySetupStatus: $("#etsySetupStatus"),
+  previewEtsyButton: $("#previewEtsyButton"),
+  connectEtsyTopButton: $("#connectEtsyTopButton"),
+  connectEtsyButton: $("#connectEtsyButton"),
+  runEtsyCopyButton: $("#runEtsyCopyButton"),
+  disconnectEtsyButton: $("#disconnectEtsyButton"),
+  etsyConnectDot: $("#etsyConnectDot"),
+  etsyConnectLabel: $("#etsyConnectLabel"),
+  etsyCallbackHint: $("#etsyCallbackHint"),
+  copyCallbackButton: $("#copyCallbackButton"),
+  autoProduct: $("#autoProduct"),
+  boardLinkInput: $("#boardLinkInput"),
+  loadBoardColumnsButton: $("#loadBoardColumnsButton"),
+  autoSourceGroup: $("#autoSourceGroup"),
+  autoSourceChecks: $("#autoSourceChecks"),
+  autoLimit: $("#autoLimit"),
+  autoContinuous: $("#autoContinuous"),
+  autoCreateEtsy: $("#autoCreateEtsy"),
+  runAutoButton: $("#runAutoButton"),
+  listLatestEtsyButton: $("#listLatestEtsyButton"),
+  latestEtsyHint: $("#latestEtsyHint"),
+  checkAutoButton: $("#checkAutoButton"),
+  jobsRefreshButton: $("#jobsRefreshButton"),
+  jobsList: $("#jobsList"),
+  consoleOutput: $("#consoleOutput"),
+  clearConsoleButton: $("#clearConsoleButton"),
+  autoAccountSelect: $("#autoAccountSelect"),
+  accountsDrawer: $("#accountsDrawer"),
+  accountsRefreshButton: $("#accountsRefreshButton"),
+  accountsList: $("#accountsList"),
+  accountForm: $("#accountForm"),
+  accSlug: $("#accSlug"),
+  accLabel: $("#accLabel"),
+  accBoard: $("#accBoard"),
+  accList: $("#accList"),
+  accShop: $("#accShop"),
+  addAccountButton: $("#addAccountButton"),
+  accountStatus: $("#accountStatus"),
 };
-
-const EDIT_ACTION_CONFIG = {
-  extend: {
-    title: "Kéo dài video",
-    hint: "Dùng khi muốn nối thêm phần cuối video hiện có.",
-    promptLabel: "Mô tả đoạn nối thêm",
-    placeholder: "Ví dụ: tiếp tục cảnh này thêm vài giây, chuyển động mượt và giữ đúng nhân vật",
-    submitLabel: "Kéo dài video",
-    promptRequired: false,
-    showPrompt: true,
-    showMotion: false,
-    showPosition: false,
-    showResolution: false,
-  },
-  upscale: {
-    title: "Nâng chất lượng video",
-    hint: "Dùng khi muốn tăng chất lượng video đã có.",
-    promptLabel: "Không cần mô tả thêm",
-    placeholder: "",
-    submitLabel: "Nâng chất lượng",
-    promptRequired: false,
-    showPrompt: false,
-    showMotion: false,
-    showPosition: false,
-    showResolution: true,
-  },
-  camera_motion: {
-    title: "Chỉnh chuyển động camera",
-    hint: "Dùng khi muốn đổi cách máy quay di chuyển.",
-    promptLabel: "Không cần mô tả thêm",
-    placeholder: "",
-    submitLabel: "Đổi chuyển động camera",
-    promptRequired: false,
-    showPrompt: false,
-    showMotion: true,
-    showPosition: false,
-    showResolution: false,
-  },
-  camera_position: {
-    title: "Chỉnh vị trí camera",
-    hint: "Dùng khi muốn đổi góc hoặc khoảng cách camera.",
-    promptLabel: "Không cần mô tả thêm",
-    placeholder: "",
-    submitLabel: "Đổi vị trí camera",
-    promptRequired: false,
-    showPrompt: false,
-    showMotion: false,
-    showPosition: true,
-    showResolution: false,
-  },
-  insert: {
-    title: "Chèn vật thể",
-    hint: "Dùng khi muốn thêm vật thể hoặc chi tiết mới vào video.",
-    promptLabel: "Mô tả vật thể cần chèn",
-    placeholder: "Ví dụ: thêm thanh kiếm phát sáng vào tay nhân vật",
-    submitLabel: "Chèn vật thể",
-    promptRequired: true,
-    showPrompt: true,
-    showMotion: false,
-    showPosition: false,
-    showResolution: false,
-  },
-  remove: {
-    title: "Xóa vật thể",
-    hint: "Dùng khi muốn gỡ một vật thể không cần thiết khỏi video.",
-    promptLabel: "Không cần mô tả thêm",
-    placeholder: "",
-    submitLabel: "Xóa vật thể",
-    promptRequired: false,
-    showPrompt: false,
-    showMotion: false,
-    showPosition: false,
-    showResolution: false,
-  },
-};
-
-function moduleTypeForLegacyKey(key) {
-  if (key === "log") {
-    return "trello";
-  }
-  if (key === "review_hold") {
-    return "approval";
-  }
-  if (key === "trello_source") {
-    return "trello_source";
-  }
-  return AUTOMATION_MODULE_TYPE_CONFIG[key] ? key : "custom";
-}
-
-function moduleTypeConfig(type) {
-  return AUTOMATION_MODULE_TYPE_CONFIG[type] || AUTOMATION_MODULE_TYPE_CONFIG.custom;
-}
-
-function boundedGenerationCount(value, fallback = 1, maxCount = 4) {
-  const numeric = Number(value);
-  const fallbackNumeric = Number(fallback);
-  const maxNumeric = Number(maxCount);
-  const resolvedMax = Number.isFinite(maxNumeric) && maxNumeric > 0 ? maxNumeric : 4;
-  const resolved = Number.isFinite(numeric) && numeric > 0
-    ? numeric
-    : Number.isFinite(fallbackNumeric) && fallbackNumeric > 0
-      ? fallbackNumeric
-      : 1;
-  return Math.max(1, Math.min(resolvedMax, resolved));
-}
-
-function flowAgentEnabledFromSettings(settings = {}) {
-  return settings?.flowAgentEnabled !== false;
-}
-
-function flowModuleImageCount(settings = {}, fallbackCount = 1) {
-  const maxCount = flowAgentEnabledFromSettings(settings) ? FLOW_AGENT_TARGET_OUTPUT_COUNT : 4;
-  const hasExplicitCount = Boolean(settings) && Object.prototype.hasOwnProperty.call(settings, "imageCount");
-  if (hasExplicitCount) {
-    return boundedGenerationCount(settings.imageCount, FLOW_AGENT_DEFAULT_IMAGE_COUNT, maxCount);
-  }
-  return boundedGenerationCount(
-    flowAgentEnabledFromSettings(settings) ? FLOW_AGENT_DEFAULT_IMAGE_COUNT : fallbackCount,
-    fallbackCount,
-    maxCount,
-  );
-}
-
-function createAutomationModule(type = "custom", seed = {}) {
-  const safeType = moduleTypeConfig(type) === AUTOMATION_MODULE_TYPE_CONFIG.custom ? (type === "custom" ? "custom" : moduleTypeForLegacyKey(type)) : type;
-  const config = moduleTypeConfig(safeType);
-  const id = String(seed.id || `${safeType}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`);
-  return {
-    id,
-    type: safeType,
-    title: String(seed.title || config.title),
-    detail: String(seed.detail || config.detail),
-    icon: String(seed.icon || config.icon),
-    enabled: seed.enabled !== false,
-    settings: {
-      ...(seed.settings || {}),
-    },
-  };
-}
-
-function defaultAutomationModules() {
-  return AUTOMATION_STEP_ORDER.map((key) => {
-    const legacy = AUTOMATION_STEP_DEFAULTS[key] || {};
-    return createAutomationModule(moduleTypeForLegacyKey(key), {
-      id: key,
-      title: legacy.title,
-      detail: legacy.detail,
-    });
-  });
-}
-
-function normalizeAutomationModule(value = {}, index = 0) {
-  const fallbackType = moduleTypeForLegacyKey(value.id || value.type || "custom");
-  const type = moduleTypeConfig(value.type) === AUTOMATION_MODULE_TYPE_CONFIG.custom && value.type !== "custom"
-    ? fallbackType
-    : (value.type || fallbackType);
-  const fallback = createAutomationModule(type, {
-    id: value.id || `module_${index + 1}`,
-  });
-  const sourceTitle = String(value.title || "").trim();
-  const sourceDetail = String(value.detail || "").trim();
-  const title = type === "source" && ["Prompt Source", "AI Prompt Source", "Flow AI Prompt"].includes(sourceTitle)
-    ? fallback.title
-    : String(value.title || fallback.title);
-  const detail = type === "source" && ["Google Sheet / file / nhập tay", "Trello / Sheet / nhập tay", "AI tự viết / Sheet tùy chọn", "Flow AI tự viết prompt"].includes(sourceDetail)
-    ? fallback.detail
-    : String(value.detail || fallback.detail);
-  return createAutomationModule(type, {
-    ...fallback,
-    ...value,
-    id: String(value.id || fallback.id),
-    title,
-    detail,
-    icon: String(value.icon || fallback.icon),
-    enabled: value.enabled !== false,
-    settings: value.settings && typeof value.settings === "object" ? value.settings : {},
-  });
-}
-
-function normalizeAutomationModules(parsed = {}) {
-  if (Array.isArray(parsed.modules) && parsed.modules.length) {
-    return parsed.modules.map(normalizeAutomationModule);
-  }
-  const modules = [];
-  const steps = parsed.steps && typeof parsed.steps === "object" ? parsed.steps : {};
-  for (const key of AUTOMATION_STEP_ORDER) {
-    const legacy = {
-      ...(AUTOMATION_STEP_DEFAULTS[key] || {}),
-      ...(steps[key] || {}),
-      id: key,
-      type: moduleTypeForLegacyKey(key),
-    };
-    modules.push(normalizeAutomationModule(legacy, modules.length));
-  }
-  return modules.length ? modules : defaultAutomationModules();
-}
-
-function automationStepsFromModules(modules = []) {
-  return Object.fromEntries((modules || []).map((module) => [module.id, module]));
-}
-
-function defaultAutomationConfig() {
-  const modules = defaultAutomationModules();
-  return {
-    version: AUTOMATION_CONFIG_VERSION,
-    enabled: false,
-    view: "diagram",
-    selectedStep: "flow",
-    sourceType: FLOW_AI_SOURCE_TYPE,
-    sourceLocation: "",
-    promptProductFilter: "",
-    telegramChat: "",
-    sheetLog: "",
-    trelloBoardId: DEFAULT_TRELLO_BOARD_URL,
-    trelloCardId: "",
-    trelloListId: DEFAULT_TRELLO_SOURCE_LIST_ID,
-    trelloAttachmentIds: [],
-    trelloSetCover: true,
-    prompt: "",
-    appEyebrow: "Flow v2",
-    appTitle: "Flow v2",
-    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, Tác nhân Flow tự viết prompt, tạo 12 ảnh trong một job rồi đẩy về đúng card Trello.",
-    accentColor: "#7c2ee6",
-    canvasZoom: 1,
-    modules,
-    steps: automationStepsFromModules(modules),
-  };
-}
-
-function normalizeAutomationConfig(value = {}) {
-  const fallback = defaultAutomationConfig();
-  const parsed = value && typeof value === "object" ? value : {};
-  let modules = normalizeAutomationModules(parsed);
-  const hasSelected = modules.some((module) => module.id === parsed?.selectedStep);
-  const selectedStep = hasSelected ? parsed.selectedStep : (modules.find((module) => module.type === "flow") || modules[0])?.id || "flow";
-  const parsedSourceLocation = String(parsed?.sourceLocation || "").trim();
-  const rawParsedSourceType = String(parsed?.sourceType || "").trim();
-  const parsedSourceType = rawParsedSourceType === "ai" ? FLOW_AI_SOURCE_TYPE : rawParsedSourceType;
-  const usedDefaultSheet = !parsedSourceLocation || parsedSourceLocation === DEFAULT_PROMPT_SHEET_URL;
-  const shouldMigrateDefaultSheet = (!parsedSourceType || parsedSourceType === "sheets") && usedDefaultSheet;
-  const sourceType = shouldMigrateDefaultSheet ? FLOW_AI_SOURCE_TYPE : (parsedSourceType || fallback.sourceType);
-  const sourceLocation = shouldMigrateDefaultSheet ? "" : parsedSourceLocation;
-  if (shouldMigrateDefaultSheet) {
-    modules = modules.map((module) => {
-      if (module.type !== "source") {
-        return module;
-      }
-      const settings = { ...(module.settings || {}) };
-      if (!settings.sourceType || settings.sourceType === "sheets") {
-        settings.sourceType = FLOW_AI_SOURCE_TYPE;
-      }
-      if (!settings.sourceLocation || settings.sourceLocation === DEFAULT_PROMPT_SHEET_URL) {
-        settings.sourceLocation = "";
-      }
-      return { ...module, settings };
-    });
-  }
-  const trelloBoardId = String(parsed?.trelloBoardId || "").trim() || fallback.trelloBoardId;
-  const trelloListId = String(parsed?.trelloListId || "").trim() || fallback.trelloListId;
-  return {
-    ...fallback,
-    ...parsed,
-    version: AUTOMATION_CONFIG_VERSION,
-    view: ["diagram", "history", "incomplete"].includes(parsed?.view) ? parsed.view : fallback.view,
-    selectedStep,
-    sourceType,
-    sourceLocation,
-    promptProductFilter: String(parsed?.promptProductFilter || ""),
-    telegramChat: String(parsed?.telegramChat || ""),
-    sheetLog: String(parsed?.sheetLog || ""),
-    trelloBoardId,
-    trelloCardId: String(parsed?.trelloCardId || ""),
-    trelloListId,
-    trelloAttachmentIds: Array.isArray(parsed?.trelloAttachmentIds)
-      ? parsed.trelloAttachmentIds.map((item) => String(item || "").trim()).filter(Boolean)
-      : String(parsed?.trelloAttachmentIds || "")
-          .split(/[\s,;]+/)
-          .map((item) => item.trim())
-          .filter(Boolean),
-    trelloSetCover: parsed?.trelloSetCover !== false,
-    prompt: String(parsed?.prompt || ""),
-    appEyebrow: String(parsed?.appEyebrow || fallback.appEyebrow),
-    appTitle: String(parsed?.appTitle || fallback.appTitle),
-    appSubtitle: String(parsed?.appSubtitle || fallback.appSubtitle),
-    accentColor: normalizeHexColor(parsed?.accentColor || fallback.accentColor, fallback.accentColor),
-    canvasZoom: clampAutomationCanvasZoom(parsed?.canvasZoom ?? fallback.canvasZoom),
-    modules,
-    steps: automationStepsFromModules(modules),
-  };
-}
-
-function loadAutomationConfig() {
-  try {
-    const raw = window.localStorage?.getItem(AUTOMATION_STORAGE_KEY);
-    if (!raw) {
-      return defaultAutomationConfig();
-    }
-    return normalizeAutomationConfig(JSON.parse(raw));
-  } catch (error) {
-    return defaultAutomationConfig();
-  }
-}
-
-function saveAutomationConfig(config) {
-  try {
-    window.localStorage?.setItem(AUTOMATION_STORAGE_KEY, JSON.stringify(config));
-  } catch (error) {
-    // Local storage is optional; the workflow still works for this session.
-  }
-}
-
-function clampAutomationCanvasZoom(value) {
-  const zoom = Number(value);
-  if (!Number.isFinite(zoom)) {
-    return 1;
-  }
-  return Math.min(AUTOMATION_CANVAS_ZOOM_MAX, Math.max(AUTOMATION_CANVAS_ZOOM_MIN, zoom));
-}
-
-function defaultTrelloState() {
-  return {
-    configured: false,
-    credentials_saved: false,
-    api_key_saved: false,
-    token_saved: false,
-    credentials_source: "",
-    board_id: "",
-    card_id: "",
-    list_id: "",
-    upload_mode: "file",
-    set_cover: true,
-    upscale_to_2k: true,
-    updated_at: "",
-  };
-}
-
-function normalizeTrelloState(value = {}) {
-  const payload = value && typeof value === "object" ? value : {};
-  const uploadMode = ["file", "url"].includes(payload.upload_mode) ? payload.upload_mode : "file";
-  const credentialsSource = ["state", "env"].includes(payload.credentials_source)
-    ? payload.credentials_source
-    : "";
-  return {
-    ...defaultTrelloState(),
-    configured: Boolean(payload.configured),
-    credentials_saved: Boolean(payload.credentials_saved),
-    api_key_saved: Boolean(payload.api_key_saved),
-    token_saved: Boolean(payload.token_saved),
-    credentials_source: credentialsSource,
-    board_id: String(payload.board_id || ""),
-    card_id: String(payload.card_id || ""),
-    list_id: String(payload.list_id || ""),
-    upload_mode: uploadMode,
-    set_cover: payload.set_cover !== false,
-    upscale_to_2k: payload.upscale_to_2k !== false,
-    updated_at: String(payload.updated_at || ""),
-  };
-}
-
-function defaultIntegrationState() {
-  return {
-    gemini: {
-      configured: false,
-      api_key_saved: false,
-      model: "gemini-2.5-flash",
-    },
-    telegram: {
-      configured: false,
-      bot_token_saved: false,
-      chat_id: "",
-    },
-    runtime: {
-      playwright_browsers_path: "",
-      playwright_browsers_path_set: false,
-    },
-    updated_at: "",
-  };
-}
-
-function normalizeIntegrationState(value = {}) {
-  const payload = value && typeof value === "object" ? value : {};
-  const fallback = defaultIntegrationState();
-  return {
-    gemini: {
-      ...fallback.gemini,
-      ...(payload.gemini || {}),
-      configured: Boolean(payload.gemini?.configured),
-      api_key_saved: Boolean(payload.gemini?.api_key_saved),
-      model: String(payload.gemini?.model || fallback.gemini.model),
-    },
-    telegram: {
-      ...fallback.telegram,
-      ...(payload.telegram || {}),
-      configured: Boolean(payload.telegram?.configured),
-      bot_token_saved: Boolean(payload.telegram?.bot_token_saved),
-      chat_id: String(payload.telegram?.chat_id || ""),
-    },
-    runtime: {
-      ...fallback.runtime,
-      ...(payload.runtime || {}),
-      playwright_browsers_path: String(payload.runtime?.playwright_browsers_path || ""),
-      playwright_browsers_path_set: Boolean(payload.runtime?.playwright_browsers_path_set),
-    },
-    updated_at: String(payload.updated_at || ""),
-  };
-}
 
 const state = {
-  mode: "video",
-  editAction: "extend",
-  config: null,
-  auth: { authenticated: false },
-  jobs: [],
-  outputShelf: { items: [] },
-  skillLibraryCount: 0,
-  modelOptions: {
-    video: [...FALLBACK_VIDEO_MODELS],
-    image: [...FALLBACK_IMAGE_MODELS],
-  },
-  modelOptionsLoaded: false,
-  modelOptionsLoading: false,
-  startImagePath: "",
-  startImageName: "",
-  startImagePublicUrl: "",
-  imageReferenceItems: [],
-  uploading: false,
-  setupOpen: null,
-  selectedEditSourceKey: "",
-  manualMediaId: "",
-  manualWorkflowId: "",
-  motion: "truck_left",
-  position: "center",
-  resolution: "1080p",
-  promptAssistant: null,
-  userAssistant: {
-    busy: false,
-    executing: false,
-    last: null,
-  },
-  promptSourcePreview: null,
-  integrations: defaultIntegrationState(),
-  trello: defaultTrelloState(),
-  promptAiResults: {
-    video: null,
-    image: null,
-  },
-  drafts: {
-    video: { prompt: "", model: "Veo 3.1 - Fast", aspect: "landscape", count: 1, inputMode: "prompt" },
-    image: { prompt: "", model: "GEMINI_3_PRO_IMAGE", aspect: "square", count: 2 },
-    edit: { prompt: "", model: "", aspect: "landscape", count: 1 },
-  },
-  promptAiDrafts: {
-    video: { brief: "", style: "", mustInclude: "", avoid: "", audience: "" },
-    image: { brief: "", style: "", mustInclude: "", avoid: "", audience: "" },
-  },
-  storyboardDraft: {
-    script: "",
-    style: "",
-    mustInclude: "",
-    avoid: "",
-    sceneCount: "0",
-  },
-  storyboardPlan: null,
-  storyboardBusy: false,
-  automation: loadAutomationConfig(),
+  payload: {},
+  hydratedFlow: false,
+  hydratedEtsy: false,
+  hydratedIntegrations: false,
+  extensionNonce: "",
+  externalExtensionId: "",
+  polling: null,
+  lastFlowRun: readLastFlowRunContext(),
+  etsyAccounts: { accounts: [], default_slug: "" },
 };
 
-let automationCanvasPan = null;
-let automationDraggedStepId = "";
+const EXTERNAL_EXTENSION_IDS = [
+  "jpamdibjfnnneopokijhcmopgamlncmp",
+  "fchedljplejnjllckaafaggdnebngehe",
+  "hjnjmjmjiijifklidikbhblblcnbkfae",
+  "fignfifoniblkonapihmkfakmlgkbkcf",
+  "efmoofpdlibfmmhkehcilcoigfneklon",
+];
 
-const elements = {
-  projectStatus: document.querySelector("#projectStatus"),
-  authStatus: document.querySelector("#authStatus"),
-  topbarHint: document.querySelector("#topbarHint"),
-  openFlowButton: document.querySelector("#openFlowButton"),
-  logoutButton: document.querySelector("#logoutButton"),
-  setupToggle: document.querySelector("#setupToggle"),
-  setupPanel: document.querySelector("#setupPanel"),
-  configForm: document.querySelector("#configForm"),
-  projectId: document.querySelector("#projectId"),
-  projectName: document.querySelector("#projectName"),
-  generationTimeout: document.querySelector("#generationTimeout"),
-  loginButton: document.querySelector("#loginButton"),
-  openLoginButton: document.querySelector("#openLoginButton"),
-  openProjectButton: document.querySelector("#openProjectButton"),
-  focusProjectButton: document.querySelector("#focusProjectButton"),
-  automationEnabled: document.querySelector("#automationEnabled"),
-  automationEasyPanel: document.querySelector("#automationEasyPanel"),
-  easyPromptButton: document.querySelector("#easyPromptButton"),
-  easyFlowButton: document.querySelector("#easyFlowButton"),
-  easyReviewButton: document.querySelector("#easyReviewButton"),
-  easyRunButton: document.querySelector("#easyRunButton"),
-  easyPromptStatus: document.querySelector("#easyPromptStatus"),
-  easyFlowStatus: document.querySelector("#easyFlowStatus"),
-  easyReviewStatus: document.querySelector("#easyReviewStatus"),
-  scenarioCanvas: document.querySelector("#scenarioCanvas"),
-  scenarioNodeRow: document.querySelector(".scenario-node-row"),
-  automationZoomOut: document.querySelector("#automationZoomOut"),
-  automationZoomReset: document.querySelector("#automationZoomReset"),
-  automationZoomIn: document.querySelector("#automationZoomIn"),
-  automationFitButton: document.querySelector("#automationFitButton"),
-  breakRoute: document.querySelector(".break-route"),
-  automationViewButtons: Array.from(document.querySelectorAll("[data-automation-view]")),
-  scenarioHistoryPanel: document.querySelector("#scenarioHistoryPanel"),
-  scenarioIncompletePanel: document.querySelector("#scenarioIncompletePanel"),
-  automationHistoryPanelList: document.querySelector("#automationHistoryPanelList"),
-  automationIncompletePanelList: document.querySelector("#automationIncompletePanelList"),
-  automationHistoryRefreshButton: document.querySelector("#automationHistoryRefreshButton"),
-  automationIncompleteRefreshButton: document.querySelector("#automationIncompleteRefreshButton"),
-  automationUseStudioButton: document.querySelector("#automationUseStudioButton"),
-  automationOpenFlowButton: document.querySelector("#automationOpenFlowButton"),
-  automationResetReadyButton: document.querySelector("#automationResetReadyButton"),
-  automationAutoRunButton: document.querySelector("#automationAutoRunButton"),
-  automationRunButton: document.querySelector("#automationRunButton"),
-  automationRunImageButton: document.querySelector("#automationRunImageButton"),
-  automationRefreshButton: document.querySelector("#automationRefreshButton"),
-  userAssistantEngine: document.querySelector("#userAssistantEngine"),
-  userAssistantQuestion: document.querySelector("#userAssistantQuestion"),
-  userAssistantAskButton: document.querySelector("#userAssistantAskButton"),
-  userAssistantAnswer: document.querySelector("#userAssistantAnswer"),
-  userAssistantQuickButtons: Array.from(document.querySelectorAll("[data-assistant-question]")),
-  automationBrandEyebrow: document.querySelector("#automationBrandEyebrow"),
-  automationBrandTitle: document.querySelector("#automationBrandTitle"),
-  automationPromptInput: document.querySelector("#automationPromptInput"),
-  automationSourceType: document.querySelector("#automationSourceType"),
-  automationStepNameInput: document.querySelector("#automationStepNameInput"),
-  automationStepDetailInput: document.querySelector("#automationStepDetailInput"),
-  automationStepIconInput: document.querySelector("#automationStepIconInput"),
-  automationModuleTypeInput: document.querySelector("#automationModuleTypeInput"),
-  automationModuleEnabledInput: document.querySelector("#automationModuleEnabledInput"),
-  automationModuleStatus: document.querySelector("#automationModuleStatus"),
-  automationModuleAddButton: document.querySelector("#automationModuleAddButton"),
-  automationModuleDuplicateButton: document.querySelector("#automationModuleDuplicateButton"),
-  automationModuleMoveLeftButton: document.querySelector("#automationModuleMoveLeftButton"),
-  automationModuleMoveRightButton: document.querySelector("#automationModuleMoveRightButton"),
-  automationModuleDeleteButton: document.querySelector("#automationModuleDeleteButton"),
-  automationModuleSettings: document.querySelector("#automationModuleSettings"),
-  automationPromptSourceSection: document.querySelector("#automationPromptSourceSection"),
-  automationTelegramInput: document.querySelector("#automationTelegramInput"),
-  automationSheetInput: document.querySelector("#automationSheetInput"),
-  automationSheetStatus: document.querySelector("#automationSheetStatus"),
-  automationSheetPasteInput: document.querySelector("#automationSheetPasteInput"),
-  automationSheetFileInput: document.querySelector("#automationSheetFileInput"),
-  automationSheetFileButton: document.querySelector("#automationSheetFileButton"),
-  automationSheetPreviewButton: document.querySelector("#automationSheetPreviewButton"),
-  automationSheetPreviewList: document.querySelector("#automationSheetPreviewList"),
-  automationProductFilterInput: document.querySelector("#automationProductFilterInput"),
-  automationTrelloBoardInput: document.querySelector("#automationTrelloBoardInput"),
-  automationTrelloBoardStorageInput: document.querySelector("#automationTrelloBoardStorageInput"),
-  automationTrelloCardInput: document.querySelector("#automationTrelloCardInput"),
-  automationTrelloListInput: document.querySelector("#automationTrelloListInput"),
-  automationTrelloKeyInput: document.querySelector("#automationTrelloKeyInput"),
-  automationTrelloTokenInput: document.querySelector("#automationTrelloTokenInput"),
-  automationTrelloUploadMode: document.querySelector("#automationTrelloUploadMode"),
-  automationTrelloUpscale2KInput: document.querySelector("#automationTrelloUpscale2KInput"),
-  automationTrelloStatus: document.querySelector("#automationTrelloStatus"),
-  automationTrelloSaveButton: document.querySelector("#automationTrelloSaveButton"),
-  automationTrelloClearButton: document.querySelector("#automationTrelloClearButton"),
-  automationTrelloSection: document.querySelector("#automationTrelloSection"),
-  trelloSetupWizard: document.querySelector("#trelloSetupWizard"),
-  trelloWizardKeyInput: document.querySelector("#trelloWizardKeyInput"),
-  trelloWizardTokenInput: document.querySelector("#trelloWizardTokenInput"),
-  trelloWizardBoardInput: document.querySelector("#trelloWizardBoardInput"),
-  trelloWizardSaveButton: document.querySelector("#trelloWizardSaveButton"),
-  trelloWizardLaterButton: document.querySelector("#trelloWizardLaterButton"),
-  trelloWizardStatus: document.querySelector("#trelloWizardStatus"),
-  trelloWizardCloseTriggers: Array.from(document.querySelectorAll("[data-trello-wizard-close]")),
-  automationEnvStatus: document.querySelector("#automationEnvStatus"),
-  automationGeminiKeyInput: document.querySelector("#automationGeminiKeyInput"),
-  automationGeminiModelInput: document.querySelector("#automationGeminiModelInput"),
-  automationTelegramTokenInput: document.querySelector("#automationTelegramTokenInput"),
-  automationPlaywrightPathInput: document.querySelector("#automationPlaywrightPathInput"),
-  automationEnvSaveButton: document.querySelector("#automationEnvSaveButton"),
-  automationEnvClearButton: document.querySelector("#automationEnvClearButton"),
-  automationAppIntegrationsSection: document.querySelector("#automationAppIntegrationsSection"),
-  automationAppEyebrowInput: document.querySelector("#automationAppEyebrowInput"),
-  automationAppTitleInput: document.querySelector("#automationAppTitleInput"),
-  automationAppSubtitleInput: document.querySelector("#automationAppSubtitleInput"),
-  automationSourceLocationInput: document.querySelector("#automationSourceLocationInput"),
-  automationAccentInput: document.querySelector("#automationAccentInput"),
-  automationExportButton: document.querySelector("#automationExportButton"),
-  automationImportButton: document.querySelector("#automationImportButton"),
-  automationResetButton: document.querySelector("#automationResetButton"),
-  automationImportFile: document.querySelector("#automationImportFile"),
-  automationImageTotalCount: document.querySelector("#automationImageTotalCount"),
-  automationActiveCount: document.querySelector("#automationActiveCount"),
-  automationFailureCount: document.querySelector("#automationFailureCount"),
-  automationCompletedCount: document.querySelector("#automationCompletedCount"),
-  automationTransferHint: document.querySelector("#automationTransferHint"),
-  automationRunningStatus: document.querySelector("#automationRunningStatus"),
-  automationHistory: document.querySelector("#automationHistory"),
-  messageBar: document.querySelector("#messageBar"),
-  composerTitle: document.querySelector("#composerTitle"),
-  composerHint: document.querySelector("#composerHint"),
-  videoInputModeStrip: document.querySelector("#videoInputModeStrip"),
-  videoInputModeNote: document.querySelector("#videoInputModeNote"),
-  promptAiSummary: document.querySelector("#promptAiSummary"),
-  promptAiBadge: document.querySelector("#promptAiBadge"),
-  promptAiBriefLabel: document.querySelector("#promptAiBriefLabel"),
-  promptAiBrief: document.querySelector("#promptAiBrief"),
-  promptAiStyle: document.querySelector("#promptAiStyle"),
-  promptAiMustInclude: document.querySelector("#promptAiMustInclude"),
-  promptAiAvoid: document.querySelector("#promptAiAvoid"),
-  promptAiAudience: document.querySelector("#promptAiAudience"),
-  promptAiHint: document.querySelector("#promptAiHint"),
-  promptAiSubmit: document.querySelector("#promptAiSubmit"),
-  promptAiResult: document.querySelector("#promptAiResult"),
-  promptAiResultTitle: document.querySelector("#promptAiResultTitle"),
-  promptAiResultSummary: document.querySelector("#promptAiResultSummary"),
-  promptAiSkillChips: document.querySelector("#promptAiSkillChips"),
-  promptAiResultText: document.querySelector("#promptAiResultText"),
-  usePromptAiResultButton: document.querySelector("#usePromptAiResultButton"),
-  promptAiCard: document.querySelector("#promptAiCard"),
-  storyboardCard: document.querySelector("#storyboardCard"),
-  storyboardBadge: document.querySelector("#storyboardBadge"),
-  storyboardScript: document.querySelector("#storyboardScript"),
-  storyboardStyle: document.querySelector("#storyboardStyle"),
-  storyboardMustInclude: document.querySelector("#storyboardMustInclude"),
-  storyboardAvoid: document.querySelector("#storyboardAvoid"),
-  storyboardSceneCount: document.querySelector("#storyboardSceneCount"),
-  storyboardHint: document.querySelector("#storyboardHint"),
-  storyboardPlanButton: document.querySelector("#storyboardPlanButton"),
-  storyboardGenerateButton: document.querySelector("#storyboardGenerateButton"),
-  storyboardResult: document.querySelector("#storyboardResult"),
-  storyboardResultTitle: document.querySelector("#storyboardResultTitle"),
-  storyboardResultMeta: document.querySelector("#storyboardResultMeta"),
-  storyboardResultSummary: document.querySelector("#storyboardResultSummary"),
-  storyboardSkillChips: document.querySelector("#storyboardSkillChips"),
-  storyboardSceneList: document.querySelector("#storyboardSceneList"),
-  promptLabel: document.querySelector("#promptLabel"),
-  promptInput: document.querySelector("#promptInput"),
-  composerSummaryMode: document.querySelector("#composerSummaryMode"),
-  composerSummaryText: document.querySelector("#composerSummaryText"),
-  composerPolicyNotice: document.querySelector("#composerPolicyNotice"),
-  composerPolicyPill: document.querySelector("#composerPolicyPill"),
-  composerPolicyTitle: document.querySelector("#composerPolicyTitle"),
-  composerPolicyText: document.querySelector("#composerPolicyText"),
-  composerPolicyList: document.querySelector("#composerPolicyList"),
-  editActionStrip: document.querySelector("#editActionStrip"),
-  editActionSummary: document.querySelector("#editActionSummary"),
-  editActionSummaryTitle: document.querySelector("#editActionSummaryTitle"),
-  editActionSummaryText: document.querySelector("#editActionSummaryText"),
-  editActionButtons: Array.from(document.querySelectorAll("[data-edit-action]")),
-  editSourceWrap: document.querySelector("#editSourceWrap"),
-  editSourceCards: document.querySelector("#editSourceCards"),
-  editSourceSelect: document.querySelector("#editSourceSelect"),
-  manualMediaId: document.querySelector("#manualMediaId"),
-  manualWorkflowId: document.querySelector("#manualWorkflowId"),
-  startImageWrap: document.querySelector("#startImageWrap"),
-  startImageFile: document.querySelector("#startImageFile"),
-  startImageStatus: document.querySelector("#startImageStatus"),
-  startImagePreview: document.querySelector("#startImagePreview"),
-  startImagePreviewImage: document.querySelector("#startImagePreviewImage"),
-  startImagePreviewName: document.querySelector("#startImagePreviewName"),
-  startImagePreviewHint: document.querySelector("#startImagePreviewHint"),
-  clearStartImageButton: document.querySelector("#clearStartImageButton"),
-  imageReferenceWrap: document.querySelector("#imageReferenceWrap"),
-  imageReferenceFiles: document.querySelector("#imageReferenceFiles"),
-  imageReferenceTitle: document.querySelector("#imageReferenceTitle"),
-  imageReferenceDescription: document.querySelector("#imageReferenceDescription"),
-  imageReferenceFieldLabel: document.querySelector("#imageReferenceFieldLabel"),
-  videoReferenceHero: document.querySelector("#videoReferenceHero"),
-  videoReferenceHeroImage: document.querySelector("#videoReferenceHeroImage"),
-  videoReferenceHeroTitle: document.querySelector("#videoReferenceHeroTitle"),
-  videoReferenceHeroText: document.querySelector("#videoReferenceHeroText"),
-  imageReferenceList: document.querySelector("#imageReferenceList"),
-  imageReferenceStatus: document.querySelector("#imageReferenceStatus"),
-  generationOptionsWrap: document.querySelector("#generationOptionsWrap"),
-  modelSelect: document.querySelector("#modelSelect"),
-  aspectChoices: document.querySelector("#aspectChoices"),
-  countChoices: document.querySelector("#countChoices"),
-  editOptionsWrap: document.querySelector("#editOptionsWrap"),
-  motionField: document.querySelector("#motionField"),
-  motionSelect: document.querySelector("#motionSelect"),
-  positionField: document.querySelector("#positionField"),
-  positionSelect: document.querySelector("#positionSelect"),
-  resolutionField: document.querySelector("#resolutionField"),
-  resolutionSelect: document.querySelector("#resolutionSelect"),
-  aspectSelect: document.querySelector("#aspectSelect"),
-  countInput: document.querySelector("#countInput"),
-  readyHint: document.querySelector("#readyHint"),
-  submitButton: document.querySelector("#submitButton"),
-  composerForm: document.querySelector("#composerForm"),
-  refreshButton: document.querySelector("#refreshButton"),
-  latestStatusCard: document.querySelector("#latestStatusCard"),
-  modeButtons: Array.from(document.querySelectorAll(".mode-button")),
-  videoInputModeButtons: Array.from(document.querySelectorAll("[data-video-input-mode]")),
-};
-
-function escapeHtml(value) {
-  return String(value || "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
+function text(value, fallback = "-") {
+  const result = String(value ?? "").trim();
+  return result || fallback;
 }
 
-function normalizeHexColor(value, fallback = "#7c2ee6") {
-  const raw = String(value || "").trim();
-  const longMatch = raw.match(/^#?([0-9a-f]{6})$/i);
-  if (longMatch) {
-    return `#${longMatch[1].toLowerCase()}`;
+function clampInt(value, min, max, fallback) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed)) {
+    return fallback;
   }
-  const shortMatch = raw.match(/^#?([0-9a-f]{3})$/i);
-  if (shortMatch) {
-    return `#${shortMatch[1]
-      .split("")
-      .map((part) => `${part}${part}`)
-      .join("")
-      .toLowerCase()}`;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function setBadge(element, label, tone = "") {
+  if (!element) return;
+  element.textContent = label;
+  element.className = ["pill", tone].filter(Boolean).join(" ");
+}
+
+function setToolBadge(element, label, tone = "") {
+  if (!element) return;
+  element.textContent = label;
+  element.className = ["tool-badge", tone].filter(Boolean).join(" ");
+}
+
+// Set once the user loads a board's columns via "Load cột": after that, an empty selection
+// means "nothing picked yet" instead of silently defaulting to the hardcoded C6 column.
+let boardColumnsLoaded = false;
+
+function selectedTrelloSourceKeys() {
+  const checked = Array.from(document.querySelectorAll("input[name='autoSource']:checked"))
+    .map((box) => box.value)
+    .filter((key) => TRELLO_SOURCE_OPTIONS[key]);
+  if (checked.length) return checked;
+  return boardColumnsLoaded ? [] : ["c6"];
+}
+
+function selectedTrelloSourceKey() {
+  // The Flow path and all labels still work off a single column: use the first
+  // checked column. The Etsy draft path uses selectedTrelloSourceKeys() for multi.
+  return selectedTrelloSourceKeys()[0];
+}
+
+function selectedTrelloSource() {
+  return TRELLO_SOURCE_OPTIONS[selectedTrelloSourceKey()] || TRELLO_SOURCE_OPTIONS.c6;
+}
+
+function selectedImageEngine() {
+  return els.imageEngineSelect?.value === "gemini_api" ? "gemini_api" : "google_flow";
+}
+
+function imageEngineLabel() {
+  return selectedImageEngine() === "gemini_api" ? "Gemini API" : "Google Flow";
+}
+
+function autoRouteLabel() {
+  if (TOOL_MODE === "etsy") {
+    return `${selectedTrelloSource().label} -> kiểm ảnh Trello -> Etsy Draft`;
   }
-  return fallback;
+  if (TOOL_MODE === "amazon") {
+    return `${selectedTrelloSource().label} -> kiểm ảnh Trello -> Amazon Draft`;
+  }
+  if (TOOL_MODE === "flow") {
+    return `${selectedTrelloSource().label} -> ${imageEngineLabel()}`;
+  }
+  return `${selectedTrelloSource().label} -> ${imageEngineLabel()} -> Listing Etsy riêng`;
 }
 
-function hexToRgb(value) {
-  const hex = normalizeHexColor(value).replace("#", "");
-  const number = Number.parseInt(hex, 16);
-  return {
-    r: (number >> 16) & 255,
-    g: (number >> 8) & 255,
-    b: number & 255,
-  };
+function updateAutoSourceUi() {
+  if (!els.trelloBadge) return;
+  els.trelloBadge.textContent = autoRouteLabel();
+  renderEtsyListingAction(state.payload);
 }
 
-function rgbToHex({ r, g, b }) {
-  return `#${[r, g, b]
-    .map((channel) => Math.max(0, Math.min(255, Math.round(channel))).toString(16).padStart(2, "0"))
-    .join("")}`;
+function detectToolMode() {
+  const params = new URLSearchParams(window.location.search);
+  const queryMode = params.get("tool");
+  if (queryMode === "flow" || queryMode === "etsy" || queryMode === "amazon") return queryMode;
+  const path = window.location.pathname.replace(/\/+$/, "");
+  if (path.endsWith("/flow") || path.endsWith("/flow-tool")) return "flow";
+  if (path.endsWith("/etsy") || path.endsWith("/etsy-tool")) return "etsy";
+  if (path.endsWith("/amazon") || path.endsWith("/amazon-tool")) return "amazon";
+  return "combined";
 }
 
-function mixHexColor(left, right, ratio = 0.22) {
-  const a = hexToRgb(left);
-  const b = hexToRgb(right);
-  return rgbToHex({
-    r: a.r * (1 - ratio) + b.r * ratio,
-    g: a.g * (1 - ratio) + b.g * ratio,
-    b: a.b * (1 - ratio) + b.b * ratio,
+function listingMarketplaceKey() {
+  return TOOL_MODE === "amazon" ? "amazon" : "etsy";
+}
+
+function listingMarketplaceName() {
+  return listingMarketplaceKey() === "amazon" ? "Amazon" : "Etsy";
+}
+
+function listingCopyResultKey() {
+  return listingMarketplaceKey() === "amazon" ? "amazon_browser_copy" : "etsy_browser_copy";
+}
+
+function listingQueueEndpoint() {
+  return listingMarketplaceKey() === "amazon" ? "/api/amazon/browser-copy/queue" : "/api/etsy/browser-copy/queue";
+}
+
+function listingEnqueueEndpoint() {
+  return listingMarketplaceKey() === "amazon" ? "/api/amazon/browser-copy/enqueue" : "/api/etsy/browser-copy/enqueue";
+}
+
+function listingJobEnqueueEndpoint(jobId) {
+  const encoded = encodeURIComponent(jobId);
+  return listingMarketplaceKey() === "amazon"
+    ? `/api/jobs/${encoded}/amazon-browser-copy/enqueue`
+    : `/api/jobs/${encoded}/etsy-browser-copy/enqueue`;
+}
+
+function applyListingJobFlags(job = {}) {
+  const isAmazon = listingMarketplaceKey() === "amazon";
+  job.etsy_enabled = !isAmazon;
+  job.etsy_browser_copy_enabled = !isAmazon;
+  job.etsy_publish = false;
+  job.amazon_enabled = isAmazon;
+  job.amazon_browser_copy_enabled = isAmazon;
+  job.amazon_publish = false;
+  job.amazon_delete_existing_images = true;
+  return job;
+}
+
+function setHidden(selector, hidden) {
+  document.querySelectorAll(selector).forEach((element) => {
+    element.hidden = hidden;
   });
 }
 
-function normalizeProjectInput(value) {
-  const source = String(value || "").trim();
-  if (!source) {
-    return "";
-  }
-
-  let raw = source;
-  try {
-    const parsed = new URL(source);
-    raw = parsed.pathname || source;
-  } catch (error) {
-    raw = source;
-  }
-
-  if (raw.includes("/project/")) {
-    raw = raw.split("/project/").slice(-1)[0].trim();
-  }
-
-  raw = raw.split("?")[0].split("#")[0].trim().replace(/^\/+|\/+$/g, "");
-  if (raw.includes("/")) {
-    raw = raw.split("/")[0].trim();
-  }
-
-  try {
-    raw = decodeURIComponent(raw);
-  } catch (error) {
-    raw = raw;
-  }
-
-  return raw;
+function setFirstText(selector, value) {
+  const element = document.querySelector(selector);
+  if (element) element.textContent = value;
 }
 
-function normalizePolicyText(value) {
-  return String(value || "")
+function setToolModeActive(mode) {
+  document.querySelectorAll("[data-tool-link]").forEach((link) => {
+    const isActive = link.getAttribute("data-tool-link") === mode;
+    link.classList.toggle("active", isActive || (mode === "combined" && link.getAttribute("data-tool-link") === "combined"));
+  });
+}
+
+function applyToolMode() {
+  document.body.dataset.toolMode = TOOL_MODE;
+  setToolModeActive(TOOL_MODE);
+  const listingOnly = TOOL_MODE === "etsy" || TOOL_MODE === "amazon";
+  setHidden(".etsy-only", !listingOnly);
+  setHidden(".account-pick", TOOL_MODE === "amazon");
+
+  if (TOOL_MODE === "flow") {
+    document.title = "Flow Tool";
+    setFirstText(".kicker", "Flow Tool");
+    setFirstText(".topbar h1", "Tạo ảnh từ Trello");
+    setHidden(".setup-etsy, .etsy-listing-step, #etsyDrawer, #etsyPill, #extensionStatusButton, .small-status > a[href='/api/extension/download']", true);
+    setHidden(".setup-flow, .check-step, .run-step, .auto-step, #flowDrawer, #flowPill", false);
+    if (els.autoProduct) {
+      els.autoProduct.placeholder = "Để trống: lấy cột đang chọn. Hoặc nhập SKU/tên sản phẩm để chạy Flow...";
+    }
+    return;
+  }
+
+  if (listingOnly) {
+    const marketplace = listingMarketplaceName();
+    document.title = `${marketplace} Draft Tool`;
+    setFirstText(".kicker", `${marketplace} Tool`);
+    setFirstText(".topbar h1", "Listing ảnh vào Draft");
+    setHidden(".setup-flow, .check-step, .run-step, #flowDrawer, #flowPill, #runAutoButton, #checkAutoButton, .auto-continuous", true);
+    setHidden(".setup-etsy, .etsy-listing-step, #etsyDrawer, #etsyPill, #extensionStatusButton, .small-status > a[href='/api/extension/download']", false);
+    setHidden("#previewEtsyButton, .advanced-etsy-api", TOOL_MODE === "amazon");
+    // Renumber the reused step headers for the listing-only sequence (1 source -> 2 listing -> 3 VM).
+    setFirstText(".etsy-listing-step .step-no", "2");
+    setFirstText(".setup-etsy .step-no", "3");
+    setFirstText(".setup-etsy strong", `Máy ảo ${marketplace}`);
+    setFirstText(".etsy-listing-main strong", `Listing ảnh ${marketplace}`);
+    setFirstText("#etsyDrawer summary span", `Cấu hình máy ảo ${marketplace}`);
+    setFirstText(".mode-intro small", `Chọn cột Trello hoặc nhập SKU đã có ảnh output, rồi bấm Listing ảnh ${marketplace} bên dưới.`);
+    if (els.autoProduct) {
+      els.autoProduct.placeholder = `Dán link card Trello để đăng đúng card đó lên ${marketplace} — hoặc để trống lấy cột, hoặc nhập SKU...`;
+    }
+    return;
+  }
+
+  document.title = "Flow Etsy Console";
+  setFirstText(".kicker", "Flow / Etsy");
+  setFirstText(".topbar h1", "Làm theo từng bước");
+  setHidden(".setup-flow, .setup-etsy, .check-step, .run-step, .auto-step, .etsy-listing-step, #flowDrawer, #etsyDrawer, #flowPill, #etsyPill, #extensionStatusButton, .small-status > a[href='/api/extension/download']", false);
+  setHidden(".account-pick", false);
+  setHidden("#previewEtsyButton, .advanced-etsy-api", false);
+  if (els.autoProduct) {
+    els.autoProduct.placeholder = "Dán link card Trello, hoặc để trống lấy cột, hoặc nhập tên sản phẩm...";
+  }
+}
+
+function normalizeLookup(value) {
+  return text(value, "")
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, " ")
-    .replace(/\s+/g, " ")
+    .replace(/[^a-z0-9]+/g, " ")
     .trim();
 }
 
-function policyTextHasAny(value, terms) {
-  const normalized = normalizePolicyText(value);
-  if (!normalized) {
-    return false;
-  }
-  return terms.some((term) => normalized.includes(term));
+// A pasted Trello card link (or bare card id) lets the user draft ONE specific card to Etsy
+// without pre-configuring a column ("thay v\u00ec c\u00e0i c\u1ed1 \u0111\u1ecbnh"). The backend's explicit-card path
+// already turns a card id/shortLink into a straight-to-Etsy draft when the card already has
+// output images, so this is purely a frontend routing detail: send the ref as trello_card_id
+// instead of using the box as a product-search query.
+function parseTrelloCardRef(value) {
+  const raw = text(value, "").trim();
+  if (!raw) return "";
+  // Full or partial Trello card URL: .../c/<shortLink>/<slug>
+  const urlMatch = raw.match(/\/c\/([A-Za-z0-9]{6,})/);
+  if (urlMatch) return urlMatch[1];
+  // Bare 24-char hex card id (unambiguous; a product name never looks like this).
+  if (/^[a-f0-9]{24}$/i.test(raw)) return raw;
+  return "";
 }
 
-function currentComposerPolicyNotice() {
-  if (state.mode === "edit") {
-    return null;
+function parseTrelloCardRefs(value) {
+  const tokens = text(value, "")
+    .split(/[\s,]+/)
+    .map((token) => token.trim())
+    .filter(Boolean);
+  const refs = [];
+  const seen = new Set();
+  for (const token of tokens) {
+    const ref = parseTrelloCardRef(token);
+    if (ref && !seen.has(ref)) {
+      seen.add(ref);
+      refs.push(ref);
+    }
   }
-  const prompt = currentDraft().prompt || "";
-  const hasMinor = policyTextHasAny(prompt, POLICY_MINOR_TERMS);
-  const hasAppearance = policyTextHasAny(prompt, POLICY_APPEARANCE_TERMS);
-  const hasApparel = policyTextHasAny(prompt, POLICY_APPAREL_TERMS);
-  const hasReferenceImages = Boolean(state.startImagePath) || state.imageReferenceItems.length > 0;
-  const hasProductImages = state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === "product");
-  const isProductVideoFlow = state.mode === "video" && currentVideoInputMode() === "reference";
-  const isImageEditFlow = state.mode === "image" && state.imageReferenceItems.length > 0;
-  const isStartVideoFlow = state.mode === "video" && currentVideoInputMode() === "start";
+  return refs;
+}
 
-  if (hasMinor && (hasAppearance || hasApparel || hasReferenceImages)) {
-    return {
-      tone: "warning",
-      pill: "Cảnh báo policy",
-      title: "Prompt này có nguy cơ bị Flow chặn vì liên quan người có thể chưa đủ tuổi.",
-      text: "Nếu ảnh hoặc mô tả ám chỉ người mẫu còn quá trẻ, Google Flow thường chặn các thao tác thay đồ, ghép logo lên áo, làm đẹp ngoại hình hoặc fashion edit.",
-      tips: [
-        "Đổi mô tả sang người mẫu trưởng thành rõ ràng, ví dụ: người mẫu trưởng thành 25 tuổi.",
-        "Nếu chỉ cần demo sản phẩm, dùng mannequin, flat-lay hoặc áo treo thay vì người thật.",
-        "Với luồng sản phẩm thành video, giữ ảnh sản phẩm nhưng mô tả rõ người mẫu trưởng thành.",
-      ],
+// Paste a Trello BOARD link -> load that board's columns dynamically and let the user tick
+// which columns to draft ("thay vì cài cố định"). The backend resolves the board id from the
+// link and returns its open lists; we register each as a dynamic source so the existing
+// multi-column draft path works unchanged.
+async function loadBoardColumns(boardInput) {
+  const board = text(boardInput, "");
+  const query = board ? `?board=${encodeURIComponent(board)}` : "";
+  const result = await api(`/api/trello/board/lists${query}`);
+  if (!result?.ok) {
+    boardColumnsLoaded = false;
+    const missing = Array.isArray(result?.missing) ? result.missing.join(", ") : "";
+    throw new Error(result?.error || (missing ? `thiếu ${missing}` : "không đọc được board"));
+  }
+  const lists = Array.isArray(result.lists) ? result.lists : [];
+  if (!lists.length) {
+    throw new Error("Board không có cột mở nào.");
+  }
+  renderBoardColumns(lists, result.board_id || board);
+  logLine(
+    `Đã load ${lists.length} cột từ board ${result.board_id || board}. Tick cột muốn đăng rồi bấm Listing ảnh Etsy.`
+  );
+  return result;
+}
+
+function renderBoardColumns(lists, boardId) {
+  if (!els.autoSourceChecks) return;
+  const board = text(boardId, DEFAULT_TRELLO_BOARD_ID);
+  // Register each loaded column as a dynamic source keyed by its list id, mirroring the shape
+  // of TRELLO_SOURCE_OPTIONS so selectedTrelloSourceKeys() / autoBatchPayload() / the whole
+  // multi-column Etsy draft path keep working with no further changes.
+  for (const col of lists) {
+    const id = text(col.id, "");
+    if (!id) continue;
+    TRELLO_SOURCE_OPTIONS[id] = {
+      label: text(col.name, id),
+      product: "",
+      listId: id,
+      boardId: board,
     };
   }
+  els.autoSourceChecks.innerHTML = lists
+    .map((col) => {
+      const id = text(col.id, "");
+      if (!id) return "";
+      const count = Number.isFinite(col.card_count) ? col.card_count : 0;
+      const label = `${escapeHtml(text(col.name, id))}${count ? ` (${count})` : ""}`;
+      return `<label class="source-check"><input type="checkbox" name="autoSource" value="${escapeHtml(
+        id
+      )}" /><span>${label}</span></label>`;
+    })
+    .filter(Boolean)
+    .join("");
+  boardColumnsLoaded = true;
+  updateAutoSourceUi();
+}
 
-  if ((isProductVideoFlow || isImageEditFlow || isStartVideoFlow) && (hasAppearance || hasApparel || hasProductImages)) {
-    return {
-      tone: "watch",
-      pill: "Gợi ý an toàn",
-      title: "Flow có thể chặn nếu ảnh người mẫu trông quá trẻ.",
-      text: "Luồng hiện tại đang chạm vào thay đồ, làm đẹp hoặc dựng người mẫu từ sản phẩm. Nếu ảnh tham chiếu là người trông nhỏ tuổi, Google Flow hay từ chối ngay từ bước upload hoặc generate.",
-      tips: [
-        "Giữ mô tả theo hướng người mẫu trưởng thành, mannequin hoặc ảnh flat-lay.",
-        "Nếu chỉ muốn thử áo hoặc logo, dùng ảnh sản phẩm riêng thay vì ảnh người trông quá trẻ.",
-      ],
-    };
+function readLastFlowRunContext() {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(LAST_FLOW_RUN_STORAGE_KEY) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function rememberLastFlowRunContext(context = {}) {
+  const next = {
+    sourceKey: text(context.sourceKey, ""),
+    sourceLabel: text(context.sourceLabel, ""),
+    product: text(context.product, ""),
+    cardId: text(context.cardId, ""),
+    listId: text(context.listId, ""),
+    jobId: text(context.jobId, ""),
+    startedAt: Number(context.startedAt || Date.now()),
+  };
+  state.lastFlowRun = next;
+  try {
+    window.localStorage.setItem(LAST_FLOW_RUN_STORAGE_KEY, JSON.stringify(next));
+  } catch {}
+  renderEtsyListingAction(state.payload);
+  return next;
+}
+
+function logLine(message, payload) {
+  const stamp = new Date().toLocaleTimeString("vi-VN", { hour12: false });
+  const next = [`[${stamp}] ${message}`];
+  if (payload !== undefined) {
+    next.push(typeof payload === "string" ? payload : JSON.stringify(payload, null, 2));
+  }
+  const current = els.consoleOutput.textContent.trim();
+  els.consoleOutput.textContent = current && current !== "Sẵn sàng." ? `${next.join("\n")}\n\n${current}` : next.join("\n");
+}
+
+function showConsole() {
+  if (els.consoleDrawer) {
+    els.consoleDrawer.open = true;
+  }
+}
+
+function compactQueueTask(task = {}) {
+  const created = Date.parse(task.created_at || "");
+  const ageSeconds = Number.isFinite(created) ? Math.max(0, Math.round((Date.now() - created) / 1000)) : null;
+  const result = task.result || {};
+  return {
+    task_id: task.id || "",
+    status: task.status || "",
+    sku: task.sku || "",
+    card: task.card_url || task.card_id || "",
+    images: Number(task.image_count || 0),
+    account: task.account_id || "",
+    worker: task.worker_id || "",
+    age_seconds: ageSeconds,
+    error: task.error || result.error || result.message || result.reason || "",
+  };
+}
+
+function vmQueueHint(queue = {}) {
+  const tasks = Array.isArray(queue.tasks) ? queue.tasks : [];
+  const active = tasks.find((task) => ["queued", "in_progress"].includes(task.status));
+  if (!active) return "Queue VM đang trống.";
+  if (active.status === "in_progress") {
+    return `VM đã nhận task ${active.id || ""}${active.worker_id ? ` (${active.worker_id})` : ""}.`;
+  }
+  return "Task vẫn đang chờ VM. Nếu đứng lâu, kiểm tra VM proxy/tunnel và popup extension: Backend URL phải trỏ được tới backend này.";
+}
+
+function setVmQueueUi(queue = {}) {
+  const queued = Number(queue.queued || 0);
+  const inProgress = Number(queue.in_progress || 0);
+  const latest = queue.latest || {};
+  const latestCompact = compactQueueTask(latest);
+  const marketplace = listingMarketplaceName();
+  const active = Array.isArray(queue.tasks)
+    ? queue.tasks.find((task) => ["queued", "in_progress"].includes(task.status))
+    : null;
+  if (els.etsyState) {
+    if (inProgress) els.etsyState.textContent = "VM đang chạy";
+    else if (queued) els.etsyState.textContent = "Chờ VM";
+    else if (latest.status === "failed") els.etsyState.textContent = "VM lỗi";
+    else els.etsyState.textContent = "Queue trống";
+  }
+  if (els.etsyDetail) {
+    const sku = active?.sku || latest?.sku || "";
+    els.etsyDetail.textContent = latest.status === "failed"
+      ? `${marketplace} lỗi: ${latestCompact.error || "không rõ lỗi"}`
+      : queued || inProgress
+      ? `Queue ${marketplace}: ${queued} chờ, ${inProgress} đang chạy${sku ? ` · ${sku}` : ""}`
+      : `Extension trên VM sẽ lấy task ${marketplace} Draft khi có hàng.`;
+  }
+  if (els.etsyConnectDot) {
+    els.etsyConnectDot.className = `dot ${queued || inProgress ? "ok" : ""}`.trim();
+  }
+  if (els.etsyConnectLabel) {
+    els.etsyConnectLabel.textContent = queued || inProgress
+      ? `VM queue: ${queued} chờ, ${inProgress} đang chạy`
+      : "VM queue đang trống";
+  }
+}
+
+function logAutoRunResult(result = {}) {
+  const mode = result.mode || "";
+  if (mode === "flow_batch") {
+    logLine(result.message || "Đã tạo batch Flow.", {
+      mode,
+      job_id: result.job?.id || "",
+      status: result.job?.status || "",
+      ready_for_ai: result.trello_status?.message || "",
+    });
+    return;
   }
 
+  if (mode === "etsy_from_existing_outputs") {
+    const tasks = Array.isArray(result.tasks) ? result.tasks : [];
+    const queued = tasks.filter((task) => task.enqueued).length;
+    const duplicates = tasks.filter((task) => task.duplicate).length;
+    const compactTasks = tasks.map((task) => compactQueueTask(task.queue_task || {}));
+    const waitingForVm = compactTasks.some((task) => task.status === "queued" && !task.worker);
+    logLine(result.message || `Đã queue ${queued} Etsy Draft.`, {
+      mode,
+      queued,
+      duplicates,
+      ready_for_ai: result.trello_status?.message || "",
+      tasks: compactTasks,
+      next: waitingForVm
+        ? "Đã queue vào backend; chờ extension trên VM polling và lưu Draft."
+        : "Theo dõi queue để xem VM xử lý.",
+    });
+    return;
+  }
+
+  logLine(result.message || "Đã chạy Auto Trello một chạm.", {
+    mode,
+    ok: Boolean(result.ok),
+    job_id: result.job?.id || "",
+  });
+}
+
+function waitForExtensionResponse(payload, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const requestId =
+      globalThis.crypto && typeof globalThis.crypto.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const timer = window.setTimeout(() => {
+      window.removeEventListener("message", onMessage);
+      reject(new Error("Không thấy extension trả lời. Cài/reload extension mới, cấp quyền origin Cloudflare, rồi refresh trang."));
+    }, timeoutMs);
+    function onMessage(event) {
+      if (event.source !== window || event.origin !== window.location.origin) return;
+      const data = event.data || {};
+      if (data.source !== "flow-ext" || data.type !== "RESPONSE" || data.requestId !== requestId) return;
+      window.clearTimeout(timer);
+      window.removeEventListener("message", onMessage);
+      resolve(data.result || {});
+    }
+    window.addEventListener("message", onMessage);
+    window.postMessage({ ...payload, requestId }, window.location.origin);
+  });
+}
+
+function sendExternalExtensionMessage(extensionId, message, timeoutMs = 10000) {
+  return new Promise((resolve, reject) => {
+    if (!globalThis.chrome?.runtime?.sendMessage) {
+      reject(new Error("Trang này chưa có chrome.runtime external messaging."));
+      return;
+    }
+    const timer = window.setTimeout(() => reject(new Error(`External extension timeout: ${extensionId}`)), timeoutMs);
+    chrome.runtime.sendMessage(extensionId, message, (result) => {
+      window.clearTimeout(timer);
+      const lastError = chrome.runtime.lastError;
+      if (lastError) {
+        reject(new Error(lastError.message));
+        return;
+      }
+      resolve(result || {});
+    });
+  });
+}
+
+async function pingExternalExtension() {
+  for (const extensionId of EXTERNAL_EXTENSION_IDS) {
+    try {
+      const result = await sendExternalExtensionMessage(extensionId, { type: "PING_EXT" }, 4000);
+      if (result?.ok) {
+        state.externalExtensionId = extensionId;
+        return { ...result, external: true, extensionId };
+      }
+    } catch (_error) {
+      // Try the next known extension id.
+    }
+  }
   return null;
 }
 
-function formatTime(value) {
-  if (!value) {
-    return "";
+async function ensureExtensionNonce() {
+  if (state.extensionNonce) return state.extensionNonce;
+  let result;
+  try {
+    result = await waitForExtensionResponse({ source: "flow-web", type: "PING_EXT" });
+  } catch (error) {
+    const external = await pingExternalExtension();
+    if (external?.ok) {
+      state.extensionNonce = "external";
+      return state.extensionNonce;
+    }
+    throw error;
   }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
+  if (!result?.ok || !result?.nonce) {
+    throw new Error(result?.message || "Extension chưa sẵn sàng trên trang này.");
   }
-  return new Intl.DateTimeFormat("vi-VN", {
-    hour: "2-digit",
-    minute: "2-digit",
-    day: "2-digit",
-    month: "2-digit",
-  }).format(date);
+  state.extensionNonce = result.nonce;
+  return state.extensionNonce;
 }
 
-function truncate(value, length = 140) {
-  const text = String(value || "").trim();
-  if (text.length <= length) {
-    return text;
+async function extensionCommand(message) {
+  const nonce = await ensureExtensionNonce();
+  if (state.externalExtensionId) {
+    return await sendExternalExtensionMessage(state.externalExtensionId, message, 30000);
   }
-  return `${text.slice(0, length - 1)}…`;
+  let result = await waitForExtensionResponse({ source: "flow-web", nonce, message });
+  if (result?.reason === "bad_nonce") {
+    state.extensionNonce = "";
+    const freshNonce = await ensureExtensionNonce();
+    result = await waitForExtensionResponse({ source: "flow-web", nonce: freshNonce, message });
+  }
+  return result;
 }
 
-function basename(value) {
-  const text = String(value || "").trim();
-  if (!text) {
-    return "";
+function summarizePreflight(result) {
+  const lines = [result?.summary || (result?.ready ? "Sẵn sàng chạy." : "Còn mục cần xử lý.")];
+  const blockers = Array.isArray(result?.blockers) ? result.blockers : [];
+  const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
+  if (blockers.length) {
+    lines.push("Blocker:");
+    blockers.forEach((item) => lines.push(`- ${item.label}: ${item.detail || item.action || "cần xử lý"}`));
   }
-  return text.split("/").pop() || text;
-}
-
-function fileKindLabel(count) {
-  return count > 1 ? `${count} ảnh` : "1 ảnh";
-}
-
-function uploadPublicUrlFromPath(value) {
-  const name = basename(value);
-  if (!name) {
-    return "";
+  if (warnings.length) {
+    lines.push("Cần tự kiểm:");
+    warnings.forEach((item) => lines.push(`- ${item.label}: ${item.action || item.detail || "kiểm tra thủ công"}`));
   }
-  return `/files/uploads/${encodeURIComponent(name)}`;
-}
-
-function statusLabel(status) {
-  const map = {
-    queued: "Đang xếp hàng",
-    running: "Đang chạy",
-    polling: "Đang xử lý",
-    completed: "Hoàn tất",
-    failed: "Lỗi",
-    interrupted: "Bị ngắt",
-  };
-  return map[status] || status || "Không rõ";
-}
-
-function formatDuration(ms) {
-  const totalSeconds = Math.max(0, Math.round(ms / 1000));
-  if (totalSeconds < 60) {
-    return `${totalSeconds} giây`;
+  const nextActions = Array.isArray(result?.next_actions) ? result.next_actions.filter(Boolean) : [];
+  if (nextActions.length) {
+    lines.push("Việc tiếp theo:");
+    nextActions.forEach((item) => lines.push(`- ${item}`));
   }
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-  if (minutes < 60) {
-    return seconds ? `${minutes} phút ${seconds} giây` : `${minutes} phút`;
-  }
-  const hours = Math.floor(minutes / 60);
-  const remainMinutes = minutes % 60;
-  return remainMinutes ? `${hours} giờ ${remainMinutes} phút` : `${hours} giờ`;
+  return lines.join("\n");
 }
 
 async function api(path, options = {}) {
-  const isFormData = options.body instanceof FormData;
   const response = await fetch(path, {
+    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
-    headers: {
-      ...(isFormData ? {} : { "Content-Type": "application/json" }),
-      ...(options.headers || {}),
-    },
   });
-
-  const text = await response.text();
-  let payload = {};
-  if (text) {
-    try {
-      payload = JSON.parse(text);
-    } catch (error) {
-      payload = { detail: text };
-    }
-  }
-
+  const contentType = response.headers.get("content-type") || "";
+  const body = contentType.includes("application/json") ? await response.json() : await response.text();
   if (!response.ok) {
-    throw new Error(payload.detail || payload.error || "Có lỗi xảy ra.");
+    const detail = typeof body === "object" ? body.detail || body.error || JSON.stringify(body) : body;
+    throw new Error(detail || `HTTP ${response.status}`);
   }
-
-  return payload;
+  return body;
 }
 
-function showMessage(message, tone = "neutral") {
-  if (!message) {
-    elements.messageBar.hidden = true;
-    elements.messageBar.textContent = "";
-    elements.messageBar.dataset.tone = "";
-    return;
-  }
-  elements.messageBar.hidden = false;
-  elements.messageBar.textContent = message;
-  elements.messageBar.dataset.tone = tone;
+function jobStatusTone(status) {
+  if (["completed", "ready", "ok"].includes(status)) return "ready";
+  if (["queued", "running", "polling"].includes(status)) return "warn";
+  if (["failed", "stopped", "cancelled"].includes(status)) return "bad";
+  return "";
 }
 
-function currentModeConfig() {
-  return MODE_CONFIG[state.mode];
+function isFlowReady(payload) {
+  return Boolean(payload?.auth?.authenticated && payload?.config?.project_id);
 }
 
-function currentEditConfig() {
-  return EDIT_ACTION_CONFIG[state.editAction] || EDIT_ACTION_CONFIG.extend;
-}
+function renderTopStatus(payload) {
+  setBadge(els.healthPill, "Backend OK", "ready");
 
-function currentOperationConfig() {
-  if (state.mode === "edit") {
-    const modeConfig = currentModeConfig();
-    const editConfig = currentEditConfig();
-    return {
-      ...modeConfig,
-      ...editConfig,
-    };
-  }
-  return currentModeConfig();
-}
-
-function modeForJobType(jobType) {
-  if (jobType === "image") {
-    return "image";
-  }
-  if (EDIT_JOB_TYPES.has(jobType)) {
-    return "edit";
-  }
-  return "video";
-}
-
-function currentDraft() {
-  return state.drafts[state.mode];
-}
-
-function normalizeVideoInputMode(value) {
-  const raw = String(value || "").trim().toLowerCase();
-  if (raw === "start" || raw === "reference") {
-    return raw;
-  }
-  return "prompt";
-}
-
-function currentVideoInputMode() {
-  return normalizeVideoInputMode(state.drafts.video?.inputMode || "prompt");
-}
-
-function currentVideoInputConfig() {
-  return VIDEO_INPUT_MODE_CONFIG[currentVideoInputMode()] || VIDEO_INPUT_MODE_CONFIG.prompt;
-}
-
-function currentPromptAiDraft() {
-  return state.promptAiDrafts[state.mode] || null;
-}
-
-function currentPromptAiResult() {
-  return state.promptAiResults[state.mode];
-}
-
-function modelOptionsForMode(mode) {
-  if (mode === "image") {
-    return state.modelOptions.image?.length ? state.modelOptions.image : FALLBACK_IMAGE_MODELS;
-  }
-  if (mode === "video") {
-    return state.modelOptions.video?.length ? state.modelOptions.video : FALLBACK_VIDEO_MODELS;
-  }
-  return [];
-}
-
-function defaultModelForMode(mode) {
-  return modelOptionsForMode(mode)[0]?.value || "";
-}
-
-function modelLabelForMode(mode, value) {
-  const raw = String(value || "").trim();
-  const matched = modelOptionsForMode(mode).find((item) => item.value === raw);
-  if (matched) {
-    return matched.label;
-  }
-  if (mode === "image") {
-    if (raw === "GEMINI_3_PRO_IMAGE") {
-      return "Nano Banana Pro";
-    }
-    if (raw === "NARWHAL") {
-      return "Nano Banana 2";
-    }
-    if (raw === "IMAGEN_3") {
-      return "Imagen 3";
-    }
-  }
-  return raw;
-}
-
-function aspectTitle(value) {
-  return ASPECT_DETAILS[String(value || "").trim()]?.title || "Ngang 16:9";
-}
-
-function referenceRoleLabel(value) {
-  return REFERENCE_ROLE_OPTIONS.find((item) => item.value === value)?.label || "Tham chiếu";
-}
-
-function referenceRoleDetail(value) {
-  return REFERENCE_ROLE_OPTIONS.find((item) => item.value === value)?.detail || "Ảnh phụ để tham chiếu.";
-}
-
-function normalizeReferenceRole(value) {
-  const raw = String(value || "").trim().toLowerCase();
-  if (raw === "base" || raw === "logo" || raw === "product" || raw === "reference") {
-    return raw;
-  }
-  return "reference";
-}
-
-function referenceRoleOptionsForMode(mode) {
-  if (mode === "video") {
-    return REFERENCE_ROLE_OPTIONS.filter((item) => item.value !== "base");
-  }
-  return REFERENCE_ROLE_OPTIONS;
-}
-
-function primaryReferenceRoleForMode(mode = state.mode) {
-  return mode === "video" ? "product" : "base";
-}
-
-function normalizeReferenceRoleForMode(value, mode, index = 0) {
-  const role = normalizeReferenceRole(value);
-  if (mode === "video" && role === "base") {
-    return index === 0 ? "product" : "reference";
-  }
-  return role;
-}
-
-function ensurePrimaryReferenceRole(items, mode = state.mode) {
-  if (!Array.isArray(items) || !items.length) {
-    return [];
-  }
-  const primaryRole = primaryReferenceRoleForMode(mode);
-  const normalized = items.map((item, index) => ({
-    ...item,
-    role: normalizeReferenceRoleForMode(item.role, mode, index),
-  }));
-  if (!normalized.some((item) => item.role === primaryRole)) {
-    normalized[0] = { ...normalized[0], role: primaryRole };
-  }
-  return normalized;
-}
-
-function clearStartImageState({ resetInput = true } = {}) {
-  state.startImagePath = "";
-  state.startImageName = "";
-  state.startImagePublicUrl = "";
-  if (resetInput && elements.startImageFile) {
-    elements.startImageFile.value = "";
-  }
-}
-
-function clearReferenceImageState({ resetInput = true } = {}) {
-  state.imageReferenceItems = [];
-  if (resetInput && elements.imageReferenceFiles) {
-    elements.imageReferenceFiles.value = "";
-  }
-}
-
-function setVideoInputMode(mode, { clearConflicts = true, announce = false } = {}) {
-  const nextMode = normalizeVideoInputMode(mode);
-  const previousMode = currentVideoInputMode();
-  state.drafts.video.inputMode = nextMode;
-
-  if (clearConflicts) {
-    if (nextMode === "prompt") {
-      clearStartImageState();
-      clearReferenceImageState();
-    } else if (nextMode === "start") {
-      clearReferenceImageState();
-    } else if (nextMode === "reference") {
-      clearStartImageState();
-      state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, "video");
-    }
-  }
-
-  if (announce && nextMode !== previousMode) {
-    showMessage(currentVideoInputConfig().note, "success");
-  }
-}
-
-function syncDraftFromForm() {
-  const draft = currentDraft();
-  draft.prompt = elements.promptInput.value;
-  draft.model = elements.modelSelect.value || draft.model || defaultModelForMode(state.mode);
-  draft.aspect = elements.aspectSelect.value;
-  draft.count = Math.max(1, Math.min(4, Number(elements.countInput.value || draft.count || 1)));
-}
-
-function syncEditInputsFromForm() {
-  state.selectedEditSourceKey = elements.editSourceSelect.value || "";
-  state.manualMediaId = elements.manualMediaId.value.trim();
-  state.manualWorkflowId = elements.manualWorkflowId.value.trim();
-  state.motion = elements.motionSelect.value || "truck_left";
-  state.position = elements.positionSelect.value || "center";
-  state.resolution = elements.resolutionSelect.value || "1080p";
-}
-
-function syncPromptAiDraftFromForm() {
-  const draft = currentPromptAiDraft();
-  if (!draft) {
-    return;
-  }
-  draft.brief = elements.promptAiBrief.value;
-  draft.style = elements.promptAiStyle.value;
-  draft.mustInclude = elements.promptAiMustInclude.value;
-  draft.avoid = elements.promptAiAvoid.value;
-  draft.audience = elements.promptAiAudience.value;
-}
-
-function syncStoryboardDraftFromForm() {
-  state.storyboardDraft.script = elements.storyboardScript.value;
-  state.storyboardDraft.style = elements.storyboardStyle.value;
-  state.storyboardDraft.mustInclude = elements.storyboardMustInclude.value;
-  state.storyboardDraft.avoid = elements.storyboardAvoid.value;
-  state.storyboardDraft.sceneCount = elements.storyboardSceneCount.value || "0";
-}
-
-function applyDraftToForm() {
-  const draft = currentDraft();
-  const config = currentModeConfig();
-  const options = modelOptionsForMode(state.mode);
-  const fallbackModel = defaultModelForMode(state.mode);
-  const nextModel = options.some((item) => item.value === draft.model) ? draft.model : fallbackModel;
-  draft.model = nextModel;
-  elements.promptInput.value = draft.prompt || "";
-  elements.modelSelect.innerHTML = options
-    .map((item) => `<option value="${escapeHtml(item.value)}">${escapeHtml(item.label)}</option>`)
-    .join("");
-  elements.modelSelect.value = nextModel;
-  elements.aspectSelect.value = draft.aspect || config.defaultAspect;
-  elements.countInput.value = String(draft.count || config.defaultCount);
-}
-
-function applyEditInputsToForm() {
-  elements.editSourceSelect.value = state.selectedEditSourceKey || "";
-  elements.manualMediaId.value = state.manualMediaId || "";
-  elements.manualWorkflowId.value = state.manualWorkflowId || "";
-  elements.motionSelect.value = state.motion || "truck_left";
-  elements.positionSelect.value = state.position || "center";
-  elements.resolutionSelect.value = state.resolution || "1080p";
-}
-
-function renderAspectChoices() {
-  const selected = String(elements.aspectSelect.value || currentDraft().aspect || currentModeConfig().defaultAspect).trim();
-  const buttons = Array.from(elements.aspectChoices?.querySelectorAll("[data-aspect-option]") || []);
-  for (const button of buttons) {
-    button.classList.toggle("active", button.dataset.aspectOption === selected);
-  }
-}
-
-function renderCountChoices() {
-  const selected = String(elements.countInput.value || currentDraft().count || currentModeConfig().defaultCount);
-  const buttons = Array.from(elements.countChoices?.querySelectorAll("[data-count-option]") || []);
-  for (const button of buttons) {
-    button.classList.toggle("active", button.dataset.countOption === selected);
-  }
-}
-
-function applyPromptAiDraftToForm() {
-  const draft = currentPromptAiDraft();
-  if (!draft) {
-    elements.promptAiBrief.value = "";
-    elements.promptAiStyle.value = "";
-    elements.promptAiMustInclude.value = "";
-    elements.promptAiAvoid.value = "";
-    elements.promptAiAudience.value = "";
-    return;
-  }
-  elements.promptAiBrief.value = draft.brief || "";
-  elements.promptAiStyle.value = draft.style || "";
-  elements.promptAiMustInclude.value = draft.mustInclude || "";
-  elements.promptAiAvoid.value = draft.avoid || "";
-  elements.promptAiAudience.value = draft.audience || "";
-}
-
-function applyStoryboardDraftToForm() {
-  elements.storyboardScript.value = state.storyboardDraft.script || "";
-  elements.storyboardStyle.value = state.storyboardDraft.style || "";
-  elements.storyboardMustInclude.value = state.storyboardDraft.mustInclude || "";
-  elements.storyboardAvoid.value = state.storyboardDraft.avoid || "";
-  elements.storyboardSceneCount.value = state.storyboardDraft.sceneCount || "0";
-}
-
-function isReady() {
-  return Boolean(state.config?.project_id) && Boolean(state.auth?.authenticated);
-}
-
-function applyAutomationBranding() {
-  const automation = normalizeAutomationConfig(state.automation);
-  state.automation = automation;
-  const eyebrow = automation.appEyebrow || "Flow v2";
-  const title = automation.appTitle || "Flow v2";
-  const accent = normalizeHexColor(automation.accentColor);
-  const accentStrong = mixHexColor(accent, "#000000", 0.22);
-  const accentSoft = mixHexColor(accent, "#ffffff", 0.9);
-  const accentRing = mixHexColor(accent, "#ffffff", 0.74);
-  document.documentElement.style.setProperty("--accent", accent);
-  document.documentElement.style.setProperty("--accent-strong", accentStrong);
-  document.documentElement.style.setProperty("--accent-soft", accentSoft);
-  document.documentElement.style.setProperty("--accent-ring", accentRing);
-  if (elements.automationBrandEyebrow) {
-    elements.automationBrandEyebrow.textContent = eyebrow;
-  }
-  if (elements.automationBrandTitle) {
-    elements.automationBrandTitle.textContent = title;
-  }
-  document.title = title && title !== "Flow v2" ? `${title} | Flow v2` : "Flow v2";
-}
-
-function renderTopbar() {
-  applyAutomationBranding();
-  const projectId = state.config?.project_id || "";
-  const projectName = String(state.config?.project_name || "").trim();
-  const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
-  elements.projectStatus.textContent = projectId ? projectName || `Project ${truncate(projectId, 18)}` : "Chưa có project";
-  elements.projectStatus.dataset.state = projectId ? "ready" : "pending";
-  elements.authStatus.textContent = state.auth?.authenticated ? "Đã đăng nhập" : "Chưa đăng nhập";
-  elements.authStatus.dataset.state = state.auth?.authenticated ? "ready" : "pending";
-  elements.openFlowButton.textContent = projectId ? "Mở Flow" : "Mở đăng nhập";
-  elements.logoutButton.hidden = !state.auth?.authenticated;
-  elements.logoutButton.disabled = activeJobs > 0;
-  elements.logoutButton.title = activeJobs > 0 ? "Hãy chờ các tác vụ đang chạy hoàn tất rồi đăng xuất." : "";
-  elements.setupToggle.textContent = state.setupOpen ? "Ẩn thiết lập" : "Thiết lập";
-  elements.setupPanel.hidden = !state.setupOpen;
-  if (elements.automationEnabled) {
-    elements.automationEnabled.checked = Boolean(state.automation?.enabled);
-    elements.automationEnabled.closest(".scenario-toggle")?.querySelector("span")?.replaceChildren(
-      document.createTextNode(state.automation?.enabled ? "Active" : "Inactive")
-    );
-  }
-
-  if (!projectId) {
-    elements.topbarHint.textContent = "Lưu project một lần rồi chỉ việc nhập prompt.";
-  } else if (!state.auth?.authenticated) {
-    elements.topbarHint.textContent = "Project đã có. Chỉ còn đăng nhập Google Flow là chạy được.";
-  } else if (activeJobs) {
-    elements.topbarHint.textContent = `Đang có ${activeJobs} lượt chạy. Tab Google Flow vẫn được giữ mở để bạn theo dõi trực tiếp.`;
+  if (isFlowReady(payload)) {
+    setBadge(els.flowPill, "Flow ready", "ready");
+    els.flowState.textContent = "Sẵn sàng";
+    els.flowDetail.textContent = `Project ${text(payload.config.project_id)}`;
+    if (els.flowSetupStatus) els.flowSetupStatus.textContent = "Đã setup";
+    setToolBadge(els.flowBadge, "Ready", "ready");
+  } else if (payload?.auth?.authenticated) {
+    setBadge(els.flowPill, "Thiếu project", "warn");
+    els.flowState.textContent = "Thiếu project";
+    els.flowDetail.textContent = "Đã đăng nhập, chưa lưu project Flow";
+    if (els.flowSetupStatus) els.flowSetupStatus.textContent = "Cần Project ID";
+    setToolBadge(els.flowBadge, "Needs project", "warn");
   } else {
-    elements.topbarHint.textContent =
-      state.automation.appSubtitle || "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
+    setBadge(els.flowPill, "Cần login", "warn");
+    els.flowState.textContent = "Cần đăng nhập";
+    els.flowDetail.textContent = "Mở Flow rồi login Google";
+    if (els.flowSetupStatus) els.flowSetupStatus.textContent = "Cần login";
+    setToolBadge(els.flowBadge, "Login", "warn");
   }
 
-  if (document.activeElement !== elements.projectId) {
-    elements.projectId.value = state.config?.project_url || state.config?.project_id || "";
-  }
-  if (document.activeElement !== elements.projectName) {
-    elements.projectName.value = state.config?.project_name || "";
-  }
-  if (document.activeElement !== elements.generationTimeout) {
-    elements.generationTimeout.value = String(state.config?.generation_timeout_s || 300);
+  const etsy = payload?.etsy || {};
+  const marketplace = listingMarketplaceName();
+  setBadge(els.etsyPill, `VM ${marketplace}`, "ready");
+  els.etsyState.textContent = "Queue VM";
+  els.etsyDetail.textContent = `Extension trên máy ảo tự lấy task ${marketplace} và lưu Draft`;
+  if (els.etsySetupStatus) els.etsySetupStatus.textContent = "Extension trên VM sẽ tự lấy queue";
+  setToolBadge(els.etsyBadge, "VM queue", "ready");
+  els.etsyWarning.hidden = false;
+  els.etsyWarning.textContent = `Luồng chính không setup ${marketplace} ở máy này. Nút Chạy Flow chỉ tạo ảnh/Trello; nút Listing ảnh ${marketplace} mới gửi queue cho VM lưu Draft.`;
+  renderEtsyConnect(etsy);
+
+  const extension = payload?.extensions || {};
+  const readyCount = Number(extension.ready_count || 0);
+  const totalCount = Array.isArray(extension.items) ? extension.items.length : 0;
+  els.extensionState.textContent = `${readyCount}/${totalCount || 0}`;
+  els.extensionDetail.textContent = totalCount ? "tool sẵn sàng" : "chưa đọc registry";
+
+  const trello = payload?.trello || {};
+  if (els.trelloBadge) {
+    els.trelloBadge.className = trello.configured ? "flow-route-badge ready" : "flow-route-badge warn";
+    els.trelloBadge.textContent = trello.configured ? autoRouteLabel() : "Cần setup Trello trước";
   }
 }
 
-function automationStepConfig(stepKey) {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  let module = state.automation.modules.find((item) => item.id === stepKey);
-  if (!module) {
-    module = state.automation.modules.find((item) => item.type === "flow") || state.automation.modules[0] || createAutomationModule("custom", { id: "module_1" });
-    state.automation.selectedStep = module.id;
+function renderEtsyConnect(etsy = {}) {
+  const marketplace = listingMarketplaceName();
+  if (els.etsyConnectDot) els.etsyConnectDot.className = "dot ok";
+  if (els.etsyConnectLabel) {
+    els.etsyConnectLabel.textContent = "VM extension polling queue";
   }
-  state.automation.steps = automationStepsFromModules(state.automation.modules);
-  return module;
-}
-
-function selectedAutomationModule() {
-  return automationStepConfig(state.automation.selectedStep);
-}
-
-function selectedAutomationModuleIndex() {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  return Math.max(0, state.automation.modules.findIndex((module) => module.id === state.automation.selectedStep));
-}
-
-function persistAutomationModules() {
-  state.automation.steps = automationStepsFromModules(state.automation.modules);
-  saveAutomationConfig(state.automation);
-}
-
-function renderAutomationCanvasControls() {
-  const zoom = clampAutomationCanvasZoom(state.automation.canvasZoom);
-  state.automation.canvasZoom = zoom;
-  if (elements.scenarioNodeRow) {
-    elements.scenarioNodeRow.style.zoom = String(zoom);
-  }
-  if (elements.automationZoomReset) {
-    elements.automationZoomReset.textContent = `${Math.round(zoom * 100)}%`;
-  }
-  if (elements.automationZoomOut) {
-    elements.automationZoomOut.disabled = zoom <= AUTOMATION_CANVAS_ZOOM_MIN + 0.01;
-  }
-  if (elements.automationZoomIn) {
-    elements.automationZoomIn.disabled = zoom >= AUTOMATION_CANVAS_ZOOM_MAX - 0.01;
+  if (els.disconnectEtsyButton) els.disconnectEtsyButton.hidden = true;
+  const label = "Xem queue";
+  if (els.connectEtsyButton) els.connectEtsyButton.textContent = label;
+  if (els.connectEtsyTopButton) els.connectEtsyTopButton.textContent = label;
+  const hint = document.querySelector(".connect-hint");
+  if (hint) {
+    hint.textContent = `Extension ${marketplace} nằm trên máy ảo và đang polling backend. Máy này không cần login ${marketplace}, không mở tab ${marketplace} local. Nút Listing ảnh ${marketplace} mới queue task để máy ảo tự copy listing và lưu Draft.`;
   }
 }
 
-function setAutomationCanvasZoom(value, { keepCenter = true } = {}) {
-  const canvas = elements.scenarioCanvas;
-  const previousZoom = clampAutomationCanvasZoom(state.automation.canvasZoom);
-  const nextZoom = clampAutomationCanvasZoom(value);
-  if (Math.abs(previousZoom - nextZoom) < 0.005) {
-    renderAutomationCanvasControls();
-    return;
-  }
-  const centerX = canvas ? canvas.scrollLeft + canvas.clientWidth / 2 : 0;
-  const centerY = canvas ? canvas.scrollTop + canvas.clientHeight / 2 : 0;
-  state.automation.canvasZoom = nextZoom;
-  saveAutomationConfig(state.automation);
-  renderAutomationCanvasControls();
-  if (canvas && keepCenter) {
-    const ratio = nextZoom / previousZoom;
-    canvas.scrollTo({
-      left: Math.max(0, centerX * ratio - canvas.clientWidth / 2),
-      top: Math.max(0, centerY * ratio - canvas.clientHeight / 2),
-      behavior: "smooth",
-    });
-  }
+function hydrateFlowForm(config = {}) {
+  if (state.hydratedFlow) return;
+  els.flowProjectId.value = text(config.project_id, "");
+  els.flowProjectName.value = text(config.project_name, "");
+  els.flowTimeout.value = String(config.generation_timeout_s || 300);
+  els.flowCdpUrl.value = text(config.cdp_url, "");
+  state.hydratedFlow = true;
 }
 
-function fitAutomationCanvas() {
-  if (!elements.scenarioCanvas || !elements.scenarioNodeRow) {
-    return;
+function hydrateIntegrationForm(integrations = {}) {
+  if (state.hydratedIntegrations) return;
+  const gemini = integrations.gemini || {};
+  if (els.geminiModel) {
+    const model = text(gemini.image_model, "");
+    els.geminiModel.value = model && model.includes("image") ? model : "gemini-2.5-flash-image";
   }
-  const currentZoom = clampAutomationCanvasZoom(state.automation.canvasZoom);
-  const baseWidth = Math.max(1, (elements.scenarioNodeRow.scrollWidth || 820) / currentZoom);
-  const availableWidth = Math.max(320, elements.scenarioCanvas.clientWidth - 96);
-  const nextZoom = clampAutomationCanvasZoom(Math.min(1, availableWidth / baseWidth));
-  setAutomationCanvasZoom(nextZoom, { keepCenter: false });
-  window.setTimeout(() => {
-    elements.scenarioCanvas.scrollTo({
-      left: Math.max(0, (elements.scenarioNodeRow.scrollWidth - elements.scenarioCanvas.clientWidth) / 2),
-      top: 0,
-      behavior: "smooth",
-    });
-  }, 0);
+  if (els.imageEngineSelect) {
+    const savedEngine = window.localStorage.getItem("flow-image-engine") || "";
+    els.imageEngineSelect.value = savedEngine === "gemini_api" ? "gemini_api" : "google_flow";
+  }
+  state.hydratedIntegrations = true;
 }
 
-function scrollAutomationNodeIntoView(stepId = state.automation.selectedStep) {
-  const safeStepId = window.CSS?.escape
-    ? CSS.escape(String(stepId))
-    : String(stepId).replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const selector = `[data-scenario-step="${safeStepId}"]`;
-  const node = elements.scenarioNodeRow?.querySelector(selector);
-  node?.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+function hydrateEtsyForm(etsy = {}) {
+  if (state.hydratedEtsy) return;
+  els.etsyShopId.value = text(etsy.shop_id, "");
+  els.etsyUserId.value = text(etsy.user_id, "");
+  els.etsyTaxonomyId.value = text(etsy.taxonomy_id, "");
+  els.etsyShippingProfileId.value = text(etsy.shipping_profile_id, "");
+  els.etsyPrice.value = text(etsy.price, "9.99");
+  els.etsyQuantity.value = String(etsy.quantity || 1);
+  state.hydratedEtsy = true;
 }
 
-function automationModuleEnabled(type) {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  return state.automation.modules.some((module) => module.type === type && module.enabled !== false);
-}
+function renderJobs(payload) {
+  const jobs = Array.isArray(payload?.jobs) ? [...payload.jobs] : [];
+  const active = jobs.filter((job) => ["queued", "running", "polling"].includes(job.status)).length;
+  const failed = jobs.filter((job) => ["failed", "stopped"].includes(job.status)).length;
+  els.jobState.textContent = String(jobs.length);
+  els.jobDetail.textContent = `${active} active, ${failed} cần xem`;
 
-function selectAutomationModuleByType(type, { create = false } = {}) {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  let module = state.automation.modules.find((item) => item.type === type);
-  if (!module && create) {
-    module = createAutomationModule(type);
-    state.automation.modules.push(module);
-  }
-  if (!module) {
-    return null;
-  }
-  state.automation.selectedStep = module.id;
-  persistAutomationModules();
-  renderAutomationDashboard();
-  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
-  return module;
-}
-
-function addAutomationModule({ duplicate = false } = {}) {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  const index = selectedAutomationModuleIndex();
-  const selected = state.automation.modules[index] || createAutomationModule("custom");
-  const seed = duplicate
-    ? {
-        ...selected,
-        id: "",
-        title: `${selected.title || moduleTypeConfig(selected.type).title} copy`,
-        settings: { ...(selected.settings || {}) },
-      }
-    : {};
-  const module = createAutomationModule(duplicate ? selected.type : "custom", seed);
-  state.automation.modules.splice(index + 1, 0, module);
-  state.automation.selectedStep = module.id;
-  persistAutomationModules();
-  renderAutomationDashboard();
-  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
-  showMessage(duplicate ? "Đã nhân bản cục đang chọn." : "Đã thêm một cục mới sau module đang chọn.", "success");
-}
-
-function deleteSelectedAutomationModule() {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  if (state.automation.modules.length <= 1) {
-    showMessage("Cần giữ lại ít nhất một cục trong luồng.", "error");
-    return;
-  }
-  const index = selectedAutomationModuleIndex();
-  state.automation.modules.splice(index, 1);
-  const next = state.automation.modules[Math.max(0, index - 1)] || state.automation.modules[0];
-  state.automation.selectedStep = next.id;
-  persistAutomationModules();
-  renderAutomationDashboard();
-  showMessage("Đã xóa cục khỏi luồng.", "success");
-}
-
-function moveSelectedAutomationModule(direction) {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  const index = selectedAutomationModuleIndex();
-  const nextIndex = index + direction;
-  if (nextIndex < 0 || nextIndex >= state.automation.modules.length) {
-    return;
-  }
-  const [module] = state.automation.modules.splice(index, 1);
-  state.automation.modules.splice(nextIndex, 0, module);
-  persistAutomationModules();
-  renderAutomationDashboard();
-  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
-}
-
-function syncAutomationFromForm() {
-  if (!elements.automationPromptInput) {
-    return;
-  }
-  state.automation.enabled = Boolean(elements.automationEnabled?.checked);
-  state.automation.prompt = elements.automationPromptInput.value;
-  state.automation.sourceType = elements.automationSourceType.value || FLOW_AI_SOURCE_TYPE;
-  state.automation.sourceLocation = elements.automationSourceLocationInput.value.trim();
-  state.automation.promptProductFilter = elements.automationProductFilterInput?.value?.trim() || "";
-  state.automation.telegramChat = elements.automationTelegramInput.value.trim();
-  state.automation.sheetLog = elements.automationSheetInput?.value?.trim() || state.automation.sheetLog || "";
-  state.automation.trelloBoardId =
-    elements.automationTrelloBoardInput?.value?.trim() ||
-    elements.automationTrelloBoardStorageInput?.value?.trim() ||
-    "";
-  state.automation.trelloCardId = elements.automationTrelloCardInput.value.trim();
-  state.automation.trelloListId = elements.automationTrelloListInput.value.trim();
-  state.automation.appEyebrow = elements.automationAppEyebrowInput.value.trim() || "Flow v2";
-  state.automation.appTitle = elements.automationAppTitleInput.value.trim() || "Flow v2";
-  state.automation.appSubtitle =
-    elements.automationAppSubtitleInput.value.trim() ||
-    "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
-  state.automation.accentColor = normalizeHexColor(elements.automationAccentInput.value, "#7c2ee6");
-
-  const selected = state.automation.selectedStep || "flow";
-  const current = automationStepConfig(selected);
-  const selectedType = elements.automationModuleTypeInput?.value || current.type || "custom";
-  const typeChanged = selectedType !== current.type;
-  current.type = selectedType;
-  const typeDefaults = moduleTypeConfig(selectedType);
-  current.title = typeChanged ? typeDefaults.title : elements.automationStepNameInput.value.trim() || current.title || typeDefaults.title;
-  current.detail = typeChanged ? typeDefaults.detail : elements.automationStepDetailInput.value.trim() || current.detail || typeDefaults.detail;
-  current.icon = typeChanged ? typeDefaults.icon : (elements.automationStepIconInput?.value || "").trim() || current.icon || typeDefaults.icon;
-  current.enabled = elements.automationModuleEnabledInput ? Boolean(elements.automationModuleEnabledInput.checked) : current.enabled !== false;
-  state.automation.steps = automationStepsFromModules(state.automation.modules);
-  saveAutomationConfig(state.automation);
-}
-
-function automationJobs() {
-  return (state.jobs || []).filter((job) => job.type === "image" || job.type === "batch_image");
-}
-
-function activeContinuousAutoTrelloJob() {
-  return automationJobs().find((job) => {
-    if (!ACTIVE_STATUSES.has(job.status) || job.type !== "batch_image") {
-      return false;
-    }
-    const input = job.input || {};
-    const result = job.result || {};
-    return Boolean(input.continuous || result.continuous);
-  }) || null;
-}
-
-function automationStepTone(module, stats) {
-  const executionNode = latestAutomationExecutionNode(module);
-  if (executionNode) {
-    const status = String(executionNode.status || "").toLowerCase();
-    if (status === "running") {
-      return "active";
-    }
-    if (status === "completed") {
-      return "done";
-    }
-    if (status === "skipped") {
-      return "watch";
-    }
-    if (status === "failed") {
-      if ((module.type || module.id) === "trello_source" && trelloSourceIsReady(module)) {
-        return "ready";
-      }
-      return "blocked";
-    }
-  }
-  if (module.enabled === false) {
-    return "disabled";
-  }
-  const stepKey = module.type || module.id;
-  if (stepKey === "source") {
-    return state.automation.prompt.trim() || shouldAutoDiscoverTrello() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
-  }
-  if (stepKey === "trello_source") {
-    return trelloSourceIsReady(module) ? "ready" : "blocked";
-  }
-  if (stepKey === "normalize") {
-    return state.automation.prompt.trim() || shouldAutoDiscoverTrello() ? "done" : "pending";
-  }
-  if (stepKey === "flow") {
-    if (!state.config?.project_id || !state.auth?.authenticated) {
-      return "blocked";
-    }
-    if (stats.active.length) {
-      return "active";
-    }
-    return stats.completed.length ? "done" : "ready";
-  }
-  if (stepKey === "telegram" || stepKey === "approval") {
-    if (stats.active.length) {
-      return "pending";
-    }
-    return stats.completed.length ? "watch" : "pending";
-  }
-  if (stepKey === "trello") {
-    return stats.completed.length ? "ready" : "pending";
-  }
-  return "pending";
-}
-
-function trelloSourceIsReady(module = {}) {
-  if (!state.trello?.credentials_saved) {
-    return false;
-  }
-  const settings = module.settings || {};
-  const card = settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "";
-  const list = settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "";
-  const board = settings.trelloBoard || state.automation.trelloBoardId || state.trello?.board_id || "";
-  return Boolean(card || (board && list));
-}
-
-function latestAutomationExecutionNode(module) {
-  const jobs = automationJobs()
-    .slice()
-    .sort((left, right) => new Date(right.updated_at || right.created_at || 0).getTime() - new Date(left.updated_at || left.created_at || 0).getTime());
-  for (const job of jobs) {
-    if (!ACTIVE_STATUSES.has(job.status) && job.status !== "completed") {
-      continue;
-    }
-    const execution = job.result?.automation_execution;
-    const nodes = Array.isArray(execution?.nodes) ? execution.nodes : [];
-    const matched = nodes.find((node) => node.id === module.id) || nodes.find((node) => node.type === module.type);
-    if (matched) {
-      const nodeStatus = String(matched.status || "").toLowerCase();
-      if (nodeStatus === "running" && !ACTIVE_STATUSES.has(job.status)) {
-        continue;
-      }
-      return matched;
-    }
-  }
-  return null;
-}
-
-function automationNodeStatusLabel(status) {
-  const labels = {
-    active: "Đang chạy",
-    blocked: "Cần thiết lập",
-    disabled: "Đang tắt",
-    done: "Xong",
-    pending: "Chưa chạy",
-    ready: "Sẵn sàng",
-    watch: "Chờ duyệt",
-  };
-  return labels[status] || "Chưa chạy";
-}
-
-function renderAutomationNodes(stats) {
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  if (elements.breakRoute) {
-    elements.breakRoute.hidden = true;
-  }
-  if (!elements.scenarioNodeRow) {
-    return;
-  }
-  elements.scenarioNodeRow.innerHTML = state.automation.modules
-    .map((module, index) => {
-      const typeConfig = moduleTypeConfig(module.type);
-      const iconClass = typeConfig.iconClass || "node-icon-custom";
-      const status = automationStepTone(module, stats);
-      const active = state.automation.selectedStep === module.id ? " active" : "";
-      const disabled = module.enabled === false ? " module-disabled" : "";
-      const link = index > 0 ? `<span class="scenario-link" aria-hidden="true"></span>` : "";
-      return `
-        ${link}
-        <button type="button" class="scenario-node${active}${disabled}" data-scenario-step="${escapeHtml(module.id)}" data-status="${escapeHtml(status)}" aria-pressed="${state.automation.selectedStep === module.id ? "true" : "false"}" draggable="true" title="Bấm để chỉnh, kéo để đổi vị trí">
-          <span class="node-order">${index + 1}</span>
-          <span class="node-icon ${escapeHtml(iconClass)}">${escapeHtml(module.icon || typeConfig.icon)}</span>
-          <strong>${escapeHtml(module.title || typeConfig.title)}</strong>
-          <small>${escapeHtml(module.detail || typeConfig.detail)}</small>
-          <span class="node-state">${escapeHtml(automationNodeStatusLabel(status))}</span>
-        </button>
-      `;
-    })
-    .join("");
-}
-
-function renderAutomationInspector(stats) {
-  const selected = state.automation.selectedStep || "flow";
-  const selectedConfig = automationStepConfig(selected);
-  const selectedType = selectedConfig.type || "custom";
-  const typeDefaults = moduleTypeConfig(selectedType);
-  if (document.activeElement !== elements.automationStepNameInput) {
-    elements.automationStepNameInput.value = selectedConfig.title || "";
-  }
-  if (document.activeElement !== elements.automationStepDetailInput) {
-    elements.automationStepDetailInput.value = selectedConfig.detail || "";
-  }
-  if (elements.automationModuleTypeInput && document.activeElement !== elements.automationModuleTypeInput) {
-    elements.automationModuleTypeInput.value = selectedType;
-  }
-  if (elements.automationStepIconInput && document.activeElement !== elements.automationStepIconInput) {
-    elements.automationStepIconInput.value = selectedConfig.icon || typeDefaults.icon || "";
-  }
-  if (elements.automationModuleEnabledInput && document.activeElement !== elements.automationModuleEnabledInput) {
-    elements.automationModuleEnabledInput.checked = selectedConfig.enabled !== false;
-  }
-  if (elements.automationModuleStatus) {
-    elements.automationModuleStatus.textContent = `${typeDefaults.label}${selectedConfig.enabled === false ? " tắt" : ""}`;
-    elements.automationModuleStatus.dataset.state = selectedConfig.enabled === false ? "pending" : "ready";
-  }
-  if (elements.automationPromptSourceSection) {
-    elements.automationPromptSourceSection.hidden = selectedType !== "source";
-  }
-  if (elements.automationTrelloSection) {
-    elements.automationTrelloSection.hidden = selectedType !== "trello";
-  }
-  if (elements.automationAppIntegrationsSection) {
-    elements.automationAppIntegrationsSection.hidden = !["telegram", "flow"].includes(selectedType);
-  }
-  renderModuleSettings(selectedConfig);
-  if (document.activeElement !== elements.automationTelegramInput) {
-    elements.automationTelegramInput.value = state.automation.telegramChat || state.integrations?.telegram?.chat_id || "";
-  }
-  if (document.activeElement !== elements.automationSheetInput) {
-    if (elements.automationSheetInput) {
-      elements.automationSheetInput.value = state.automation.sheetLog || "";
-    }
-  }
-  const boardValue = state.automation.trelloBoardId || state.trello?.board_id || "";
-  if (document.activeElement !== elements.automationTrelloBoardInput && elements.automationTrelloBoardInput) {
-    elements.automationTrelloBoardInput.value = boardValue;
-  }
-  if (document.activeElement !== elements.automationTrelloBoardStorageInput && elements.automationTrelloBoardStorageInput) {
-    elements.automationTrelloBoardStorageInput.value = boardValue;
-  }
-  if (document.activeElement !== elements.automationTrelloCardInput) {
-    elements.automationTrelloCardInput.value = state.automation.trelloCardId || state.trello?.card_id || "";
-  }
-  if (document.activeElement !== elements.automationTrelloListInput) {
-    elements.automationTrelloListInput.value = state.automation.trelloListId || state.trello?.list_id || "";
-  }
-  if (document.activeElement !== elements.automationTrelloUploadMode) {
-    elements.automationTrelloUploadMode.value = state.trello?.upload_mode || "file";
-  }
-  if (elements.automationTrelloUpscale2KInput && document.activeElement !== elements.automationTrelloUpscale2KInput) {
-    elements.automationTrelloUpscale2KInput.checked = state.trello?.upscale_to_2k !== false;
-  }
-  if (elements.automationGeminiModelInput && document.activeElement !== elements.automationGeminiModelInput) {
-    elements.automationGeminiModelInput.value = state.integrations?.gemini?.model || "gemini-2.5-flash";
-  }
-  if (elements.automationPlaywrightPathInput && document.activeElement !== elements.automationPlaywrightPathInput) {
-    elements.automationPlaywrightPathInput.value = state.integrations?.runtime?.playwright_browsers_path || "";
-  }
-  if (document.activeElement !== elements.automationPromptInput) {
-    elements.automationPromptInput.value = state.automation.prompt || "";
-  }
-  if (document.activeElement !== elements.automationSourceType) {
-    elements.automationSourceType.value = state.automation.sourceType || FLOW_AI_SOURCE_TYPE;
-  }
-  if (document.activeElement !== elements.automationSourceLocationInput) {
-    elements.automationSourceLocationInput.value = state.automation.sourceLocation || "";
-  }
-  if (elements.automationProductFilterInput && document.activeElement !== elements.automationProductFilterInput) {
-    elements.automationProductFilterInput.value = state.automation.promptProductFilter || "";
-  }
-  if (document.activeElement !== elements.automationAppEyebrowInput) {
-    elements.automationAppEyebrowInput.value = state.automation.appEyebrow || "Flow v2";
-  }
-  if (document.activeElement !== elements.automationAppTitleInput) {
-    elements.automationAppTitleInput.value = state.automation.appTitle || "Flow v2";
-  }
-  if (document.activeElement !== elements.automationAppSubtitleInput) {
-    elements.automationAppSubtitleInput.value =
-      state.automation.appSubtitle || "Mọi thứ đã sẵn sàng. Nhập prompt rồi bấm chạy, tab Google Flow sẽ được giữ mở.";
-  }
-  if (document.activeElement !== elements.automationAccentInput) {
-    elements.automationAccentInput.value = normalizeHexColor(state.automation.accentColor, "#7c2ee6");
-  }
-
-  elements.automationImageTotalCount.textContent = String(stats.completed.length);
-  elements.automationActiveCount.textContent = String(stats.active.length);
-  elements.automationFailureCount.textContent = String(stats.failed.length);
-  elements.automationCompletedCount.textContent = String(stats.completed.length);
-  elements.automationTransferHint.textContent = modelLabelForMode("image", state.drafts.image.model || defaultModelForMode("image")) || "Flow";
-  elements.automationRunningStatus.textContent = stats.active.length ? `${stats.active.length} execution running` : "No execution";
-  elements.automationRunningStatus.dataset.state = stats.active.length ? "ready" : "pending";
-
-  if (elements.automationTrelloStatus) {
-    const envBased = state.trello?.credentials_source === "env";
-    if (state.trello?.configured) {
-      elements.automationTrelloStatus.textContent = envBased
-        ? "Đã sẵn sàng (.env.local)"
-        : "Đã sẵn sàng";
-      elements.automationTrelloStatus.dataset.state = "ready";
-    } else if (state.trello?.credentials_saved) {
-      elements.automationTrelloStatus.textContent = envBased
-        ? "Thiếu board/card/list (key/token từ .env.local)"
-        : "Thiếu board/card/list";
-      elements.automationTrelloStatus.dataset.state = "pending";
-    } else if (state.trello?.board_id || state.trello?.card_id || state.trello?.list_id) {
-      elements.automationTrelloStatus.textContent = "Thiếu key/token";
-      elements.automationTrelloStatus.dataset.state = "pending";
-    } else {
-      elements.automationTrelloStatus.textContent = "Chưa lưu";
-      elements.automationTrelloStatus.dataset.state = "pending";
-    }
-  }
-
-  if (elements.automationEnvStatus) {
-    const configuredCount = [
-      state.integrations?.gemini?.configured,
-      state.integrations?.telegram?.configured,
-      state.integrations?.runtime?.playwright_browsers_path_set,
-    ].filter(Boolean).length;
-    if (configuredCount >= 2) {
-      elements.automationEnvStatus.textContent = `${configuredCount}/3 đã lưu`;
-      elements.automationEnvStatus.dataset.state = "ready";
-    } else if (configuredCount === 1) {
-      elements.automationEnvStatus.textContent = "1/3 đã lưu";
-      elements.automationEnvStatus.dataset.state = "pending";
-    } else {
-      elements.automationEnvStatus.textContent = "Chưa lưu";
-      elements.automationEnvStatus.dataset.state = "pending";
-    }
-  }
-  renderPromptSourcePreview();
-}
-
-function renderModuleSettings(module) {
-  if (!elements.automationModuleSettings) {
-    return;
-  }
-  const type = module.type || "custom";
-  const settings = module.settings || {};
-  if (type === "source") {
-    const rawSourceType = settings.sourceType || state.automation.sourceType || FLOW_AI_SOURCE_TYPE;
-    const sourceType = rawSourceType === "ai" ? FLOW_AI_SOURCE_TYPE : rawSourceType;
-    elements.automationModuleSettings.innerHTML = `
-      <label class="field">
-        <span>Nguồn của cục này</span>
-        <select data-module-setting="sourceType">
-          <option value="flow_ai"${sourceType === FLOW_AI_SOURCE_TYPE ? " selected" : ""}>Tác nhân Flow tự viết prompt</option>
-          <option value="manual"${sourceType === "manual" ? " selected" : ""}>Nhập tay / clipboard</option>
-          <option value="trello"${sourceType === "trello" ? " selected" : ""}>Trello list</option>
-          <option value="sheets"${sourceType === "sheets" ? " selected" : ""}>Google Sheets / Excel</option>
-          <option value="folder"${sourceType === "folder" ? " selected" : ""}>Folder / CSV nội bộ</option>
-        </select>
-      </label>
-      <label class="field">
-        <span>Sheet / CSV link tùy chọn</span>
-        <input type="text" data-module-setting="sourceLocation" value="${escapeHtml(settings.sourceLocation || state.automation.sourceLocation || "")}" placeholder="Chỉ dán nếu muốn dùng prompt có sẵn" />
-      </label>
-      <label class="field">
-        <span>Lọc sản phẩm</span>
-        <input type="text" data-module-setting="promptProductFilter" value="${escapeHtml(settings.promptProductFilter || state.automation.promptProductFilter || "")}" placeholder="Ví dụ: tote_bag, áo, wedding_hoop" />
-      </label>
-      <div class="customize-actions source-actions">
-        <button type="button" class="ghost-button card-button" data-module-action="preview-source">Lấy prompt tùy chọn</button>
-        <button type="button" class="ghost-button card-button" data-module-action="upload-source">Upload file</button>
-      </div>
-    `;
-    return;
-  }
-  if (type === "flow") {
-    const imageModel = settings.imageModel || state.drafts.image.model;
-    const imageAspect = settings.imageAspect || state.drafts.image.aspect;
-    const imageCount = flowModuleImageCount(settings, state.drafts.image.count || MODE_CONFIG.image.defaultCount);
-    const flowAgentEnabled = flowAgentEnabledFromSettings(settings);
-    const imageCountMax = flowAgentEnabled ? FLOW_AGENT_TARGET_OUTPUT_COUNT : 4;
-    const flowAgentAutoApprove = settings.flowAgentAutoApprove !== false;
-    elements.automationModuleSettings.innerHTML = `
-      <label class="field">
-        <span>Model ảnh Flow</span>
-        <select data-module-setting="imageModel">
-          ${state.modelOptions.image.map((item) => `<option value="${escapeHtml(item.value)}"${imageModel === item.value ? " selected" : ""}>${escapeHtml(item.label)}</option>`).join("")}
-        </select>
-      </label>
-      <div class="detail-grid sidebar-detail-grid">
-        <label class="field">
-          <span>Tỷ lệ ảnh</span>
-          <select data-module-setting="imageAspect">
-            <option value="square"${imageAspect === "square" ? " selected" : ""}>Vuông 1:1</option>
-            <option value="landscape"${imageAspect === "landscape" ? " selected" : ""}>Ngang 16:9</option>
-            <option value="portrait"${imageAspect === "portrait" ? " selected" : ""}>Dọc 9:16</option>
-          </select>
-        </label>
-        <label class="field">
-          <span>Số ảnh</span>
-          <input type="number" min="1" max="${imageCountMax}" step="1" data-module-setting="imageCount" value="${escapeHtml(imageCount)}" />
-        </label>
-      </div>
-      <label class="inline-check module-check">
-        <input type="checkbox" data-module-setting="flowAgentEnabled"${flowAgentEnabled ? " checked" : ""} />
-        <span>Dùng nút Tác nhân trong Google Flow khi có thể</span>
-      </label>
-      <label class="inline-check module-check">
-        <input type="checkbox" data-module-setting="flowAgentAutoApprove"${flowAgentAutoApprove ? " checked" : ""} />
-        <span>Tự phê duyệt Tác nhân Flow khi Flow hỏi xác nhận</span>
-      </label>
-    `;
-    return;
-  }
-  if (type === "trello_source") {
-    elements.automationModuleSettings.innerHTML = `
-      <label class="field">
-        <span>Board chứa card ảnh</span>
-        <input type="text" data-module-setting="trelloBoard" value="${escapeHtml(settings.trelloBoard || state.automation.trelloBoardId || state.trello?.board_id || "")}" placeholder="Board ID hoặc link board Trello" />
-      </label>
-      <label class="field">
-        <span>Card lấy ảnh gốc</span>
-        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello chứa ảnh gốc" />
-      </label>
-      <label class="field">
-        <span>List lọc card tùy chọn</span>
-        <input type="text" data-module-setting="trelloList" value="${escapeHtml(settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu chỉ muốn lấy card trong một list" />
-      </label>
-      <label class="field">
-        <span>Ảnh Trello đã chọn</span>
-        <input type="text" data-module-setting="trelloAttachmentIds" value="${escapeHtml(
-          Array.isArray(settings.trelloAttachmentIds)
-            ? settings.trelloAttachmentIds.join(", ")
-            : Array.isArray(state.automation.trelloAttachmentIds)
-              ? state.automation.trelloAttachmentIds.join(", ")
-              : "",
-        )}" placeholder="Attachment ID, bấm thumbnail trong trợ lý để tự điền" />
-      </label>
-      <label class="field">
-        <span>Số ảnh lấy tối đa</span>
-        <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 1)}" />
-      </label>
-      <small>Bấm đúng thumbnail trong trợ lý để khóa chính xác attachment ảnh. Nếu không chọn ảnh cụ thể, app sẽ lấy ảnh đầu tiên trong card.</small>
-    `;
-    return;
-  }
-  if (type === "telegram") {
-    elements.automationModuleSettings.innerHTML = `
-      <label class="field">
-        <span>Chat duyệt của cục này</span>
-        <input type="text" data-module-setting="telegramChat" value="${escapeHtml(settings.telegramChat || state.automation.telegramChat || state.integrations?.telegram?.chat_id || "")}" placeholder="@review_channel hoặc chat id" />
-      </label>
-      <label class="field">
-        <span>Bot token tuỳ chọn</span>
-        <input type="password" data-module-secret="telegramToken" placeholder="${state.integrations?.telegram?.bot_token_saved ? "Đã lưu token, nhập mới nếu muốn đổi" : "Dán token bot Telegram"}" />
-      </label>
-      <div class="customize-actions source-actions">
-        <button type="button" class="ghost-button card-button" data-module-action="save-integrations">Lưu Telegram</button>
-        <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ duyệt</button>
-      </div>
-    `;
-    return;
-  }
-  if (type === "trello") {
-    elements.automationModuleSettings.innerHTML = `
-      <label class="field">
-        <span>Card lưu ảnh</span>
-        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello" />
-      </label>
-      <label class="field">
-        <span>List tạo card mới</span>
-        <input type="text" data-module-setting="trelloList" value="${escapeHtml(settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu muốn mỗi job tạo card mới" />
-      </label>
-      <label class="field">
-        <span>Cách lưu ảnh</span>
-        <select data-module-setting="trelloUploadMode">
-          <option value="file"${(settings.trelloUploadMode || state.trello?.upload_mode || "file") === "file" ? " selected" : ""}>Upload file thật</option>
-          <option value="url"${(settings.trelloUploadMode || state.trello?.upload_mode) === "url" ? " selected" : ""}>Chỉ attach link</option>
-        </select>
-      </label>
-      <div class="customize-actions source-actions">
-        <button type="button" class="ghost-button card-button" data-module-action="save-trello">Lưu Trello</button>
-        <button type="button" class="ghost-button card-button" data-module-action="clear-trello">Xóa key/token</button>
-      </div>
-    `;
-    return;
-  }
-  if (type === "approval") {
-    elements.automationModuleSettings.innerHTML = `
-      <label class="field">
-        <span>Trạng thái duyệt</span>
-        <select data-module-setting="approvalMode">
-          <option value="trello"${(settings.approvalMode || "trello") === "trello" ? " selected" : ""}>Duyệt trực tiếp trên Trello</option>
-          <option value="manual"${settings.approvalMode === "manual" ? " selected" : ""}>Duyệt tay</option>
-          <option value="telegram"${settings.approvalMode === "telegram" ? " selected" : ""}>Duyệt bằng nút Telegram</option>
-          <option value="auto"${settings.approvalMode === "auto" ? " selected" : ""}>Tự ghi log sau khi tạo</option>
-        </select>
-      </label>
-      <small>Auto Trello sẽ upload ảnh tạo xong về đúng card đang chạy. Telegram chỉ dùng khi chủ nhân chọn riêng.</small>
-      <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ Telegram nếu dùng</button>
-    `;
-    return;
-  }
-  elements.automationModuleSettings.innerHTML = `
-    <label class="field">
-      <span>Ghi chú riêng của cục custom</span>
-      <textarea rows="3" data-module-setting="customNote" placeholder="Ghi lại cục này dùng để làm gì">${escapeHtml(settings.customNote || "")}</textarea>
-    </label>
-    <label class="field">
-      <span>Webhook/API URL</span>
-      <input type="url" data-module-setting="customWebhookUrl" value="${escapeHtml(settings.customWebhookUrl || "")}" placeholder="https://example.com/webhook" />
-    </label>
-    <div class="detail-grid sidebar-detail-grid">
-      <label class="field">
-        <span>Method</span>
-        <select data-module-setting="customWebhookMethod">
-          ${["POST", "PUT", "PATCH", "GET", "DELETE"].map((method) => `<option value="${method}"${(settings.customWebhookMethod || "POST") === method ? " selected" : ""}>${method}</option>`).join("")}
-        </select>
-      </label>
-      <label class="field">
-        <span>Timeout giây</span>
-        <input type="number" min="3" max="120" step="1" data-module-setting="customWebhookTimeout" value="${escapeHtml(settings.customWebhookTimeout || 20)}" />
-      </label>
-    </div>
-    <label class="field">
-      <span>Headers JSON hoặc từng dòng Key: Value</span>
-      <textarea rows="3" data-module-setting="customWebhookHeaders" placeholder='{"Authorization":"Bearer ..."}'>${escapeHtml(settings.customWebhookHeaders || "")}</textarea>
-    </label>
-    <label class="field">
-      <span>Body template</span>
-      <textarea rows="6" data-module-setting="customWebhookBody" placeholder='Để trống để app tự gửi job/prompt/artifacts. Có thể dùng {{job_id}}, {{prompt}}, {{first_artifact_url}}, {{artifacts}}.'>${escapeHtml(settings.customWebhookBody || "")}</textarea>
-    </label>
-    <small>Cục custom sẽ chạy thật nếu có URL. Dữ liệu ảnh/prompt/job tự được gắn vào payload.</small>
-  `;
-}
-
-function renderPromptSourcePreview() {
-  const preview = state.promptSourcePreview;
-  if (elements.automationSheetStatus) {
-    if (state.automation.sourceType !== "sheets") {
-      elements.automationSheetStatus.textContent = "Flow AI";
-      elements.automationSheetStatus.dataset.state = "ready";
-    } else if (preview?.prompt_count) {
-      elements.automationSheetStatus.textContent = `${preview.active_count || preview.prompt_count} prompt`;
-      elements.automationSheetStatus.dataset.state = "ready";
-    } else if (state.automation.prompt?.trim()) {
-      elements.automationSheetStatus.textContent = "Đã có prompt";
-      elements.automationSheetStatus.dataset.state = "ready";
-    } else {
-      elements.automationSheetStatus.textContent = "Chưa lấy";
-      elements.automationSheetStatus.dataset.state = "pending";
-    }
-  }
-  if (!elements.automationSheetPreviewList) {
-    return;
-  }
-  const items = preview?.preview || [];
-  if (!items.length) {
-    elements.automationSheetPreviewList.innerHTML =
-      state.automation.sourceType === "sheets"
-        ? `<p class="empty-automation-history">Dán link, upload file hoặc paste bảng rồi bấm lấy prompt.</p>`
-        : `<p class="empty-automation-history">Đang dùng Tác nhân Flow: app chỉ chọn ảnh Trello và gửi lệnh, prompt ảnh cuối do Google Flow tự viết.</p>`;
-    return;
-  }
-  const totalActive = Number(preview?.active_count || items.length || 0);
-  const extraCount = Math.max(0, totalActive - items.length);
-  elements.automationSheetPreviewList.innerHTML = items
-    .map((item) => {
-      const label = [item.product, item.index ? `#${item.index}` : "", item.notes].filter(Boolean).join(" · ");
-      return `
-        <article class="automation-history-item">
-          <strong>${escapeHtml(label || `Row ${item.row}`)}</strong>
-          <small>${escapeHtml(item.prompt)}</small>
-        </article>
-      `;
-    })
-    .join("") + (extraCount ? `<p class="empty-automation-history">Còn ${extraCount} prompt active nữa sẽ được chạy trong vòng lặp.</p>` : "");
-}
-
-function renderAutomationHistory(stats) {
-  const items = automationJobs()
-    .slice()
-    .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime())
-    .slice(0, 5);
-
-  if (!items.length) {
-    elements.automationHistory.className = "automation-history empty-automation-history";
-    elements.automationHistory.textContent = "Chưa có lượt chạy ảnh nào.";
+  const recent = jobs.slice(0, 20);
+  if (!recent.length) {
+    els.jobsList.innerHTML = `<div class="empty">Chưa có job.</div>`;
     return;
   }
 
-  elements.automationHistory.className = "automation-history";
-  elements.automationHistory.innerHTML = items
+  els.jobsList.innerHTML = recent
     .map((job) => {
-      const prompt = truncate(job.input?.prompt || "", 96) || "Không có prompt";
+      const title = text(job.title || job.input?.title || job.type, "Untitled");
+      const status = text(job.status, "unknown");
+      const count = Array.isArray(job.artifacts) ? job.artifacts.length : 0;
+      const canQueueEtsy = jobCanQueueEtsy(job);
       return `
-        <article class="automation-history-item">
-          <div>
-            <strong>${escapeHtml(job.title || "Flow image")}</strong>
-            <small>${escapeHtml(formatTime(job.created_at))} · ${escapeHtml(statusLabel(job.status))}</small>
+        <article class="job-card">
+          <div class="job-main">
+            <strong title="${escapeHtml(job.error || job.progress_snapshot?.detail || "")}">${escapeHtml(title)}</strong>
+            <small>${escapeHtml(job.id || "")}</small>
           </div>
-          <p>${escapeHtml(prompt)}</p>
-        </article>
-      `;
-    })
-    .join("");
-}
-
-function automationPanelItem(job) {
-  const prompt = truncate(job.input?.prompt || "", 132) || "Không có prompt";
-  const status = statusLabel(job.status);
-  const model = modelLabelForMode("image", job.input?.model || defaultModelForMode("image")) || "Flow";
-  return `
-    <article class="scenario-table-row">
-      <div>
-        <strong>${escapeHtml(job.title || "Flow image")}</strong>
-        <small>${escapeHtml(formatTime(job.created_at))} · ${escapeHtml(status)} · ${escapeHtml(model)}</small>
-      </div>
-      <p>${escapeHtml(prompt)}</p>
-    </article>
-  `;
-}
-
-function renderAutomationViewPanels(stats) {
-  const selectedView = state.automation.view || "diagram";
-  for (const button of elements.automationViewButtons) {
-    button.classList.toggle("active", button.dataset.automationView === selectedView);
-  }
-
-  elements.scenarioCanvas.hidden = selectedView !== "diagram";
-  if (elements.automationEasyPanel) {
-    elements.automationEasyPanel.hidden = selectedView !== "diagram";
-  }
-  elements.scenarioHistoryPanel.hidden = selectedView !== "history";
-  elements.scenarioIncompletePanel.hidden = selectedView !== "incomplete";
-
-  const command = document.querySelector(".automation-command");
-  const usage = document.querySelector(".scenario-usage");
-  if (command) {
-    command.hidden = selectedView !== "diagram";
-  }
-  if (usage) {
-    usage.hidden = selectedView !== "diagram";
-  }
-
-  const allJobs = automationJobs()
-    .slice()
-    .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime());
-  const incomplete = allJobs.filter((job) => job.status === "failed" || job.status === "interrupted");
-
-  elements.automationHistoryPanelList.innerHTML = allJobs.length
-    ? allJobs.slice(0, 16).map(automationPanelItem).join("")
-    : `<div class="scenario-panel-empty">Chưa có lượt chạy ảnh nào.</div>`;
-  elements.automationIncompletePanelList.innerHTML = incomplete.length
-    ? incomplete.slice(0, 16).map(automationPanelItem).join("")
-    : `<div class="scenario-panel-empty">Không có execution nào cần xử lý.</div>`;
-}
-
-function activePromptSourceItems({ limit = 40, ignoreFilter = false } = {}) {
-  if (state.automation.sourceType !== "sheets") {
-    return [];
-  }
-  const items = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
-  const filter = ignoreFilter ? "" : String(state.automation.promptProductFilter || "").trim();
-  const normalizedItems = items
-    .filter((item) => item?.active !== false && String(item?.prompt || "").trim())
-    .filter((item) => item?.used !== true)
-    .filter((item) => {
-      if (!filter) {
-        return true;
-      }
-      const haystackValues = [
-        item.product,
-        item.product_key,
-        item.product_name,
-        item.notes,
-      ];
-      return productFilterMatches(haystackValues, filter);
-    })
-    .map((item) => ({
-      row: Number(item.row || 0),
-      active: true,
-      used: false,
-      prompt: String(item.prompt || "").trim(),
-      product: String(item.product || "").trim(),
-      product_key: String(item.product_key || "").trim(),
-      product_name: String(item.product_name || "").trim(),
-      index: String(item.index || "").trim(),
-      notes: String(item.notes || "").trim(),
-      trello_card_id: String(item.trello_card_id || "").trim(),
-      trello_list_id: String(item.trello_list_id || "").trim(),
-    }));
-  return Number.isFinite(limit) ? normalizedItems.slice(0, Math.max(1, limit)) : normalizedItems;
-}
-
-function normalizeMatchText(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "");
-}
-
-function matchTokens(value) {
-  return String(value || "")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase()
-    .match(/[a-z0-9]+/g) || [];
-}
-
-function productFilterGroups(filter) {
-  const tokens = matchTokens(filter).filter((token) => token.length > 1);
-  const groups = tokens.length ? [tokens] : [];
-  const tokenSet = new Set(tokens);
-  const compact = normalizeMatchText(filter);
-  const wantsShirt = tokenSet.has("ao") || tokenSet.has("shirt") || tokenSet.has("tshirt") || tokenSet.has("tee");
-  const wantsChild =
-    ["tre", "em", "kid", "kids", "baby", "child", "children", "youth", "toddler"].some((token) => tokenSet.has(token)) ||
-    compact.includes("treem");
-  if (wantsShirt && !wantsChild) {
-    groups.push(["shirt"], ["tshirt"], ["tee"]);
-  }
-  if (wantsShirt && wantsChild) {
-    groups.push(
-      ["shirt", "kids"],
-      ["shirt", "kid"],
-      ["shirt", "baby"],
-      ["shirt", "child"],
-      ["shirt", "children"],
-      ["shirt", "youth"],
-      ["shirt", "toddler"],
-      ["tshirt", "kids"],
-      ["tshirt", "baby"],
-      ["tee", "kids"],
-      ["tee", "baby"],
-    );
-  }
-  const seen = new Set();
-  return groups.filter((group) => {
-    const key = group.join("|");
-    if (!group.length || seen.has(key)) {
-      return false;
-    }
-    seen.add(key);
-    return true;
-  });
-}
-
-function productFilterMatches(values, filter) {
-  const query = normalizeMatchText(filter);
-  if (!query) {
-    return true;
-  }
-  const haystack = values.map((value) => String(value || "")).join(" ");
-  const haystackCompact = normalizeMatchText(haystack);
-  if (query && haystackCompact && (haystackCompact.includes(query) || query.includes(haystackCompact))) {
-    return true;
-  }
-  const tokenSet = new Set(matchTokens(haystack));
-  return productFilterGroups(filter).some((group) => group.length && group.every((token) => tokenSet.has(token)));
-}
-
-function shouldAutoDiscoverTrello(batchItems = activePromptSourceItems({ limit: 500 })) {
-  if (!automationModuleEnabled("trello_source")) {
-    return false;
-  }
-  const board = String(state.automation.trelloBoardId || state.trello?.board_id || "").trim();
-  const sourceType = String(state.automation.sourceType || FLOW_AI_SOURCE_TYPE);
-  const hasPrompt = Boolean(String(state.automation.prompt || "").trim());
-  return Boolean(
-    board &&
-      (
-        sourceType === FLOW_AI_SOURCE_TYPE ||
-        sourceType === "sheets" ||
-        sourceType === "trello" ||
-        batchItems.length ||
-        !hasPrompt
-      )
-  );
-}
-
-function effectiveAutomationBatchLimit({ autoTrello = false } = {}) {
-  return automationModuleEnabled("trello_source") && !autoTrello ? 1 : (autoTrello ? 0 : 40);
-}
-
-function renderEasyPanel(stats) {
-  const batchItems = activePromptSourceItems();
-  const autoTrelloReady = shouldAutoDiscoverTrello(batchItems);
-  const continuousAutoJob = activeContinuousAutoTrelloJob();
-  const batchLimit = effectiveAutomationBatchLimit({ autoTrello: autoTrelloReady });
-  const displayedBatchCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : batchItems.length;
-  const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0 || autoTrelloReady;
-  const projectReady = Boolean(state.config?.project_id);
-  const flowModuleReady = automationModuleEnabled("flow");
-  const flowReady = flowModuleReady && projectReady && Boolean(state.auth?.authenticated);
-  const trelloReady = automationModuleEnabled("trello") && Boolean(
-    state.trello?.configured ||
-    state.automation.trelloBoardId ||
-    state.automation.trelloCardId ||
-    state.automation.trelloListId
-  );
-
-  if (elements.easyPromptStatus) {
-    elements.easyPromptStatus.textContent = autoTrelloReady && !batchItems.length
-      ? "Tác nhân Flow viết prompt"
-      : batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Nhập yêu cầu hoặc Auto Trello";
-  }
-  if (elements.easyFlowStatus) {
-    elements.easyFlowStatus.textContent = flowReady ? "Đã sẵn sàng" : !flowModuleReady ? "Thiếu cục Flow" : projectReady ? "Cần đăng nhập" : "Cần project";
-  }
-  if (elements.easyReviewStatus) {
-    elements.easyReviewStatus.textContent = trelloReady ? "Duyệt trên Trello" : "Cần Trello";
-  }
-  const runHint = elements.easyRunButton?.querySelector("small");
-  if (runHint) {
-    runHint.textContent = stats.active.length
-      ? "Đang tạo ảnh"
-      : autoTrelloReady && flowReady
-        ? `Chạy đến hết ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}`
-      : batchItems.length > 1 && flowReady
-        ? batchLimit === 1
-          ? "Chạy 1 prompt/card Trello"
-          : "Chạy vòng lặp sheet"
-        : promptReady && flowReady ? "Sẵn sàng chạy" : "Bấm để chạy";
-  }
-  if (elements.automationRunImageButton) {
-    elements.automationRunImageButton.textContent = autoTrelloReady
-      ? (displayedBatchCount ? `Auto ${displayedBatchCount} prompt` : `Auto hết ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}`)
-      : batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
-  }
-  if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.textContent = continuousAutoJob ? "Dừng auto" : "Bật auto liên tục";
-    elements.automationAutoRunButton.disabled = !continuousAutoJob && (stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello"));
-  }
-  if (elements.automationResetReadyButton) {
-    const blockingActiveJobs = stats.active.filter((job) => job.id !== continuousAutoJob?.id);
-    elements.automationResetReadyButton.disabled = blockingActiveJobs.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
-  }
-  if (elements.automationRunButton) {
-    elements.automationRunButton.textContent = autoTrelloReady ? "Chạy 1 lượt" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
-  }
-  elements.easyPromptButton?.classList.toggle("ready", promptReady);
-  elements.easyFlowButton?.classList.toggle("ready", flowReady);
-  elements.easyReviewButton?.classList.toggle("ready", trelloReady);
-  elements.easyRunButton?.classList.toggle("ready", promptReady && flowReady && !stats.active.length);
-  if (elements.easyRunButton) {
-    elements.easyRunButton.disabled = stats.active.length > 0;
-  }
-}
-
-function renderAutomationDashboard() {
-  if (!elements.scenarioCanvas) {
-    return;
-  }
-  const jobs = automationJobs();
-  const stats = {
-    active: jobs.filter((job) => ACTIVE_STATUSES.has(job.status)),
-    completed: jobs.filter((job) => job.status === "completed"),
-    failed: jobs.filter((job) => job.status === "failed" || job.status === "interrupted"),
-  };
-  renderAutomationNodes(stats);
-  renderAutomationCanvasControls();
-  renderAutomationInspector(stats);
-  renderAutomationHistory(stats);
-  renderAutomationViewPanels(stats);
-  renderEasyPanel(stats);
-}
-
-function renderComposer() {
-  const config = currentOperationConfig();
-  const videoInput = state.mode === "video" ? currentVideoInputConfig() : null;
-  elements.composerTitle.textContent = config.title;
-  elements.composerHint.textContent = videoInput?.hint || config.hint;
-  elements.promptLabel.textContent = config.promptLabel;
-  elements.promptInput.placeholder = videoInput?.placeholder || config.placeholder || "";
-  elements.submitButton.textContent = config.submitLabel;
-  elements.videoInputModeStrip.hidden = state.mode !== "video";
-  elements.videoInputModeNote.hidden = state.mode !== "video";
-  elements.startImageWrap.hidden = !(state.mode === "video" && config.showStartImage && currentVideoInputMode() === "start");
-  elements.imageReferenceWrap.hidden = !(state.mode === "image" || (state.mode === "video" && currentVideoInputMode() === "reference"));
-  elements.readyHint.textContent = isReady()
-    ? `${videoInput?.readyText || config.readyText} Tab Google Flow sẽ được giữ mở sau khi gửi.`
-    : "Lưu project và đăng nhập một lần rồi bấm chạy.";
-  elements.promptLabel.parentElement.hidden = Boolean(state.mode === "edit" && !config.showPrompt);
-
-  for (const button of elements.modeButtons) {
-    button.classList.toggle("active", button.dataset.mode === state.mode);
-  }
-  for (const button of elements.videoInputModeButtons) {
-    button.classList.toggle("active", button.dataset.videoInputMode === currentVideoInputMode());
-  }
-  elements.videoInputModeNote.textContent = videoInput?.note || "";
-
-  applyDraftToForm();
-  renderAspectChoices();
-  renderCountChoices();
-  renderEditControls();
-  renderComposerSummary();
-  renderUploadStatus();
-  renderImageReferenceStatus();
-  if (currentModeConfig().showPromptAi) {
-    renderPromptAssistant();
-  }
-  renderStoryboardCard();
-}
-
-function renderComposerSummary() {
-  if (state.mode === "edit") {
-    const source = selectedEditSource();
-    const action = currentEditConfig();
-    elements.composerSummaryMode.textContent = action.title;
-    if (source) {
-      elements.composerSummaryText.textContent = `Đang dùng ${source.title} làm nguồn để ${action.title.toLowerCase()}.`;
-    } else if (state.manualMediaId && state.manualWorkflowId) {
-      elements.composerSummaryText.textContent = "Đang dùng Media ID và Workflow ID nhập tay cho thao tác chỉnh video này.";
-    } else {
-      elements.composerSummaryText.textContent = "Chọn video cần chỉnh rồi bấm chạy.";
-    }
-    renderComposerPolicyNotice();
-    return;
-  }
-
-  if (state.mode === "image") {
-    const modelLabel = modelLabelForMode("image", currentDraft().model);
-    if (state.imageReferenceItems.length) {
-      const baseItem = state.imageReferenceItems.find((item) => item.role === "base") || state.imageReferenceItems[0];
-      const logoCount = state.imageReferenceItems.filter((item) => item.role === "logo").length;
-      const productCount = state.imageReferenceItems.filter((item) => item.role === "product").length;
-      elements.composerSummaryMode.textContent = "Chỉnh ảnh từ ảnh tham chiếu";
-      elements.composerSummaryText.textContent = `Đang dùng ${fileKindLabel(state.imageReferenceItems.length)} để ghép hoặc chỉnh bằng model ${modelLabel}. Ảnh chính là ${baseItem?.name || "ảnh đầu tiên"}${logoCount ? `, có thêm ${logoCount} logo` : ""}${productCount ? `, ${productCount} ảnh sản phẩm` : ""}.`;
-      renderComposerPolicyNotice();
-      return;
-    }
-    elements.composerSummaryMode.textContent = "Ảnh từ prompt";
-    elements.composerSummaryText.textContent = `App sẽ tạo ảnh trực tiếp từ mô tả vừa nhập bằng model ${modelLabel}.`;
-    renderComposerPolicyNotice();
-    return;
-  }
-
-  const videoModelLabel = modelLabelForMode("video", currentDraft().model);
-  if (currentVideoInputMode() === "reference") {
-    if (!state.imageReferenceItems.length) {
-      elements.composerSummaryMode.textContent = "Sản phẩm -> người mẫu -> video";
-      elements.composerSummaryText.textContent = `Thêm ít nhất 1 ảnh sản phẩm, logo hoặc ảnh tham chiếu. App sẽ tự dựng khung đầu rồi tạo video bằng model ${videoModelLabel}.`;
-      renderComposerPolicyNotice();
-      return;
-    }
-    const productCount = state.imageReferenceItems.filter((item) => normalizeReferenceRole(item.role) === "product").length;
-    const logoCount = state.imageReferenceItems.filter((item) => normalizeReferenceRole(item.role) === "logo").length;
-    elements.composerSummaryMode.textContent = "Sản phẩm -> người mẫu -> video";
-    elements.composerSummaryText.textContent = `App sẽ tự dựng một ảnh khung đầu từ ${fileKindLabel(state.imageReferenceItems.length)} rồi tạo video luôn bằng model ${videoModelLabel}.${productCount ? ` Có ${productCount} ảnh sản phẩm` : ""}${logoCount ? ` và ${logoCount} logo` : ""}.`;
-    renderComposerPolicyNotice();
-    return;
-  }
-  if (currentVideoInputMode() === "start") {
-    if (!state.startImagePath) {
-      elements.composerSummaryMode.textContent = "Video từ ảnh";
-      elements.composerSummaryText.textContent = `Chọn một ảnh đầu vào để app animate từ khung đầu tiên bằng model ${videoModelLabel}.`;
-      renderComposerPolicyNotice();
-      return;
-    }
-    elements.composerSummaryMode.textContent = "Video từ ảnh";
-    elements.composerSummaryText.textContent = `Đang dùng ${state.startImageName || "ảnh đầu vào"} làm khung đầu tiên bằng model ${videoModelLabel}.`;
-    renderComposerPolicyNotice();
-    return;
-  }
-
-  elements.composerSummaryMode.textContent = "Video từ prompt";
-  elements.composerSummaryText.textContent = `Không có ảnh đầu vào. App sẽ tạo video trực tiếp từ mô tả vừa nhập bằng model ${videoModelLabel}.`;
-  renderComposerPolicyNotice();
-}
-
-function renderComposerPolicyNotice() {
-  const notice = currentComposerPolicyNotice();
-  if (!notice) {
-    elements.composerPolicyNotice.hidden = true;
-    elements.composerPolicyNotice.dataset.tone = "";
-    elements.composerPolicyPill.textContent = "";
-    elements.composerPolicyTitle.textContent = "";
-    elements.composerPolicyText.textContent = "";
-    elements.composerPolicyList.innerHTML = "";
-    return;
-  }
-  elements.composerPolicyNotice.hidden = false;
-  elements.composerPolicyNotice.dataset.tone = notice.tone || "watch";
-  elements.composerPolicyPill.textContent = notice.pill || "Gợi ý an toàn";
-  elements.composerPolicyTitle.textContent = notice.title || "";
-  elements.composerPolicyText.textContent = notice.text || "";
-  elements.composerPolicyList.innerHTML = (notice.tips || [])
-    .map((tip) => `<li>${escapeHtml(tip)}</li>`)
-    .join("");
-}
-
-function renderUploadStatus() {
-  if (state.mode !== "video" || currentVideoInputMode() !== "start") {
-    return;
-  }
-  const hasImage = Boolean(state.startImagePath);
-  elements.startImagePreview.hidden = !hasImage;
-  if (hasImage) {
-    elements.startImagePreviewImage.src = state.startImagePublicUrl || uploadPublicUrlFromPath(state.startImagePath);
-    elements.startImagePreviewName.textContent = state.startImageName || "Ảnh đầu vào";
-    elements.startImagePreviewHint.textContent = "Video sẽ bám theo ảnh này khi render trên Google Flow.";
-  } else {
-    elements.startImagePreviewImage.removeAttribute("src");
-    elements.startImagePreviewName.textContent = "Ảnh đầu vào";
-    elements.startImagePreviewHint.textContent = "Video sẽ bám theo ảnh này khi render.";
-  }
-  if (state.uploading) {
-    elements.startImageStatus.textContent = "Đang tải ảnh đầu vào...";
-    return;
-  }
-  if (hasImage) {
-    elements.startImageStatus.textContent = `Đã gắn ${state.startImageName || "ảnh đầu vào"}. App sẽ tạo video từ ảnh này.`;
-    return;
-  }
-  elements.startImageStatus.textContent = "Chưa có ảnh đầu vào. Hãy chọn một ảnh để app animate từ khung đầu này.";
-}
-
-function availableVideoSources() {
-  const shelfItems = (state.outputShelf?.items || []).filter((item) => {
-    const mimeType = String(item.mime_type || "");
-    return mimeType.startsWith("video/") || item.job_type === "video" || EDIT_JOB_TYPES.has(item.job_type);
-  });
-
-  const deduped = [];
-  const seen = new Set();
-  for (const item of shelfItems) {
-    const mediaId = String(item.media_id || "").trim();
-    const workflowId = String(item.workflow_id || "").trim();
-    if (!mediaId || !workflowId) {
-      continue;
-    }
-    const key = `${mediaId}::${workflowId}`;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    deduped.push({
-      key,
-      mediaId,
-      workflowId,
-      label: `${item.job_title || item.title || "Video"} · ${formatTime(item.created_at)}`,
-      title: item.title || item.job_title || "Video gần đây",
-      previewUrl: item.preview_url || item.local_file_url || item.source_url || "",
-      prompt: String(item.prompt || "").trim(),
-      createdAt: item.created_at || "",
-      mimeType: item.mime_type || "",
-    });
-  }
-  return deduped;
-}
-
-function selectedEditSource() {
-  const items = availableVideoSources();
-  return items.find((item) => item.key === state.selectedEditSourceKey) || null;
-}
-
-function renderEditControls() {
-  const isEdit = state.mode === "edit";
-  elements.editActionStrip.hidden = !isEdit;
-  elements.editActionSummary.hidden = !isEdit;
-  elements.editSourceWrap.hidden = !isEdit;
-  elements.generationOptionsWrap.hidden = isEdit;
-  elements.promptAiCard.hidden = !currentModeConfig().showPromptAi;
-
-  if (!isEdit) {
-    elements.editOptionsWrap.hidden = true;
-    return;
-  }
-
-  for (const button of elements.editActionButtons) {
-    button.classList.toggle("active", button.dataset.editAction === state.editAction);
-  }
-
-  const action = currentEditConfig();
-  elements.editActionSummaryTitle.textContent = action.title;
-  elements.editActionSummaryText.textContent = action.hint;
-
-  const sources = availableVideoSources();
-  const options = ['<option value="">Chọn một video</option>']
-    .concat(
-      sources.map(
-        (item) => `<option value="${escapeHtml(item.key)}">${escapeHtml(item.label)}</option>`
-      )
-    )
-    .join("");
-  elements.editSourceSelect.innerHTML = options;
-  if (!state.selectedEditSourceKey && !state.manualMediaId && !state.manualWorkflowId && sources[0]) {
-    state.selectedEditSourceKey = sources[0].key;
-  }
-  if (!sources.some((item) => item.key === state.selectedEditSourceKey)) {
-    state.selectedEditSourceKey = "";
-  }
-
-  elements.editSourceCards.innerHTML = sources.length
-    ? sources
-        .map((item) => {
-          const active = item.key === state.selectedEditSourceKey;
-          const prompt = truncate(item.prompt || "", 88) || "Không có prompt lưu cùng video này.";
-          const mediaPreview = String(item.previewUrl || "").trim();
-          return `
-            <button
-              type="button"
-              class="source-card${active ? " active" : ""}"
-              data-action="pick-edit-source"
-              data-key="${escapeHtml(item.key)}"
-            >
-              ${
-                mediaPreview
-                  ? mediaPreview.includes(".mp4") || String(item.mimeType || "").startsWith("video/")
-                    ? `<video class="source-card-media" src="${escapeHtml(mediaPreview)}" muted playsinline preload="metadata"></video>`
-                    : `<img class="source-card-media" src="${escapeHtml(mediaPreview)}" alt="${escapeHtml(item.title)}" />`
-                  : `<div class="source-card-placeholder">Không có preview</div>`
-              }
-              <div class="source-card-copy">
-                <strong>${escapeHtml(item.title)}</strong>
-                <small>${escapeHtml(formatTime(item.createdAt))}</small>
-                <p>${escapeHtml(prompt)}</p>
-              </div>
-            </button>
-          `;
-        })
-        .join("")
-    : `<div class="empty-inline-card">Chưa có video gần đây để chọn. Khi chưa thấy nguồn ở đây, có thể mở phần nhập tay bên dưới.</div>`;
-
-  applyEditInputsToForm();
-
-  const hasOptions = action.showMotion || action.showPosition || action.showResolution;
-  elements.editOptionsWrap.hidden = !hasOptions;
-  elements.motionField.hidden = !action.showMotion;
-  elements.positionField.hidden = !action.showPosition;
-  elements.resolutionField.hidden = !action.showResolution;
-}
-
-function renderImageReferenceStatus() {
-  if (state.mode !== "image" && !(state.mode === "video" && currentVideoInputMode() === "reference")) {
-    return;
-  }
-
-  const isVideo = state.mode === "video";
-  elements.imageReferenceTitle.textContent = isVideo
-    ? "Ảnh sản phẩm hoặc ảnh tham chiếu"
-    : "Ảnh tham chiếu để ghép hoặc chỉnh";
-  elements.imageReferenceDescription.textContent = isVideo
-    ? "Ví dụ: đưa ảnh áo hoặc sản phẩm vào đây. App sẽ tự dựng một ảnh người mẫu/keyframe trước, rồi dùng chính ảnh đó để tạo video luôn."
-    : "Ví dụ: một ảnh người mẫu và một ảnh logo áo. Sau đó viết yêu cầu như “ghép logo này lên áo của người mẫu”.";
-  elements.imageReferenceFieldLabel.textContent = isVideo
-    ? "Chọn 1 đến 4 ảnh sản phẩm hoặc ảnh tham chiếu"
-    : "Chọn 1 đến 4 ảnh tham chiếu";
-
-  const items = state.imageReferenceItems || [];
-  if (state.uploading && !items.length) {
-    elements.videoReferenceHero.hidden = true;
-    elements.imageReferenceList.hidden = true;
-    elements.imageReferenceList.innerHTML = "";
-    elements.imageReferenceStatus.textContent = isVideo ? "Đang tải ảnh sản phẩm/tham chiếu..." : "Đang tải ảnh tham chiếu...";
-    return;
-  }
-  if (!items.length) {
-    elements.videoReferenceHero.hidden = true;
-    elements.videoReferenceHeroImage.removeAttribute("src");
-    elements.videoReferenceHeroTitle.textContent = "Chưa có ảnh chính";
-    elements.videoReferenceHeroText.textContent = "App sẽ ưu tiên ảnh này để dựng người mẫu hoặc keyframe trước khi tạo video.";
-    elements.imageReferenceList.hidden = true;
-    elements.imageReferenceList.innerHTML = "";
-    elements.imageReferenceStatus.textContent = isVideo
-      ? "Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ tự dựng khung đầu rồi tạo video luôn."
-      : "Chưa có ảnh tham chiếu. Nếu thêm ảnh ở đây, app sẽ dùng chúng để ghép/chỉnh ảnh.";
-    return;
-  }
-
-  elements.imageReferenceList.hidden = false;
-  const primaryItem = isVideo
-    ? items.find((item) => normalizeReferenceRole(item.role) === "product") || items[0]
-    : items.find((item) => normalizeReferenceRole(item.role) === "base") || items[0];
-  elements.videoReferenceHero.hidden = !isVideo;
-  if (isVideo && primaryItem) {
-    elements.videoReferenceHeroImage.src = primaryItem.publicUrl || uploadPublicUrlFromPath(primaryItem.path);
-    elements.videoReferenceHeroTitle.textContent = primaryItem.name || "Ảnh sản phẩm chính";
-    elements.videoReferenceHeroText.textContent = "App sẽ ưu tiên ảnh này để dựng người mẫu hoặc keyframe đầu tiên trước khi tạo video.";
-  }
-  elements.imageReferenceList.innerHTML = items
-    .map((item, index) => {
-      const source = item.publicUrl || uploadPublicUrlFromPath(item.path);
-      const role = normalizeReferenceRoleForMode(item.role || (index === 0 ? primaryReferenceRoleForMode(state.mode) : "reference"), state.mode, index);
-      const roleOptions = referenceRoleOptionsForMode(state.mode).map(
-        (option) => `<option value="${escapeHtml(option.value)}"${option.value === role ? " selected" : ""}>${escapeHtml(option.label)}</option>`
-      ).join("");
-      const isPrimary = isVideo ? role === "product" : role === "base";
-      return `
-        <article class="upload-preview reference-card${isPrimary ? " is-primary" : ""}">
-          <img class="upload-preview-image" src="${escapeHtml(source)}" alt="${escapeHtml(item.name || "Ảnh tham chiếu")}" />
-          <div class="upload-preview-copy">
-            <strong>${escapeHtml(item.name || "Ảnh tham chiếu")}</strong>
-            <p>${escapeHtml(referenceRoleDetail(role))}</p>
-            <div class="reference-card-actions">
-              <span class="reference-role-pill">${escapeHtml(referenceRoleLabel(role))}</span>
-              ${
-                isVideo && !isPrimary
-                  ? `<button type="button" class="ghost-button card-button" data-action="promote-reference-image" data-index="${index}">Ưu tiên ảnh này</button>`
-                  : ""
-              }
-            </div>
-            <label class="field inline-role-field">
-              <span>Vai trò</span>
-              <select data-action="reference-role" data-index="${index}">
-                ${roleOptions}
-              </select>
-            </label>
-          </div>
-          <button type="button" class="ghost-button card-button" data-action="remove-reference-image" data-index="${index}">Bỏ ảnh</button>
-        </article>
-      `;
-    })
-    .join("");
-  elements.imageReferenceStatus.textContent = isVideo
-    ? `Đã gắn ${fileKindLabel(items.length)}. App sẽ dùng ${primaryItem?.name || "ảnh đầu tiên"} làm sản phẩm hoặc ảnh chính để dựng khung đầu, rồi mới tạo video.`
-    : `Đã gắn ${fileKindLabel(items.length)}. Ảnh chính hiện là ${primaryItem?.name || "ảnh đầu tiên"}, các ảnh còn lại sẽ được dùng theo vai trò đã chọn.`;
-}
-
-function renderPromptAiResult() {
-  const result = currentPromptAiResult();
-  if (!result?.prompt) {
-    elements.promptAiResult.hidden = true;
-    elements.promptAiResultSummary.textContent = "";
-    elements.promptAiResultText.textContent = "";
-    elements.promptAiSkillChips.hidden = true;
-    elements.promptAiSkillChips.innerHTML = "";
-    return;
-  }
-
-  elements.promptAiResult.hidden = false;
-  elements.promptAiResultTitle.textContent = result.title || (state.mode === "video" ? "Prompt video" : "Prompt ảnh");
-  elements.promptAiResultSummary.textContent = result.summary || "AI đã viết prompt xong.";
-  elements.promptAiResultText.textContent = result.prompt || "";
-
-  const skills = Array.isArray(result.applied_skills) ? result.applied_skills.filter(Boolean) : [];
-  if (skills.length) {
-    elements.promptAiSkillChips.hidden = false;
-    elements.promptAiSkillChips.innerHTML = skills
-      .slice(0, 6)
-      .map((skill) => `<span class="skill-chip">${escapeHtml(skill)}</span>`)
-      .join("");
-  } else {
-    elements.promptAiSkillChips.hidden = true;
-    elements.promptAiSkillChips.innerHTML = "";
-  }
-}
-
-function renderPromptAssistant() {
-  const config = currentModeConfig();
-  const assistant = state.promptAssistant || {};
-  elements.promptAiBriefLabel.textContent = config.promptAiLabel || "Bạn muốn tạo gì?";
-  elements.promptAiBrief.placeholder = config.promptAiPlaceholder || "Mô tả ý muốn ở đây.";
-
-  const skillCount = Number(assistant.skill_count || 0);
-  const ready = Boolean(assistant.ready) && skillCount > 0;
-  const engineLabel = assistant.engine_label || "Nội bộ";
-
-  elements.promptAiBadge.textContent = ready ? engineLabel : "Đang nạp skill";
-  elements.promptAiBadge.dataset.state = ready ? "ready" : "pending";
-  elements.promptAiSummary.textContent =
-    assistant.headline ||
-    "Công cụ gợi ý lệnh đang sẵn sàng nếu chủ nhân muốn chỉnh tay.";
-  elements.promptAiHint.textContent = ready
-    ? (assistant.summary || `Đã nạp ${skillCount} skill để gợi ý prompt.`)
-    : "Kho skill viết prompt đang được chuẩn bị. Bạn vẫn có thể thử bấm viết prompt.";
-
-  applyPromptAiDraftToForm();
-  renderPromptAiResult();
-}
-
-function userAssistantContextSummary() {
-  const config = state.config || {};
-  const trello = state.trello || defaultTrelloState();
-  const integrations = state.integrations || defaultIntegrationState();
-  const promptItems = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
-  const promptRows = promptItems.length;
-  const activeRows = activePromptSourceItems({ limit: 500 }).length;
-  const sampleProducts = promptItems
-    .map((item) => item.product_key || item.product_name || item.product || item.notes)
-    .filter(Boolean)
-    .slice(0, 5)
-    .join(", ");
-  const enabledModules = normalizeAutomationModules(state.automation)
-    .filter((module) => module.enabled !== false)
-    .map((module) => module.type)
-    .join(" -> ");
-  const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
-  const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
-  return [
-    `Quy trình chuẩn: Trello ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt và tạo 12 ảnh trong một job -> upload lại đúng card Trello để duyệt trực tiếp`,
-    `Nguồn sản phẩm: ảnh attachment trên từng Trello card trong list ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}`,
-    `Màn hình đang ở chế độ ${state.mode}`,
-    `Module bật: ${enabledModules || "chưa có"}`,
-    `Nguồn prompt ${state.automation.sourceType || "flow_ai"} tại ${state.automation.sourceLocation || "Tác nhân Flow tự viết, Sheet tùy chọn"}`,
-    `Bộ lọc sản phẩm ${state.automation.promptProductFilter || "chưa lọc"}`,
-    `Sản phẩm/prompt mẫu ${sampleProducts || "chưa preview"}`,
-    `Flow project ${config.project_id ? "đã lưu" : "chưa lưu"}`,
-    `đăng nhập ${state.auth?.authenticated ? "đã có" : "chưa thấy"}`,
-    `Trello ${trello.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
-    `Telegram ${integrations.telegram?.configured ? "đã cấu hình tùy chọn" : "không bắt buộc"}`,
-    `Gemini ${integrations.gemini?.configured ? "đã bật" : "chưa bật"}`,
-    `prompt preview ${promptRows} dòng, ${activeRows} dòng active sau lọc`,
-    `${activeJobs} job đang chạy`,
-    `${failedJobs} job lỗi`,
-  ].join("; ");
-}
-
-function renderUserAssistant() {
-  if (!elements.userAssistantEngine || !elements.userAssistantAnswer) {
-    return;
-  }
-  const last = state.userAssistant?.last || null;
-  const gemini = state.integrations?.gemini || {};
-  const engineLabel = last?.engine_label || (gemini.configured ? "Gemini" : "Nội bộ");
-  const modelLabel = last?.model ? ` · ${last.model}` : "";
-  elements.userAssistantEngine.textContent = `${engineLabel}${modelLabel}`;
-  elements.userAssistantEngine.dataset.state = gemini.configured || last?.engine === "gemini" ? "ready" : "pending";
-  if (elements.userAssistantAskButton) {
-    elements.userAssistantAskButton.disabled = Boolean(state.userAssistant?.busy);
-    elements.userAssistantAskButton.textContent = state.userAssistant?.busy ? "Đang hỏi..." : "Hỏi AI";
-  }
-
-  if (!last?.answer) {
-    elements.userAssistantAnswer.textContent =
-      "Hỏi lỗi Trello, Sheet hoặc Flow tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.";
-    return;
-  }
-
-  const paragraphs = String(last.answer || "")
-    .split(/\n{2,}/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-    .map((line) => `<p>${escapeHtml(line)}</p>`)
-    .join("");
-  const actions = Array.isArray(last.suggested_actions) ? last.suggested_actions.filter(Boolean) : [];
-  const executableActions = actions.filter((action) => action.action);
-  const trelloCandidates = Array.isArray(last.trello_candidates) ? last.trello_candidates.filter(Boolean) : [];
-  const flowPlan = last.flow_operator_plan && typeof last.flow_operator_plan === "object" ? last.flow_operator_plan : null;
-  const selectedAttachmentCount = Array.isArray(state.automation?.trelloAttachmentIds)
-    ? state.automation.trelloAttachmentIds.filter(Boolean).length
-    : 0;
-  const hasRunAction = executableActions.some((action) => action.action === "run_auto_trello");
-  const canRunSelectedTrelloImage = Boolean(trelloCandidates.length && state.automation?.trelloCardId && selectedAttachmentCount);
-  const planButtonLabel = state.userAssistant?.executing
-    ? "Đang làm..."
-    : canRunSelectedTrelloImage
-      ? "Chạy ảnh đã chọn"
-      : hasRunAction
-        ? "Làm theo kế hoạch"
-        : trelloCandidates.length
-          ? "Bấm thumbnail ảnh trước"
-          : "Làm theo kế hoạch";
-  const planButton = executableActions.length
-    ? `<button type="button" class="secondary-button assistant-plan-button" data-assistant-action-plan ${
-        state.userAssistant?.executing ? "disabled" : ""
-      }>${planButtonLabel}</button>`
-    : "";
-  const flowPlanSteps = Array.isArray(flowPlan?.steps) ? flowPlan.steps.filter(Boolean).slice(0, 5) : [];
-  const flowPlanHtml = flowPlan
-    ? `<div class="assistant-flow-plan">
-        <div class="assistant-flow-plan-head">
-          <strong>${escapeHtml(flowPlan.title || "Flow AI Operator")}</strong>
-          <span>${escapeHtml(flowPlan.summary || "AI đã lập kế hoạch thao tác Flow.")}</span>
-        </div>
-        ${
-          flowPlanSteps.length
-            ? `<div class="assistant-flow-steps">${flowPlanSteps
-                .map(
-                  (step) => `<div class="assistant-flow-step">
-                    <strong>${escapeHtml(step.label || "Bước automation")}</strong>
-                    <span>${escapeHtml(step.detail || "")}</span>
-                    <em>${escapeHtml(step.status || "sẵn sàng")}</em>
-                  </div>`,
-                )
-                .join("")}</div>`
-            : ""
-        }
-        <div class="assistant-flow-prompt">Prompt ảnh cuối sẽ do Tác nhân Flow tự viết bên trong Google Flow.</div>
-      </div>`
-    : "";
-  const candidateHtml = trelloCandidates.length
-    ? `<div class="assistant-candidate-list">
-        <strong>Card Trello tìm được</strong>
-        ${trelloCandidates
-          .map((candidate) => {
-            const inReady = Boolean(candidate.in_ready_list);
-            const status = inReady ? `Đúng ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}` : "Có thể chọn trực tiếp";
-            const value = candidate.short_link || candidate.card_id || candidate.url || "";
-            const previews = Array.isArray(candidate.image_previews) ? candidate.image_previews.filter(Boolean).slice(0, 4) : [];
-            const firstAttachmentId = previews.map((preview) => String(preview?.id || "").trim()).find(Boolean) || "";
-            const previewHtml = previews.length
-              ? `<div class="assistant-candidate-thumbs" aria-label="Ảnh trong card Trello">
-                  ${previews
-                    .map((preview, index) => {
-                      const src = String(preview.preview_url || preview.url || "").trim();
-                      if (!src) return "";
-                      const label = preview.name || `Ảnh ${index + 1}`;
-                      return `<button type="button" class="assistant-candidate-thumb" data-assistant-card-value="${escapeHtml(
-                        value,
-                      )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" data-assistant-attachment-id="${escapeHtml(
-                        preview.id || "",
-                      )}" ${preview.id ? "data-assistant-run-after-select=\"true\"" : ""} ${
-                        state.userAssistant?.executing || !value ? "disabled" : ""
-                      } title="${escapeHtml(
-                        `Chọn và chạy ảnh này trong ${candidate.name || "card Trello"}`,
-                      )}">
-                        <img src="${escapeHtml(src)}" alt="${escapeHtml(label)}" loading="lazy">
-                      </button>`;
-                    })
-                    .join("")}
-                </div>`
-              : "";
-            const pinButton =
-              value
-                ? `<button type="button" class="ghost-button card-button assistant-candidate-pin" data-assistant-card-value="${escapeHtml(
-                    value,
-                  )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" data-assistant-attachment-id="${escapeHtml(
-                    firstAttachmentId,
-                  )}" ${firstAttachmentId ? "data-assistant-run-after-select=\"true\"" : ""} ${
-                    state.userAssistant?.executing ? "disabled" : ""
-                  }>${firstAttachmentId ? "Chọn & chạy" : "Chọn card"}</button>`
-                : "";
-            return `
-              <div class="assistant-candidate-item" data-ready="${inReady ? "true" : "false"}">
-                <div class="assistant-candidate-main">
-                  <strong>${escapeHtml(candidate.name || candidate.short_link || "Card Trello")}</strong>
-                  <span>${escapeHtml(candidate.list_name || "Không rõ list")} · ${Number(candidate.image_count || 0)} ảnh · ${status}</span>
-                  ${previewHtml ? `<span>Bấm đúng thumbnail để dùng chính ảnh đó làm ảnh gốc.</span>` : ""}
-                  ${previewHtml}
-                  ${
-                    candidate.url
-                      ? `<a href="${escapeHtml(candidate.url)}" target="_blank" rel="noreferrer">Mở card</a>`
-                      : ""
-                  }
-                </div>
-                ${pinButton}
-              </div>
-            `;
-          })
-          .join("")}
-      </div>`
-    : "";
-  const actionHtml = actions.length
-    ? `<div class="assistant-action-list">${actions
-        .map((action, index) => {
-          const canExecute = Boolean(action.action);
-          const buttonLabel = action.action === "set_trello_card" && action.payload?.run_after_select ? "Chọn & chạy" : "Thực hiện";
-          const button = canExecute
-            ? `<button type="button" class="ghost-button card-button assistant-action-button" data-assistant-action-index="${index}" ${
-                state.userAssistant?.executing ? "disabled" : ""
-              }>${buttonLabel}</button>`
-            : "";
-          return `
-            <div class="assistant-action-item">
-              <div>
-                <strong>${escapeHtml(action.label || "Việc cần làm")}</strong>
-                <span>${escapeHtml(action.detail || "")}</span>
-              </div>
-              ${button}
-            </div>
-          `;
-        })
-        .join("")}</div>`
-    : "";
-  elements.userAssistantAnswer.innerHTML = `${paragraphs}${flowPlanHtml}${candidateHtml}${planButton}${actionHtml}`;
-}
-
-function renderStoryboardResult() {
-  const plan = state.storyboardPlan;
-  const items = Array.isArray(plan?.items) ? plan.items : [];
-  if (!items.length) {
-    elements.storyboardResult.hidden = true;
-    elements.storyboardResultTitle.textContent = "Storyboard ảnh";
-    elements.storyboardResultMeta.textContent = "0 cảnh";
-    elements.storyboardResultSummary.textContent = "";
-    elements.storyboardSkillChips.hidden = true;
-    elements.storyboardSkillChips.innerHTML = "";
-    elements.storyboardSceneList.innerHTML = "";
-    return;
-  }
-
-  elements.storyboardResult.hidden = false;
-  elements.storyboardResultTitle.textContent = plan.title || "Storyboard ảnh";
-  elements.storyboardResultMeta.textContent = `${items.length} cảnh`;
-  elements.storyboardResultSummary.textContent =
-    plan.summary || `Đã tách ${items.length} cảnh storyboard từ kịch bản.`;
-
-  const skills = Array.isArray(plan.applied_skills) ? plan.applied_skills.filter(Boolean) : [];
-  if (skills.length) {
-    elements.storyboardSkillChips.hidden = false;
-    elements.storyboardSkillChips.innerHTML = skills
-      .slice(0, 6)
-      .map((skill) => `<span class="skill-chip">${escapeHtml(skill)}</span>`)
-      .join("");
-  } else {
-    elements.storyboardSkillChips.hidden = true;
-    elements.storyboardSkillChips.innerHTML = "";
-  }
-
-  elements.storyboardSceneList.innerHTML = items
-    .map((item) => {
-      const title = String(item.title || `Cảnh ${item.index || 1}`).trim();
-      const beat = String(item.beat || "").trim();
-      const continuity = String(item.continuity || "").trim();
-      const prompt = String(item.image_prompt || "").trim();
-      return `
-        <article class="storyboard-scene-card">
-          <div class="storyboard-scene-head">
-            <strong>${escapeHtml(title)}</strong>
-            <span class="mini-pill">Cảnh ${escapeHtml(String(item.index || 1))}</span>
-          </div>
-          ${beat ? `<p class="storyboard-scene-beat">${escapeHtml(beat)}</p>` : ""}
-          ${continuity ? `<p class="storyboard-scene-note">${escapeHtml(continuity)}</p>` : ""}
-          <div class="prompt-ai-text storyboard-scene-prompt">${escapeHtml(prompt)}</div>
-        </article>
-      `;
-    })
-    .join("");
-}
-
-function renderStoryboardCard() {
-  const visible = state.mode === "video";
-  elements.storyboardCard.hidden = !visible;
-  if (!visible) {
-    return;
-  }
-
-  applyStoryboardDraftToForm();
-  const busy = Boolean(state.storyboardBusy);
-  const ready = isReady();
-  elements.storyboardBadge.textContent = ready ? "Storyboard ảnh" : "Lên cảnh trước";
-  elements.storyboardBadge.dataset.state = ready ? "ready" : "pending";
-  elements.storyboardHint.textContent = ready
-    ? "Dán kịch bản, app sẽ tách cảnh rồi có thể tạo luôn các ảnh keyframe bằng luồng tạo ảnh hiện tại."
-    : "Có thể tách cảnh trước. Muốn tạo luôn ảnh storyboard thì cần lưu project và đăng nhập Google Flow.";
-  elements.storyboardPlanButton.disabled = busy;
-  elements.storyboardGenerateButton.disabled = busy;
-  renderStoryboardResult();
-}
-
-function jobsForCurrentMode() {
-  return (state.jobs || [])
-    .filter((job) => (state.mode === "edit" ? EDIT_JOB_TYPES.has(job.type) : job.type === state.mode))
-    .filter((job) => ACTIVE_STATUSES.has(job.status))
-    .sort((left, right) => new Date(right.created_at || 0).getTime() - new Date(left.created_at || 0).getTime());
-}
-
-function fillComposerFromSource(mode, payload = {}) {
-  const resolvedMode = MODE_CONFIG[mode] ? mode : modeForJobType(payload.type || mode);
-  if (!MODE_CONFIG[resolvedMode]) {
-    return;
-  }
-  syncDraftFromForm();
-  syncPromptAiDraftFromForm();
-  syncEditInputsFromForm();
-  state.mode = resolvedMode;
-  state.drafts[resolvedMode] = {
-    prompt: String(payload.prompt || "").trim(),
-    model: String(payload.model || defaultModelForMode(resolvedMode)).trim() || defaultModelForMode(resolvedMode),
-    aspect: String(payload.aspect || MODE_CONFIG[resolvedMode].defaultAspect).trim() || MODE_CONFIG[resolvedMode].defaultAspect,
-    count: Math.max(1, Math.min(4, Number(payload.count || MODE_CONFIG[resolvedMode].defaultCount))),
-  };
-  state.promptAiDrafts[resolvedMode] = {
-    ...state.promptAiDrafts[resolvedMode],
-    brief: String(payload.prompt || "").trim(),
-  };
-
-  if (resolvedMode === "video") {
-    state.startImagePath = String(payload.start_image_path || "").trim();
-    state.startImageName = basename(state.startImagePath);
-    state.startImagePublicUrl = uploadPublicUrlFromPath(state.startImagePath);
-    state.imageReferenceItems = ensurePrimaryReferenceRole(
-      (payload.reference_image_paths || [])
-      .map((path) => String(path || "").trim())
-      .filter(Boolean)
-      .map((path, index) => ({
-        path,
-        name: basename(path),
-        publicUrl: uploadPublicUrlFromPath(path),
-        role: normalizeReferenceRoleForMode(payload.reference_image_roles?.[index] || (index === 0 ? "product" : "reference"), "video", index),
-      })),
-      "video"
-    );
-    state.drafts.video.inputMode = state.startImagePath ? "start" : state.imageReferenceItems.length ? "reference" : "prompt";
-  } else if (resolvedMode === "image") {
-    state.startImagePath = "";
-    state.startImageName = "";
-    state.startImagePublicUrl = "";
-    state.imageReferenceItems = ensurePrimaryReferenceRole(
-      (payload.reference_image_paths || [])
-      .map((path) => String(path || "").trim())
-      .filter(Boolean)
-      .map((path, index) => ({
-        path,
-        name: basename(path),
-        publicUrl: uploadPublicUrlFromPath(path),
-        role: normalizeReferenceRoleForMode(payload.reference_image_roles?.[index] || (index === 0 ? "base" : "reference"), "image", index),
-      })),
-      "image"
-    );
-  } else {
-    state.startImagePath = "";
-    state.startImageName = "";
-    state.startImagePublicUrl = "";
-    state.imageReferenceItems = [];
-    state.editAction = EDIT_JOB_TYPES.has(payload.type) ? payload.type : state.editAction;
-    state.manualMediaId = String(payload.media_id || "").trim();
-    state.manualWorkflowId = String(payload.workflow_id || "").trim();
-    state.motion = String(payload.motion || state.motion || "truck_left").trim() || "truck_left";
-    state.position = String(payload.position || state.position || "center").trim() || "center";
-    state.resolution = String(payload.resolution || state.resolution || "1080p").trim() || "1080p";
-    const matchedKey = availableVideoSources().find(
-      (item) => item.mediaId === state.manualMediaId && item.workflowId === state.manualWorkflowId
-    )?.key;
-    state.selectedEditSourceKey = matchedKey || "";
-  }
-
-  renderAll();
-  window.scrollTo({ top: 0, behavior: "smooth" });
-  elements.promptInput.focus();
-}
-
-function describeJob(job) {
-  if (job.status === "failed" || job.status === "interrupted") {
-    return job.error || job.progress_snapshot?.detail || "Tác vụ chưa hoàn tất.";
-  }
-  if (job.type === "video" && job.status === "completed" && !(job.artifacts || []).length) {
-    return "Flow báo đã xong nhưng app chưa thấy clip video để hiển thị.";
-  }
-  return (
-    job.progress_snapshot?.detail ||
-    job.progress_hint?.detail ||
-    (job.logs || []).slice(-1)[0]?.message ||
-    "Đã gửi yêu cầu."
-  );
-}
-
-function jobProgressLabel(job) {
-  if (job.type === "video" && job.status === "completed" && !(job.artifacts || []).length) {
-    return "Chưa thấy clip";
-  }
-  return job.progress_snapshot?.stage_label || statusLabel(job.status);
-}
-
-function jobProgressTone(job) {
-  if (job.type === "video" && job.status === "completed" && !(job.artifacts || []).length) {
-    return "watch";
-  }
-  if (job.status === "completed") {
-    return "done";
-  }
-  if (job.status === "failed" || job.status === "interrupted") {
-    return "error";
-  }
-  return "active";
-}
-
-function jobDuration(job) {
-  const start = new Date(job.created_at || "").getTime();
-  const end = new Date((job.status === "completed" || job.status === "failed" || job.status === "interrupted") ? (job.updated_at || job.created_at || "") : Date.now()).getTime();
-  if (Number.isNaN(start) || Number.isNaN(end)) {
-    return "";
-  }
-  return formatDuration(Math.max(0, end - start));
-}
-
-function parseDateValue(value) {
-  if (!value) {
-    return null;
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return null;
-  }
-  return date;
-}
-
-function formatStepMoment(value) {
-  const date = parseDateValue(value);
-  if (!date) {
-    return "";
-  }
-  return new Intl.DateTimeFormat("vi-VN", {
-    hour: "2-digit",
-    minute: "2-digit",
-  }).format(date);
-}
-
-function formatStepDuration(startValue, endValue) {
-  const start = parseDateValue(startValue);
-  const end = parseDateValue(endValue);
-  if (!start || !end) {
-    return "";
-  }
-  return formatDuration(Math.max(0, end.getTime() - start.getTime()));
-}
-
-function isReferenceToVideoJob(job) {
-  return job?.type === "video" && !String(job?.input?.start_image_path || "").trim() && Array.isArray(job?.input?.reference_image_paths) && job.input.reference_image_paths.length > 0;
-}
-
-function jobJourneySteps(job) {
-  if (isReferenceToVideoJob(job)) {
-    return [
-      { key: "prepare_frame", label: "Dựng khung đầu" },
-      { key: "send_video", label: "Gửi video" },
-      { key: "wait_video", label: "Chờ clip" },
-      { key: "save", label: "Lưu" },
-      { key: "done", label: "Xong" },
-    ];
-  }
-  return [
-    { key: "connect", label: "Kết nối" },
-    { key: "send", label: "Gửi" },
-    { key: "wait", label: "Chờ" },
-    { key: "save", label: "Lưu" },
-    { key: "done", label: "Xong" },
-  ];
-}
-
-function jobJourneyCurrentKey(job) {
-  const stage = String(job?.progress_snapshot?.stage || "").trim();
-  const blockedStage = String(job?.progress_hint?.stage || "").trim() || stage;
-  const isAutoReference = isReferenceToVideoJob(job);
-  const hasAutoStartFrame = Boolean(String(job?.result?.auto_start_frame_path || "").trim() || String(job?.result?.auto_start_frame_public_url || "").trim());
-  const effectiveStage = job?.status === "failed" || job?.status === "interrupted" ? blockedStage : stage;
-
-  if (job?.status === "completed") {
-    return "done";
-  }
-
-  if (effectiveStage === "saving_artifacts") {
-    return "save";
-  }
-  if (effectiveStage === "awaiting_response" || effectiveStage === "polling") {
-    return isAutoReference ? "wait_video" : "wait";
-  }
-  if (effectiveStage === "sending_request") {
-    if (isAutoReference) {
-      return hasAutoStartFrame ? "send_video" : "prepare_frame";
-    }
-    return "send";
-  }
-  if (effectiveStage === "connecting" || effectiveStage === "queued") {
-    return isAutoReference ? "prepare_frame" : "connect";
-  }
-  return isAutoReference ? "prepare_frame" : "connect";
-}
-
-function renderJobJourney(job) {
-  const steps = jobJourneySteps(job);
-  const currentKey = jobJourneyCurrentKey(job);
-  const currentIndex = Math.max(0, steps.findIndex((step) => step.key === currentKey));
-  const isBlocked = job.status === "failed" || job.status === "interrupted";
-  const allDone = job.status === "completed";
-
-  return `
-    <div class="job-journey" aria-label="Tiến trình chi tiết">
-      ${steps
-        .map((step, index) => {
-          let tone = "pending";
-          if (allDone) {
-            tone = "done";
-          } else if (isBlocked) {
-            if (index < currentIndex) {
-              tone = "done";
-            } else if (index === currentIndex) {
-              tone = "blocked";
+          <div class="job-side">
+            <span class="tool-badge ${jobStatusTone(status)}">${escapeHtml(status)}${count ? ` · ${count}` : ""}</span>
+            ${
+              canQueueEtsy
+                ? `<button class="job-etsy-button" type="button" data-action="queue-etsy" data-job-id="${escapeHtml(job.id || "")}">Listing ảnh ${escapeHtml(listingMarketplaceName())}</button>`
+                : ""
             }
-          } else if (index < currentIndex) {
-            tone = "done";
-          } else if (index === currentIndex) {
-            tone = "current";
-          }
-
-          return `<span class="job-journey-step" data-tone="${escapeHtml(tone)}">${escapeHtml(step.label)}</span>`;
-        })
-        .join("")}
-    </div>
-  `;
+          </div>
+        </article>
+      `;
+    })
+    .join("");
 }
 
-function renderJobStepNotes(job) {
-  const notes = [];
-  const currentKey = jobJourneyCurrentKey(job);
-  const currentStep = jobJourneySteps(job).find((step) => step.key === currentKey);
-  const detail = describeJob(job);
-  const lastSignalAt = String(job?.progress_snapshot?.last_signal_at || job?.updated_at || "").trim();
-  const autoStartFrameAt = String(job?.result?.auto_start_frame_at || "").trim();
-  const autoStartFramePath = String(job?.result?.auto_start_frame_path || "").trim();
-
-  if (isReferenceToVideoJob(job) && autoStartFrameAt) {
-    const frameDuration = formatStepDuration(job.created_at, autoStartFrameAt);
-    notes.push({
-      title: "Dựng khung đầu",
-      meta: frameDuration ? `Xong sau ${frameDuration}` : formatStepMoment(autoStartFrameAt),
-      detail: autoStartFramePath
-        ? `Đã dựng xong ${basename(autoStartFramePath)} để dùng làm keyframe đầu tiên.`
-        : "App đã dựng xong ảnh khung đầu để dùng cho bước tạo video.",
-      tone: "done",
-    });
-  }
-
-  if (currentStep) {
-    const activePrefix =
-      job.status === "completed"
-        ? "Hoàn tất"
-        : job.status === "failed" || job.status === "interrupted"
-        ? "Dừng ở bước này"
-        : "Đang xử lý";
-    const activeDuration = job.status === "completed"
-      ? formatStepDuration(job.created_at, job.updated_at)
-      : formatStepDuration(lastSignalAt || job.created_at, new Date().toISOString());
-    notes.push({
-      title: currentStep.label,
-      meta: activeDuration ? `${activePrefix} · ${activeDuration}` : `${activePrefix}${formatStepMoment(lastSignalAt) ? ` · ${formatStepMoment(lastSignalAt)}` : ""}`,
-      detail,
-      tone: job.status === "failed" || job.status === "interrupted" ? "blocked" : job.status === "completed" ? "done" : "current",
-    });
-  }
-
-  const deduped = [];
-  const seen = new Set();
-  for (const note of notes) {
-    const key = `${note.title}::${note.detail}`;
-    if (seen.has(key)) {
-      continue;
-    }
-    seen.add(key);
-    deduped.push(note);
-  }
-
-  if (!deduped.length) {
-    return "";
-  }
-
-  return `
-    <div class="job-step-notes">
-      ${deduped
-        .map(
-          (note) => `
-            <article class="job-step-note" data-tone="${escapeHtml(note.tone)}">
-              <div class="job-step-note-head">
-                <strong>${escapeHtml(note.title)}</strong>
-                ${note.meta ? `<span>${escapeHtml(note.meta)}</span>` : ""}
-              </div>
-              <p>${escapeHtml(note.detail)}</p>
-            </article>
-          `
-        )
-        .join("")}
-    </div>
-  `;
+function jobCanQueueEtsy(job = {}) {
+  const input = job.input || {};
+  const artifacts = Array.isArray(job.artifacts) ? job.artifacts : [];
+  const cardId = text(input.trello_source_card_id || input.trello_card_id, "");
+  return job.type === "image" && job.status === "completed" && artifacts.length > 0 && Boolean(cardId);
 }
 
-function renderLatestStatus() {
-  const latestJob = jobsForCurrentMode()[0];
-  if (!latestJob) {
-    elements.latestStatusCard.className = "latest-status empty-state";
-    elements.latestStatusCard.textContent = "Chưa có lượt chạy nào. Sau khi bấm chạy, tab Google Flow sẽ được giữ mở.";
+function jobMatchesEtsyContext(job = {}, context = {}) {
+  if (!jobCanQueueEtsy(job)) return false;
+  const input = job.input || {};
+  const jobCard = text(input.trello_source_card_id || input.trello_card_id, "");
+  const jobList = text(input.trello_list_id, "");
+  const jobProduct = normalizeLookup(
+    [
+      input.prompt_product,
+      input.prompt_product_key,
+      input.title,
+      job.title,
+    ].filter(Boolean).join(" ")
+  );
+  const cardId = text(context.cardId, "");
+  const listId = text(context.listId, "");
+  const product = normalizeLookup(context.product || "");
+
+  if (cardId) return jobCard === cardId;
+  if (product) return jobProduct.includes(product);
+  if (context.allowListOnly && listId) return jobList === listId;
+  return false;
+}
+
+function latestQueueableEtsyJob(payload = state.payload) {
+  const jobs = Array.isArray(payload?.jobs) ? payload.jobs : [];
+  const queueable = jobs.filter((job) => jobCanQueueEtsy(job));
+  const source = selectedTrelloSource();
+  const sourceKey = selectedTrelloSourceKey();
+  const typedProduct = text(els.autoProduct?.value, "");
+  const sourceContext = {
+    sourceKey,
+    product: typedProduct || source.product || "",
+    cardId: source.cardId || "",
+    listId: source.listId || "",
+    allowListOnly: false,
+  };
+  const lastRun = state.lastFlowRun || {};
+
+  if (lastRun.jobId) {
+    const exactJob = queueable.find((job) => job.id === lastRun.jobId);
+    if (exactJob) return exactJob;
+  }
+
+  if (lastRun.sourceKey === sourceKey) {
+    const startedAt = Number(lastRun.startedAt || 0);
+    const minCreatedAt = startedAt ? startedAt - 60_000 : 0;
+    const runContext = {
+      product: lastRun.product || sourceContext.product,
+      cardId: lastRun.cardId || sourceContext.cardId,
+      listId: lastRun.listId || sourceContext.listId,
+      allowListOnly: true,
+    };
+    const fromCurrentRun = queueable.find((job) => {
+      const createdAt = Date.parse(job.created_at || job.updated_at || "");
+      return Number.isFinite(createdAt)
+        && createdAt >= minCreatedAt
+        && jobMatchesEtsyContext(job, runContext);
+    });
+    if (fromCurrentRun) return fromCurrentRun;
+  }
+
+  return queueable.find((job) => jobMatchesEtsyContext(job, sourceContext)) || null;
+}
+
+function renderEtsyListingAction(payload) {
+  if (!els.listLatestEtsyButton || !els.latestEtsyHint) return;
+  const marketplace = listingMarketplaceName();
+  setFirstText(".etsy-listing-main strong", `Listing ảnh ${marketplace}`);
+  const cardRefs = parseTrelloCardRefs(els.autoProduct?.value);
+  if (cardRefs.length) {
+    // A pasted card link bypasses column config entirely: draft exactly that/those card(s).
+    const trelloReady = Boolean(state.payload?.trello?.configured);
+    els.listLatestEtsyButton.disabled = !trelloReady;
+    els.latestEtsyHint.textContent = trelloReady
+      ? `Lấy ${cardRefs.length} card từ link Trello -> ${marketplace} Draft`
+      : `Cấu hình Trello trước khi gửi link card sang ${marketplace} Draft`;
     return;
   }
-
-  const prompt = truncate(latestJob.input?.prompt || "", 180) || "Không có mô tả.";
-  const note = describeJob(latestJob);
-  const duration = jobDuration(latestJob);
-  const sourceImagePath = String(latestJob.input?.start_image_path || "").trim();
-  const referenceImageCount = Array.isArray(latestJob.input?.reference_image_paths)
-    ? latestJob.input.reference_image_paths.length
-    : 0;
-  const autoStartFramePath = String(latestJob.result?.auto_start_frame_path || "").trim();
-  const autoStartFramePreview = String(latestJob.result?.auto_start_frame_public_url || "").trim()
-    || uploadPublicUrlFromPath(autoStartFramePath);
-  const autoStartFramePrompt = truncate(latestJob.result?.auto_start_frame_prompt || "", 150);
-  const sourceLabel = sourceImagePath
-    ? `Ảnh gốc: ${basename(sourceImagePath)}`
-    : latestJob.type === "video" && referenceImageCount
-    ? `Ảnh tham chiếu: ${referenceImageCount}`
-    : referenceImageCount
-    ? `Ảnh tham chiếu: ${referenceImageCount}`
-    : "";
-  const canRetry =
-    latestJob.status === "failed" ||
-    latestJob.status === "interrupted" ||
-    (latestJob.type === "video" && latestJob.status === "completed" && !(latestJob.artifacts || []).length);
-  const canReuse = Boolean(String(latestJob.input?.prompt || "").trim());
-  const canOpenFlow = Boolean(state.config?.project_id);
-
-  elements.latestStatusCard.className = "latest-status";
-  elements.latestStatusCard.innerHTML = `
-    <article class="status-summary-card">
-      <div class="run-head">
-        <div>
-          <strong>${escapeHtml(latestJob.title || currentOperationConfig().submitLabel)}</strong>
-          <small>${escapeHtml(formatTime(latestJob.created_at))}${duration ? ` · ${escapeHtml(duration)}` : ""}</small>
-        </div>
-        <span class="status-chip" data-status="${escapeHtml(jobProgressTone(latestJob))}">${escapeHtml(jobProgressLabel(latestJob))}</span>
-      </div>
-      ${renderJobJourney(latestJob)}
-      ${renderJobStepNotes(latestJob)}
-      ${
-        latestJob.type === "video" && autoStartFramePreview
-          ? `
-            <div class="status-start-frame">
-              <img class="status-start-frame-image" src="${escapeHtml(autoStartFramePreview)}" alt="Ảnh khung đầu tự dựng" />
-              <div class="status-start-frame-copy">
-                <span class="mini-pill">Khung đầu đã dựng</span>
-                <strong>${escapeHtml(basename(autoStartFramePath) || "Ảnh khung đầu tự dựng")}</strong>
-                <p>${escapeHtml(autoStartFramePrompt || "App sẽ dùng chính ảnh này làm keyframe đầu tiên trước khi render video.")}</p>
-              </div>
-            </div>
-          `
-          : ""
-      }
-      ${sourceLabel ? `<p class="run-source">${escapeHtml(sourceLabel)}</p>` : ""}
-      <p class="run-prompt">${escapeHtml(prompt)}</p>
-      <p class="run-note">${escapeHtml(note)}</p>
-      <p class="run-note flow-open-note">Tab Google Flow vẫn được giữ mở để bạn xem trực tiếp trên đó.</p>
-      <div class="card-actions">
-        ${
-          canOpenFlow
-            ? `<button type="button" class="ghost-button card-button" data-action="open-flow-project">Mở Flow</button>`
-            : ""
-        }
-        ${
-          canReuse
-            ? `<button type="button" class="ghost-button card-button" data-action="reuse-job" data-job-id="${escapeHtml(latestJob.id)}">Dùng lại prompt</button>`
-            : ""
-        }
-        ${
-          canRetry
-            ? `<button type="button" class="ghost-button card-button" data-action="retry-job" data-job-id="${escapeHtml(latestJob.id)}">Chạy lại</button>`
-            : ""
-        }
-      </div>
-    </article>
-  `;
+  if (boardColumnsLoaded && !document.querySelector("input[name='autoSource']:checked")) {
+    // A board's columns are loaded but none ticked yet — prompt for a selection.
+    els.listLatestEtsyButton.disabled = true;
+    els.latestEtsyHint.textContent = `Tick ít nhất 1 cột vừa load để gửi ${marketplace} Draft`;
+    return;
+  }
+  const sourceKeys = selectedTrelloSourceKeys();
+  const multiColumn = sourceKeys.length > 1;
+  const job = multiColumn ? null : latestQueueableEtsyJob(payload);
+  const source = selectedTrelloSource();
+  const product = text(els.autoProduct?.value || source.product, "");
+  // Whole-column drafting only needs a list id (always present for a picked column); a
+  // typed product/cardId also works. So the button stays clickable whenever a column is
+  // selected and Trello is configured.
+  const canCheckTrello = Boolean(
+    state.payload?.trello?.configured && (multiColumn || source.cardId || product || source.listId)
+  );
+  els.listLatestEtsyButton.disabled = !job && !canCheckTrello;
+  if (job) {
+    const title = text(job.title || job.input?.title || job.id, "job Flow đã xong");
+    const count = Array.isArray(job.artifacts) ? job.artifacts.length : 0;
+    const countLabel = count && !title.includes(`${count} ảnh`) ? ` · ${count} ảnh` : "";
+    els.latestEtsyHint.textContent = `${title}${countLabel} -> ${marketplace} Draft`;
+  } else if (multiColumn) {
+    const labels = sourceKeys.map((key) => TRELLO_SOURCE_OPTIONS[key]?.label || key).join(", ");
+    els.latestEtsyHint.textContent = `Kiểm ${sourceKeys.length} cột (${labels}); card nào có ảnh thì gửi ${marketplace} Draft`;
+  } else if (canCheckTrello) {
+    els.latestEtsyHint.textContent = `Kiểm Trello ${product || source.label}; nếu đã có ảnh thì gửi ${marketplace} Draft`;
+  } else {
+    els.latestEtsyHint.textContent = product
+      ? `Chưa có ảnh Flow xong cho ${product}`
+      : `Nhập SKU/tên sản phẩm hoặc chạy Flow trước khi gửi ${marketplace} Draft`;
+  }
 }
 
-function renderAll() {
-  renderTopbar();
-  renderAutomationDashboard();
-  renderUserAssistant();
-  renderComposer();
-  renderLatestStatus();
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
-async function loadState({ silent = false } = {}) {
+function renderState(payload) {
+  state.payload = payload || {};
+  hydrateFlowForm(state.payload.config || {});
+  hydrateIntegrationForm(state.payload.integrations || {});
+  hydrateEtsyForm(state.payload.etsy || {});
+  renderTopStatus(state.payload);
+  renderJobs(state.payload);
+  renderEtsyListingAction(state.payload);
+}
+
+async function refreshState({ quiet = false } = {}) {
   try {
     const payload = await api("/api/state");
-    state.config = payload.config || {};
-    state.auth = payload.auth || { authenticated: false };
-    state.jobs = (payload.jobs || []).filter((job) => job.type !== "login");
-    state.outputShelf = payload.output_shelf || { items: [] };
-    state.promptAssistant = payload.prompt_assistant || null;
-    state.integrations = normalizeIntegrationState(payload.integrations || {});
-    state.trello = normalizeTrelloState(payload.trello || {});
-    state.skillLibraryCount = Array.isArray(payload.skills) ? payload.skills.length : 0;
-
-    if (state.setupOpen == null) {
-      state.setupOpen = !isReady();
-    }
-
-    renderAll();
-    maybeAutoPreviewPromptSource();
-    maybeShowTrelloWizard();
-    if (isReady() && !state.modelOptionsLoaded) {
-      void loadModelOptions();
-    }
-    if (!silent) {
-      showMessage("");
-    }
+    renderState(payload);
+    if (!quiet) logLine("Đã refresh state.");
   } catch (error) {
-    showMessage(error.message, "error");
+    setBadge(els.healthPill, "Backend lỗi", "bad");
+    logLine(`Refresh lỗi: ${error.message}`);
   }
 }
 
-function maybeAutoPreviewPromptSource() {
-  if (promptSourceAutoPreviewStarted || state.promptSourcePreview?.prompt_count) {
-    return;
-  }
-  if (state.automation.sourceType !== "sheets" || !String(state.automation.sourceLocation || "").trim()) {
-    return;
-  }
-  promptSourceAutoPreviewStarted = true;
-  void previewPromptSource(null, { silent: true });
-}
-
-async function saveConfig(event) {
-  event.preventDefault();
-  const projectId = normalizeProjectInput(elements.projectId.value);
-  if (!projectId) {
-    showMessage("Hãy dán link project hoặc mã project.", "error");
-    elements.projectId.focus();
-    return;
-  }
-
-  syncDraftFromForm();
+async function withBusy(button, label, task) {
+  const oldText = button.textContent;
+  const oldHtml = button.innerHTML;
+  button.disabled = true;
+  button.textContent = label;
   try {
-    await api("/api/config", {
-      method: "PUT",
-      body: JSON.stringify({
-        project_id: projectId,
-        project_name: elements.projectName.value.trim(),
-        active_workflow_id: state.config?.active_workflow_id || "",
-        headless: Boolean(state.config?.headless),
-        cdp_url: state.config?.cdp_url || "",
-        generation_timeout_s: Math.max(30, Number(elements.generationTimeout.value || 300)),
-        poll_interval_s: state.config?.poll_interval_s || 5,
-        output_dir: state.config?.output_dir || "",
-      }),
-    });
-    showMessage("Đã lưu project.", "success");
-    await loadState({ silent: true });
+    return await task();
   } catch (error) {
-    showMessage(error.message, "error");
-  }
-}
-
-async function loginFlow() {
-  try {
-    await api("/api/auth/login", { method: "POST" });
-    showMessage("Đang mở cửa sổ đăng nhập Google Flow. Nếu chưa thấy Chromium hiện ra, bấm thêm nút Mở Flow.", "success");
-    state.setupOpen = true;
-    renderTopbar();
-  } catch (error) {
-    showMessage(formatFlowWindowError(error.message), "error");
-  }
-}
-
-async function openFlowLoginSurface() {
-  try {
-    const payload = await api("/api/flow/open-login", { method: "POST" });
-    showMessage(`Đã gọi lại cửa sổ đăng nhập Flow. Nếu vẫn chưa thấy, hãy kiểm tra Chromium/Chrome for Testing trên màn hình.`, "success");
-    state.setupOpen = true;
-    renderTopbar();
-    return payload;
-  } catch (error) {
-    showMessage(formatFlowWindowError(error.message), "error");
+    logLine(`${oldText} lỗi: ${error.message}`);
     return null;
-  }
-}
-
-async function openFlowProjectSurface() {
-  try {
-    const payload = await api("/api/flow/open-project", { method: "POST" });
-    const hasProject = Boolean(state.config?.project_id);
-    showMessage(
-      hasProject
-        ? "Đã gọi lại tab project Flow đang dùng."
-        : "Đã mở lại Flow. Hãy lưu project hoặc đăng nhập nếu cần.",
-      "success"
-    );
-    return payload;
-  } catch (error) {
-    showMessage(formatFlowWindowError(error.message), "error");
-    return null;
-  }
-}
-
-function formatFlowWindowError(message) {
-  const text = String(message || "").trim();
-  if (/session 0|session nền của windows/i.test(text)) {
-    return `${text} Nếu đang dùng Windows, hãy chạy Flow v2 ngay trên màn hình desktop rồi đăng nhập lại trong cửa sổ đó.`;
-  }
-  return text;
-}
-
-async function logoutFlow() {
-  if (!state.auth?.authenticated) {
-    showMessage("Phiên Google Flow hiện đã ở trạng thái đăng xuất.", "success");
-    return;
-  }
-
-  elements.logoutButton.disabled = true;
-  try {
-    const payload = await api("/api/auth/logout", { method: "POST" });
-    state.setupOpen = true;
-    await loadState({ silent: true });
-    showMessage(
-      payload.had_session
-        ? "Đã đăng xuất Google Flow. Khi cần chạy tiếp, chỉ việc đăng nhập lại."
-        : "Phiên Google Flow đã ở trạng thái đăng xuất.",
-      "success"
-    );
-  } catch (error) {
-    showMessage(error.message, "error");
   } finally {
-    renderTopbar();
+    button.disabled = false;
+    button.innerHTML = oldHtml || oldText;
   }
 }
 
-async function uploadStartImage(event) {
-  const file = event.target.files?.[0];
-  if (!file) {
-    clearStartImageState({ resetInput: false });
-    renderUploadStatus();
-    return;
+function baseAutomationGraph(options = {}) {
+  const config = typeof options === "boolean" ? { includeEtsy: options } : (options || {});
+  const includeEtsy = Boolean(config.includeEtsy);
+  const includeAmazon = Boolean(config.includeAmazon);
+  const includeListing = includeEtsy || includeAmazon;
+  const includeTrello = config.includeTrello !== false;
+  const etsyMode = text(config.etsyMode, "browser_copy");
+  const imageCount = clampInt(config.imageCount, 1, 4, 4);
+  const imageEngine = config.imageEngine === "gemini_api" ? "gemini_api" : selectedImageEngine();
+  const flowAgentEnabled = imageEngine !== "gemini_api";
+  const modules = [
+    { id: "master-bot", type: "master_bot", title: "Master Bot", enabled: true },
+  ];
+  if (includeTrello) {
+    modules.push({ id: "trello-source", type: "trello_source", title: "Trello Image Source", enabled: true });
   }
-
-  const data = new FormData();
-  data.append("file", file);
-  state.uploading = true;
-  renderUploadStatus();
-  try {
-    const payload = await api("/api/uploads", { method: "POST", body: data });
-    if (state.mode === "video") {
-      setVideoInputMode("start", { clearConflicts: true });
-      renderComposer();
-    }
-    state.startImagePath = payload.saved_path || "";
-    state.startImageName = payload.file_name || file.name;
-    state.startImagePublicUrl = payload.public_url || uploadPublicUrlFromPath(payload.saved_path || file.name);
-    showMessage("Đã tải ảnh đầu vào.", "success");
-  } catch (error) {
-    clearStartImageState({ resetInput: false });
-    event.target.value = "";
-    showMessage(error.message, "error");
-  } finally {
-    state.uploading = false;
-    renderComposerSummary();
-    renderUploadStatus();
+  modules.push({
+    id: "flow",
+    type: "flow",
+    title: imageEngine === "gemini_api" ? "Gemini API Images" : "Google Flow",
+    enabled: true,
+    settings: {
+      imageCount,
+      imageEngine,
+      flowAgentEnabled,
+      flowAgentAutoApprove: flowAgentEnabled,
+    },
+  });
+  if (includeTrello) {
+    modules.push({ id: "trello-archive", type: "trello", title: "Trello Archive", enabled: true });
   }
-}
-
-async function uploadImageReferences(event) {
-  const files = Array.from(event.target.files || []);
-  if (!files.length) {
-    return;
-  }
-
-  if (state.imageReferenceItems.length + files.length > 4) {
-    event.target.value = "";
-    showMessage(
-      state.mode === "video"
-        ? "Tối đa 4 ảnh sản phẩm/tham chiếu cho một lượt dựng ảnh rồi tạo video."
-        : "Tối đa 4 ảnh tham chiếu cho một lượt ghép/chỉnh ảnh.",
-      "error"
-    );
-    return;
-  }
-
-  state.uploading = true;
-  if (state.mode === "video") {
-    setVideoInputMode("reference", { clearConflicts: true });
-    renderComposer();
-  }
-  renderImageReferenceStatus();
-  try {
-    for (const file of files) {
-      const data = new FormData();
-      data.append("file", file);
-      const payload = await api("/api/uploads", { method: "POST", body: data });
-      const primaryRole = primaryReferenceRoleForMode(state.mode);
-      const hasPrimary = state.imageReferenceItems.some((item) => normalizeReferenceRole(item.role) === primaryRole);
-      const defaultRole = hasPrimary ? "reference" : primaryRole;
-      state.imageReferenceItems.push({
-        path: payload.saved_path || "",
-        name: payload.file_name || file.name,
-        publicUrl: payload.public_url || uploadPublicUrlFromPath(payload.saved_path || file.name),
-        role: defaultRole,
+  if (includeEtsy) {
+    if (etsyMode === "api_draft") {
+      modules.push({ id: "etsy", type: "etsy", title: "Etsy API Draft", enabled: true });
+    } else {
+      modules.push({
+        id: "etsy-copy",
+        type: "etsy_browser_copy",
+        title: "Etsy Copy Listing",
+        enabled: true,
+        settings: { keepColorChart: true, deleteExistingImages: true },
       });
     }
-    state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, state.mode);
-    showMessage(
-      state.mode === "video"
-        ? "Đã tải ảnh tham chiếu. App có thể tự dựng khung đầu rồi tạo video luôn."
-        : "Đã tải ảnh tham chiếu để ghép/chỉnh ảnh.",
-      "success"
+  }
+  if (includeAmazon) {
+    modules.push({
+      id: "amazon-copy",
+      type: "amazon_browser_copy",
+      title: "Amazon Copy Listing",
+      enabled: true,
+      settings: { deleteExistingImages: true },
+    });
+  }
+  const edges = [];
+  if (includeTrello) {
+    edges.push(
+      { source: "master-bot", target: "trello-source", condition: "success" },
+      { source: "trello-source", target: "flow", condition: "success" },
     );
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    state.uploading = false;
-    event.target.value = "";
-    renderComposerSummary();
-    renderImageReferenceStatus();
+  } else {
+    edges.push({ source: "master-bot", target: "flow", condition: "success" });
   }
-}
-
-function clearStartImage() {
-  clearStartImageState();
-  if (state.mode === "video" && currentVideoInputMode() === "start") {
-    state.drafts.video.inputMode = "prompt";
+  const listingTarget = includeAmazon ? "amazon-copy" : (etsyMode === "api_draft" ? "etsy" : "etsy-copy");
+  if (includeListing && includeTrello) {
+    edges.push({ source: "flow", target: "trello-archive", condition: "success" });
+    edges.push({ source: "trello-archive", target: listingTarget, condition: "success" });
+  } else if (includeListing) {
+    edges.push({ source: "flow", target: listingTarget, condition: "success" });
+  } else if (includeTrello) {
+    edges.push({ source: "flow", target: "trello-archive", condition: "success" });
   }
-  renderComposerSummary();
-  renderUploadStatus();
-  renderComposer();
-  showMessage("Đã bỏ ảnh đầu vào.", "success");
-}
-
-function removeReferenceImage(indexValue) {
-  const index = Number(indexValue);
-  if (!Number.isInteger(index) || index < 0 || index >= state.imageReferenceItems.length) {
-    return;
-  }
-  state.imageReferenceItems.splice(index, 1);
-  if (state.imageReferenceItems.length) {
-    state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, state.mode);
-  } else if (state.mode === "video" && currentVideoInputMode() === "reference") {
-    state.drafts.video.inputMode = "prompt";
-  }
-  renderComposerSummary();
-  renderImageReferenceStatus();
-  renderComposer();
-  showMessage("Đã bỏ một ảnh tham chiếu.", "success");
-}
-
-function setReferenceImageRole(indexValue, roleValue) {
-  const index = Number(indexValue);
-  if (!Number.isInteger(index) || index < 0 || index >= state.imageReferenceItems.length) {
-    return;
-  }
-  const role = normalizeReferenceRoleForMode(roleValue, state.mode, index);
-  const primaryRole = primaryReferenceRoleForMode(state.mode);
-  state.imageReferenceItems = state.imageReferenceItems.map((item, itemIndex) => ({
-    ...item,
-    role:
-      role === primaryRole && itemIndex !== index
-        ? normalizeReferenceRole(item.role) === primaryRole
-          ? "reference"
-          : normalizeReferenceRoleForMode(item.role, state.mode, itemIndex)
-        : normalizeReferenceRoleForMode(item.role, state.mode, itemIndex),
-  }));
-  state.imageReferenceItems[index].role = role;
-  state.imageReferenceItems = ensurePrimaryReferenceRole(state.imageReferenceItems, state.mode);
-  renderComposerSummary();
-  renderImageReferenceStatus();
-  showMessage(`Đã đổi vai trò ảnh sang ${referenceRoleLabel(role).toLowerCase()}.`, "success");
-}
-
-function promoteReferenceImage(indexValue) {
-  const index = Number(indexValue);
-  if (!Number.isInteger(index) || index < 0 || index >= state.imageReferenceItems.length) {
-    return;
-  }
-  setReferenceImageRole(index, primaryReferenceRoleForMode(state.mode));
-}
-
-function useAutomationPromptInStudio() {
-  syncAutomationFromForm();
-  renderAutomationDashboard();
-  document.querySelector(".scenario-sidebar")?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  elements.automationStepNameInput?.focus();
-  elements.automationStepNameInput?.select();
-  showMessage("Đang chỉnh module ngay trong dashboard. Logic Flow vẫn chạy ngầm khi bấm Run once.", "success");
-}
-
-function exportAutomationConfig() {
-  syncAutomationFromForm();
-  const payload = normalizeAutomationConfig(state.automation);
-  const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = "flow-automation-config.json";
-  document.body.append(link);
-  link.click();
-  link.remove();
-  window.setTimeout(() => URL.revokeObjectURL(url), 0);
-  showMessage("Đã export cấu hình custom. File JSON này có thể import lại trên Windows hoặc MacBook.", "success");
-}
-
-async function importAutomationConfig(event) {
-  const file = event.target.files?.[0];
-  if (!file) {
-    return;
-  }
-  try {
-    const imported = JSON.parse(await file.text());
-    state.automation = normalizeAutomationConfig(imported);
-    saveAutomationConfig(state.automation);
-    renderAll();
-    showMessage("Đã import cấu hình custom cho automation.", "success");
-  } catch (error) {
-    showMessage("File cấu hình không hợp lệ. Hãy chọn file JSON đã export từ Flow v2.", "error");
-  } finally {
-    event.target.value = "";
-  }
-}
-
-function resetAutomationConfig() {
-  state.automation = defaultAutomationConfig();
-  saveAutomationConfig(state.automation);
-  renderAll();
-  showMessage("Đã reset phần custom về mặc định.", "success");
-}
-
-async function resetReadyForAiOutputs({ skipConfirm = false, quiet = false } = {}) {
-  if (automationSubmitInFlight) {
-    return null;
-  }
-  syncAutomationFromForm();
-  const boardId = String(state.automation.trelloBoardId || state.trello?.board_id || DEFAULT_TRELLO_BOARD_URL).trim();
-  const listId = String(state.automation.trelloListId || state.trello?.list_id || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
-  if (!skipConfirm) {
-    const confirmed = window.confirm(
-      `Reset ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} sẽ xóa ảnh output do Flow tạo trên các card trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}, giữ nguyên ảnh nguồn. Sau đó Auto sẽ chạy lại các card đó. Tiếp tục?`
-    );
-    if (!confirmed) {
-      return null;
-    }
-  }
-  automationSubmitInFlight = true;
-  if (elements.automationResetReadyButton) {
-    elements.automationResetReadyButton.disabled = true;
-  }
-  if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.disabled = true;
-  }
-  try {
-    const result = await api("/api/trello/ready/reset", {
-      method: "POST",
-      body: JSON.stringify({
-        trello_board_id: boardId,
-        trello_list_id: listId,
-      }),
-    });
-    const deleted = Number(result.attachments_deleted || 0);
-    const cardsReset = Number(result.cards_reset || 0);
-    const cardsSeen = Number(result.cards_seen || 0);
-    if (!quiet) {
-      showMessage(
-        deleted
-          ? `Đã reset ${cardsReset} card trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}, xóa ${deleted} ảnh output. Bấm Bật auto liên tục để chạy lại.`
-          : `${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} có ${cardsSeen} card nhưng chưa có ảnh output nào cần xóa.`,
-        "success",
-      );
-    }
-    await loadState({ silent: true });
-    return result;
-  } catch (error) {
-    showMessage(error.message, "error");
-    return null;
-  } finally {
-    automationSubmitInFlight = false;
-    if (elements.automationResetReadyButton) {
-      elements.automationResetReadyButton.disabled = false;
-    }
-    if (elements.automationAutoRunButton) {
-      elements.automationAutoRunButton.disabled = false;
-    }
-    renderAutomationDashboard();
-  }
-}
-
-async function prepareReadyForAutoTrello() {
-  syncAutomationFromForm();
-  const boardId = String(state.automation.trelloBoardId || state.trello?.board_id || DEFAULT_TRELLO_BOARD_URL).trim();
-  const listId = String(state.automation.trelloListId || state.trello?.list_id || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
-  try {
-    const status = await api("/api/trello/ready/status", {
-      method: "POST",
-      body: JSON.stringify({
-        trello_board_id: boardId,
-        trello_list_id: listId,
-      }),
-    });
-    const eligible = Number(status.eligible || 0);
-    const complete = Number(status.complete || 0);
-    const cardsSeen = Number(status.cards_seen || 0);
-    const targetOutputCount = Number(status.target_output_count || FLOW_AGENT_TARGET_OUTPUT_COUNT);
-    if (eligible > 0 || !cardsSeen) {
-      return true;
-    }
-    if (complete > 0) {
-      const confirmed = window.confirm(
-        `${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} hiện có ${complete} card đã có ảnh output nên Auto sẽ không làm lại. Reset ảnh output để tạo lại đủ ${targetOutputCount} ảnh cho các card này ngay bây giờ?`
-      );
-      if (!confirmed) {
-        showMessage(`Auto chưa chạy vì các card ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} đã có ảnh output. Bấm Reset Ready nếu muốn tạo lại đủ ${targetOutputCount} ảnh.`, "error");
-        return false;
-      }
-      const resetResult = await resetReadyForAiOutputs({ skipConfirm: true, quiet: true });
-      if (!resetResult) {
-        return false;
-      }
-      showMessage(
-        `Đã reset ${resetResult.cards_reset || 0} card, xóa ${resetResult.attachments_deleted || 0} ảnh output. Auto sẽ lấy sản phẩm và chạy lại.`,
-        "success",
-      );
-      return true;
-    }
-    if (Number(status.without_source || 0) > 0) {
-      showMessage(`${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} có card nhưng chưa có attachment ảnh nguồn hợp lệ.`, "error");
-      return false;
-    }
-  } catch (error) {
-    showMessage(`Chưa kiểm tra được ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} trước khi chạy: ${error.message}. App vẫn sẽ thử Auto.`, "error");
-  }
-  return true;
-}
-
-async function saveTrelloConfig({ clearCredentials = false } = {}) {
-  syncAutomationFromForm();
-  const payload = {
-    api_key: clearCredentials ? "" : elements.automationTrelloKeyInput?.value?.trim() || "",
-    token: clearCredentials ? "" : elements.automationTrelloTokenInput?.value?.trim() || "",
-    board_id: elements.automationTrelloBoardStorageInput?.value?.trim() || elements.automationTrelloBoardInput?.value?.trim() || "",
-    card_id: elements.automationTrelloCardInput?.value?.trim() || "",
-    list_id: elements.automationTrelloListInput?.value?.trim() || "",
-    upload_mode: elements.automationTrelloUploadMode?.value || state.trello?.upload_mode || "file",
-    set_cover: state.automation.trelloSetCover !== false,
-    upscale_to_2k:
-      elements.automationTrelloUpscale2KInput
-        ? Boolean(elements.automationTrelloUpscale2KInput.checked)
-        : state.trello?.upscale_to_2k !== false,
-    clear_credentials: clearCredentials,
-  };
-
-  if (elements.automationTrelloSaveButton) {
-    elements.automationTrelloSaveButton.disabled = true;
-  }
-  if (elements.automationTrelloClearButton) {
-    elements.automationTrelloClearButton.disabled = true;
-  }
-
-  try {
-    const response = await api("/api/integrations/trello", {
-      method: "PUT",
-      body: JSON.stringify(payload),
-    });
-    state.trello = normalizeTrelloState(response.trello || {});
-    state.automation.trelloBoardId = state.trello.board_id || payload.board_id;
-    state.automation.trelloCardId = state.trello.card_id || payload.card_id;
-    state.automation.trelloListId = state.trello.list_id || payload.list_id;
-    saveAutomationConfig(state.automation);
-
-    if (elements.automationTrelloKeyInput) {
-      elements.automationTrelloKeyInput.value = "";
-    }
-    if (elements.automationTrelloTokenInput) {
-      elements.automationTrelloTokenInput.value = "";
-    }
-
-    renderAutomationDashboard();
-    if (clearCredentials) {
-      showMessage("Đã xóa key/token Trello trong app. Board/card/list vẫn giữ để cấu hình lại nhanh.", "success");
-    } else if (state.trello.configured) {
-      showMessage("Đã lưu Trello. Ảnh Flow tạo xong sẽ tự đẩy lên nơi lưu này.", "success");
-    } else if (state.trello.credentials_saved) {
-      showMessage("Đã lưu key/token Trello. Hãy thêm board, card hoặc list để app biết lấy/lưu ảnh ở đâu.", "success");
-    } else {
-      showMessage("Đã lưu board/card/list Trello. Hãy thêm API key và token để bật tự động.", "success");
-    }
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    if (elements.automationTrelloSaveButton) {
-      elements.automationTrelloSaveButton.disabled = false;
-    }
-    if (elements.automationTrelloClearButton) {
-      elements.automationTrelloClearButton.disabled = false;
-    }
-  }
-}
-
-// ── Trello first-run setup wizard ──────────────────────────────────
-// Pops a modal the first time chủ nhân opens the app without Trello creds,
-// then writes the 3 values straight into `.env.local` so the next launches
-// don't need any setup. Dismissed state lives in sessionStorage so a fresh
-// browser tab still gets the nudge.
-const TRELLO_WIZARD_DISMISS_KEY = "flow.v2.trelloWizard.dismissedThisSession";
-
-function isTrelloWizardDismissedForSession() {
-  try {
-    return window.sessionStorage?.getItem(TRELLO_WIZARD_DISMISS_KEY) === "1";
-  } catch (error) {
-    return false;
-  }
-}
-
-function rememberTrelloWizardDismissal() {
-  try {
-    window.sessionStorage?.setItem(TRELLO_WIZARD_DISMISS_KEY, "1");
-  } catch (error) {
-    // sessionStorage may be blocked; the wizard will simply reappear next
-    // load, which is the safer default for a setup nudge.
-  }
-}
-
-function showTrelloWizardStatus(message, tone = "info") {
-  const node = elements.trelloWizardStatus;
-  if (!node) {
-    return;
-  }
-  if (!message) {
-    node.hidden = true;
-    node.textContent = "";
-    node.removeAttribute("data-tone");
-    return;
-  }
-  node.hidden = false;
-  node.textContent = message;
-  node.dataset.tone = tone;
-}
-
-function openTrelloWizard() {
-  const wizard = elements.trelloSetupWizard;
-  if (!wizard) {
-    return;
-  }
-  wizard.hidden = false;
-  wizard.setAttribute("aria-hidden", "false");
-  showTrelloWizardStatus("");
-  // Focus first empty input so the user can paste immediately.
-  const inputs = [
-    elements.trelloWizardKeyInput,
-    elements.trelloWizardTokenInput,
-    elements.trelloWizardBoardInput,
-  ];
-  const firstEmpty = inputs.find((input) => input && !input.value.trim()) || inputs[0];
-  setTimeout(() => firstEmpty?.focus(), 30);
-  document.body.style.overflow = "hidden";
-}
-
-function closeTrelloWizard({ remember = true } = {}) {
-  const wizard = elements.trelloSetupWizard;
-  if (!wizard) {
-    return;
-  }
-  wizard.hidden = true;
-  wizard.setAttribute("aria-hidden", "true");
-  document.body.style.overflow = "";
-  if (remember) {
-    rememberTrelloWizardDismissal();
-  }
-}
-
-function maybeShowTrelloWizard() {
-  if (!elements.trelloSetupWizard) {
-    return;
-  }
-  if (state.trello?.credentials_saved && state.trello?.configured) {
-    closeTrelloWizard({ remember: false });
-    return;
-  }
-  if (state.trello?.credentials_saved && !state.trello?.configured) {
-    // Creds OK but board/card/list missing → user can fix inside the
-    // inspector, no need to block the dashboard with a modal.
-    return;
-  }
-  if (isTrelloWizardDismissedForSession()) {
-    return;
-  }
-  openTrelloWizard();
-}
-
-async function submitTrelloWizard() {
-  const key = elements.trelloWizardKeyInput?.value?.trim() || "";
-  const token = elements.trelloWizardTokenInput?.value?.trim() || "";
-  const board = elements.trelloWizardBoardInput?.value?.trim() || "";
-
-  if (!key || !token || !board) {
-    showTrelloWizardStatus("Cần điền đủ API key, token và Trello board URL.", "error");
-    return;
-  }
-
-  const saveButton = elements.trelloWizardSaveButton;
-  if (saveButton) {
-    saveButton.disabled = true;
-  }
-  showTrelloWizardStatus("Đang ghi creds vào .env.local…", "info");
-
-  try {
-    const response = await api("/api/integrations/trello", {
-      method: "PUT",
-      body: JSON.stringify({
-        api_key: key,
-        token,
-        board_id: board,
-        card_id: state.trello?.card_id || "",
-        list_id: state.trello?.list_id || "",
-        upload_mode: state.trello?.upload_mode || "file",
-        set_cover: state.automation?.trelloSetCover !== false,
-        upscale_to_2k: state.trello?.upscale_to_2k !== false,
-        clear_credentials: false,
-        persist_to_env: true,
-      }),
-    });
-
-    const nextTrello = normalizeTrelloState(response.trello || response || {});
-    state.trello = nextTrello;
-    state.automation.trelloBoardId = nextTrello.board_id || board;
-    saveAutomationConfig(state.automation);
-
-    const persisted = response?.persisted_to_env === true;
-    const persistError = String(response?.persist_error || "").trim();
-
-    if (persisted) {
-      showTrelloWizardStatus(
-        "Đã lưu vào .env.local. Lần sau chỉ việc chạy — không cần nhập lại.",
-        "success"
-      );
-      showMessage(
-        "Đã setup Trello vĩnh viễn vào .env.local. Auto Trello đã sẵn sàng.",
-        "success"
-      );
-    } else {
-      // Saved to state.json but couldn't touch .env.local (permissions /
-      // sandboxed FS). Surface the error so chủ nhân can copy values
-      // manually if needed.
-      const fallback = persistError
-        ? `Đã lưu vào app, nhưng không ghi được vào .env.local: ${persistError}. App vẫn dùng được trong phiên này.`
-        : "Đã lưu vào app, nhưng không ghi được vào .env.local. Hãy thêm thủ công để giữ qua các lần khởi động.";
-      showTrelloWizardStatus(fallback, "error");
-    }
-
-    renderAutomationDashboard();
-
-    if (persisted) {
-      setTimeout(() => closeTrelloWizard({ remember: false }), 1100);
-    }
-  } catch (error) {
-    showTrelloWizardStatus(error.message || "Lưu thất bại. Hãy kiểm tra creds.", "error");
-  } finally {
-    if (saveButton) {
-      saveButton.disabled = false;
-    }
-  }
-}
-
-async function saveIntegrationConfig({ clearSecrets = false } = {}) {
-  syncAutomationFromForm();
-  const payload = {
-    gemini_api_key: clearSecrets ? "" : elements.automationGeminiKeyInput?.value?.trim() || "",
-    gemini_model: elements.automationGeminiModelInput?.value?.trim() || state.integrations?.gemini?.model || "gemini-2.5-flash",
-    telegram_bot_token: clearSecrets ? "" : elements.automationTelegramTokenInput?.value?.trim() || "",
-    telegram_chat_id: elements.automationTelegramInput?.value?.trim() || "",
-    playwright_browsers_path: elements.automationPlaywrightPathInput?.value?.trim() || "",
-    clear_gemini_api_key: clearSecrets,
-    clear_telegram_bot_token: clearSecrets,
-  };
-
-  if (elements.automationEnvSaveButton) {
-    elements.automationEnvSaveButton.disabled = true;
-  }
-  if (elements.automationEnvClearButton) {
-    elements.automationEnvClearButton.disabled = true;
-  }
-
-  try {
-    const response = await api("/api/integrations/settings", {
-      method: "PUT",
-      body: JSON.stringify(payload),
-    });
-    state.integrations = normalizeIntegrationState(response.integrations || {});
-    state.automation.telegramChat = state.integrations.telegram.chat_id || payload.telegram_chat_id;
-    saveAutomationConfig(state.automation);
-
-    if (elements.automationGeminiKeyInput) {
-      elements.automationGeminiKeyInput.value = "";
-    }
-    if (elements.automationTelegramTokenInput) {
-      elements.automationTelegramTokenInput.value = "";
-    }
-
-    renderAutomationDashboard();
-    if (clearSecrets) {
-      showMessage("Đã xóa Gemini key và Telegram bot token trong app. Các field không nhạy cảm vẫn giữ lại.", "success");
-    } else {
-      showMessage("Đã lưu cấu hình app. Từ giờ không cần sửa file .env cho Gemini, Telegram hoặc Playwright path.", "success");
-    }
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    if (elements.automationEnvSaveButton) {
-      elements.automationEnvSaveButton.disabled = false;
-    }
-    if (elements.automationEnvClearButton) {
-      elements.automationEnvClearButton.disabled = false;
-    }
-  }
-}
-
-async function previewPromptSource(file = null, { silent = false } = {}) {
-  syncAutomationFromForm();
-  const data = new FormData();
-  data.append("source_url", state.automation.sourceLocation || "");
-  data.append("text", elements.automationSheetPasteInput?.value || "");
-  if (file) {
-    data.append("file", file);
-  }
-
-  if (elements.automationSheetPreviewButton) {
-    elements.automationSheetPreviewButton.disabled = true;
-  }
-  if (elements.automationSheetFileButton) {
-    elements.automationSheetFileButton.disabled = true;
-  }
-
-  try {
-    const payload = await api("/api/prompt-sources/preview", {
-      method: "POST",
-      body: data,
-    });
-    state.promptSourcePreview = payload;
-    state.automation.sourceType = "sheets";
-    state.automation.prompt = payload.prompt || state.automation.prompt || "";
-    saveAutomationConfig(state.automation);
-    renderAll();
-    const count = Number(payload.active_count || payload.prompt_count || 0);
-    if (!silent) {
-      showMessage(`Đã lấy ${count} prompt từ sheet/file. Bấm tạo ảnh để app chạy lần lượt các dòng active rồi gửi Telegram duyệt.`, "success");
-    }
-    return payload;
-  } catch (error) {
-    if (!silent) {
-      showMessage(error.message, "error");
-    }
-    return null;
-  } finally {
-    if (elements.automationSheetPreviewButton) {
-      elements.automationSheetPreviewButton.disabled = false;
-    }
-    if (elements.automationSheetFileButton) {
-      elements.automationSheetFileButton.disabled = false;
-    }
-    if (elements.automationSheetFileInput) {
-      elements.automationSheetFileInput.value = "";
-    }
-  }
-}
-
-function syncModuleSettingFromControl(control) {
-  const module = selectedAutomationModule();
-  const setting = control.dataset.moduleSetting;
-  const value = control.type === "checkbox" ? Boolean(control.checked) : control.value;
-  module.settings = module.settings || {};
-  module.settings[setting] = value;
-  if (setting === "sourceType") {
-    state.automation.sourceType = value || FLOW_AI_SOURCE_TYPE;
-    if (elements.automationSourceType) {
-      elements.automationSourceType.value = state.automation.sourceType;
-    }
-  } else if (setting === "sourceLocation") {
-    state.automation.sourceLocation = String(value || "").trim();
-    if (elements.automationSourceLocationInput) {
-      elements.automationSourceLocationInput.value = state.automation.sourceLocation;
-    }
-  } else if (setting === "promptProductFilter") {
-    state.automation.promptProductFilter = String(value || "").trim();
-    if (elements.automationProductFilterInput) {
-      elements.automationProductFilterInput.value = state.automation.promptProductFilter;
-    }
-  } else if (setting === "imageModel") {
-    state.drafts.image.model = value || defaultModelForMode("image");
-  } else if (setting === "imageAspect") {
-    state.drafts.image.aspect = value || "square";
-  } else if (setting === "imageCount") {
-    const maxCount = flowAgentEnabledFromSettings(module.settings) ? FLOW_AGENT_TARGET_OUTPUT_COUNT : 4;
-    const count = Math.max(1, Math.min(maxCount, Number(value || 1)));
-    state.drafts.image.count = count;
-    module.settings[setting] = count;
-  } else if (setting === "telegramChat") {
-    state.automation.telegramChat = String(value || "").trim();
-    if (elements.automationTelegramInput) {
-      elements.automationTelegramInput.value = state.automation.telegramChat;
-    }
-  } else if (setting === "trelloBoard") {
-    state.automation.trelloBoardId = String(value || "").trim();
-    if (elements.automationTrelloBoardInput) {
-      elements.automationTrelloBoardInput.value = state.automation.trelloBoardId;
-    }
-    if (elements.automationTrelloBoardStorageInput) {
-      elements.automationTrelloBoardStorageInput.value = state.automation.trelloBoardId;
-    }
-  } else if (setting === "trelloCard") {
-    state.automation.trelloCardId = String(value || "").trim();
-    if (elements.automationTrelloCardInput) {
-      elements.automationTrelloCardInput.value = state.automation.trelloCardId;
-    }
-  } else if (setting === "trelloList") {
-    state.automation.trelloListId = String(value || "").trim();
-    if (elements.automationTrelloListInput) {
-      elements.automationTrelloListInput.value = state.automation.trelloListId;
-    }
-  } else if (setting === "trelloAttachmentIds") {
-    const ids = String(value || "")
-      .split(/[\s,;]+/)
-      .map((item) => item.trim())
-      .filter(Boolean);
-    state.automation.trelloAttachmentIds = ids;
-    module.settings[setting] = ids;
-  } else if (setting === "trelloAttachmentLimit") {
-    module.settings[setting] = Math.max(1, Math.min(4, Number(value || 1)));
-  } else if (setting === "trelloUploadMode") {
-    state.trello.upload_mode = value || "file";
-    if (elements.automationTrelloUploadMode) {
-      elements.automationTrelloUploadMode.value = state.trello.upload_mode;
-    }
-  }
-  persistAutomationModules();
-}
-
-function automationExecutionGraphPayload() {
-  const modules = normalizeAutomationModules(state.automation)
-    .map((module) => ({
-      id: module.id,
-      type: module.type || "custom",
-      title: module.title || moduleTypeConfig(module.type).title,
-      detail: module.detail || moduleTypeConfig(module.type).detail,
-      enabled: module.enabled !== false,
-      settings: {
-        ...(module.settings || {}),
-      },
-    }));
-  const enabledModules = modules.filter((module) => module.enabled);
-  const edges = enabledModules.slice(1).map((module, index) => ({
-    source: enabledModules[index].id,
-    target: module.id,
-    condition: "success",
-  }));
   return {
-    version: AUTOMATION_CONFIG_VERSION,
-    selected_module_id: state.automation.selectedStep || "",
+    version: 1,
+    selected_module_id: "flow",
     modules,
     edges,
   };
 }
 
-async function handleModuleSettingsAction(action) {
-  if (action === "preview-source") {
-    await previewPromptSource();
-  } else if (action === "upload-source") {
-    elements.automationSheetFileInput?.click();
-  } else if (action === "save-integrations") {
-    const tokenInput = elements.automationModuleSettings?.querySelector("[data-module-secret='telegramToken']");
-    if (tokenInput && elements.automationTelegramTokenInput) {
-      elements.automationTelegramTokenInput.value = tokenInput.value;
-    }
-    await saveIntegrationConfig();
-  } else if (action === "save-trello") {
-    await saveTrelloConfig();
-  } else if (action === "clear-trello") {
-    await saveTrelloConfig({ clearCredentials: true });
-  } else if (action === "sync-telegram-approvals") {
-    await syncTelegramApprovals();
-  }
-}
-
-async function syncTelegramApprovals() {
-  try {
-    const payload = await api("/api/telegram/approvals/sync", {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
-    await loadState({ silent: true });
-    const result = payload.telegram_approvals || {};
-    const count = Number(result.processed || 0);
-    showMessage(
-      count
-        ? `Đã đồng bộ ${count} lượt duyệt từ Telegram.`
-        : result.configured === false
-          ? "Chưa lưu Telegram bot token nên chưa đồng bộ được lượt duyệt."
-          : "Chưa có lượt duyệt Telegram mới.",
-      count ? "success" : "error"
-    );
-  } catch (error) {
-    showMessage(error.message, "error");
-  }
-}
-
-function automationImageJobPayload(prompt) {
-  const imageDraft = state.drafts.image;
-  const graph = automationExecutionGraphPayload();
-  const flowModule = graph.modules.find((module) => module.enabled && module.type === "flow") || {};
-  const flowSettings = flowModule.settings || {};
-  const flowAgentEnabled = flowAgentEnabledFromSettings(flowSettings);
-  const telegramEnabled = automationModuleEnabled("telegram");
-  const trelloEnabled = automationModuleEnabled("trello");
+function quickJobPayload() {
+  const prompt = text(
+    els.quickPrompt.value,
+    "Tạo bộ ảnh sản phẩm thương mại, nền sáng, giữ đúng hình dáng, chất liệu và chi tiết chính từ ảnh nguồn."
+  );
+  const trelloEnabled = Boolean(els.quickTrelloEnabled.checked);
+  const imageCount = clampInt(els.imageCount.value, 1, 4, 4);
+  const imageEngine = selectedImageEngine();
+  const flowAgentEnabled = imageEngine !== "gemini_api";
+  const etsy = state.payload.etsy || {};
   return {
     type: "image",
-    title: "Automation image from prompt",
-    prompt: String(prompt || "").trim(),
-    model: flowSettings.imageModel || imageDraft.model || defaultModelForMode("image"),
-    aspect: flowSettings.imageAspect || imageDraft.aspect || "square",
-    count: flowModuleImageCount(flowSettings, imageDraft.count || MODE_CONFIG.image.defaultCount),
-    timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
-    telegram_enabled: telegramEnabled,
-    telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
+    title: "Quick Flow image set",
+    prompt,
+    count: imageCount,
+    image_engine: imageEngine,
+    aspect: els.aspectSelect.value || "square",
     trello_enabled: trelloEnabled,
+    etsy_enabled: false,
+    etsy_browser_copy_enabled: false,
+    etsy_publish: false,
+    amazon_enabled: false,
+    amazon_browser_copy_enabled: false,
+    amazon_publish: false,
     flow_agent_enabled: flowAgentEnabled,
-    flow_agent_auto_approve: flowSettings.flowAgentAutoApprove !== false,
-    automation_graph: graph,
-    trello_board_id: trelloEnabled ? state.automation.trelloBoardId || state.trello?.board_id || "" : "",
-    trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
-    trello_list_id: trelloEnabled ? state.automation.trelloListId || state.trello?.list_id || "" : "",
-    trello_attachment_ids: trelloEnabled
-      ? Array.isArray(state.automation.trelloAttachmentIds)
-        ? state.automation.trelloAttachmentIds.filter(Boolean)
-        : []
-      : [],
-    trello_set_cover: state.automation.trelloSetCover !== false,
-    prompt_product: state.automation.promptProductFilter || "",
-    prompt_product_key: state.automation.promptProductFilter || "",
-    prompt_notes: state.automation.promptProductFilter ? `Trello search: ${state.automation.promptProductFilter}` : "",
+    flow_agent_auto_approve: flowAgentEnabled,
+    automation_graph: baseAutomationGraph({ includeEtsy: false, includeTrello: trelloEnabled, imageCount, imageEngine }),
+    etsy_price: text(els.etsyPrice.value || etsy.price, ""),
+    etsy_quantity: clampInt(els.etsyQuantity.value || etsy.quantity, 1, 999, 1),
+    etsy_taxonomy_id: text(els.etsyTaxonomyId.value || etsy.taxonomy_id, ""),
+    etsy_shipping_profile_id: text(els.etsyShippingProfileId.value || etsy.shipping_profile_id, ""),
   };
 }
 
-function forcePayloadToReadyTrelloScope(payload) {
-  if (!payload || typeof payload !== "object") {
-    return payload;
-  }
-  const boardId = String(state.trello?.board_id || payload.trello_board_id || "").trim();
-  const readyListId = String(state.trello?.list_id || payload.trello_list_id || "").trim();
-  payload.trello_board_id = boardId;
-  payload.trello_list_id = readyListId;
-  payload.trello_card_id = "";
-  payload.trello_attachment_ids = [];
-  payload.prompt = "";
-  payload.prompt_product = "";
-  payload.prompt_product_key = "";
-  payload.prompt_notes = "";
-  payload.aspect = "square";
-  payload.count = FLOW_AGENT_DEFAULT_IMAGE_COUNT;
-  payload.flow_agent_enabled = true;
-  payload.flow_agent_auto_approve = true;
-  const modules = Array.isArray(payload.automation_graph?.modules) ? payload.automation_graph.modules : [];
-  modules.forEach((module) => {
-    if (!module || !["trello_source", "trello", "flow"].includes(module.type)) {
-      return;
-    }
-    module.settings = module.settings && typeof module.settings === "object" ? module.settings : {};
-    if (module.type === "flow") {
-      module.settings.imageAspect = "square";
-      module.settings.imageCount = FLOW_AGENT_DEFAULT_IMAGE_COUNT;
-      module.settings.flowAgentEnabled = true;
-      module.settings.flowAgentAutoApprove = true;
-      return;
-    }
-    if (boardId) {
-      module.settings.trelloBoard = boardId;
-    }
-    if (readyListId) {
-      module.settings.trelloList = readyListId;
-    }
-    module.settings.trelloCard = "";
-    module.settings.trelloAttachmentIds = [];
-    delete module.settings.trelloAttachmentId;
+function autoBatchPayload(sourceKey) {
+  const source =
+    sourceKey && TRELLO_SOURCE_OPTIONS[sourceKey] ? TRELLO_SOURCE_OPTIONS[sourceKey] : selectedTrelloSource();
+  // Empty product box = run the whole selected column (per the field's placeholder).
+  // Do NOT fall back to source.product (the column name), or it becomes a search
+  // query that matches zero cards and the backend rejects the run with a 400.
+  const product = text(els.autoProduct.value, "");
+  const includeEtsy = false;
+  const imageEngine = selectedImageEngine();
+  const flowAgentEnabled = imageEngine !== "gemini_api";
+  const trelloBoard = text(source.boardId || state.payload.trello?.board_id || DEFAULT_TRELLO_BOARD_ID, DEFAULT_TRELLO_BOARD_ID);
+  return {
+    title: "Auto Trello Flow",
+    limit: clampInt(els.autoLimit.value, 1, 100, 40),
+    auto_trello: true,
+    continuous: Boolean(els.autoContinuous.checked),
+    run_until_empty: Boolean(els.autoContinuous.checked),
+    create_etsy_draft: false,
+    poll_interval_s: 30,
+    items: [],
+    job: {
+      type: "image",
+      title: "Auto AI Trello",
+      prompt: text(
+        els.quickPrompt.value,
+        imageEngine === "gemini_api"
+          ? "Tự phân tích ảnh nguồn Trello và tạo bộ ảnh sản phẩm thương mại đúng sản phẩm."
+          : "Flow Agent tự phân tích ảnh nguồn Trello, viết prompt và tạo bộ ảnh sản phẩm."
+      ),
+      count: 4,
+      image_engine: imageEngine,
+      aspect: "square",
+      trello_enabled: true,
+      etsy_enabled: includeEtsy,
+      etsy_browser_copy_enabled: includeEtsy,
+      etsy_publish: false,
+      etsy_keep_color_chart: true,
+      etsy_delete_existing_images: true,
+      amazon_enabled: false,
+      amazon_browser_copy_enabled: false,
+      amazon_publish: false,
+      amazon_delete_existing_images: true,
+      flow_agent_enabled: flowAgentEnabled,
+      flow_agent_auto_approve: flowAgentEnabled,
+      trello_board_id: trelloBoard,
+      trello_list_id: source.listId,
+      trello_card_id: source.cardId || "",
+      trello_source_card_id: source.cardId || "",
+      prompt_product: product,
+      prompt_product_key: product,
+      prompt_notes: product ? `Trello search trong ${source.label}: ${product}` : "",
+      automation_graph: baseAutomationGraph({ includeEtsy, includeTrello: true, imageCount: 4, imageEngine }),
+    },
+  };
+}
+
+async function runPreflight() {
+  const payload = {
+    instruction: text(els.quickPrompt.value, "Kiểm tra trạng thái Flow/Etsy/Trello trước khi chạy."),
+    auto_trello: true,
+    continuous: Boolean(els.autoContinuous.checked),
+    limit: clampInt(els.autoLimit.value, 0, 100, 0),
+    create_etsy_draft: false,
+  };
+  const result = await api("/api/master-bot/preflight", {
+    method: "POST",
+    body: JSON.stringify(payload),
   });
-  return payload;
+  logLine(result.ready ? "Preflight OK." : "Preflight còn blocker.", summarizePreflight(result));
+  return result;
 }
 
-async function stopContinuousAutoTrello() {
-  const job = activeContinuousAutoTrelloJob();
-  if (!job) {
-    showMessage("Không có Auto AI Trello liên tục nào đang chạy.", "error");
+async function saveEtsy() {
+  const payload = {
+    api_key: els.etsyApiKey.value.trim(),
+    api_secret: els.etsyApiSecret.value.trim(),
+    user_id: els.etsyUserId.value.trim(),
+    shop_id: els.etsyShopId.value.trim(),
+    taxonomy_id: els.etsyTaxonomyId.value.trim(),
+    shipping_profile_id: els.etsyShippingProfileId.value.trim(),
+    quantity: clampInt(els.etsyQuantity.value, 1, 999, 1),
+    price: text(els.etsyPrice.value, "9.99"),
+  };
+  const result = await api("/api/integrations/etsy", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  els.etsyApiKey.value = "";
+  els.etsyApiSecret.value = "";
+  state.hydratedEtsy = false;
+  logLine("Đã lưu Etsy.", result);
+  await refreshState({ quiet: true });
+}
+
+function accountStatusNote(text, tone = "") {
+  if (!els.accountStatus) return;
+  els.accountStatus.hidden = !text;
+  els.accountStatus.textContent = text || "";
+  els.accountStatus.className = `status${tone ? ` ${tone}` : ""}`;
+}
+
+function selectedEtsyAccountId() {
+  return String(els.autoAccountSelect?.value || "").trim();
+}
+
+function renderEtsyAccounts(snapshot = {}) {
+  state.etsyAccounts = {
+    accounts: Array.isArray(snapshot.accounts) ? snapshot.accounts : [],
+    default_slug: snapshot.default_slug || "",
+  };
+  const accounts = state.etsyAccounts.accounts;
+
+  // Keep the one-click selector in sync (preserve current pick if still valid).
+  if (els.autoAccountSelect) {
+    const current = els.autoAccountSelect.value;
+    const options = accounts.map((acc) => {
+      const slug = acc.is_default ? "" : String(acc.slug || "");
+      const label = acc.is_default
+        ? "Mặc định (trung6)"
+        : `${acc.label || acc.slug} (${acc.slug})`;
+      return `<option value="${escapeHtml(slug)}">${escapeHtml(label)}</option>`;
+    });
+    // Always ensure a default option exists even before the first load resolves.
+    if (!accounts.some((acc) => acc.is_default)) {
+      options.unshift('<option value="">Mặc định (trung6)</option>');
+    }
+    els.autoAccountSelect.innerHTML = options.join("");
+    const stillValid = Array.from(els.autoAccountSelect.options).some((opt) => opt.value === current);
+    els.autoAccountSelect.value = stillValid ? current : "";
+  }
+
+  if (!els.accountsList) return;
+  if (!accounts.length) {
+    els.accountsList.innerHTML = '<p class="account-empty">Chưa có tài khoản nào.</p>';
     return;
   }
-  if (automationSubmitInFlight) {
-    return;
-  }
-  automationSubmitInFlight = true;
-  if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.disabled = true;
-  }
+  els.accountsList.innerHTML = accounts
+    .map((acc) => {
+      const isDefault = Boolean(acc.is_default);
+      const slug = isDefault ? "" : String(acc.slug || "");
+      const name = isDefault ? "Mặc định (trung6)" : `${acc.label || acc.slug}`;
+      const board = acc.trello_board_id || "(global)";
+      const list = acc.trello_list_id || "(cả board)";
+      const shop = acc.etsy_shop_id || "-";
+      const enabled = acc.enabled === false ? " · TẮT" : "";
+      const del = isDefault
+        ? ""
+        : `<button class="link-button" type="button" data-action="del-account" data-slug="${escapeHtml(slug)}">Xoá</button>`;
+      return `<div class="account-row">
+        <div class="account-meta">
+          <strong>${escapeHtml(name)}</strong>
+          <small>slug: <code>${escapeHtml(slug || "(default)")}</code>${escapeHtml(enabled)}</small>
+          <small>board: <code>${escapeHtml(board)}</code> · list: <code>${escapeHtml(list)}</code> · shop: <code>${escapeHtml(shop)}</code></small>
+        </div>
+        <div class="account-actions">${del}</div>
+      </div>`;
+    })
+    .join("");
+}
+
+async function loadEtsyAccounts({ quiet = true } = {}) {
   try {
-    await api(`/api/jobs/${encodeURIComponent(job.id)}/stop`, { method: "POST" });
-    showMessage("Đã gửi lệnh dừng. App sẽ không nhận thêm card mới sau tác vụ hiện tại.", "success");
-    await loadState({ silent: true });
+    const data = await api("/api/etsy/accounts");
+    renderEtsyAccounts(data.etsy_accounts || {});
+    if (!quiet) logLine("Đã tải danh sách tài khoản Etsy.");
   } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    automationSubmitInFlight = false;
-    renderAutomationDashboard();
+    if (!quiet) logLine(`Tải tài khoản Etsy lỗi: ${error.message}`);
   }
 }
 
-async function submitAutomationImage({ autoTrello = false, batchLimit = null, continuousAutoTrello = false } = {}) {
-  if (automationSubmitInFlight) {
+async function upsertEtsyAccount() {
+  const slug = text(els.accSlug?.value, "");
+  if (!slug) {
+    accountStatusNote("Nhập slug cho tài khoản (vd: shop-2).", "error");
     return;
   }
-  syncAutomationFromForm();
-  const selectedTrelloAttachmentIds = Array.isArray(state.automation.trelloAttachmentIds)
-    ? state.automation.trelloAttachmentIds.filter(Boolean)
-    : [];
-  const selectedTrelloCard = String(state.automation.trelloCardId || "").trim();
-  const selectedTrelloImageCandidate = Boolean(selectedTrelloCard && selectedTrelloAttachmentIds.length);
-  const selectedTrelloImageRun = Boolean(
-    !autoTrello &&
-      selectedTrelloImageCandidate &&
-      (shouldAutoDiscoverTrello([]) || String(state.automation.sourceType || FLOW_AI_SOURCE_TYPE) === FLOW_AI_SOURCE_TYPE)
-  );
-  let batchItems = selectedTrelloImageRun ? [] : activePromptSourceItems({ limit: autoTrello ? Infinity : 500 });
-  const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
-  const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
-  const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
-  const aiWillWritePrompt = Boolean(autoDiscoverTrello && !prompt);
-  if (!state.config?.project_id) {
-    state.setupOpen = true;
-    renderTopbar();
-    showMessage("Hãy lưu project Flow trước khi chạy automation.", "error");
-    return;
-  }
-  if (!state.auth?.authenticated) {
-    state.setupOpen = true;
-    renderTopbar();
-    showMessage("Hãy đăng nhập Google Flow trước khi automation tạo ảnh.", "error");
-    return;
-  }
-  if (!prompt && !aiWillWritePrompt) {
-    showMessage(
-      trelloSearchQuery
-        ? `Chưa có lệnh nhập tay. Có thể bấm Auto Trello để Tác nhân Flow tự viết prompt cho "${trelloSearchQuery}".`
-        : "Hãy nhập yêu cầu ngắn, hoặc bấm Auto Trello để Tác nhân Flow tự viết prompt từ card có ảnh.",
-      "error",
-    );
-    elements.automationPromptInput.focus();
-    return;
-  }
-  if (!automationModuleEnabled("flow")) {
-    showMessage("Luồng cần có một cục Google Flow đang bật để tạo ảnh.", "error");
-    selectAutomationModuleByType("flow", { create: true });
-    return;
-  }
-  if (autoDiscoverTrello && !automationModuleEnabled("trello_source")) {
-    showMessage("Auto Trello cần bật cục Trello Image Source để tự tìm ảnh trong card.", "error");
-    selectAutomationModuleByType("trello_source", { create: true });
-    return;
-  }
-  if (autoDiscoverTrello && !automationModuleEnabled("trello")) {
-    showMessage("Auto Trello cần bật cục Trello Archive để ảnh tạo xong được lưu về đúng card.", "error");
-    selectAutomationModuleByType("trello", { create: true });
-    return;
-  }
-
-  const payload = automationImageJobPayload(prompt);
-  const selectedImageDefaultLimit = selectedTrelloImageRun ? 1 : 0;
-  const explicitBatchLimit = Number(batchLimit || 0);
-  const runUntilReadyEmpty = Boolean(autoDiscoverTrello && !selectedTrelloImageRun && !(Number.isFinite(explicitBatchLimit) && explicitBatchLimit > 0));
-  if (autoDiscoverTrello && !selectedTrelloImageRun) {
-    batchItems = [];
-    state.automation.promptProductFilter = "";
-    forcePayloadToReadyTrelloScope(payload);
-    saveAutomationConfig(state.automation);
-  }
-  const resolvedBatchLimit = runUntilReadyEmpty
-    ? 0
-    : Math.max(
-        1,
-        Math.min(40, Number(explicitBatchLimit || selectedImageDefaultLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)),
-      );
-  const queuedCount = autoDiscoverTrello
-    ? (runUntilReadyEmpty ? 0 : (batchItems.length ? Math.min(batchItems.length, resolvedBatchLimit) : resolvedBatchLimit))
-    : batchItems.length > 1 ? Math.min(batchItems.length, resolvedBatchLimit) : 1;
-
-  automationSubmitInFlight = true;
-  elements.automationRunButton.disabled = true;
-  elements.automationRunImageButton.disabled = true;
-  if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.disabled = true;
-  }
-  if (elements.easyRunButton) {
-    elements.easyRunButton.disabled = true;
-  }
+  const payload = {
+    slug,
+    label: text(els.accLabel?.value, ""),
+    trello_board_id: text(els.accBoard?.value, ""),
+    trello_list_id: text(els.accList?.value, ""),
+    etsy_shop_id: text(els.accShop?.value, ""),
+    enabled: true,
+  };
   try {
-    if (batchItems.length > 1 || autoDiscoverTrello) {
-      await api("/api/jobs/batch", {
-        method: "POST",
-        body: JSON.stringify({
-          title: continuousAutoTrello ? "Auto AI Trello: chờ sản phẩm mới liên tục" : autoDiscoverTrello ? "Auto Trello: quét card có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
-          limit: continuousAutoTrello ? 0 : resolvedBatchLimit,
-          auto_trello: autoDiscoverTrello,
-          run_until_empty: continuousAutoTrello || runUntilReadyEmpty,
-          continuous: Boolean(continuousAutoTrello),
-          poll_interval_s: 30,
-          job: {
-            ...payload,
-            title: autoDiscoverTrello ? "Auto image from Trello card" : "Automation image from sheet row",
-          },
-          items: autoDiscoverTrello && !selectedTrelloImageRun ? [] : batchItems,
-        }),
-      });
+    const data = await api("/api/etsy/accounts", { method: "POST", body: JSON.stringify(payload) });
+    renderEtsyAccounts(data.etsy_accounts || {});
+    accountStatusNote(`Đã lưu tài khoản "${slug}".`, "success");
+    if (els.accSlug) els.accSlug.value = "";
+    if (els.accLabel) els.accLabel.value = "";
+    if (els.accBoard) els.accBoard.value = "";
+    if (els.accList) els.accList.value = "";
+    if (els.accShop) els.accShop.value = "";
+    logLine(`Đã thêm/cập nhật tài khoản Etsy "${slug}".`);
+  } catch (error) {
+    accountStatusNote(error.message || "Lưu tài khoản thất bại.", "error");
+  }
+}
+
+async function deleteEtsyAccount(slug) {
+  if (!slug) return;
+  try {
+    const data = await api("/api/etsy/accounts/delete", { method: "POST", body: JSON.stringify({ slug }) });
+    renderEtsyAccounts(data.etsy_accounts || {});
+    accountStatusNote(`Đã xoá tài khoản "${slug}".`, "success");
+    logLine(`Đã xoá tài khoản Etsy "${slug}".`);
+  } catch (error) {
+    accountStatusNote(error.message || "Xoá tài khoản thất bại.", "error");
+  }
+}
+
+async function queueEtsyForAccount(accountId) {
+  // Multi-account one-click: the board/list come from the account registry on
+  // the backend, so we deliberately clear board/list/card scoping and let the
+  // server resolve them. Tasks get stamped with this account_id -> only that
+  // machine's worker claims them.
+  const acc = (state.etsyAccounts.accounts || []).find((a) => String(a.slug || "") === accountId);
+  const label = acc ? acc.label || acc.slug : accountId;
+  const payload = autoBatchPayload(selectedTrelloSourceKeys()[0] || "");
+  payload.create_etsy_draft = true;
+  payload.etsy_only = true;
+  payload.continuous = false;
+  payload.run_until_empty = false;
+  payload.limit = clampInt(els.autoLimit?.value, 0, 100, 0);
+  payload.title = `Auto Trello -> Etsy (${label})`;
+  payload.job.etsy_enabled = true;
+  payload.job.etsy_browser_copy_enabled = true;
+  payload.job.etsy_publish = false;
+  payload.job.etsy_account_id = accountId;
+  payload.job.trello_board_id = "";
+  payload.job.trello_list_id = "";
+  payload.job.trello_card_id = "";
+  payload.job.trello_source_card_id = "";
+  payload.job.prompt_product = "";
+  payload.job.prompt_product_key = "";
+
+  const result = await api("/api/jobs/auto-trello-one-click", { method: "POST", body: JSON.stringify(payload) });
+  if (result.mode === "flow_batch" || result.mode === "explicit_trello_card") {
+    logLine(`Tài khoản ${label}: card chưa đủ ảnh output để Listing Etsy; thêm ảnh vào board của tài khoản này trước.`);
+    throw new Error("Card của tài khoản này chưa có ảnh để Listing Etsy.");
+  }
+  const tasks = result.tasks || [];
+  const queued = tasks.filter((task) => task.enqueued && !task.duplicate).length;
+  const duplicate = tasks.filter((task) => task.duplicate).length;
+  logLine(`Đã queue Etsy Draft cho tài khoản ${label}: ${queued} mới, ${duplicate} trùng.`, {
+    mode: result.mode,
+    account: accountId,
+    message: result.message || "",
+    tasks: tasks.map((task) => ({
+      card_id: task.card_id || "",
+      card_name: task.card_name || "",
+      enqueued: Boolean(task.enqueued),
+      duplicate: Boolean(task.duplicate),
+      queue_task: compactQueueTask(task.queue_task || {}),
+    })),
+  });
+  if (!queued && !duplicate) {
+    throw new Error(`Tài khoản ${label}: không có card nào đủ ảnh để Listing Etsy.`);
+  }
+  const queue = await inspectEtsyQueue();
+  logLine(vmQueueHint(queue));
+  await refreshState({ quiet: true });
+  return result;
+}
+
+async function inspectEtsyQueue() {
+  const marketplace = listingMarketplaceName();
+  const queue = await api(listingQueueEndpoint());
+  const tasks = Array.isArray(queue.tasks) ? queue.tasks : [];
+  const completed = tasks.filter((task) => task.status === "completed").length;
+  const failed = tasks.filter((task) => task.status === "failed").length;
+  const summary = `${Number(queue.queued || 0)} chờ, ${Number(queue.in_progress || 0)} đang chạy, ${completed} xong, ${failed} lỗi`;
+  setVmQueueUi(queue);
+  logLine(`Queue VM ${marketplace}: ${summary}.`, compactQueueTask(queue.latest || {}));
+  return queue;
+}
+
+async function connectEtsy() {
+  return inspectEtsyQueue();
+}
+
+async function disconnectEtsy() {
+  const result = await api("/api/integrations/etsy", {
+    method: "PUT",
+    body: JSON.stringify({ clear_credentials: true }),
+  });
+  state.hydratedEtsy = false;
+  logLine("Đã ngắt kết nối Etsy.", result);
+  await refreshState({ quiet: true });
+}
+
+async function saveFlowConfig() {
+  const current = state.payload.config || {};
+  const payload = {
+    project_id: els.flowProjectId.value.trim(),
+    project_name: els.flowProjectName.value.trim(),
+    active_workflow_id: text(current.active_workflow_id, ""),
+    headless: Boolean(current.headless),
+    cdp_url: els.flowCdpUrl.value.trim(),
+    generation_timeout_s: clampInt(els.flowTimeout.value, 60, 3600, 300),
+    poll_interval_s: Number(current.poll_interval_s || 5),
+    output_dir: text(current.output_dir, ""),
+  };
+  const result = await api("/api/config", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  state.hydratedFlow = false;
+  logLine("Đã lưu Flow.", result);
+  await refreshState({ quiet: true });
+}
+
+async function saveGeminiConfig() {
+  const payload = {
+    gemini_api_key: els.geminiApiKey.value.trim(),
+    gemini_image_model: text(els.geminiModel.value, "gemini-2.5-flash-image"),
+  };
+  const result = await api("/api/integrations/settings", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+  els.geminiApiKey.value = "";
+  state.hydratedIntegrations = false;
+  logLine("Đã lưu Gemini.", result);
+  await refreshState({ quiet: true });
+}
+
+async function previewEtsy() {
+  const result = await api("/api/etsy/preview", {
+    method: "POST",
+    body: JSON.stringify(quickJobPayload()),
+  });
+  logLine("Preview Etsy.", result);
+}
+
+async function runEtsyBrowserCopy() {
+  const marketplace = listingMarketplaceName();
+  const payload = quickJobPayload();
+  applyListingJobFlags(payload);
+  const prepare = await api(listingEnqueueEndpoint(), {
+    method: "POST",
+    body: JSON.stringify({ ...payload, source_job_id: `manual-${Date.now()}` }),
+  });
+  const copy = prepare[listingCopyResultKey()] || {};
+  logLine(`Đã đưa ${marketplace} browser copy vào queue.`, copy);
+  if (!copy.enqueued || !copy.browser_automation_ready || !copy.automation_payload) {
+    const missing = Array.isArray(copy.missing) && copy.missing.length ? ` Thiếu: ${copy.missing.join(", ")}` : "";
+    throw new Error(`${marketplace} browser copy chưa sẵn sàng để queue.${missing}`);
+  }
+  logLine("VM extension sẽ tự polling queue này.", `Không mở ${marketplace} ở máy local để tránh nhầm profile hoặc logout.`);
+  await refreshState({ quiet: true });
+  return copy;
+}
+
+async function queueEtsyFromFlowJob(jobId) {
+  const marketplace = listingMarketplaceName();
+  const result = await api(listingJobEnqueueEndpoint(jobId), {
+    method: "POST",
+    body: "{}",
+  });
+  const copy = result[listingCopyResultKey()] || {};
+  const queueTask = compactQueueTask(copy.queue_task || {});
+  logLine(
+    copy.enqueued
+      ? `Đã queue Listing ảnh ${marketplace} từ job Flow.`
+      : `Listing ảnh ${marketplace} chưa queue được.`,
+    {
+      job_id: jobId,
+      enqueued: Boolean(copy.enqueued),
+      duplicate: Boolean(copy.duplicate),
+      title: copy.title || "",
+      sku: copy.sku || "",
+      images: copy.image_count || 0,
+      missing: copy.missing || [],
+      queue_task: queueTask,
+      next: copy.enqueued
+        ? `VM ${marketplace} sẽ polling task này, copy listing và lưu Draft.`
+        : "Kiểm tra job đã archive ảnh Flow lên đúng Trello card chưa.",
+    }
+  );
+  const queue = await inspectEtsyQueue();
+  logLine(vmQueueHint(queue));
+  await refreshState({ quiet: true });
+  setVmQueueUi(queue);
+  return copy;
+}
+
+async function queueEtsyFromTrelloOutputs() {
+  // Multi-account: a non-default account draws cards from its OWN registered
+  // Trello board (resolved server-side), not the default-board column picker.
+  const marketplace = listingMarketplaceName();
+  const isAmazon = listingMarketplaceKey() === "amazon";
+  const accountId = isAmazon ? "" : selectedEtsyAccountId();
+  if (accountId) {
+    return queueEtsyForAccount(accountId);
+  }
+  // "Chọn cột rồi bấm" — draft every image-ready card in each selected column. One or
+  // many columns. A typed SKU/product only makes sense for a single column; with several
+  // columns picked we always run whole-column drafts (query stays empty so the backend
+  // drafts all complete cards in the column instead of doing a zero-match name search).
+  const sourceKeys = selectedTrelloSourceKeys();
+  const typedProduct = text(els.autoProduct?.value, "");
+  const multiColumn = sourceKeys.length > 1;
+  const limit = clampInt(els.autoLimit?.value, 0, 100, 0);
+
+  const summary = { columns: [], totalQueued: 0, totalDuplicate: 0, anyOk: false };
+
+  for (const sourceKey of sourceKeys) {
+    const source = TRELLO_SOURCE_OPTIONS[sourceKey];
+    if (!source) continue;
+    const product = multiColumn ? "" : typedProduct;
+    if (!source.cardId && !product && !source.listId) continue;
+
+    const payload = autoBatchPayload(sourceKey);
+    payload.create_etsy_draft = true;
+    payload.etsy_only = true;
+    payload.continuous = false;
+    payload.run_until_empty = false;
+    payload.limit = limit;
+    applyListingJobFlags(payload.job);
+    payload.job.automation_graph = baseAutomationGraph({
+      includeEtsy: !isAmazon,
+      includeAmazon: isAmazon,
+      includeTrello: true,
+      imageCount: 4,
+      imageEngine: selectedImageEngine(),
+    });
+    // Keep the query empty for a whole-column run (scoped by trello_list_id). Only a real
+    // SKU/product typed by the user against a single column becomes a search query.
+    payload.job.prompt_product = product;
+    payload.job.prompt_product_key = product;
+    if (source.cardId && !multiColumn) {
+      payload.job.trello_card_id = source.cardId;
+      payload.job.trello_source_card_id = source.cardId;
     } else {
-      await api("/api/jobs", {
+      // Whole-column draft: clear card scoping so the backend drafts every image-ready card.
+      payload.job.trello_card_id = "";
+      payload.job.trello_source_card_id = "";
+    }
+
+    let result;
+    try {
+      result = await api("/api/jobs/auto-trello-one-click", {
         method: "POST",
         body: JSON.stringify(payload),
       });
-    }
-    state.mode = "image";
-    state.setupOpen = false;
-    state.automation.enabled = true;
-    saveAutomationConfig(state.automation);
-    showMessage(
-      autoDiscoverTrello
-        ? continuousAutoTrello
-          ? `Đã bật auto liên tục. App sẽ chờ card mới trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi bạn bấm Dừng auto.`
-          : runUntilReadyEmpty
-          ? `Đã xếp hàng chạy 1 lượt. App sẽ quét toàn bộ card có ảnh trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi hết danh sách hiện tại.`
-          : `Đã xếp hàng chạy 1 lượt. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 12 ảnh trong một job rồi đẩy về đúng card để duyệt trên Trello.`
-        : batchItems.length > 1
-        ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi đẩy về đúng card Trello để duyệt.`
-        : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, app sẽ lưu về Trello nếu cục Trello đang bật.",
-      "success"
-    );
-    await loadState({ silent: true });
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    automationSubmitInFlight = false;
-    elements.automationRunButton.disabled = false;
-    elements.automationRunImageButton.disabled = false;
-    if (elements.automationAutoRunButton) {
-      elements.automationAutoRunButton.disabled = false;
-    }
-    if (elements.easyRunButton) {
-      elements.easyRunButton.disabled = false;
-    }
-    renderAutomationDashboard();
-  }
-}
-
-async function submitCreate(event) {
-  event.preventDefault();
-  syncDraftFromForm();
-  syncEditInputsFromForm();
-
-  if (!state.config?.project_id) {
-    state.setupOpen = true;
-    renderTopbar();
-    showMessage("Hãy lưu project trước.", "error");
-    return;
-  }
-
-  if (!state.auth?.authenticated) {
-    state.setupOpen = true;
-    renderTopbar();
-    showMessage("Hãy đăng nhập Google Flow trước.", "error");
-    return;
-  }
-
-  const draft = currentDraft();
-  const operationConfig = currentOperationConfig();
-  if (operationConfig.promptRequired && !draft.prompt.trim()) {
-    showMessage("Hãy nhập mô tả trước khi chạy.", "error");
-    elements.promptInput.focus();
-    return;
-  }
-
-  const payload = {
-    type: state.mode,
-    prompt: draft.prompt.trim(),
-    model: draft.model || defaultModelForMode(state.mode),
-    aspect: draft.aspect || currentModeConfig().defaultAspect,
-    count: Math.max(1, Math.min(4, Number(draft.count || currentModeConfig().defaultCount))),
-    timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
-  };
-
-  if (state.mode === "video") {
-    payload.type = "video";
-    if (currentVideoInputMode() === "start") {
-      if (!state.startImagePath) {
-        showMessage("Hãy tải ảnh đầu vào trước khi chạy video từ ảnh.", "error");
-        return;
-      }
-      payload.start_image_path = state.startImagePath;
-    }
-    if (currentVideoInputMode() === "reference") {
-      if (!state.imageReferenceItems.length) {
-        showMessage("Hãy tải ít nhất 1 ảnh sản phẩm hoặc ảnh tham chiếu trước khi chạy.", "error");
-        return;
-      }
-      payload.reference_image_paths = state.imageReferenceItems.map((item) => item.path).filter(Boolean);
-      payload.reference_image_roles = state.imageReferenceItems.map((item, index) =>
-        normalizeReferenceRoleForMode(item.role || (index === 0 ? "product" : "reference"), "video", index)
-      );
-    }
-  }
-
-  if (state.mode === "image") {
-    payload.type = "image";
-    if (state.imageReferenceItems.length) {
-      payload.reference_image_paths = state.imageReferenceItems.map((item) => item.path).filter(Boolean);
-      payload.reference_image_roles = state.imageReferenceItems.map((item, index) => normalizeReferenceRole(item.role || (index === 0 ? "base" : "reference")));
-    }
-  }
-
-  if (state.mode === "edit") {
-    const source = selectedEditSource();
-    payload.type = state.editAction;
-    payload.prompt = draft.prompt.trim();
-    payload.aspect = "landscape";
-    payload.count = 1;
-    payload.motion = state.motion;
-    payload.position = state.position;
-    payload.resolution = state.resolution;
-    payload.media_id = source?.mediaId || state.manualMediaId.trim();
-    payload.workflow_id = source?.workflowId || state.manualWorkflowId.trim();
-
-    if (!payload.media_id || !payload.workflow_id) {
-      showMessage("Hãy chọn video cần chỉnh hoặc nhập Media ID và Workflow ID.", "error");
-      return;
-    }
-  }
-
-  elements.submitButton.disabled = true;
-  try {
-    await api("/api/jobs", {
-      method: "POST",
-      body: JSON.stringify(payload),
-    });
-    const submitMessage =
-      state.mode === "video" && currentVideoInputMode() === "reference"
-        ? "Đã gửi yêu cầu dựng khung đầu rồi tạo video. Tab Google Flow sẽ được giữ mở."
-        : state.mode === "video" && currentVideoInputMode() === "start"
-        ? "Đã gửi yêu cầu tạo video từ ảnh. Tab Google Flow sẽ được giữ mở."
-        : state.mode === "image" && state.imageReferenceItems.length
-        ? "Đã gửi yêu cầu chỉnh ảnh từ ảnh tham chiếu. Tab Google Flow sẽ được giữ mở."
-        : state.mode === "edit"
-        ? `Đã gửi yêu cầu ${currentEditConfig().title.toLowerCase()}. Tab Google Flow sẽ được giữ mở.`
-        : `Đã gửi yêu cầu ${state.mode === "video" ? "tạo video" : "tạo ảnh"}. Tab Google Flow sẽ được giữ mở.`;
-    showMessage(submitMessage, "success");
-    state.setupOpen = false;
-    await loadState({ silent: true });
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    elements.submitButton.disabled = false;
-  }
-}
-
-function applyGeneratedPromptToComposer(prompt) {
-  const text = String(prompt || "").trim();
-  if (!text) {
-    return;
-  }
-  elements.promptInput.value = text;
-  syncDraftFromForm();
-}
-
-async function submitPromptAi() {
-  syncPromptAiDraftFromForm();
-  const draft = currentPromptAiDraft();
-  const brief = String(draft.brief || elements.promptInput.value || "").trim();
-  if (!brief) {
-    showMessage("Hãy mô tả ngắn gọn điều muốn tạo để AI viết prompt.", "error");
-    elements.promptAiBrief.focus();
-    return;
-  }
-
-  if (!draft.brief.trim()) {
-    elements.promptAiBrief.value = brief;
-    syncPromptAiDraftFromForm();
-  }
-
-  elements.promptAiSubmit.disabled = true;
-  try {
-    const payload = await api("/api/prompt-ai/generate", {
-      method: "POST",
-      body: JSON.stringify({
-        mode: state.mode,
-        brief,
-        style: draft.style.trim(),
-        must_include: draft.mustInclude.trim(),
-        avoid: draft.avoid.trim(),
-        audience: draft.audience.trim(),
-        aspect: elements.aspectSelect.value || currentModeConfig().defaultAspect,
-      }),
-    });
-    state.promptAiResults[state.mode] = payload;
-    applyGeneratedPromptToComposer(payload.prompt || "");
-    renderPromptAiResult();
-    showMessage("AI đã viết prompt và đổ ngay vào ô tạo.", "success");
-    elements.promptInput.focus();
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    elements.promptAiSubmit.disabled = false;
-  }
-}
-
-function usePromptAiResult() {
-  const result = currentPromptAiResult();
-  if (!result?.prompt) {
-    showMessage("Chưa có prompt AI nào để dùng lại.", "error");
-    return;
-  }
-  applyGeneratedPromptToComposer(result.prompt);
-  showMessage("Đã chép prompt AI xuống ô tạo.", "success");
-  elements.promptInput.focus();
-}
-
-async function askUserAssistant(questionOverride = "") {
-  const question = String(questionOverride || elements.userAssistantQuestion?.value || "").trim();
-  if (!question) {
-    showMessage("Nhập câu hỏi cho trợ lý trước đã.", "error");
-    elements.userAssistantQuestion?.focus();
-    return;
-  }
-  if (elements.userAssistantQuestion && questionOverride) {
-    elements.userAssistantQuestion.value = question;
-  }
-
-  state.userAssistant.busy = true;
-  renderUserAssistant();
-  try {
-    const payload = await api("/api/assistant/help", {
-      method: "POST",
-      body: JSON.stringify({
-        question,
-        context: userAssistantContextSummary(),
-      }),
-    });
-    state.userAssistant.last = { ...payload, question };
-    applyAssistantImmediateHints(payload);
-    renderUserAssistant();
-    showMessage("Trợ lý đã trả lời.", "success");
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    state.userAssistant.busy = false;
-    renderUserAssistant();
-  }
-}
-
-function mergeAssistantActions(...groups) {
-  const merged = [];
-  const seen = new Set();
-  groups.flat().filter(Boolean).forEach((action) => {
-    const payloadKey = action.payload ? JSON.stringify(action.payload).slice(0, 240) : "";
-    const key = `${action.action || ""}:${action.label || ""}:${payloadKey}`;
-    if (seen.has(key)) {
-      return;
-    }
-    seen.add(key);
-    merged.push(action);
-  });
-  return merged.slice(0, 10);
-}
-
-async function requestFlowAiOperatorPlan(instructionOverride = "") {
-  const instruction = String(
-    instructionOverride ||
-      elements.userAssistantQuestion?.value ||
-      state.userAssistant?.last?.flow_operator_plan?.instruction ||
-      "",
-  ).trim();
-  if (!instruction) {
-    showMessage("Nhập yêu cầu cho Flow AI Operator trước đã.", "error");
-    elements.userAssistantQuestion?.focus();
-    return null;
-  }
-  const payload = await api("/api/flow-ai/plan", {
-    method: "POST",
-    body: JSON.stringify({
-      instruction,
-      context: userAssistantContextSummary(),
-      run_mode: "plan",
-    }),
-  });
-  const previous = state.userAssistant.last || {};
-  state.userAssistant.last = {
-    ...previous,
-    answer:
-      previous.answer ||
-      "Flow AI Operator đã lập kế hoạch. Chủ nhân có thể bấm từng hành động hoặc dùng Làm theo kế hoạch.",
-    flow_operator_plan: payload,
-    suggested_actions: mergeAssistantActions(payload.suggested_actions || [], previous.suggested_actions || []),
-    trello_candidates: payload.trello_candidates || previous.trello_candidates || [],
-    engine: payload.engine || previous.engine,
-    engine_label: payload.engine_label || previous.engine_label,
-    model: payload.model || previous.model,
-  };
-  applyAssistantImmediateHints(state.userAssistant.last);
-  renderUserAssistant();
-  showMessage("Flow AI Operator đã sẵn sàng thao tác.", "success");
-  return payload;
-}
-
-function applyFlowAiPrompt(prompt) {
-  const text = String(prompt || "").trim();
-  if (!text) {
-    showMessage("Flow Agent chưa có lệnh để chuẩn bị.", "error");
-    return false;
-  }
-  applyGeneratedPromptToComposer(text);
-  if (elements.automationPromptInput) {
-    elements.automationPromptInput.value = text;
-  }
-  syncAutomationFromForm();
-  state.automation.prompt = text;
-  saveAutomationConfig(state.automation);
-  renderAll();
-  showMessage("Đã chuẩn bị lệnh cho Tác nhân Flow. Prompt ảnh cuối sẽ do Google Flow tự viết.", "success");
-  return true;
-}
-
-function applyAssistantImmediateHints(payload) {
-  const actions = Array.isArray(payload?.suggested_actions) ? payload.suggested_actions : [];
-  const productAction = actions.find((action) => action?.action === "apply_product_filter" && action?.requires_confirmation !== true);
-  const productValue = String(productAction?.payload?.value || "").trim();
-  if (productValue && productValue !== String(state.automation.promptProductFilter || "").trim()) {
-    setAssistantProductFilter(productValue);
-  }
-}
-
-function setAssistantProductFilter(value) {
-  const filter = String(value || "").trim();
-  if (!filter) {
-    showMessage("AI chưa nhận ra tên sản phẩm để lọc.", "error");
-    return false;
-  }
-  syncAutomationFromForm();
-  state.automation.promptProductFilter = filter;
-  state.automation.sourceType = FLOW_AI_SOURCE_TYPE;
-  if (state.automation.sourceLocation === DEFAULT_PROMPT_SHEET_URL) {
-    state.automation.sourceLocation = "";
-  }
-  state.automation.modules = normalizeAutomationModules(state.automation).map((module) => {
-    if (module.type !== "source") {
-      return module;
-    }
-    return {
-      ...module,
-      settings: {
-        ...(module.settings || {}),
-        sourceType: FLOW_AI_SOURCE_TYPE,
-        sourceLocation: "",
-        promptProductFilter: filter,
-      },
-    };
-  });
-  if (elements.automationSourceType) {
-    elements.automationSourceType.value = FLOW_AI_SOURCE_TYPE;
-  }
-  if (elements.automationSourceLocationInput && elements.automationSourceLocationInput.value === DEFAULT_PROMPT_SHEET_URL) {
-    elements.automationSourceLocationInput.value = "";
-  }
-  if (elements.automationProductFilterInput) {
-    elements.automationProductFilterInput.value = filter;
-  }
-  persistAutomationModules();
-  renderAll();
-  showMessage(`AI đã lọc sản phẩm theo "${filter}".`, "success");
-  return true;
-}
-
-function setAssistantTrelloCard(value, options = {}) {
-  const card = String(value || "").trim();
-  if (!card) {
-    showMessage("AI chưa nhận ra card Trello cần ghim.", "error");
-    return false;
-  }
-  const listId = String(options.listId || "").trim();
-  const attachmentId = String(options.attachmentId || "").trim();
-  syncAutomationFromForm();
-  state.automation.trelloCardId = card;
-  if (listId) {
-    state.automation.trelloListId = listId;
-  }
-  state.automation.trelloAttachmentIds = attachmentId ? [attachmentId] : [];
-  state.automation.modules = normalizeAutomationModules(state.automation).map((module) => {
-    if (!["trello_source", "trello"].includes(module.type)) {
-      return module;
-    }
-    const settings = {
-      ...(module.settings || {}),
-      trelloCard: card,
-      ...(listId ? { trelloList: listId } : {}),
-    };
-    if (attachmentId) {
-      settings.trelloAttachmentIds = [attachmentId];
-    } else {
-      delete settings.trelloAttachmentIds;
-      delete settings.trelloAttachmentId;
-    }
-    return {
-      ...module,
-      settings,
-    };
-  });
-  if (elements.automationTrelloCardInput) {
-    elements.automationTrelloCardInput.value = card;
-  }
-  if (elements.automationTrelloListInput && listId) {
-    elements.automationTrelloListInput.value = listId;
-  }
-  persistAutomationModules();
-  renderAll();
-  showMessage(
-    attachmentId ? `AI đã chọn đúng ảnh Trello "${attachmentId}" trong card "${card}".` : `AI đã ghim đúng card Trello "${card}".`,
-    "success",
-  );
-  return true;
-}
-
-function assistantTextForBatchIntent() {
-  return String(
-    state.userAssistant?.last?.question ||
-      state.userAssistant?.last?.flow_operator_plan?.instruction ||
-      elements.userAssistantQuestion?.value ||
-      "",
-  ).trim();
-}
-
-function normalizedAssistantIntentText() {
-  return assistantTextForBatchIntent()
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toLowerCase();
-}
-
-function assistantRequestedSingleTestRun() {
-  const text = normalizedAssistantIntentText();
-  if (!text) {
-    return false;
-  }
-  return (
-    /\b(test|thu|kiem tra|demo)\b/.test(text) ||
-    /\b(1|mot|one)\s+(anh|image|prompt|san pham|card)\b/.test(text)
-  );
-}
-
-function assistantRequestedNumericBatchLimit() {
-  const text = normalizedAssistantIntentText();
-  if (!text) {
-    return null;
-  }
-  const numberMatch = text.match(/\b(\d{1,2})\s*(prompt|card|san pham)\b/);
-  if (numberMatch) {
-    return Math.max(1, Math.min(6, Number(numberMatch[1] || 1)));
-  }
-  const words = {
-    mot: 1,
-    one: 1,
-    hai: 2,
-    two: 2,
-    ba: 3,
-    three: 3,
-    bon: 4,
-    four: 4,
-    nam: 5,
-    five: 5,
-    sau: 6,
-    six: 6,
-  };
-  for (const [word, value] of Object.entries(words)) {
-    if (new RegExp(`\\b${word}\\s*(prompt|card|san pham)\\b`).test(text)) {
-      return value;
-    }
-  }
-  return assistantRequestedSingleTestRun() ? 1 : null;
-}
-
-function assistantPlanBatchLimit(actions = []) {
-  const runAction = actions.find((action) => action?.action === "run_auto_trello");
-  const explicitLimit = Number(runAction?.payload?.limit || 0);
-  if (Number.isFinite(explicitLimit) && explicitLimit > 0) {
-    return explicitLimit;
-  }
-  return assistantRequestedNumericBatchLimit();
-}
-
-async function executeUserAssistantAction(action, { skipConfirmation = false } = {}) {
-  if (!action?.action || state.userAssistant.executing) {
-    return;
-  }
-  const actionName = String(action.action || "");
-  if (action.requires_confirmation && !skipConfirmation) {
-    const ok = window.confirm(`${action.label || "Thực hiện hành động"}?\n\n${action.detail || ""}`);
-    if (!ok) {
-      return;
-    }
-  }
-
-  state.userAssistant.executing = true;
-  renderUserAssistant();
-  try {
-    if (actionName === "apply_product_filter") {
-      setAssistantProductFilter(action.payload?.value || "");
-    } else if (actionName === "set_trello_card") {
-      const selected = setAssistantTrelloCard(action.payload?.value || "", {
-        listId: action.payload?.list_id || "",
-        attachmentId: action.payload?.attachment_id || "",
-      });
-      if (selected && action.payload?.run_after_select) {
-        await submitAutomationImage({
-          autoTrello: true,
-          batchLimit: assistantPlanBatchLimit(state.userAssistant?.last?.suggested_actions || []),
-        });
-      }
-    } else if (actionName === "plan_flow_ai_operator") {
-      await requestFlowAiOperatorPlan(action.payload?.instruction || "");
-    } else if (actionName === "apply_flow_ai_prompt") {
-      applyFlowAiPrompt(action.payload?.prompt || state.userAssistant?.last?.flow_operator_plan?.flow_prompt || "");
-    } else if (actionName === "preview_prompt_source") {
-      await previewPromptSource();
-    } else if (actionName === "sync_telegram_approvals") {
-      await syncTelegramApprovals();
-    } else if (actionName === "open_flow_project") {
-      await openFlowProjectSurface();
-    } else if (actionName === "select_trello_source") {
-      selectAutomationModuleByType("trello_source", { create: true });
-      showMessage("AI đã mở cục Trello Image Source để kiểm tra nguồn ảnh.", "success");
-    } else if (actionName === "run_auto_trello") {
-      if (state.automation.sourceType === "sheets" && String(state.automation.sourceLocation || "").trim() && !activePromptSourceItems({ limit: 500 }).length) {
-        await previewPromptSource(null, { silent: true });
-      }
-      await submitAutomationImage({ autoTrello: true, batchLimit: action.payload?.limit || null });
-    } else {
-      showMessage("Hành động AI này chưa được app hỗ trợ.", "error");
-    }
-  } catch (error) {
-    showMessage(error.message || "AI chưa thực hiện được hành động này.", "error");
-  } finally {
-    state.userAssistant.executing = false;
-    renderUserAssistant();
-  }
-}
-
-async function executeUserAssistantPlan() {
-  const actions = Array.isArray(state.userAssistant?.last?.suggested_actions)
-    ? state.userAssistant.last.suggested_actions.filter((action) => action?.action)
-    : [];
-  if (!actions.length || state.userAssistant.executing) {
-    return;
-  }
-  const hasRunAction = actions.some((action) => action.action === "run_auto_trello");
-  const trelloCandidates = Array.isArray(state.userAssistant?.last?.trello_candidates)
-    ? state.userAssistant.last.trello_candidates.filter(Boolean)
-    : [];
-  const selectedAttachmentIds = Array.isArray(state.automation?.trelloAttachmentIds)
-    ? state.automation.trelloAttachmentIds.filter(Boolean)
-    : [];
-  if (!hasRunAction && trelloCandidates.length) {
-    if (state.automation?.trelloCardId && selectedAttachmentIds.length) {
-      showMessage("Đã có ảnh Trello được chọn, app bắt đầu chạy Auto Trello cho đúng ảnh đó.", "success");
-      await submitAutomationImage({ autoTrello: true, batchLimit: assistantPlanBatchLimit(actions) });
-      return;
-    }
-    showMessage("Hãy bấm đúng thumbnail ảnh Trello trước, rồi bấm Chạy ảnh đã chọn.", "error");
-    return;
-  }
-  const needsConfirmation = actions.some((action) => action.requires_confirmation);
-  if (needsConfirmation) {
-    const ok = window.confirm("AI sẽ thực hiện các bước có thể làm trong app. Nếu có bước chạy Auto Trello, app sẽ bắt đầu tạo/chỉnh ảnh bằng Flow. Tiếp tục?");
-    if (!ok) {
-      return;
-    }
-  }
-  const setCardActions = actions.filter((action) => action.action === "set_trello_card");
-  const orderedActions = actions.slice().sort((left, right) => {
-    if (left.action === "run_auto_trello") {
-      return 1;
-    }
-    if (right.action === "run_auto_trello") {
-      return -1;
-    }
-    return 0;
-  });
-  for (const action of orderedActions) {
-    if (setCardActions.length > 1 && action.action === "set_trello_card") {
+    } catch (err) {
+      // A "nothing to draft" 400 for one column must not abort the remaining columns.
+      const message = err?.message || String(err);
+      summary.columns.push({ label: source.label, queued: 0, duplicate: 0, error: message });
+      logLine(`Cột ${source.label}: ${message}`);
       continue;
     }
-    await executeUserAssistantAction(action, { skipConfirmation: true });
-  }
-}
-
-async function requestStoryboardPlan() {
-  syncStoryboardDraftFromForm();
-  const script = String(state.storyboardDraft.script || "").trim();
-  if (!script) {
-    showMessage("Hãy dán kịch bản trước khi tách cảnh.", "error");
-    elements.storyboardScript.focus();
-    return null;
-  }
-
-  const payload = await api("/api/storyboard/plan", {
-    method: "POST",
-    body: JSON.stringify({
-      script,
-      style: String(state.storyboardDraft.style || "").trim(),
-      must_include: String(state.storyboardDraft.mustInclude || "").trim(),
-      avoid: String(state.storyboardDraft.avoid || "").trim(),
-      aspect: elements.aspectSelect.value || currentModeConfig().defaultAspect,
-      scene_count: Math.max(0, Number(state.storyboardDraft.sceneCount || 0)),
-    }),
-  });
-  state.storyboardPlan = payload;
-  renderStoryboardCard();
-  return payload;
-}
-
-async function submitStoryboardPlan() {
-  state.storyboardBusy = true;
-  renderStoryboardCard();
-  try {
-    const payload = await requestStoryboardPlan();
-    if (!payload) {
-      return;
-    }
-    showMessage(`Đã tách ${payload.scene_count || 0} cảnh storyboard từ kịch bản.`, "success");
-  } catch (error) {
-    showMessage(error.message, "error");
-  } finally {
-    state.storyboardBusy = false;
-    renderStoryboardCard();
-  }
-}
-
-async function submitStoryboardImages() {
-  state.storyboardBusy = true;
-  renderStoryboardCard();
-  let createdCount = 0;
-  try {
-    const plan = await requestStoryboardPlan();
-    if (!plan) {
-      return;
-    }
-    if (!isReady()) {
-      showMessage(
-        `Đã tách ${plan.scene_count || 0} cảnh. Hãy đăng nhập Google Flow rồi bấm lại để app tạo luôn các ảnh storyboard.`,
-        "error"
-      );
-      return;
+    if (result.mode === "flow_batch" || result.mode === "explicit_trello_card") {
+      summary.columns.push({ label: source.label, queued: 0, duplicate: 0, error: "chưa đủ ảnh output" });
+      logLine(`Cột ${source.label}: chưa đủ ảnh output để Listing ${marketplace}; hãy chạy Flow trước.`);
+      continue;
     }
 
-    const imageModel = state.drafts.image.model || defaultModelForMode("image");
-    const aspect = elements.aspectSelect.value || currentModeConfig().defaultAspect;
-    const items = Array.isArray(plan.items) ? plan.items : [];
-    for (const item of items) {
-      const sceneIndex = Math.max(1, Number(item.index || createdCount + 1));
-      const title = String(item.title || `Cảnh ${sceneIndex}`).trim();
-      const prompt = String(item.image_prompt || "").trim();
-      if (!prompt) {
-        continue;
-      }
-      await api("/api/jobs", {
+    const tasks = result.tasks || [];
+    const queued = tasks.filter((task) => task.enqueued && !task.duplicate).length;
+    const duplicate = tasks.filter((task) => task.duplicate).length;
+    summary.anyOk = summary.anyOk || Boolean(result.ok);
+    summary.totalQueued += queued;
+    summary.totalDuplicate += duplicate;
+    summary.columns.push({ label: source.label, queued, duplicate, error: "" });
+    logLine(`Đã kiểm Trello và queue ${marketplace} Draft: ${source.label}.`, {
+      mode: result.mode,
+      message: result.message || "",
+      source: source.label,
+      product,
+      tasks: tasks.map((task) => ({
+        card_id: task.card_id || "",
+        card_name: task.card_name || "",
+        enqueued: Boolean(task.enqueued),
+        duplicate: Boolean(task.duplicate),
+        missing: task.missing || [],
+        queue_task: compactQueueTask(task.queue_task || {}),
+      })),
+    });
+  }
+
+  if (!summary.columns.length) {
+    throw new Error(`Chọn ít nhất 1 cột (hoặc nhập SKU/tên sản phẩm) để Listing ${marketplace}.`);
+  }
+  if (!summary.totalQueued) {
+    if (summary.totalDuplicate) {
+      logLine(`Tất cả ${summary.totalDuplicate} card đã được đưa sang ${marketplace} Draft trước đó; không queue trùng.`);
+      await refreshState({ quiet: true });
+      return summary;
+    }
+    throw new Error(`Không có card nào đủ ảnh output để đẩy sang ${marketplace} Draft (hãy chạy Flow trước).`);
+  }
+
+  const columnsLabel = summary.columns.map((column) => column.label).join(", ");
+  logLine(
+    `Tổng: queue ${summary.totalQueued} card mới sang ${marketplace} Draft từ ${summary.columns.length} cột (${columnsLabel})` +
+      (summary.totalDuplicate ? `, bỏ qua ${summary.totalDuplicate} card đã Draft.` : ".")
+  );
+  const queue = await inspectEtsyQueue();
+  logLine(vmQueueHint(queue));
+  await refreshState({ quiet: true });
+  setVmQueueUi(queue);
+  return summary;
+}
+
+async function queueEtsyFromCardRefs(refs) {
+  // "Dán link card -> listing" — draft each specific Trello card the user pasted, regardless of
+  // which column is checked. The backend explicit-card path drafts straight to Etsy when the
+  // card already has output images (no Flow re-run); a card without images returns a clean 400.
+  const marketplace = listingMarketplaceName();
+  const isAmazon = listingMarketplaceKey() === "amazon";
+  const summary = { total: refs.length, queued: 0, duplicate: 0, failed: 0, items: [] };
+  for (const ref of refs) {
+    const payload = autoBatchPayload(selectedTrelloSourceKey());
+    payload.create_etsy_draft = true;
+    payload.etsy_only = true;
+    payload.continuous = false;
+    payload.run_until_empty = false;
+    payload.limit = 1;
+    applyListingJobFlags(payload.job);
+    payload.job.automation_graph = baseAutomationGraph({
+      includeEtsy: !isAmazon,
+      includeAmazon: isAmazon,
+      includeTrello: true,
+      imageCount: 4,
+      imageEngine: selectedImageEngine(),
+    });
+    // The pasted link is a card reference, NOT a product-name search query.
+    payload.job.prompt_product = "";
+    payload.job.prompt_product_key = "";
+    payload.job.prompt_notes = `${marketplace} draft từ link card Trello: ${ref}`;
+    payload.job.trello_card_id = ref;
+    payload.job.trello_source_card_id = ref;
+    // Let the backend resolve the real list from the card itself.
+    payload.job.trello_list_id = "";
+
+    let result;
+    try {
+      result = await api("/api/jobs/auto-trello-one-click", {
         method: "POST",
-        body: JSON.stringify({
-          type: "image",
-          title: `Storyboard ảnh cảnh ${sceneIndex} · ${title}`,
-          prompt,
-          model: imageModel,
-          aspect,
-          count: 1,
-          timeout_s: Math.max(30, Number(state.config?.generation_timeout_s || 300)),
-        }),
+        body: JSON.stringify(payload),
       });
-      createdCount += 1;
+    } catch (err) {
+      const message = err?.message || String(err);
+      summary.failed += 1;
+      summary.items.push({ ref, error: message });
+      logLine(`Card ${ref}: ${message}`);
+      continue;
     }
 
-    state.mode = "image";
-    state.setupOpen = false;
-    await loadState({ silent: true });
-    showMessage(
-      `Đã xếp ${createdCount} ảnh storyboard từ kịch bản. Em đã chuyển sang tab Ảnh để chủ nhân theo dõi kết quả.`,
-      "success"
+    // etsy_only + a card with no Flow output images returns a 400 (handled above). If the
+    // backend still routed to Flow gen, surface it as "needs Flow first" rather than a draft.
+    if (result.mode === "explicit_trello_card" || result.mode === "flow_batch") {
+      summary.failed += 1;
+      summary.items.push({ ref, error: "card chưa có ảnh output" });
+      logLine(`Card ${ref}: chưa có ảnh output Flow nên không Listing ${marketplace} được; chạy Flow trước.`);
+      continue;
+    }
+
+    const tasks = result.tasks || [];
+    const enqueued = tasks.filter((task) => task.enqueued).length;
+    summary.queued += enqueued;
+    summary.items.push({
+      ref,
+      queued: enqueued,
+      card_name: tasks[0]?.card_name || result.job?.title || ref,
+    });
+    logLine(`Đã queue ${marketplace} Draft từ link card: ${tasks[0]?.card_name || ref}.`, {
+      mode: result.mode,
+      message: result.message || "",
+      card: ref,
+      tasks: tasks.map((task) => ({
+        card_id: task.card_id || "",
+        card_name: task.card_name || "",
+        enqueued: Boolean(task.enqueued),
+        queue_task: compactQueueTask(task.queue_task || {}),
+      })),
+    });
+  }
+
+  if (!summary.queued) {
+    throw new Error(
+      summary.failed
+        ? `Không queue được link card nào (${summary.failed} lỗi). Card cần có ảnh output Flow trước.`
+        : `Không có link card hợp lệ để gửi ${marketplace} Draft.`
     );
-  } catch (error) {
-    if (createdCount > 0) {
-      state.mode = "image";
-      await loadState({ silent: true });
-      showMessage(
-        `Đã xếp ${createdCount} ảnh storyboard rồi, nhưng các cảnh tiếp theo dừng lại vì: ${error.message}`,
-        "error"
+  }
+  logLine(
+    `Tổng: queue ${summary.queued}/${summary.total} card từ link sang ${marketplace} Draft` +
+      (summary.failed ? `, ${summary.failed} card chưa có ảnh.` : ".")
+  );
+  const queue = await inspectEtsyQueue();
+  logLine(vmQueueHint(queue));
+  await refreshState({ quiet: true });
+  setVmQueueUi(queue);
+  return summary;
+}
+
+function bindEvents() {
+  els.refreshButton.addEventListener("click", () => refreshState());
+  els.jobsRefreshButton.addEventListener("click", () => refreshState());
+  els.jobsStatusButton.addEventListener("click", () => {
+    els.jobsDrawer.open = true;
+  });
+  els.etsyStatusButton.addEventListener("click", () => {
+    els.etsyDrawer.open = true;
+    els.etsyDrawer.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  els.saveEtsyShortcutButton.addEventListener("click", () => {
+    els.etsyDrawer.open = true;
+    els.etsyDrawer.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  els.flowStatusButton.addEventListener("click", () => {
+    els.flowDrawer.open = true;
+    els.flowDrawer.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
+  els.extensionStatusButton.addEventListener("click", () => {
+    window.location.href = "/api/extension/download";
+  });
+  els.clearConsoleButton.addEventListener("click", () => {
+    els.consoleOutput.textContent = "Sẵn sàng.";
+  });
+  // Delegated so dynamically-rendered board columns (from "Load cột") fire it too.
+  els.autoSourceGroup?.addEventListener("change", (event) => {
+    if (event.target?.name !== "autoSource") return;
+    updateAutoSourceUi();
+    const labels = selectedTrelloSourceKeys().map((key) => TRELLO_SOURCE_OPTIONS[key]?.label || key);
+    logLine(`Nguồn Trello: ${labels.join(", ") || "(chưa chọn cột)"}.`);
+  });
+  els.loadBoardColumnsButton?.addEventListener("click", () => {
+    withBusy(els.loadBoardColumnsButton, "Đang load", () => loadBoardColumns(els.boardLinkInput?.value || ""));
+  });
+  els.autoProduct?.addEventListener("input", () => {
+    renderEtsyListingAction(state.payload);
+  });
+  els.imageEngineSelect?.addEventListener("change", () => {
+    window.localStorage.setItem("flow-image-engine", selectedImageEngine());
+    updateAutoSourceUi();
+    logLine(`Chế độ ảnh: ${imageEngineLabel()}.`);
+  });
+  els.autoCreateEtsy?.addEventListener("change", () => {
+    updateAutoSourceUi();
+    logLine(`Auto chỉ chạy Flow/Trello; bấm Listing ảnh ${listingMarketplaceName()} sau khi ảnh xong.`);
+  });
+  els.listLatestEtsyButton?.addEventListener("click", () => {
+    // A pasted Trello card link wins over column config: draft exactly that card to Etsy.
+    const cardRefs = parseTrelloCardRefs(els.autoProduct?.value);
+    if (cardRefs.length) {
+      withBusy(els.listLatestEtsyButton, "Đang lấy card", () => queueEtsyFromCardRefs(cardRefs));
+      return;
+    }
+    // Multi-column selection always drafts every image-ready card in the selected columns.
+    // Only when a single column is selected do we honor the "just-ran this Flow job" quick
+    // path (so a fresh single-card Flow run still queues just that card).
+    const multiColumn = selectedTrelloSourceKeys().length > 1;
+    const job = multiColumn ? null : latestQueueableEtsyJob();
+    withBusy(
+      els.listLatestEtsyButton,
+      "Đang kiểm Trello",
+      () => (job?.id ? queueEtsyFromFlowJob(job.id) : queueEtsyFromTrelloOutputs())
+    );
+  });
+  els.jobsList?.addEventListener("click", (event) => {
+    const button = event.target.closest("[data-action='queue-etsy']");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const jobId = button.getAttribute("data-job-id") || "";
+    if (!jobId) return;
+    withBusy(button, "Đang queue", () => queueEtsyFromFlowJob(jobId));
+  });
+
+  els.openFlowButton.addEventListener("click", () =>
+    withBusy(els.openFlowButton, "Đang mở", async () => {
+      const result = await api("/api/flow/open-project", { method: "POST", body: "{}" });
+      logLine("Đã gọi mở Flow project.", result);
+      await refreshState({ quiet: true });
+    })
+  );
+
+  els.openFlowFromSetupButton.addEventListener("click", () =>
+    withBusy(els.openFlowFromSetupButton, "Đang mở", async () => {
+      const result = await api("/api/flow/open-project", { method: "POST", body: "{}" });
+      logLine("Đã gọi mở Flow project.", result);
+      await refreshState({ quiet: true });
+    })
+  );
+
+  els.openLoginButton.addEventListener("click", () =>
+    withBusy(els.openLoginButton, "Đang mở", async () => {
+      const result = await api("/api/flow/open-login", { method: "POST", body: "{}" });
+      logLine("Đã gọi mở trang login Flow.", result);
+      await refreshState({ quiet: true });
+    })
+  );
+
+  els.preflightButton.addEventListener("click", () =>
+    withBusy(els.preflightButton, "Đang kiểm", runPreflight)
+  );
+
+  els.checkAutoButton.addEventListener("click", () =>
+    withBusy(els.checkAutoButton, "Đang kiểm", runPreflight)
+  );
+
+  els.runQuickJobButton.addEventListener("click", () =>
+    withBusy(els.runQuickJobButton, "Đang chạy", async () => {
+      const startedAt = Date.now() - 5_000;
+      const payload = quickJobPayload();
+      const result = await api("/api/jobs", { method: "POST", body: JSON.stringify(payload) });
+      rememberLastFlowRunContext({
+        sourceKey: "quick",
+        sourceLabel: "Quick Flow",
+        jobId: result.job?.id || "",
+        startedAt,
+      });
+      logLine("Đã tạo job Flow.", result);
+      await refreshState({ quiet: true });
+    })
+  );
+
+  els.runAutoButton.addEventListener("click", () =>
+    withBusy(els.runAutoButton, "Đang chạy", async () => {
+      showConsole();
+      logLine(`Start: quét ${selectedTrelloSource().label}, tạo Flow/Trello trước; Listing ảnh ${listingMarketplaceName()} bấm riêng sau khi ảnh xong.`);
+      const source = selectedTrelloSource();
+      const startedAt = Date.now() - 5_000;
+      const payload = autoBatchPayload();
+      const result = await api("/api/jobs/auto-trello-one-click", { method: "POST", body: JSON.stringify(payload) });
+      rememberLastFlowRunContext({
+        sourceKey: selectedTrelloSourceKey(),
+        sourceLabel: source.label,
+        product: text(els.autoProduct?.value || source.product, ""),
+        cardId: source.cardId || "",
+        listId: source.listId || "",
+        startedAt,
+      });
+      logAutoRunResult(result);
+      let queue = null;
+      if (payload.job?.etsy_browser_copy_enabled || payload.job?.etsy_enabled) {
+        queue = await inspectEtsyQueue();
+        logLine(vmQueueHint(queue));
+      } else {
+        logLine(`Auto đang tách bước: Flow/Trello chạy trước. Khi job ảnh completed, bấm nút Listing ảnh ${listingMarketplaceName()} trong Jobs.`);
+      }
+      await refreshState({ quiet: true });
+      if (queue) setVmQueueUi(queue);
+    })
+  );
+
+  els.saveEtsyButton.addEventListener("click", () =>
+    withBusy(els.saveEtsyButton, "Đang lưu", saveEtsy)
+  );
+
+  if (els.addAccountButton) {
+    els.addAccountButton.addEventListener("click", () =>
+      withBusy(els.addAccountButton, "Đang lưu", upsertEtsyAccount)
+    );
+  }
+  if (els.accountsRefreshButton) {
+    els.accountsRefreshButton.addEventListener("click", (event) => {
+      event.preventDefault();
+      loadEtsyAccounts({ quiet: false });
+    });
+  }
+  if (els.accountsList) {
+    els.accountsList.addEventListener("click", (event) => {
+      const button = event.target.closest('[data-action="del-account"]');
+      if (!button) return;
+      const slug = button.getAttribute("data-slug") || "";
+      if (slug && window.confirm(`Xoá tài khoản Etsy "${slug}"?`)) {
+        deleteEtsyAccount(slug);
+      }
+    });
+  }
+  if (els.autoAccountSelect) {
+    els.autoAccountSelect.addEventListener("change", () => {
+      const accountId = selectedEtsyAccountId();
+      logLine(
+        accountId
+          ? `One-click sẽ dùng tài khoản "${accountId}" (board riêng đã đăng ký).`
+          : "One-click dùng tài khoản mặc định (trung6, board global)."
       );
-    } else {
-      showMessage(error.message, "error");
-    }
-  } finally {
-    state.storyboardBusy = false;
-    renderStoryboardCard();
-  }
-}
-
-function buildRetryPayload(job) {
-  const input = job?.input || {};
-  return {
-    type: job.type,
-    prompt: String(input.prompt || "").trim(),
-    title: "",
-    timeout_s: Math.max(30, Number(input.timeout_s || state.config?.generation_timeout_s || 300)),
-    source_job_id: job.id,
-    model: String(input.model || defaultModelForMode(modeForJobType(job.type))).trim(),
-    aspect: String(input.aspect || MODE_CONFIG[job.type]?.defaultAspect || "landscape").trim(),
-    count: Math.max(1, Math.min(4, Number(input.count || MODE_CONFIG[job.type]?.defaultCount || 1))),
-    start_image_path: String(input.start_image_path || "").trim(),
-    reference_image_paths: Array.isArray(input.reference_image_paths) ? input.reference_image_paths : [],
-    reference_image_roles: Array.isArray(input.reference_image_roles) ? input.reference_image_roles : [],
-    reference_media_names: Array.isArray(input.reference_media_names) ? input.reference_media_names : [],
-    media_id: String(input.media_id || "").trim(),
-    workflow_id: String(input.workflow_id || "").trim(),
-    motion: String(input.motion || "").trim(),
-    position: String(input.position || "").trim(),
-    resolution: String(input.resolution || "1080p").trim() || "1080p",
-    mask_x: Number(input.mask_x ?? 0.5),
-    mask_y: Number(input.mask_y ?? 0.5),
-    brush_size: Number(input.brush_size ?? 40),
-  };
-}
-
-async function retryJob(jobId) {
-  const job = (state.jobs || []).find((item) => item.id === jobId);
-  if (!job) {
-    showMessage("Không tìm thấy lượt chạy để thử lại.", "error");
-    return;
-  }
-
-  try {
-    await api("/api/jobs", {
-      method: "POST",
-      body: JSON.stringify(buildRetryPayload(job)),
     });
-    showMessage("Đã gửi lại lượt chạy với đúng cấu hình cũ. Tab Google Flow sẽ được giữ mở.", "success");
-    state.setupOpen = false;
-    await loadState({ silent: true });
-  } catch (error) {
-    showMessage(error.message, "error");
-  }
-}
-
-function reuseJob(jobId) {
-  const job = (state.jobs || []).find((item) => item.id === jobId);
-  if (!job) {
-    showMessage("Không tìm thấy lượt chạy để dùng lại.", "error");
-    return;
   }
 
-  fillComposerFromSource(job.type, job.input || {});
-  showMessage("Đã đổ lại prompt và thông số lên form.", "success");
-}
+  els.saveFlowButton.addEventListener("click", () =>
+    withBusy(els.saveFlowButton, "Đang lưu", saveFlowConfig)
+  );
 
-function changeMode(mode) {
-  if (!MODE_CONFIG[mode] || mode === state.mode) {
-    return;
-  }
-  syncDraftFromForm();
-  syncPromptAiDraftFromForm();
-  state.mode = mode;
-  if (mode === "video" && !state.drafts.video.inputMode) {
-    state.drafts.video.inputMode = "prompt";
-  }
-  renderAll();
-}
+  els.saveGeminiButton?.addEventListener("click", () =>
+    withBusy(els.saveGeminiButton, "Đang lưu", saveGeminiConfig)
+  );
 
-function parseVideoModelOptions(payload) {
-  const items = Array.isArray(payload?.result?.videoModels) ? payload.result.videoModels : [];
-  const seen = new Set();
-  const options = [];
-  for (const item of items) {
-    const label = String(item?.displayName || "").trim();
-    const caps = Array.isArray(item?.capabilities) ? item.capabilities : [];
-    const deprecated = String(item?.modelStatus || "").toUpperCase().includes("DEPRECATED");
-    if (!label || deprecated || label.includes("[Lower Priority]")) {
-      continue;
-    }
-    const supportsCreate =
-      caps.includes("VIDEO_MODEL_CAPABILITY_TEXT") ||
-      caps.includes("VIDEO_MODEL_CAPABILITY_START_IMAGE");
-    if (!supportsCreate || seen.has(label)) {
-      continue;
-    }
-    seen.add(label);
-    options.push({ value: label, label });
-  }
-  return options.length ? options : [...FALLBACK_VIDEO_MODELS];
-}
+  els.previewEtsyButton.addEventListener("click", () =>
+    withBusy(els.previewEtsyButton, "Đang preview", previewEtsy)
+  );
 
-async function loadModelOptions() {
-  if (state.modelOptionsLoading || !isReady()) {
-    return;
+  if (els.connectEtsyTopButton) {
+    els.connectEtsyTopButton.addEventListener("click", () =>
+      withBusy(els.connectEtsyTopButton, "Đang xem", () => connectEtsy())
+    );
   }
-  state.modelOptionsLoading = true;
-  try {
-    const payload = await api("/api/models");
-    state.modelOptions.video = parseVideoModelOptions(payload);
-    state.modelOptions.image = [...FALLBACK_IMAGE_MODELS];
-    state.modelOptionsLoaded = true;
-    state.drafts.video.model = state.modelOptions.video.some((item) => item.value === state.drafts.video.model)
-      ? state.drafts.video.model
-      : defaultModelForMode("video");
-    state.drafts.image.model = state.modelOptions.image.some((item) => item.value === state.drafts.image.model)
-      ? state.drafts.image.model
-      : defaultModelForMode("image");
-    if (state.mode !== "edit") {
-      renderComposer();
-    }
-  } catch (error) {
-    state.modelOptions.video = [...FALLBACK_VIDEO_MODELS];
-    state.modelOptions.image = [...FALLBACK_IMAGE_MODELS];
-  } finally {
-    state.modelOptionsLoading = false;
+  if (els.connectEtsyButton) {
+    els.connectEtsyButton.addEventListener("click", () =>
+      withBusy(els.connectEtsyButton, "Đang xem", () => connectEtsy())
+    );
   }
-}
-
-function setupPolling() {
-  window.setInterval(() => {
-    if (document.hidden) {
-      return;
-    }
-    loadState({ silent: true });
-  }, 5000);
-}
-
-function isAutomationCanvasControl(target) {
-  return Boolean(target.closest(".scenario-canvas-tools, button, a, input, textarea, select, [contenteditable='true']"));
-}
-
-function handleAutomationCanvasPointerDown(event) {
-  if (event.button !== 0 || !elements.scenarioCanvas || isAutomationCanvasControl(event.target)) {
-    return;
+  if (els.runEtsyCopyButton) {
+    els.runEtsyCopyButton.addEventListener("click", () =>
+      withBusy(els.runEtsyCopyButton, "Đang chạy", runEtsyBrowserCopy)
+    );
   }
-  event.preventDefault();
-  automationCanvasPan = {
-    pointerId: event.pointerId,
-    startX: event.clientX,
-    startY: event.clientY,
-    scrollLeft: elements.scenarioCanvas.scrollLeft,
-    scrollTop: elements.scenarioCanvas.scrollTop,
-  };
-  elements.scenarioCanvas.classList.add("is-panning");
-  elements.scenarioCanvas.setPointerCapture?.(event.pointerId);
-}
-
-function handleAutomationCanvasPointerMove(event) {
-  if (!automationCanvasPan || automationCanvasPan.pointerId !== event.pointerId || !elements.scenarioCanvas) {
-    return;
+  if (els.disconnectEtsyButton) {
+    els.disconnectEtsyButton.addEventListener("click", () =>
+      withBusy(els.disconnectEtsyButton, "Đang ngắt", disconnectEtsy)
+    );
   }
-  event.preventDefault();
-  const dx = event.clientX - automationCanvasPan.startX;
-  const dy = event.clientY - automationCanvasPan.startY;
-  elements.scenarioCanvas.scrollLeft = automationCanvasPan.scrollLeft - dx;
-  elements.scenarioCanvas.scrollTop = automationCanvasPan.scrollTop - dy;
-}
-
-function stopAutomationCanvasPan(event) {
-  if (!automationCanvasPan || (event?.pointerId && automationCanvasPan.pointerId !== event.pointerId)) {
-    return;
-  }
-  if (event?.pointerId) {
-    elements.scenarioCanvas?.releasePointerCapture?.(event.pointerId);
-  }
-  elements.scenarioCanvas?.classList.remove("is-panning");
-  automationCanvasPan = null;
-}
-
-function clearAutomationDragState() {
-  automationDraggedStepId = "";
-  elements.scenarioNodeRow?.querySelectorAll(".is-dragging, .is-drop-target").forEach((node) => {
-    node.classList.remove("is-dragging", "is-drop-target");
-  });
-}
-
-function reorderAutomationModules(dragStepId, targetStepId) {
-  if (!dragStepId || !targetStepId || dragStepId === targetStepId) {
-    clearAutomationDragState();
-    return;
-  }
-  syncAutomationFromForm();
-  state.automation.modules = normalizeAutomationModules(state.automation);
-  const fromIndex = state.automation.modules.findIndex((module) => module.id === dragStepId);
-  const toIndex = state.automation.modules.findIndex((module) => module.id === targetStepId);
-  if (fromIndex < 0 || toIndex < 0) {
-    clearAutomationDragState();
-    return;
-  }
-  const [module] = state.automation.modules.splice(fromIndex, 1);
-  state.automation.modules.splice(toIndex, 0, module);
-  state.automation.selectedStep = module.id;
-  persistAutomationModules();
-  renderAutomationDashboard();
-  window.setTimeout(() => scrollAutomationNodeIntoView(module.id), 0);
-  showMessage("Đã đổi vị trí module trên sơ đồ.", "success");
-}
-
-function handleAutomationKeyboard(event) {
-  if (state.automation.view !== "diagram" || event.metaKey || event.ctrlKey || event.altKey) {
-    return;
-  }
-  const active = document.activeElement;
-  if (active?.matches?.("input, textarea, select, [contenteditable='true']")) {
-    return;
-  }
-  if (event.key === "+" || event.key === "=") {
-    event.preventDefault();
-    setAutomationCanvasZoom(state.automation.canvasZoom + AUTOMATION_CANVAS_ZOOM_STEP);
-  } else if (event.key === "-") {
-    event.preventDefault();
-    setAutomationCanvasZoom(state.automation.canvasZoom - AUTOMATION_CANVAS_ZOOM_STEP);
-  } else if (event.key === "0") {
-    event.preventDefault();
-    setAutomationCanvasZoom(1);
-  }
-}
-
-elements.modeButtons.forEach((button) => {
-  button.addEventListener("click", () => changeMode(button.dataset.mode));
-});
-
-elements.videoInputModeButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    if (state.mode !== "video") {
-      return;
-    }
-    setVideoInputMode(button.dataset.videoInputMode, { clearConflicts: true, announce: true });
-    renderAll();
-  });
-});
-
-elements.editActionButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    state.editAction = button.dataset.editAction || "extend";
-    renderAll();
-  });
-});
-
-elements.setupToggle.addEventListener("click", () => {
-  state.setupOpen = !state.setupOpen;
-  renderTopbar();
-});
-
-elements.configForm.addEventListener("submit", saveConfig);
-elements.loginButton.addEventListener("click", loginFlow);
-elements.openFlowButton.addEventListener("click", openFlowProjectSurface);
-elements.openLoginButton.addEventListener("click", openFlowLoginSurface);
-elements.openProjectButton.addEventListener("click", openFlowProjectSurface);
-elements.focusProjectButton.addEventListener("click", openFlowProjectSurface);
-elements.automationEnabled.addEventListener("change", () => {
-  syncAutomationFromForm();
-  renderTopbar();
-  renderAutomationDashboard();
-});
-elements.automationOpenFlowButton.addEventListener("click", openFlowProjectSurface);
-elements.automationRefreshButton.addEventListener("click", () => loadState());
-elements.automationHistoryRefreshButton.addEventListener("click", () => loadState());
-elements.automationIncompleteRefreshButton.addEventListener("click", () => loadState());
-elements.automationResetReadyButton?.addEventListener("click", resetReadyForAiOutputs);
-elements.automationRunButton.addEventListener("click", submitAutomationImage);
-elements.automationRunImageButton.addEventListener("click", submitAutomationImage);
-elements.automationAutoRunButton?.addEventListener("click", async () => {
-  if (activeContinuousAutoTrelloJob()) {
-    void stopContinuousAutoTrello();
-    return;
-  }
-  const ready = await prepareReadyForAutoTrello();
-  if (!ready) {
-    return;
-  }
-  void submitAutomationImage({ autoTrello: true, continuousAutoTrello: true });
-});
-elements.automationUseStudioButton.addEventListener("click", useAutomationPromptInStudio);
-elements.automationExportButton.addEventListener("click", exportAutomationConfig);
-elements.automationImportButton.addEventListener("click", () => elements.automationImportFile.click());
-elements.automationImportFile.addEventListener("change", importAutomationConfig);
-elements.automationResetButton.addEventListener("click", resetAutomationConfig);
-elements.automationZoomOut?.addEventListener("click", () => setAutomationCanvasZoom(state.automation.canvasZoom - AUTOMATION_CANVAS_ZOOM_STEP));
-elements.automationZoomIn?.addEventListener("click", () => setAutomationCanvasZoom(state.automation.canvasZoom + AUTOMATION_CANVAS_ZOOM_STEP));
-elements.automationZoomReset?.addEventListener("click", () => setAutomationCanvasZoom(1));
-elements.automationFitButton?.addEventListener("click", fitAutomationCanvas);
-elements.easyPromptButton?.addEventListener("click", () => {
-  state.automation.view = "diagram";
-  selectAutomationModuleByType("source", { create: true });
-  window.setTimeout(() => {
-    if (state.automation.sourceType !== "sheets") {
-      elements.automationProductFilterInput?.focus();
-    } else if (!String(state.automation.prompt || "").trim()) {
-      elements.automationSheetPasteInput?.focus();
-    } else {
-      elements.automationPromptInput?.focus();
-    }
-  }, 0);
-});
-elements.easyFlowButton?.addEventListener("click", async () => {
-  state.automation.view = "diagram";
-  selectAutomationModuleByType("flow", { create: true });
-  if (!state.config?.project_id) {
-    state.setupOpen = true;
-    renderTopbar();
-    elements.projectId?.focus();
-    showMessage("Dán link project Flow rồi bấm Lưu project.", "error");
-    return;
-  }
-  if (!state.auth?.authenticated) {
-    await loginFlow();
-    return;
-  }
-  await openFlowProjectSurface();
-});
-elements.easyReviewButton?.addEventListener("click", () => {
-  state.automation.view = "diagram";
-  selectAutomationModuleByType("telegram", { create: true });
-  window.setTimeout(() => {
-    const input = elements.automationModuleSettings?.querySelector("[data-module-setting='telegramChat']");
-    input?.focus();
-  }, 0);
-});
-elements.easyRunButton?.addEventListener("click", submitAutomationImage);
-elements.automationModuleAddButton?.addEventListener("click", () => addAutomationModule());
-elements.automationModuleDuplicateButton?.addEventListener("click", () => addAutomationModule({ duplicate: true }));
-elements.automationModuleDeleteButton?.addEventListener("click", deleteSelectedAutomationModule);
-elements.automationModuleMoveLeftButton?.addEventListener("click", () => moveSelectedAutomationModule(-1));
-elements.automationModuleMoveRightButton?.addEventListener("click", () => moveSelectedAutomationModule(1));
-elements.automationModuleSettings?.addEventListener("input", (event) => {
-  const control = event.target.closest("[data-module-setting]");
-  if (!control) {
-    return;
-  }
-  syncModuleSettingFromControl(control);
-});
-elements.automationModuleSettings?.addEventListener("change", (event) => {
-  const control = event.target.closest("[data-module-setting]");
-  if (!control) {
-    return;
-  }
-  syncModuleSettingFromControl(control);
-  renderAutomationDashboard();
-});
-elements.automationModuleSettings?.addEventListener("click", (event) => {
-  const action = event.target.closest("[data-module-action]")?.dataset.moduleAction;
-  if (!action) {
-    return;
-  }
-  handleModuleSettingsAction(action);
-});
-elements.automationSheetPreviewButton?.addEventListener("click", () => previewPromptSource());
-elements.automationSheetFileButton?.addEventListener("click", () => elements.automationSheetFileInput?.click());
-elements.automationSheetFileInput?.addEventListener("change", (event) => {
-  const file = event.target.files?.[0];
-  if (file) {
-    previewPromptSource(file);
-  }
-});
-elements.automationTrelloSaveButton?.addEventListener("click", () => saveTrelloConfig());
-elements.automationTrelloClearButton?.addEventListener("click", () => saveTrelloConfig({ clearCredentials: true }));
-
-elements.trelloWizardSaveButton?.addEventListener("click", () => {
-  void submitTrelloWizard();
-});
-elements.trelloWizardCloseTriggers.forEach((node) => {
-  node.addEventListener("click", () => closeTrelloWizard({ remember: true }));
-});
-document.addEventListener("keydown", (event) => {
-  if (event.key !== "Escape") {
-    return;
-  }
-  const wizard = elements.trelloSetupWizard;
-  if (wizard && !wizard.hidden) {
-    closeTrelloWizard({ remember: true });
-  }
-});
-elements.automationTrelloUpscale2KInput?.addEventListener("change", (event) => {
-  if (!state.trello) {
-    state.trello = defaultTrelloState();
-  }
-  state.trello.upscale_to_2k = Boolean(event.target?.checked);
-});
-elements.userAssistantAskButton?.addEventListener("click", () => askUserAssistant());
-elements.userAssistantQuestion?.addEventListener("keydown", (event) => {
-  if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-    event.preventDefault();
-    void askUserAssistant();
-  }
-});
-elements.userAssistantQuickButtons.forEach((button) => {
-  button.addEventListener("click", () => askUserAssistant(button.dataset.assistantQuestion || ""));
-});
-elements.userAssistantAnswer?.addEventListener("click", (event) => {
-  const candidateButton = event.target.closest("[data-assistant-card-value]");
-  if (candidateButton) {
-    const selected = setAssistantTrelloCard(candidateButton.dataset.assistantCardValue || "", {
-      listId: candidateButton.dataset.assistantListId || "",
-      attachmentId: candidateButton.dataset.assistantAttachmentId || "",
+  if (els.copyCallbackButton) {
+    els.copyCallbackButton.addEventListener("click", async () => {
+      const url = els.etsyCallbackHint ? els.etsyCallbackHint.textContent.trim() : "";
+      if (!url) return;
+      try {
+        await navigator.clipboard.writeText(url);
+        els.copyCallbackButton.textContent = "Đã copy";
+        window.setTimeout(() => {
+          els.copyCallbackButton.textContent = "Copy";
+        }, 1500);
+      } catch (error) {
+        logLine(`Không copy được Callback URL: ${error.message}`);
+      }
     });
-    if (selected && candidateButton.dataset.assistantRunAfterSelect === "true") {
-      window.setTimeout(() => {
-        const actions = Array.isArray(state.userAssistant?.last?.suggested_actions)
-          ? state.userAssistant.last.suggested_actions.filter((action) => action?.action)
-          : [];
-        void submitAutomationImage({ autoTrello: true, batchLimit: assistantPlanBatchLimit(actions) });
-      }, 0);
-    }
-    return;
   }
-  const planButton = event.target.closest("[data-assistant-action-plan]");
-  if (planButton) {
-    void executeUserAssistantPlan();
-    return;
-  }
-  const actionButton = event.target.closest("[data-assistant-action-index]");
-  if (!actionButton) {
-    return;
-  }
-  const index = Number(actionButton.dataset.assistantActionIndex);
-  const action = state.userAssistant?.last?.suggested_actions?.[index];
-  void executeUserAssistantAction(action);
-});
-elements.automationEnvSaveButton?.addEventListener("click", () => saveIntegrationConfig());
-elements.automationEnvClearButton?.addEventListener("click", () => saveIntegrationConfig({ clearSecrets: true }));
-elements.automationViewButtons.forEach((button) => {
-  button.addEventListener("click", () => {
-    state.automation.view = button.dataset.automationView || "diagram";
-    saveAutomationConfig(state.automation);
-    renderAutomationDashboard();
-  });
-});
-elements.scenarioCanvas?.addEventListener("pointerdown", handleAutomationCanvasPointerDown);
-elements.scenarioCanvas?.addEventListener("pointermove", handleAutomationCanvasPointerMove);
-elements.scenarioCanvas?.addEventListener("pointerup", stopAutomationCanvasPan);
-elements.scenarioCanvas?.addEventListener("pointercancel", stopAutomationCanvasPan);
-elements.scenarioCanvas?.addEventListener("wheel", (event) => {
-  if (!event.ctrlKey && !event.metaKey) {
-    return;
-  }
-  event.preventDefault();
-  setAutomationCanvasZoom(state.automation.canvasZoom + (event.deltaY > 0 ? -AUTOMATION_CANVAS_ZOOM_STEP : AUTOMATION_CANVAS_ZOOM_STEP));
-}, { passive: false });
-elements.scenarioNodeRow?.addEventListener("dragstart", (event) => {
-  const node = event.target.closest(".scenario-node");
-  if (!node) {
-    return;
-  }
-  automationDraggedStepId = node.dataset.scenarioStep || "";
-  node.classList.add("is-dragging");
-  event.dataTransfer.effectAllowed = "move";
-  event.dataTransfer.setData("text/plain", automationDraggedStepId);
-});
-elements.scenarioNodeRow?.addEventListener("dragover", (event) => {
-  const node = event.target.closest(".scenario-node");
-  if (!node || !automationDraggedStepId || node.dataset.scenarioStep === automationDraggedStepId) {
-    return;
-  }
-  event.preventDefault();
-  event.dataTransfer.dropEffect = "move";
-  elements.scenarioNodeRow.querySelectorAll(".is-drop-target").forEach((item) => item.classList.remove("is-drop-target"));
-  node.classList.add("is-drop-target");
-});
-elements.scenarioNodeRow?.addEventListener("dragleave", (event) => {
-  event.target.closest(".scenario-node")?.classList.remove("is-drop-target");
-});
-elements.scenarioNodeRow?.addEventListener("drop", (event) => {
-  const node = event.target.closest(".scenario-node");
-  if (!node) {
-    clearAutomationDragState();
-    return;
-  }
-  event.preventDefault();
-  reorderAutomationModules(automationDraggedStepId || event.dataTransfer.getData("text/plain"), node.dataset.scenarioStep || "");
-});
-elements.scenarioNodeRow?.addEventListener("dragend", clearAutomationDragState);
-document.addEventListener("keydown", handleAutomationKeyboard);
-elements.scenarioCanvas.addEventListener("click", (event) => {
-  const target = event.target.closest("[data-scenario-step]");
-  if (!target) {
-    return;
-  }
-  const nextStep = target.dataset.scenarioStep || "flow";
-  if (!state.automation.modules.some((module) => module.id === nextStep)) {
-    return;
-  }
-  syncAutomationFromForm();
-  state.automation.selectedStep = nextStep;
-  saveAutomationConfig(state.automation);
-  renderAutomationDashboard();
-  window.setTimeout(() => scrollAutomationNodeIntoView(nextStep), 0);
-});
-[
-  elements.automationPromptInput,
-  elements.automationSourceType,
-  elements.automationStepNameInput,
-  elements.automationStepDetailInput,
-  elements.automationStepIconInput,
-  elements.automationModuleTypeInput,
-  elements.automationModuleEnabledInput,
-  elements.automationTelegramInput,
-  elements.automationSheetInput,
-  elements.automationTrelloBoardInput,
-  elements.automationTrelloBoardStorageInput,
-  elements.automationTrelloCardInput,
-  elements.automationTrelloListInput,
-  elements.automationAppEyebrowInput,
-  elements.automationAppTitleInput,
-  elements.automationAppSubtitleInput,
-  elements.automationSourceLocationInput,
-  elements.automationProductFilterInput,
-  elements.automationAccentInput,
-]
-  .filter(Boolean)
-  .forEach((control) => {
-  const isBrandControl = [
-    elements.automationAppEyebrowInput,
-    elements.automationAppTitleInput,
-    elements.automationAppSubtitleInput,
-    elements.automationAccentInput,
-  ].includes(control);
-  control.addEventListener("input", () => {
-    syncAutomationFromForm();
-    if (isBrandControl) {
-      renderAll();
-    } else {
-      renderAutomationDashboard();
-    }
-  });
-  control.addEventListener("change", () => {
-    syncAutomationFromForm();
-    if (isBrandControl) {
-      renderAll();
-    } else {
-      renderAutomationDashboard();
-    }
-  });
-});
-elements.logoutButton.addEventListener("click", logoutFlow);
-elements.startImageFile.addEventListener("change", uploadStartImage);
-elements.imageReferenceFiles.addEventListener("change", uploadImageReferences);
-elements.clearStartImageButton.addEventListener("click", clearStartImage);
-elements.editSourceSelect.addEventListener("change", () => {
-  if (elements.editSourceSelect.value) {
-    state.manualMediaId = "";
-    state.manualWorkflowId = "";
-  }
-  syncEditInputsFromForm();
-  renderComposerSummary();
-  renderEditControls();
-});
-elements.editSourceCards.addEventListener("click", (event) => {
-  const actionTarget = event.target.closest("[data-action='pick-edit-source']");
-  if (!actionTarget) {
-    return;
-  }
-  state.selectedEditSourceKey = actionTarget.dataset.key || "";
-  state.manualMediaId = "";
-  state.manualWorkflowId = "";
-  applyEditInputsToForm();
-  renderComposerSummary();
-  renderEditControls();
-});
-elements.manualMediaId.addEventListener("input", () => {
-  if (elements.manualMediaId.value.trim()) {
-    state.selectedEditSourceKey = "";
-  }
-  syncEditInputsFromForm();
-  renderComposerSummary();
-  renderEditControls();
-});
-elements.manualWorkflowId.addEventListener("input", () => {
-  if (elements.manualWorkflowId.value.trim()) {
-    state.selectedEditSourceKey = "";
-  }
-  syncEditInputsFromForm();
-  renderComposerSummary();
-  renderEditControls();
-});
-elements.motionSelect.addEventListener("change", syncEditInputsFromForm);
-elements.positionSelect.addEventListener("change", syncEditInputsFromForm);
-elements.resolutionSelect.addEventListener("change", syncEditInputsFromForm);
-elements.composerForm.addEventListener("submit", submitCreate);
-elements.refreshButton.addEventListener("click", () => loadState());
-elements.promptAiSubmit.addEventListener("click", submitPromptAi);
-elements.usePromptAiResultButton.addEventListener("click", usePromptAiResult);
-elements.storyboardPlanButton.addEventListener("click", submitStoryboardPlan);
-elements.storyboardGenerateButton.addEventListener("click", submitStoryboardImages);
-elements.promptAiBrief.addEventListener("input", syncPromptAiDraftFromForm);
-elements.promptAiStyle.addEventListener("input", syncPromptAiDraftFromForm);
-elements.promptAiMustInclude.addEventListener("input", syncPromptAiDraftFromForm);
-elements.promptAiAvoid.addEventListener("input", syncPromptAiDraftFromForm);
-elements.promptAiAudience.addEventListener("input", syncPromptAiDraftFromForm);
-elements.storyboardScript.addEventListener("input", syncStoryboardDraftFromForm);
-elements.storyboardStyle.addEventListener("input", syncStoryboardDraftFromForm);
-elements.storyboardMustInclude.addEventListener("input", syncStoryboardDraftFromForm);
-elements.storyboardAvoid.addEventListener("input", syncStoryboardDraftFromForm);
-elements.storyboardSceneCount.addEventListener("change", syncStoryboardDraftFromForm);
-elements.promptInput.addEventListener("input", syncDraftFromForm);
-elements.promptInput.addEventListener("input", renderComposerSummary);
-elements.modelSelect.addEventListener("change", () => {
-  syncDraftFromForm();
-  renderComposerSummary();
-});
-elements.aspectSelect.addEventListener("change", () => {
-  syncDraftFromForm();
-  renderAspectChoices();
-});
-elements.aspectChoices.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-aspect-option]");
-  if (!button) {
-    return;
-  }
-  elements.aspectSelect.value = button.dataset.aspectOption || currentModeConfig().defaultAspect;
-  syncDraftFromForm();
-  renderAspectChoices();
-});
-elements.countInput.addEventListener("input", () => {
-  syncDraftFromForm();
-  renderCountChoices();
-});
-elements.countChoices.addEventListener("click", (event) => {
-  const button = event.target.closest("[data-count-option]");
-  if (!button) {
-    return;
-  }
-  elements.countInput.value = button.dataset.countOption || String(currentModeConfig().defaultCount);
-  syncDraftFromForm();
-  renderCountChoices();
-});
-elements.latestStatusCard.addEventListener("click", (event) => {
-  const actionTarget = event.target.closest("[data-action]");
-  if (!actionTarget) {
-    return;
-  }
-  if (actionTarget.dataset.action === "open-flow-project") {
-    openFlowProjectSurface();
-    return;
-  }
-  if (actionTarget.dataset.action === "retry-job") {
-    retryJob(actionTarget.dataset.jobId);
-    return;
-  }
-  if (actionTarget.dataset.action === "reuse-job") {
-    reuseJob(actionTarget.dataset.jobId);
-  }
-});
-elements.imageReferenceList.addEventListener("click", (event) => {
-  const promoteTarget = event.target.closest("[data-action='promote-reference-image']");
-  if (promoteTarget) {
-    promoteReferenceImage(promoteTarget.dataset.index);
-    return;
-  }
-  const actionTarget = event.target.closest("[data-action='remove-reference-image']");
-  if (!actionTarget) {
-    return;
-  }
-  removeReferenceImage(actionTarget.dataset.index);
-});
-elements.imageReferenceList.addEventListener("change", (event) => {
-  const select = event.target.closest("[data-action='reference-role']");
-  if (!select) {
-    return;
-  }
-  setReferenceImageRole(select.dataset.index, select.value);
-});
 
-loadState();
-setupPolling();
+  window.addEventListener("message", (event) => {
+    if (event.origin !== window.location.origin) return;
+    const data = event.data || {};
+    if (data.type !== "etsy-oauth") return;
+    if (data.ok) {
+      logLine("Etsy đã kết nối xong.");
+      refreshState({ quiet: true });
+    } else {
+      logLine(`Kết nối Etsy thất bại: ${data.error || "không rõ lỗi"}`);
+    }
+  });
+}
+
+async function boot() {
+  if (els.etsyCallbackHint) {
+    els.etsyCallbackHint.textContent = `${window.location.origin}/api/etsy/oauth/callback`;
+  }
+  applyToolMode();
+  bindEvents();
+  updateAutoSourceUi();
+  await refreshState({ quiet: true });
+  await loadEtsyAccounts({ quiet: true });
+  state.polling = window.setInterval(() => refreshState({ quiet: true }), 7000);
+}
+
+boot();
