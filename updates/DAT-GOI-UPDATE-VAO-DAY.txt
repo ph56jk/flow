@@ -1,0 +1,9 @@
+Dat file flow-rule-update-*.zip vao thu muc nay, sau do double click Cap-nhat-rule.cmd o thu muc Flow v2.
+
+Updater se:
+- Cho job dang chay ket thuc.
+- Sao luu rule cu.
+- Xac minh checksum va chi cap nhat file rule duoc phep.
+- Mo lai Flow v2.
+
+Tai khoan, profile, lich su, anh va cau hinh Trello khong bi thay doi.

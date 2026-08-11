@@ -83,7 +83,27 @@ function Find-LatestPythonExe {
     if (-not (Test-Path $PythonRoot)) {
         return $null
     }
+
+    # Prefer an interpreter at the root of an installed Python directory.
+    # The recursive tree also contains Lib\venv\scripts\nt\python.exe, which is
+    # only a venv template and fails with "No pyvenv.cfg file" when launched.
+    $directCandidates = @()
+    $rootPython = Join-Path $PythonRoot "python.exe"
+    if (Test-Path $rootPython) {
+        $directCandidates += Get-Item $rootPython
+    }
+    Get-ChildItem -Path $PythonRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $candidate = Join-Path $_.FullName "python.exe"
+        if (Test-Path $candidate) {
+            $directCandidates += Get-Item $candidate
+        }
+    }
+    if ($directCandidates.Count -gt 0) {
+        return $directCandidates | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName
+    }
+
     return Get-ChildItem -Path $PythonRoot -Recurse -Filter "python.exe" -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.FullName -notmatch "[\\/]Lib[\\/]venv[\\/]scripts[\\/]" } |
         Sort-Object LastWriteTimeUtc -Descending |
         Select-Object -First 1 -ExpandProperty FullName
 }

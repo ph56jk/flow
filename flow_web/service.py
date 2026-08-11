@@ -138,6 +138,10 @@ class FlowWebService:
     PROJECT_HEALTH_TIMELINE_LIMIT = 4
     PROJECT_HEALTH_RECENCY_DAYS = 14
     CLEANUP_PREVIEW_LIMIT = 3
+    STATE_PROMPT_PREVIEW_LIMIT = 2000
+    STATE_TEXT_PREVIEW_LIMIT = 800
+    STATE_LOG_LIMIT = 3
+    STATE_CLEANUP_CACHE_TTL_S = 60.0
     CLEANUP_UPLOAD_GRACE_HOURS = 2
     CLEANUP_DOWNLOAD_RETENTION_DAYS = 7
     CLEANUP_HISTORY_RETENTION_DAYS = 14
@@ -154,6 +158,7 @@ class FlowWebService:
     AI_PROMPT_SUITE_SIZE = 6
     FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12
     FLOW_AGENT_TARGET_OUTPUT_COUNT = 12
+    FLOW_AGENT_MAX_OUTPUT_COUNT = 15
     FLOW_AGENT_MAX_IMAGES_PER_RUN = 12
     BANNER_VISIBLE_WALL_HOOK_RULE = (
         "Wall-hanging banner shots must show a clearly visible wall hook, nail, or peg above the dowel, "
@@ -309,6 +314,7 @@ class FlowWebService:
         self._active_flow_profile_index = 0
         self._trello_source_downloads: Dict[str, Dict[str, Any]] = {}
         self._trello_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
+        self._cleanup_state_cache: tuple[float, str, CleanupAssistantSnapshot] | None = None
         self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
             self.store.snapshot().flow_profile_quota_blocked_until
         )
@@ -320,23 +326,28 @@ class FlowWebService:
         async with self._browser_session_lock:
             await self._close_shared_browser()
 
-    def get_state(self) -> Dict[str, Any]:
+    def get_state(self, *, compact_jobs: bool = False) -> Dict[str, Any]:
         snapshot = self.store.snapshot()
         return {
             "config": _model_dump(self._normalized_config(snapshot.config)),
-            "jobs": snapshot.jobs,
+            "jobs": [self._compact_job_payload(job) for job in snapshot.jobs] if compact_jobs else snapshot.jobs,
             "skills": [self._public_skill_payload(skill) for skill in snapshot.skills],
         }
 
     def get_state_payload(self) -> Dict[str, Any]:
-        base_state = self.get_state()
         snapshot = self.store.snapshot()
+        full_jobs = snapshot.jobs
+        base_state = {
+            "config": _model_dump(self._normalized_config(snapshot.config)),
+            "jobs": [self._compact_job_payload(job) for job in full_jobs],
+            "skills": [self._public_skill_payload(skill) for skill in snapshot.skills],
+        }
         auth = self.get_auth_status()
         projects = self.list_projects()
-        workspace = self._workspace_snapshot(base_state["config"], auth, base_state["jobs"], projects)
-        output_shelf = self._build_output_shelf(base_state["jobs"])
-        replay_pack = self._build_replay_pack(base_state["jobs"])
-        cleanup_assistant, _ = self._build_cleanup_assistant(base_state["config"], base_state["jobs"], output_shelf)
+        workspace = self._workspace_snapshot(base_state["config"], auth, full_jobs, projects)
+        output_shelf = self._build_output_shelf(full_jobs)
+        replay_pack = self._build_replay_pack(full_jobs)
+        cleanup_assistant = self._cached_cleanup_assistant(base_state["config"], full_jobs, output_shelf)
         return {
             **base_state,
             "projects": projects,
@@ -347,9 +358,211 @@ class FlowWebService:
             "output_shelf": output_shelf,
             "replay_pack": replay_pack,
             "cleanup_assistant": cleanup_assistant,
-            "project_health": self._build_project_health(base_state["config"], auth, base_state["jobs"], projects),
+            "project_health": self._build_project_health(base_state["config"], auth, full_jobs, projects),
             "prompt_assistant": self._prompt_assistant_snapshot(snapshot.skills),
         }
+
+    def _cleanup_state_cache_key(
+        self,
+        config: Dict[str, Any] | AppConfig,
+        jobs: List[JobRecord],
+        output_shelf: OutputShelfSnapshot,
+    ) -> str:
+        normalized_config = self._normalized_config(config)
+        shelf_items = output_shelf.items if output_shelf and output_shelf.items else []
+        return json.dumps(
+            {
+                "output_dir": normalized_config.output_dir,
+                "active_workflow_id": normalized_config.active_workflow_id,
+                "jobs": [
+                    {
+                        "id": job.id,
+                        "status": job.status,
+                        "updated_at": job.updated_at,
+                        "artifact_count": len(job.artifacts or []),
+                    }
+                    for job in jobs
+                ],
+                "shelf": [
+                    {
+                        "job_id": item.job_id,
+                        "artifact_index": item.artifact_index,
+                        "local_exists": item.local_exists,
+                    }
+                    for item in shelf_items
+                ],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    def _cached_cleanup_assistant(
+        self,
+        config: Dict[str, Any] | AppConfig,
+        jobs: List[JobRecord],
+        output_shelf: OutputShelfSnapshot,
+    ) -> CleanupAssistantSnapshot:
+        cache_key = self._cleanup_state_cache_key(config, jobs, output_shelf)
+        now = time.monotonic()
+        if self._cleanup_state_cache is not None:
+            cached_at, cached_key, cached_snapshot = self._cleanup_state_cache
+            if cached_key == cache_key and now - cached_at <= self.STATE_CLEANUP_CACHE_TTL_S:
+                return cached_snapshot
+
+        cleanup_assistant, _ = self._build_cleanup_assistant(config, jobs, output_shelf)
+        self._cleanup_state_cache = (now, cache_key, cleanup_assistant)
+        return cleanup_assistant
+
+    def _state_text_preview(self, value: Any, limit: int | None = None) -> Any:
+        if not isinstance(value, str):
+            return value
+        max_length = max(20, int(limit or self.STATE_TEXT_PREVIEW_LIMIT))
+        if len(value) <= max_length:
+            return value
+        return f"{value[:max_length].rstrip()}..."
+
+    def _compact_job_input_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        allowed_keys = {
+            "type",
+            "prompt",
+            "title",
+            "timeout_s",
+            "model",
+            "aspect",
+            "count",
+            "start_image_path",
+            "reference_image_paths",
+            "reference_image_roles",
+            "reference_media_names",
+            "media_id",
+            "workflow_id",
+            "motion",
+            "position",
+            "resolution",
+            "mask_x",
+            "mask_y",
+            "brush_size",
+            "continuous",
+            "run_until_empty",
+            "poll_interval_s",
+            "prompt_product",
+            "prompt_product_key",
+            "prompt_index",
+            "prompt_notes",
+            "trello_board_id",
+            "trello_card_id",
+            "trello_list_id",
+            "trello_attachment_ids",
+            "trello_source_card_id",
+            "trello_source_attachment_ids",
+            "flow_agent_enabled",
+            "flow_agent_auto_approve",
+        }
+        compact: Dict[str, Any] = {}
+        for key in allowed_keys:
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            if key == "prompt":
+                compact[key] = self._state_text_preview(value, self.STATE_PROMPT_PREVIEW_LIMIT)
+                compact["prompt_truncated"] = isinstance(value, str) and len(value) > self.STATE_PROMPT_PREVIEW_LIMIT
+            elif key == "prompt_notes":
+                compact[key] = self._state_text_preview(value, self.STATE_TEXT_PREVIEW_LIMIT)
+            else:
+                compact[key] = value
+        return compact
+
+    def _compact_automation_execution_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        nodes = payload.get("nodes") if isinstance(payload, dict) else []
+        compact_nodes: List[Dict[str, Any]] = []
+        if isinstance(nodes, list):
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                compact_nodes.append(
+                    {
+                        "id": str(node.get("id") or ""),
+                        "type": str(node.get("type") or ""),
+                        "status": str(node.get("status") or ""),
+                        "title": self._state_text_preview(str(node.get("title") or ""), 120),
+                        "label": self._state_text_preview(str(node.get("label") or ""), 120),
+                        "detail": self._state_text_preview(str(node.get("detail") or ""), 240),
+                        "error": self._state_text_preview(str(node.get("error") or ""), 240),
+                        "started_at": str(node.get("started_at") or ""),
+                        "updated_at": str(node.get("updated_at") or ""),
+                        "completed_at": str(node.get("completed_at") or ""),
+                    }
+                )
+        return {"nodes": compact_nodes}
+
+    def _compact_job_result_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        allowed_keys = {
+            "mode",
+            "count",
+            "total",
+            "completed",
+            "current_index",
+            "current_child_job_id",
+            "child_job_ids",
+            "continuous",
+            "run_until_empty",
+            "poll_interval_s",
+            "stop_requested",
+            "cycles",
+            "last_scan_at",
+            "auto_start_frame_at",
+            "auto_start_frame_path",
+            "auto_start_frame_public_url",
+            "auto_start_frame_prompt",
+        }
+        compact: Dict[str, Any] = {}
+        for key in allowed_keys:
+            if key not in payload:
+                continue
+            value = payload.get(key)
+            compact[key] = self._state_text_preview(value, self.STATE_TEXT_PREVIEW_LIMIT)
+        execution = payload.get("automation_execution")
+        if isinstance(execution, dict):
+            compact["automation_execution"] = self._compact_automation_execution_payload(execution)
+        return compact
+
+    def _compact_artifact_payload(self, artifact: Dict[str, Any]) -> Dict[str, Any]:
+        compact = dict(artifact)
+        compact["prompt"] = self._state_text_preview(compact.get("prompt", ""), 500)
+        return compact
+
+    def _compact_log_payload(self, log_payload: Dict[str, Any]) -> Dict[str, Any]:
+        compact = dict(log_payload)
+        compact["message"] = self._state_text_preview(compact.get("message", ""), self.STATE_TEXT_PREVIEW_LIMIT)
+        return compact
+
+    def _compact_job_payload(self, job: JobRecord) -> Dict[str, Any]:
+        payload = _model_dump(job)
+        input_payload = payload.get("input")
+        if isinstance(input_payload, dict):
+            payload["input"] = self._compact_job_input_payload(input_payload)
+        result_payload = payload.get("result")
+        if isinstance(result_payload, dict):
+            payload["result"] = self._compact_job_result_payload(result_payload)
+        artifacts = payload.get("artifacts")
+        if isinstance(artifacts, list):
+            payload["artifacts"] = [
+                self._compact_artifact_payload(artifact)
+                for artifact in artifacts
+                if isinstance(artifact, dict)
+            ]
+        logs = payload.get("logs")
+        if isinstance(logs, list):
+            payload["logs"] = [
+                self._compact_log_payload(log_payload)
+                for log_payload in logs[-self.STATE_LOG_LIMIT :]
+                if isinstance(log_payload, dict)
+            ]
+        replay = payload.get("replay_snapshot")
+        if isinstance(replay, dict) and isinstance(replay.get("recovery_input"), dict):
+            payload["replay_snapshot"] = {**replay, "recovery_input": {}}
+        payload["compact"] = True
+        return payload
 
     def _public_skill_payload(self, skill: SkillRecord) -> Dict[str, Any]:
         snapshot = PublicSkillSnapshot(
@@ -2437,7 +2650,7 @@ class FlowWebService:
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
         if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
-            image_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            image_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
             return f"Flow Agent {index + 1}/{total} · {label} · {image_count} ảnh"[:120]
         if item.get("generated_by_ai"):
             label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
@@ -2460,7 +2673,7 @@ class FlowWebService:
         payload["prompt_index"] = str(item.get("index") or "").strip()
         payload["prompt_notes"] = str(item.get("notes") or "").strip()
         if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
-            image_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+            image_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
             payload["count"] = image_count
             payload["flow_agent_enabled"] = True
             payload["flow_agent_auto_approve"] = True
@@ -2968,22 +3181,46 @@ class FlowWebService:
         token: str,
     ) -> tuple[str, List[str]]:
         trello_config = self.store.snapshot().trello_config
+        assigned_board_id = self._normalize_trello_board_id(os.getenv("TRELLO_BOARD_ID", ""))
+        assigned_list_value = str(os.getenv("TRELLO_LIST_ID", "") or "").strip()
         board_id = self._normalize_trello_board_id(
-            request.trello_board_id
+            assigned_board_id
+            or request.trello_board_id
             or trello_config.board_id
-            or os.getenv("TRELLO_BOARD_ID", "")
             or self.DEFAULT_TRELLO_BOARD_URL
         )
         raw_list_id = self._normalize_trello_id(
-            request.trello_list_id
+            assigned_list_value
+            or request.trello_list_id
             or trello_config.list_id
-            or os.getenv("TRELLO_LIST_ID", "")
             or self.DEFAULT_TRELLO_SOURCE_LIST_ID
         )
         if not board_id:
             raise HTTPException(status_code=400, detail="Chưa có board Trello để kiểm tra.")
         try:
-            list_ids = await asyncio.to_thread(self._trello_auto_source_list_ids, key, token, board_id, raw_list_id)
+            if assigned_list_value:
+                # Reset Ready is destructive. Keep it inside the list assigned
+                # to this process even if the browser sends stale localStorage.
+                list_ids = []
+                for value in self._split_trello_list_values(assigned_list_value):
+                    resolved = await asyncio.to_thread(
+                        self._trello_resolve_board_list_id,
+                        key,
+                        token,
+                        board_id,
+                        value,
+                    )
+                    normalized = self._normalize_trello_id(resolved)
+                    if normalized and normalized not in list_ids:
+                        list_ids.append(normalized)
+            else:
+                list_ids = await asyncio.to_thread(
+                    self._trello_auto_source_list_ids,
+                    key,
+                    token,
+                    board_id,
+                    raw_list_id,
+                )
             if not list_ids:
                 raise RuntimeError(f"Không tìm thấy list {self._trello_source_scope_label()} trên board Trello.")
         except HTTPException:
@@ -3303,7 +3540,7 @@ class FlowWebService:
 
         parts = [f"{scope_label} co {len(cards)} card"]
         if complete:
-            parts.append(f"{complete} card da co du anh output theo rule nhung phien Auto moi van co the tao moi du bo")
+            parts.append(f"{complete} card da co du anh output theo rule nen Auto se bo qua")
         if no_output:
             parts.append(f"{no_output} card co anh nguon va khi chay se tao moi du bo theo rule")
         if no_source:
@@ -3425,6 +3662,22 @@ class FlowWebService:
                             + (f": {detail_text[:220]}" if detail_text else ".")
                             + " App tiep tuc quet/chay card khac."
                         ),
+                    )
+
+                skipped_complete_ids = [
+                    self._normalize_trello_card_id(str(item or ""))
+                    for item in discovery.get("skipped_complete_card_ids", [])
+                    if self._normalize_trello_card_id(str(item or ""))
+                ]
+                skipped_complete_count = int(
+                    discovery.get("skipped_complete_cards") or len(skipped_complete_ids)
+                )
+                if skipped_complete_ids:
+                    seen_card_ids.update(skipped_complete_ids)
+                if skipped_complete_count:
+                    await self.store.append_log(
+                        batch_id,
+                        f"Bo qua {skipped_complete_count} card da du anh output theo target cua rule.",
                     )
 
                 fresh_items: List[Dict[str, Any]] = []
@@ -3753,13 +4006,28 @@ class FlowWebService:
             parts.append(f"User request: {user_text}.")
         return " ".join(parts)
 
-    def _flow_agent_reference_prompt_style_guide(self, target_count: int, *, allow_detail_collage: bool = False) -> str:
-        target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
-        collage_rule = (
-            f"Request exactly {target} outputs as separate 1:1 image files; the only allowed collage is the explicitly numbered close-up detail shot, which may be one single 1:1 image containing four close-up panels, and every other output must not be a collage, contact sheet, grid, or multi-frame canvas. "
-            if allow_detail_collage
-            else f"Request exactly {target} separate standalone 1:1 images; never make a collage, contact sheet, grid, or multi-frame canvas. "
-        )
+    def _flow_agent_reference_prompt_style_guide(
+        self,
+        target_count: int,
+        *,
+        allow_detail_collage: bool = False,
+        allow_planned_multi_panel: bool = False,
+    ) -> str:
+        target = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(target_count or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
+        if allow_planned_multi_panel:
+            collage_rule = (
+                f"Request exactly {target} outputs as separate 1:1 image files; only the explicitly numbered "
+                "infographic, detail, or process shots in the Required shot plan may be single 1:1 multi-panel "
+                "layouts, and every other output must not be a collage, contact sheet, grid, or multi-frame canvas. "
+            )
+        elif allow_detail_collage:
+            collage_rule = (
+                f"Request exactly {target} outputs as separate 1:1 image files; the only allowed collage is the explicitly numbered close-up detail shot, which may be one single 1:1 image containing four close-up panels, and every other output must not be a collage, contact sheet, grid, or multi-frame canvas. "
+            )
+        else:
+            collage_rule = (
+                f"Request exactly {target} separate standalone 1:1 images; never make a collage, contact sheet, grid, or multi-frame canvas. "
+            )
         return (
             "Use the learned product-prompt style: give a compact design analysis, then a numbered shot brief. "
             f"{collage_rule}"
@@ -6404,6 +6672,7 @@ class FlowWebService:
         fresh_snapshot = self.store.snapshot()
         fresh_output_shelf = self._build_output_shelf(fresh_snapshot.jobs)
         cleanup_assistant, _ = self._build_cleanup_assistant(config, fresh_snapshot.jobs, fresh_output_shelf)
+        self._cleanup_state_cache = None
         return {
             "scope": scope,
             "deleted_count": len(deleted_paths) + len(removed_job_ids),
@@ -6872,7 +7141,7 @@ exit 1
                 payload["aspect"] = str(settings.get("imageAspect") or "").strip()
             if settings.get("imageCount"):
                 try:
-                    max_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT if flow_agent_enabled else 4
+                    max_count = self.FLOW_AGENT_MAX_OUTPUT_COUNT if flow_agent_enabled else 4
                     payload["count"] = max(1, min(max_count, int(settings.get("imageCount") or 1)))
                 except Exception:
                     pass
@@ -8031,14 +8300,43 @@ exit 1
     def _trello_ai_title_backup_path(self) -> Path:
         return DATA_DIR / self.TRELLO_AI_TITLE_BACKUP_FILE_NAME
 
+    def _trello_ai_title_backup_entries(self) -> List[Dict[str, Any]]:
+        backup_path = self._trello_ai_title_backup_path()
+        if not backup_path.is_file():
+            return []
+        try:
+            raw = json.loads(backup_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
     def _trello_description_has_ai_title_block(self, description: str) -> bool:
         text = str(description or "")
         return self.TRELLO_AI_TITLE_BEGIN_MARKER in text and self.TRELLO_AI_TITLE_END_MARKER in text
 
+    def _trello_description_has_backed_up_ai_title(self, card: Dict[str, Any]) -> bool:
+        card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+        description = str(card.get("desc") or "")
+        if not card_id or not description.strip():
+            return False
+        description_lines = {line.strip() for line in description.splitlines() if line.strip()}
+        for entry in reversed(self._trello_ai_title_backup_entries()):
+            if self._normalize_trello_card_id(str(entry.get("card_id") or "")) != card_id:
+                continue
+            title = self._sanitize_ai_product_title(str(entry.get("title") or ""))
+            if title and title in description_lines:
+                return True
+            new_description = str(entry.get("new_description") or "").strip()
+            if new_description and description.strip() == new_description:
+                return True
+        return False
+
     def _trello_should_write_ai_title_description(self, card: Dict[str, Any]) -> bool:
         if not isinstance(card, dict):
             return False
-        return not self._trello_description_has_ai_title_block(str(card.get("desc") or ""))
+        if self._trello_description_has_ai_title_block(str(card.get("desc") or "")):
+            return False
+        return not self._trello_description_has_backed_up_ai_title(card)
 
     def _sanitize_ai_product_title(self, title: str, *, max_length: int = 140) -> str:
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip().strip('"').strip("'").strip()
@@ -8067,17 +8365,7 @@ exit 1
         safe_title = self._sanitize_ai_product_title(title)
         if not safe_title:
             return existing
-        safe_product_type = re.sub(r"\s+", " ", str(product_type or "").strip())
-        block_lines = [
-            self.TRELLO_AI_TITLE_BEGIN_MARKER,
-            "AI Suggested Etsy Title:",
-            safe_title,
-            "",
-            "AI Product Type:",
-            safe_product_type or "Unknown",
-            self.TRELLO_AI_TITLE_END_MARKER,
-        ]
-        block = "\n".join(block_lines)
+        block = safe_title
         return f"{existing}\n\n{block}".strip() if existing else block
 
     def _write_trello_ai_title_description_backup(
@@ -8094,14 +8382,7 @@ exit 1
     ) -> str:
         ensure_app_dirs()
         backup_path = self._trello_ai_title_backup_path()
-        entries: List[Dict[str, Any]] = []
-        if backup_path.is_file():
-            try:
-                raw = json.loads(backup_path.read_text(encoding="utf-8"))
-                if isinstance(raw, list):
-                    entries = [item for item in raw if isinstance(item, dict)]
-            except Exception:
-                entries = []
+        entries = self._trello_ai_title_backup_entries()
         backup_id = uuid.uuid4().hex
         entries.append(
             {
@@ -8441,6 +8722,10 @@ exit 1
             material = material if any(term in material.lower() for term in ("linen", "cotton")) else f"{material} Linen".strip()
             title = f"{design_prefix} {material} Drawstring Bag, Handmade Jewelry Pouch Gift"
             fallback_product_type = "Drawstring Bag"
+        elif "birthday hat" in normalized_type or "party hat" in normalized_type:
+            material = material if any(term in material.lower() for term in ("linen", "cotton")) else f"{material} Linen".strip()
+            title = f"{design_prefix} {material} Birthday Hat, Handmade First Birthday Party Hat"
+            fallback_product_type = "Birthday Hat"
         elif "crown" in normalized_type:
             material = material if any(term in material.lower() for term in ("linen", "cotton")) else f"{material} Linen".strip()
             title = f"{design_prefix} {material} Crown, Personalized Birthday Crown Gift"
@@ -8653,7 +8938,7 @@ exit 1
             ]
         )
         parts: List[Dict[str, Any]] = [{"text": prompt}, {"text": "SOURCE_IMAGE"}, self._inline_gemini_image_part(source_bytes, source_mime)]
-        for index, image_bytes, mime in generated_items[: self.FLOW_AGENT_TARGET_OUTPUT_COUNT]:
+        for index, image_bytes, mime in generated_items[: self.FLOW_AGENT_MAX_OUTPUT_COUNT]:
             parts.append({"text": f"OUTPUT_IMAGE_INDEX_{index}"})
             parts.append(self._inline_gemini_image_part(image_bytes, mime))
 
@@ -8709,7 +8994,7 @@ exit 1
             raise RuntimeError("Flow chưa có ảnh generated hợp lệ, app đã dừng trước khi upload Trello.")
 
         generated_items: List[tuple[int, bytes, str]] = []
-        for index, artifact in enumerate(artifacts[: self.FLOW_AGENT_TARGET_OUTPUT_COUNT]):
+        for index, artifact in enumerate(artifacts[: self.FLOW_AGENT_MAX_OUTPUT_COUNT]):
             image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
             generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
 
@@ -8758,7 +9043,7 @@ exit 1
             bad_indexes = [
                 int(item)
                 for item in raw_bad_indexes
-                if isinstance(item, (int, float)) and 0 <= int(item) < self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+                if isinstance(item, (int, float)) and 0 <= int(item) < self.FLOW_AGENT_MAX_OUTPUT_COUNT
             ]
             reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
             if not ok or bad_indexes:
@@ -9979,7 +10264,12 @@ exit 1
                 for card in cards
                 if str(card.get("_auto_trello_skip_code") or "").strip() == "missing_product_rule"
             ]
-            if not expanded and not skipped_missing_rule_cards:
+            skipped_complete_cards = [
+                card
+                for card in cards
+                if str(card.get("_auto_trello_skip_code") or "").strip() == "complete_output_set"
+            ]
+            if not expanded and not skipped_missing_rule_cards and not skipped_complete_cards:
                 raise RuntimeError(
                     "Auto Trello chưa tìm thấy card ảnh phù hợp để gửi Tác nhân Flow. "
                     "Hãy chọn card trong trợ lý, dán link card Trello, hoặc điền Lọc sản phẩm rõ hơn."
@@ -10008,6 +10298,19 @@ exit 1
                 discovery["skipped_missing_product_rule_details"] = [
                     str(card.get("_auto_trello_skip_reason") or "").strip()
                     for card in skipped_missing_rule_cards[:5]
+                    if str(card.get("_auto_trello_skip_reason") or "").strip()
+                ]
+            if skipped_complete_cards:
+                skipped_complete_ids = [
+                    self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+                    for card in skipped_complete_cards
+                ]
+                skipped_complete_ids = [card_id for card_id in skipped_complete_ids if card_id]
+                discovery["skipped_complete_cards"] = len(skipped_complete_cards)
+                discovery["skipped_complete_card_ids"] = skipped_complete_ids
+                discovery["skipped_complete_details"] = [
+                    str(card.get("_auto_trello_skip_reason") or "").strip()
+                    for card in skipped_complete_cards[:5]
                     if str(card.get("_auto_trello_skip_reason") or "").strip()
                 ]
             return expanded, discovery
@@ -10098,9 +10401,21 @@ exit 1
         normalized = self._normalize_skill_token(raw)
         compact = self._compact_match_text(raw)
         tokens = set(self._tokenize_match_words(raw))
+        card_name_tokens = set(self._tokenize_match_words(card_name))
+        ambiguous_album_notebook_name = "album" in card_name_tokens and "notebook" in card_name_tokens
         visual_product_rule_key = self._flow_operator_card_visual_product_rule_key(card)
+        card_name_product_rule_key = self._flow_operator_card_name_product_rule_key(card_name)
         text_product_rule_key = self._flow_operator_product_rule_key_from_text(raw)
-        product_rule_key = visual_product_rule_key or text_product_rule_key
+        if ambiguous_album_notebook_name:
+            product_rule_key = ""
+        elif card_name_product_rule_key:
+            product_rule_key = card_name_product_rule_key
+        elif text_product_rule_key == "ring_bearer_pillow" and visual_product_rule_key in {"wedding_pillowcase", "baby_pillowcase", "linen_pillowcase"}:
+            product_rule_key = "ring_bearer_pillow"
+        elif text_product_rule_key == "birthday_hat" and visual_product_rule_key == "crown":
+            product_rule_key = "birthday_hat"
+        else:
+            product_rule_key = visual_product_rule_key or text_product_rule_key
         is_child_shirt = (
             ("ao" in tokens or "shirt" in tokens or "tshirt" in tokens or "tee" in tokens)
             and (
@@ -10115,12 +10430,14 @@ exit 1
             "card_description": card_description,
             "attachment_names": attachment_names,
             "visual_product_rule_key": visual_product_rule_key,
+            "card_name_product_rule_key": card_name_product_rule_key,
             "text_product_rule_key": text_product_rule_key,
             "visual_product_rule_confidence": card.get("_visual_product_rule_confidence"),
             "visual_product_rule_visible_product": card.get("_visual_product_rule_visible_product"),
             "normalized": normalized,
             "compact": compact,
             "product_rule_key": product_rule_key,
+            "ambiguous_album_notebook_name": ambiguous_album_notebook_name,
             "is_apron": any(term in normalized for term in ("tap_de", "apron")) or "tapde" in compact,
             "is_doll": (
                 any(term in normalized for term in ("bup_be", "bupbe", "baby_doll", "babydoll"))
@@ -10208,6 +10525,76 @@ exit 1
         # Nếu prompt cũ không nhắc tới sản phẩm đang lọc, bỏ qua để tránh đổi sai loại hàng.
         return ""
 
+    def _flow_operator_card_name_product_rule_key(self, card_name: str) -> str:
+        raw = str(card_name or "").strip()
+        if not raw:
+            return ""
+        name_tokens = set(self._tokenize_match_words(raw))
+        if "album" in name_tokens and "notebook" in name_tokens:
+            return ""
+        rule_key = self._flow_operator_product_rule_key_from_text(raw)
+        if not rule_key:
+            return ""
+
+        normalized = self._normalize_skill_token(raw)
+        compact = self._compact_match_text(raw)
+        tokens = set(self._tokenize_match_words(raw))
+        suspicious_filename = bool(
+            re.search(r"\.(?:jpe?g|png|webp|gif|heic|avif)$", raw, re.IGNORECASE)
+            or re.search(r"(?:^|[_\-\s])20\d{10,}(?:$|[_\-\s])", raw)
+            or any(
+                marker in compact
+                for marker in (
+                    "professionalproductphotography",
+                    "fullengthprofessional",
+                    "singlewhite",
+                    "taoanh",
+                    "taohinh",
+                )
+            )
+        )
+        if not suspicious_filename:
+            return rule_key
+
+        generic_tokens = {
+            "a",
+            "an",
+            "the",
+            "single",
+            "white",
+            "linen",
+            "cotton",
+            "fabric",
+            "embroidered",
+            "embroidery",
+            "handmade",
+            "hand",
+            "made",
+            "product",
+            "photo",
+            "photography",
+            "image",
+            "pillow",
+            "pillowcase",
+            "cushion",
+            "goi",
+        }
+        suite = PRODUCT_SHOT_RULES.get(rule_key) or {}
+        for alias in suite.get("aliases", ()):
+            alias_text = str(alias or "").strip()
+            alias_tokens = set(self._tokenize_match_words(alias_text))
+            if len(alias_tokens) < 2 or not (alias_tokens - generic_tokens):
+                continue
+            alias_normalized = self._normalize_skill_token(alias_text)
+            alias_compact = self._compact_match_text(alias_text)
+            if alias_compact and alias_compact in compact:
+                return rule_key
+            if alias_normalized and alias_normalized in normalized:
+                return rule_key
+            if alias_tokens.issubset(tokens):
+                return rule_key
+        return ""
+
     def _flow_operator_product_rule_key_from_text(self, text: str) -> str:
         raw = str(text or "").strip()
         if not raw:
@@ -10261,7 +10648,7 @@ exit 1
             "wedding_pillowcase": {
                 "main": ("pillow", "pillowcase", "cushion", "cushion cover", "soft square"),
                 "context": ("wedding", "bride", "groom", "couple", "romantic", "keepsake", "anniversary"),
-                "exclude": ("ring bearer", "wedding rings", "ring holder", "vow book", "guest book"),
+                "exclude": ("ring bearer", "wedding rings", "ring holder", "ring cushion", "wedding ring pillow", "wedding ceremony pillow", "vow book", "guest book"),
             },
             "tooth_fairy_pillow": {
                 "main": (
@@ -10289,6 +10676,38 @@ exit 1
                 ),
                 "exclude": ("wedding", "bride", "groom", "ring bearer", "wedding rings", "passport", "hair bow", "drawstring"),
             },
+            "halloween_pillow": {
+                "main": (
+                    "halloween pillow",
+                    "halloween baby pillow",
+                    "halloween pillowcase",
+                    "halloween cushion",
+                    "baby pillow",
+                    "pillow",
+                    "pillowcase",
+                    "cushion",
+                    "soft square",
+                    "soft rectangular",
+                ),
+                "context": (
+                    "halloween",
+                    "pumpkin",
+                    "ghost",
+                    "bat",
+                    "spider",
+                    "witch",
+                    "nursery",
+                    "crib",
+                    "teepee",
+                    "wool embroidery",
+                    "yarn embroidery",
+                    "hooked wool",
+                    "gingham",
+                    "checkered",
+                    "hand embroidered",
+                ),
+                "exclude": ("bag", "drawstring", "treat bag", "trick or treat bag", "pouch", "bucket", "basket", "banner", "hoop", "book", "dress", "shirt", "plush"),
+            },
             "baby_pillowcase": {
                 "main": ("pillow", "pillowcase", "cushion", "cushion cover", "soft rectangular", "soft square"),
                 "context": ("baby", "nursery", "child", "children", "kid", "toddler", "infant", "crib", "name embroidery"),
@@ -10300,8 +10719,8 @@ exit 1
                 "exclude": ("baby", "nursery", "wedding", "bride", "groom", "ring bearer"),
             },
             "ring_bearer_pillow": {
-                "main": ("pillow", "pillowcase", "cushion", "ring holder", "soft square"),
-                "context": ("ring bearer", "wedding rings", "ring", "rings", "ribbon", "ceremony", "ring attachment"),
+                "main": ("ring bearer pillow", "wedding ring pillow", "ring pillow", "ring cushion", "wedding ring cushion", "ring holder pillow", "pillow", "pillowcase", "cushion", "ring holder", "soft square"),
+                "context": ("ring bearer", "wedding rings", "ring", "rings", "ribbon", "ceremony", "ring attachment", "goi dung nhan", "goi nhan cuoi", "goi de nhan"),
                 "exclude": ("guest book", "vow book"),
             },
             "hoops_with_photos": {
@@ -10323,6 +10742,69 @@ exit 1
                 "main": ("book", "booklet", "notebook", "fabric cover", "covered booklet"),
                 "context": ("vow", "vows", "personal vows", "bride vows", "groom vows", "wedding promise"),
                 "exclude": ("guest", "sign in", "signature", "album", "pillow", "cushion"),
+            },
+            "baby_christmas_album": {
+                "main": (
+                    "baby christmas album",
+                    "christmas baby album",
+                    "baby christmas photo album",
+                    "christmas baby photo album",
+                    "baby photo album",
+                    "photo album",
+                    "clear plastic photo pocket album",
+                ),
+                "context": (
+                    "baby",
+                    "christmas",
+                    "noel",
+                    "santa",
+                    "ornament",
+                    "gingerbread",
+                    "evergreen",
+                    "christmas photos",
+                    "photo pocket",
+                    "clear plastic pocket",
+                    "plastic sleeves",
+                    "cotton linen",
+                    "hand embroidered",
+                    "embroidered cover",
+                ),
+                "exclude": ("wedding", "bride", "groom", "guest", "sign in", "vow", "pillow", "passport"),
+            },
+            "christmas_album": {
+                "main": (
+                    "christmas album",
+                    "christmas photo album",
+                    "christmas memory album",
+                    "embroidered christmas album",
+                    "linen christmas album",
+                    "hand embroidered album",
+                    "photo album",
+                    "clear plastic photo pocket album",
+                ),
+                "context": (
+                    "christmas",
+                    "noel",
+                    "christmas tree",
+                    "ornament",
+                    "festive",
+                    "photo pocket",
+                    "clear plastic pocket",
+                    "plastic sleeves",
+                    "cotton linen",
+                    "hand embroidered",
+                    "embroidered cover",
+                ),
+                "exclude": (
+                    "baby christmas album",
+                    "christmas baby album",
+                    "baby",
+                    "wedding",
+                    "guest",
+                    "vow",
+                    "pillow",
+                    "passport",
+                ),
             },
             "baby_album": {
                 "main": (
@@ -10382,6 +10864,48 @@ exit 1
                 "main": ("ribbon", "fabric strip", "long strip", "sash", "streamer"),
                 "context": ("bouquet", "bridal bouquet", "wedding", "stitched lettering", "embroidered message", "draped"),
                 "exclude": ("book", "pillow", "cushion", "banner", "dress"),
+            },
+            "family_halloween_sash": {
+                "main": (
+                    "family halloween sash",
+                    "family halloween wreath sash",
+                    "wreath sash",
+                    "linen sash",
+                    "two-tail sash",
+                ),
+                "context": (
+                    "family halloween",
+                    "halloween wreath",
+                    "twig wreath",
+                    "maple leaf wreath",
+                    "two pointed tails",
+                    "embroidered motif",
+                    "embroidered text",
+                    "linen weave",
+                    "pumpkin",
+                    "ghost",
+                ),
+                "exclude": ("bouquet", "hair bow", "scrunchie", "book", "pillow", "bag", "banner"),
+            },
+            "halloween_wreath_sash": {
+                "main": (
+                    "halloween wreath sash",
+                    "halloween sash",
+                    "linen wreath sash",
+                    "two-tail sash",
+                ),
+                "context": (
+                    "halloween wreath",
+                    "dark twig wreath",
+                    "maple leaf wreath",
+                    "two pointed tails",
+                    "embroidered halloween motif",
+                    "embroidered text",
+                    "linen weave",
+                    "pumpkin",
+                    "ghost",
+                ),
+                "exclude": ("family halloween", "bouquet", "hair bow", "scrunchie", "book", "pillow", "bag", "banner"),
             },
             "hair_bow": {
                 "main": (
@@ -10457,6 +10981,114 @@ exit 1
                 ),
                 "exclude": ("guest book", "vow book", "photo album", "pillow", "cushion", "banner", "hoop", "dress", "shirt", "crown", "cross", "plush"),
             },
+            "pc_stocks": {
+                "main": (
+                    "pc stocks",
+                    "pc stock",
+                    "pc stocking",
+                    "punch needle christmas stocking",
+                    "christmas punch needle stocking",
+                    "punch needle stocking",
+                    "embroidered christmas stocking",
+                    "christmas stocking",
+                    "holiday stocking",
+                    "mini christmas stocking",
+                    "stocking",
+                ),
+                "context": (
+                    "christmas",
+                    "noel",
+                    "xmas",
+                    "punch needle",
+                    "raised wool",
+                    "raised yarn",
+                    "yarn loops",
+                    "loop pile",
+                    "white cuff",
+                    "stocking cuff",
+                    "toe",
+                    "heel",
+                    "hanging loop",
+                    "fireplace",
+                    "mantel",
+                ),
+                "exclude": (
+                    "round ornament",
+                    "embroidery hoop ornament",
+                    "sock worn on foot",
+                    "wearing socks",
+                    "pair of socks",
+                    "bag",
+                    "pillow",
+                    "banner",
+                    "book",
+                    "album",
+                    "dress",
+                    "plush",
+                ),
+            },
+            "ornament_round": {
+                "main": (
+                    "christmas ornament",
+                    "round ornament",
+                    "embroidered ornament",
+                    "linen ornament",
+                    "embroidery hoop ornament",
+                    "mini hoop ornament",
+                    "tree ornament",
+                    "hanging ornament",
+                    "ornament",
+                ),
+                "context": (
+                    "christmas",
+                    "noel",
+                    "xmas",
+                    "small round",
+                    "miniature hoop",
+                    "wooden frame",
+                    "metal clasp",
+                    "hanging cord",
+                    "hanging ribbon",
+                    "tree decoration",
+                    "linen",
+                    "hand embroidered",
+                    "raised stitches",
+                ),
+                "exclude": ("wedding", "couple", "photo", "portrait", "wall decor", "large hoop", "pillow", "cushion", "bag", "banner", "book", "dress", "shirt"),
+            },
+            "halloween_bag": {
+                "main": (
+                    "halloween bag",
+                    "halloween treat bag",
+                    "trick or treat bag",
+                    "trick-or-treat bag",
+                    "treat or trick bag",
+                    "treat-or-trick bag",
+                    "halloween candy bag",
+                    "candy bag",
+                    "treat pouch",
+                ),
+                "context": (
+                    "halloween",
+                    "trick or treat",
+                    "trick-or-treat",
+                    "treat or trick",
+                    "candy",
+                    "pumpkin",
+                    "ghost",
+                    "bat",
+                    "spider",
+                    "linen",
+                    "cotton linen",
+                    "embroidered",
+                    "hand embroidered",
+                    "small bag",
+                    "single handle",
+                    "strap",
+                    "drawstring",
+                ),
+                "exclude": ("book", "album", "pillow", "cushion", "banner", "hoop", "dress", "shirt", "crown", "cross", "plush", "bucket", "basket"),
+            },
             "drawstring_bag": {
                 "main": (
                     "drawstring bag",
@@ -10492,6 +11124,11 @@ exit 1
                 "main": ("banner", "pennant", "flag", "wall hanging", "fabric panel", "hanging panel"),
                 "context": ("dowel", "rod", "cord hanger", "rope hanger", "pointed v", "v bottom", "triangular", "nursery wall"),
                 "exclude": ("pillow", "cushion", "book", "hoop", "dress"),
+            },
+            "birthday_hat": {
+                "main": ("birthday hat", "party hat", "linen birthday hat", "fabric birthday hat", "embroidered birthday hat", "mũ sinh nhật", "mu sinh nhat"),
+                "context": ("birthday", "party", "cake", "pom-pom", "pompom", "felt ball", "ruffle", "tie strings", "wearing", "head", "baby", "child", "linen", "embroidered"),
+                "exclude": ("crown", "vương miện", "vuong mien", "cross", "crucifix", "banner", "pennant", "wall hanging", "dowel", "rod", "pillow", "cushion", "book", "dress", "hoop"),
             },
             "crown": {
                 "main": ("crown", "fabric crown", "linen crown", "birthday crown", "party crown", "baby crown", "wearable crown", "crown headband", "crown hat", "pom-pom crown", "pompom crown"),
@@ -10908,11 +11545,257 @@ exit 1
             count = int(raw_count)
         except (TypeError, ValueError):
             count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
-        return max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, count))
+        return max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, count))
 
     def _flow_operator_target_count_for_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> int:
         signals = self._flow_operator_card_product_signals(request, card)
         return self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
+
+    def _flow_agent_occasion_decor_specs(self) -> tuple[Dict[str, Any], ...]:
+        return (
+            {
+                "key": "halloween",
+                "label": "Halloween",
+                "terms": (
+                    "halloween",
+                    "trick or treat",
+                    "treat or trick",
+                    "trick-or-treat",
+                    "treat-or-trick",
+                    "pumpkin",
+                    "ghost",
+                    "witch",
+                    "bat",
+                    "spider",
+                    "boo",
+                    "jack o lantern",
+                    "jack-o-lantern",
+                    "keo halloween",
+                    "tui dung keo",
+                ),
+                "product_keys": ("halloween_bag",),
+                "decor": (
+                    "use tasteful Halloween props such as mini pumpkins, white/orange pumpkins, wrapped candy in orange/black/purple, tiny ceramic ghosts, bat or spider accents, a small witch hat, dry maple leaves, or one muted lantern with no strong yellow glow"
+                ),
+            },
+            {
+                "key": "christmas",
+                "label": "Christmas",
+                "terms": (
+                    "christmas",
+                    "xmas",
+                    "noel",
+                    "holiday",
+                    "santa",
+                    "reindeer",
+                    "snowflake",
+                    "ornament",
+                    "stocking",
+                    "gingerbread",
+                    "pine",
+                    "evergreen",
+                ),
+                "product_keys": ("ornament_round", "pc_stocks"),
+                "decor": (
+                    "use bright premium Christmas props such as evergreen sprigs, pine cones, white or red ribbon, matte ornaments, tiny stockings, wrapped gifts, neutral snowflake accents, or gingerbread details while keeping whites clean and not warm/yellow"
+                ),
+            },
+            {
+                "key": "first_birthday",
+                "label": "First birthday",
+                "terms": (
+                    "first birthday",
+                    "1st birthday",
+                    "one year old",
+                    "turning one",
+                    "cake smash",
+                    "first bday",
+                    "sinh nhat 1 tuoi",
+                    "sinh nhật 1 tuổi",
+                    "sinh nhat dau tien",
+                    "thoi noi",
+                    "thôi nôi",
+                ),
+                "product_keys": ("birthday_hat", "crown"),
+                "decor": (
+                    "use gentle first-birthday props such as a small cake or cake pedestal, pastel balloons, one mini birthday banner, soft confetti, wooden toys, baby romper/bib styling, and subtle party textiles; keep the palette airy and baby-safe"
+                ),
+            },
+            {
+                "key": "birthday",
+                "label": "Birthday",
+                "terms": ("birthday", "bday", "party", "cake", "balloon", "sinh nhat", "sinh nhật"),
+                "product_keys": (),
+                "decor": (
+                    "use refined birthday props such as a small cake, pastel balloons, light confetti, simple bunting, cake stand, or gift wrap, scaled to the product and not cluttered"
+                ),
+            },
+            {
+                "key": "wedding",
+                "label": "Wedding",
+                "terms": (
+                    "wedding",
+                    "bride",
+                    "bridal",
+                    "groom",
+                    "vow",
+                    "guest book",
+                    "ring bearer",
+                    "anniversary",
+                    "cuoi",
+                    "cưới",
+                ),
+                "product_keys": ("ring_bearer_pillow", "wedding_pillowcase", "wedding_hoop", "bride_handkerchief", "vows_book", "guest_book", "bouquet_ribbon"),
+                "decor": (
+                    "use elegant wedding props such as silk ribbon, ring box, veil edge, vow cards, invitation paper, pearls, soft florals, baby's breath, bouquet greenery, or neutral wedding table styling"
+                ),
+            },
+            {
+                "key": "baby_shower",
+                "label": "Baby shower or nursery",
+                "terms": (
+                    "baby shower",
+                    "newborn",
+                    "nursery",
+                    "crib",
+                    "baby keepsake",
+                    "be be",
+                    "em be",
+                    "so sinh",
+                    "thoi noi",
+                    "thôi nôi",
+                ),
+                "product_keys": ("tooth_fairy_pillow", "baby_pillowcase", "baby_album", "banner", "dress_baby", "plush"),
+                "decor": (
+                    "use soft nursery props such as knitted blankets, baby socks, wooden toys, milestone discs, pastel books, muslin cloth, gentle florals, or clean crib/shelf styling"
+                ),
+            },
+            {
+                "key": "easter",
+                "label": "Easter",
+                "terms": ("easter", "bunny", "rabbit", "egg hunt", "easter egg", "phuc sinh", "phục sinh"),
+                "product_keys": (),
+                "decor": (
+                    "use fresh Easter props such as pastel eggs, small bunny accents, spring flowers, pale green foliage, light baskets, or gingham cloth, staying clean and premium"
+                ),
+            },
+            {
+                "key": "valentine",
+                "label": "Valentine",
+                "terms": ("valentine", "valentines", "love", "heart", "anniversary", "tinh yeu", "tình yêu"),
+                "product_keys": (),
+                "decor": (
+                    "use understated Valentine props such as soft heart accents, blush ribbon, small florals, neutral gift wrap, or romantic paper styling without making the product cheesy or cluttered"
+                ),
+            },
+        )
+
+    def _flow_agent_text_matches_terms(self, context_text: str, terms: tuple[str, ...]) -> bool:
+        normalized = self._normalize_skill_token(context_text)
+        normalized_padded = f"_{normalized}_"
+        compact = self._compact_match_text(context_text)
+        for term in terms:
+            term_text = str(term or "").strip()
+            if not term_text:
+                continue
+            term_normalized = self._normalize_skill_token(term_text)
+            term_compact = self._compact_match_text(term_text)
+            if term_normalized and f"_{term_normalized}_" in normalized_padded:
+                return True
+            if term_compact and len(term_compact) >= 5 and term_compact in compact:
+                return True
+        return False
+
+    def _flow_agent_product_rule_context_text(self, product_key: str) -> str:
+        product_key = str(product_key or "").strip()
+        suite = PRODUCT_SHOT_RULES.get(product_key) if product_key else None
+        if not suite:
+            return product_key
+        return " ".join(
+            str(part or "").strip()
+            for part in (
+                product_key,
+                suite.get("display_name"),
+                " ".join(str(alias or "") for alias in suite.get("aliases", ())[:12]),
+            )
+            if str(part or "").strip()
+        )
+
+    def _flow_agent_occasion_decor_rule(self, context_text: str, product_key: str = "") -> str:
+        product_key = str(product_key or "").strip()
+        context = " ".join(
+            part
+            for part in (
+                str(context_text or "").strip(),
+                self._flow_agent_product_rule_context_text(product_key),
+            )
+            if part
+        )
+        matched: List[Dict[str, Any]] = []
+        for spec in self._flow_agent_occasion_decor_specs():
+            spec_product_keys = {str(item or "").strip() for item in spec.get("product_keys", ()) if str(item or "").strip()}
+            if product_key and product_key in spec_product_keys:
+                matched.append(spec)
+                continue
+            if self._flow_agent_text_matches_terms(context, tuple(spec.get("terms", ()))):
+                matched.append(spec)
+
+        seen: set[str] = set()
+        deduped: List[Dict[str, Any]] = []
+        for spec in matched:
+            key = str(spec.get("key") or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(spec)
+
+        if any(str(spec.get("key")) == "first_birthday" for spec in deduped):
+            deduped = [spec for spec in deduped if str(spec.get("key")) != "birthday"]
+
+        base_rule = (
+            "Season and occasion decor adaptation rule: choose surrounding props by matching both the exact source product and the occasion/season detected from the Trello card, product rule, and user request. "
+            "Decor must stay secondary, sparse, premium handmade Etsy style, and must never cover embroidery, print, seams, handles, cords, tie strings, edges, names, or the main product silhouette. "
+            "Keep hero/detail shots cleaner than lifestyle shots; use only 1-3 subtle props when the shot does not explicitly ask for a decorated scene. "
+            "Do not mix unrelated seasons in one image, do not force seasonal props when no occasion is present, and if the occasion conflicts with the visible product identity, the source product and Required shot plan win."
+        )
+
+        if not deduped:
+            return (
+                f"{base_rule} If no explicit occasion is detected, use neutral category-appropriate decor: craft tools for handmade/process shots, nursery props for baby products, wedding styling for wedding products, gift packaging for giftable accessories, and clean natural props that fit the visible product use."
+            )
+
+        labels = ", ".join(str(spec.get("label") or spec.get("key") or "").strip() for spec in deduped)
+        decor_lines = "; ".join(str(spec.get("decor") or "").strip() for spec in deduped if str(spec.get("decor") or "").strip())
+        return f"{base_rule} Detected occasion/season: {labels}. For matching shots, {decor_lines}. Keep the exact product unchanged; only adapt the surrounding decor, background, and props."
+
+    def _flow_operator_occasion_decor_rule_for_trello_card(
+        self,
+        request: CreateJobRequest,
+        card: Dict[str, Any],
+        signals: Dict[str, Any] | None = None,
+    ) -> str:
+        signals = signals or self._flow_operator_card_product_signals(request, card)
+        attachment_names = " ".join(
+            str(item.get("name") or "").strip()
+            for item in (card.get("_image_attachments") or [])[:6]
+            if isinstance(item, dict) and str(item.get("name") or "").strip()
+        )
+        context = " ".join(
+            str(part or "").strip()
+            for part in (
+                getattr(request, "title", ""),
+                getattr(request, "prompt", ""),
+                getattr(request, "prompt_notes", ""),
+                getattr(request, "prompt_product", ""),
+                getattr(request, "prompt_product_key", ""),
+                signals.get("card_name") or card.get("name"),
+                signals.get("attachment_names") or attachment_names,
+                signals.get("card_description") or self._flow_operator_trello_card_description_note(card),
+                signals.get("visual_product_rule_visible_product"),
+            )
+            if str(part or "").strip()
+        )
+        return self._flow_agent_occasion_decor_rule(context, str(signals.get("product_rule_key") or "").strip())
 
     def _flow_operator_product_rule_shot_suite(self, product_key: str) -> List[Dict[str, str]]:
         product_key = str(product_key or "").strip()
@@ -10921,10 +11804,17 @@ exit 1
             return []
         display_name = str(suite.get("display_name") or product_key).strip()
         lock = str(suite.get("lock") or "").strip()
+        allows_planned_prop_text = bool(suite.get("allow_planned_prop_text"))
+        readable_prop_rule = (
+            "The only allowed readable prop text is the exact short phrase explicitly required by the listed concept; "
+            "it must stay on a separate secondary prop and never become product text or a text overlay."
+            if allows_planned_prop_text
+            else "Avoid readable tags or cards unless that readable text is visibly on the source product itself."
+        )
         suffix = (
             f"Product/category lock: {lock}. "
             "The listed concept may change only the scene, pose, props, color options, or presentation; it must not change the source product form, construction, material, embroidery/print layout, or handmade identity. "
-            "Use clean clear white daylight, keep the product premium handmade, and avoid logos, watermarks, UI text, and readable tags/cards unless that readable text is visibly on the source product itself."
+            f"Use clean clear white daylight, keep the product premium handmade, and avoid logos, watermarks, and UI text. {readable_prop_rule}"
         )
         shots: List[Dict[str, str]] = []
         for index, raw_shot in enumerate(suite.get("shots", ()), start=1):
@@ -11700,6 +12590,7 @@ exit 1
         ]
         product_hint = query or card_name or f"card Trello {index + 1}"
         design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
+        occasion_decor_rule = self._flow_operator_occasion_decor_rule_for_trello_card(request, card, signals)
         target_output_count = self._flow_operator_product_rule_target_count(product_rule_key)
         target_count = max(1, min(target_output_count, int(image_count or target_output_count)))
         existing_flow_count = max(0, min(target_output_count, int(existing_flow_count or 0)))
@@ -11721,7 +12612,21 @@ exit 1
             )
         else:
             resume_note = ""
-        allows_product_detail_collage = bool(signals.get("is_pennant") or product_rule_key in {"drawstring_bag", "passport_cover", "hair_bow", "baby_album"})
+        allows_product_detail_collage = bool(
+            signals.get("is_pennant")
+            or product_rule_key
+            in {
+                "drawstring_bag",
+                "passport_cover",
+                "hair_bow",
+                "baby_album",
+                "baby_christmas_album",
+                "christmas_album",
+            }
+        )
+        allows_planned_multi_panel = bool(product_rule and product_rule.get("allow_planned_multi_panel_shots"))
+        allows_planned_infographic_text = bool(product_rule and product_rule.get("allow_planned_infographic_text"))
+        allows_planned_prop_text = bool(product_rule and product_rule.get("allow_planned_prop_text"))
         brief_parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             self._flow_agent_fresh_context_rule(),
@@ -11736,7 +12641,7 @@ exit 1
                 "Critical source lock: the selected Trello attachment is the only authoritative product image. "
                 "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
-                "Do not turn the source into a tooth fairy pillow, pillow, cushion, blanket, hoop, dress, apron, banner, baby photo album, drawstring bag, passport cover, hair bow, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
+                "Do not turn the source into a tooth fairy pillow, pillow, cushion, blanket, hoop, dress, apron, banner, baby photo album, drawstring bag, passport cover, hair bow, Christmas stocking, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
                 "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
@@ -11760,6 +12665,7 @@ exit 1
             f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The default target for this run is always a fresh full set of {target_output_count} generated output images plus the 1 source image; do not subtract any existing output attachments from this run.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
+            occasion_decor_rule,
             "Lighting and color rule for every output: clean clear white neutral daylight, accurate whites, crisp bright product color, no yellow/orange/golden/tungsten/sepia/beige cast, and no warm color grading.",
             (
                 "Product-specific notes from the Trello card description: "
@@ -11772,17 +12678,30 @@ exit 1
             self._flow_agent_reference_prompt_style_guide(
                 target_count,
                 allow_detail_collage=allows_product_detail_collage,
+                allow_planned_multi_panel=allows_planned_multi_panel,
             ),
+            (
+                "Infographic text exception: only the explicitly numbered infographic shot(s) in the Required shot plan may use the short headings and captions written in that plan. "
+                "This does not permit logos, watermarks, price labels, brand tags, product-attached labels, or any extra text in other shots."
+            ) if allows_planned_infographic_text else "",
+            (
+                "Planned prop text exception: only the exact short greeting explicitly required by the numbered shot plan may appear on its separate secondary greeting-card prop. "
+                "It must not appear on the product, as an overlay, or in any other image; all logos, watermarks, tags, labels, and other added text remain forbidden."
+            ) if allows_planned_prop_text else "",
             "Preserve the original product shape, print/design details, colors, fabric/material texture, and product identity in all images.",
             "Only change scene, styling, lighting, composition, model/background, and presentation around the source product.",
-            "Do not change the source product into a different category; if the source is a tooth fairy pillow, it must remain the same tooth-shaped tooth fairy pillow with its ribbon; if the source is a pillow, it must remain a pillow; if it is a baby photo album, it must remain the same cotton linen baby album with its embroidered cover, book construction, and photo-pocket pages when open; if it is a pennant/banner, it must remain a pennant/banner; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is a hair bow, bow hair clip, or hair tie bow, it must remain the same hair accessory form with its bow shape, tails, center knot, and elastic/clip hardware; if it is apparel, it must remain the same apparel form.",
+            "Do not change the source product into a different category; if the source is a tooth fairy pillow, it must remain the same tooth-shaped tooth fairy pillow with its ribbon; if the source is a pillow, it must remain a pillow; if it is a baby photo album, it must remain the same cotton linen baby album with its embroidered cover, book construction, and photo-pocket pages when open; if it is a birthday hat, it must remain the same linen birthday hat with its tie strings, pom-poms, ruffle trim if present, and embroidery placement; if it is a birthday crown, it must remain the same linen birthday crown with its pointed band, tie strings, pom-poms, ruffle trim if present, and embroidery placement; if it is a pennant/banner, it must remain a pennant/banner; if it is a round Christmas ornament, it must remain the same small hanging ornament with its exact round frame, clasp, cord, linen face, and embroidery; if it is a Punch Needle Christmas stocking, it must remain the same compact hanging stocking with its exact cuff, toe direction, heel curve, hanging loop, fabric color, motif placement, and raised wool loop texture; if it is a hoop, it must remain a hoop; if it is a drawstring bag, it must remain the same drawstring bag/pouch form with cords; if it is a passport cover, it must remain the same passport cover/passport holder form; if it is a hair bow, bow hair clip, or hair tie bow, it must remain the same hair accessory form with its bow shape, tails, center knot, and elastic/clip hardware; if it is apparel, it must remain the same apparel form.",
             (
-                "All outputs must be true 1:1 square product photos. For pennants, image 7 is the only allowed four-panel close-up collage inside one square image; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
-                if signals.get("is_pennant")
+                "All outputs must be true 1:1 square product photos. Only the explicitly numbered infographic, detail, or process shots in the Required shot plan may be single 1:1 multi-panel layouts; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
+                if allows_planned_multi_panel
                 else (
-                    "All outputs must be true 1:1 square product photos. The explicitly numbered close-up detail collage shot is the only allowed four-panel image inside one square; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
-                    if allows_product_detail_collage
-                    else "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas."
+                    "All outputs must be true 1:1 square product photos. For pennants, image 7 is the only allowed four-panel close-up collage inside one square image; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
+                    if signals.get("is_pennant")
+                    else (
+                        "All outputs must be true 1:1 square product photos. The explicitly numbered close-up detail collage shot is the only allowed four-panel image inside one square; every other output must be a single standalone image. No landscape crop, portrait crop, contact sheet, grid, or extra multiple-frame canvas."
+                        if allows_product_detail_collage
+                        else "All outputs must be true 1:1 square product photos; no landscape crop, portrait crop, contact sheet, grid, or multiple-frame canvas."
+                    )
                 )
             ),
             "Do not use Google Sheet prompts; do not ask the local app AI to write the final prompt.",
@@ -11837,6 +12756,13 @@ exit 1
             design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
             all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
             target_output_count = self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
+            raw_existing_flow_count = max(0, int(card.get("_flow_output_count") or 0))
+            if raw_existing_flow_count >= target_output_count:
+                card["_auto_trello_skip_code"] = "complete_output_set"
+                card["_auto_trello_skip_reason"] = (
+                    f"Card da co {raw_existing_flow_count}/{target_output_count} anh output theo rule; Auto bo qua."
+                )
+                continue
             existing_flow_count = max(0, min(target_output_count, int(card.get("_flow_output_count") or 0)))
             image_count = target_output_count
             shot_start = 0
@@ -12373,7 +13299,7 @@ exit 1
             f"cards/{quote(card_id, safe='')}",
             key,
             token,
-            fields={"idList": list_id},
+            fields={"idList": list_id, "pos": "top"},
         )
         return payload if isinstance(payload, dict) else {}
 
@@ -13778,6 +14704,8 @@ exit 1
             async with self._browser_session_lock:
                 attempts = max(1, len(profiles))
                 last_quota_error: Exception | None = None
+                attempted_source_profiles: set[str] = set()
+                attempted_try_again_profiles: set[str] = set()
                 for _ in range(attempts):
                     profile = self._current_flow_profile()
                     if self._flow_profile_is_quota_blocked(profile):
@@ -13799,6 +14727,15 @@ exit 1
                     except HTTPException:
                         raise
                     except Exception as exc:
+                        if self._is_flow_agent_source_attachment_error(exc):
+                            attempted_source_profiles.add(profile.key)
+                            next_profile = self._next_unattempted_flow_profile(
+                                profile,
+                                attempted_source_profiles,
+                            )
+                            if next_profile is not None:
+                                self._active_flow_profile_index = next_profile.index
+                                continue
                         if self._is_flow_agent_quota_error(exc):
                             last_quota_error = exc
                             await self._mark_flow_profile_quota_limited(profile, exc)
@@ -13818,6 +14755,14 @@ exit 1
                                     self._active_flow_profile_index = next_profile.index
                                     continue
                                 raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail()) from exc
+                            attempted_try_again_profiles.add(profile.key)
+                            next_profile = self._next_unattempted_flow_profile(
+                                profile,
+                                attempted_try_again_profiles,
+                            )
+                            if next_profile is not None:
+                                self._active_flow_profile_index = next_profile.index
+                                continue
                             raise HTTPException(
                                 status_code=self._flow_error_status(exc),
                                 detail=(
@@ -14086,6 +15031,23 @@ exit 1
             return candidate
         return None
 
+    def _next_unattempted_flow_profile(
+        self,
+        current: FlowBrowserProfile,
+        attempted_keys: set[str],
+    ) -> FlowBrowserProfile | None:
+        profiles = self._flow_profile_specs()
+        if len(profiles) <= 1:
+            return None
+        for offset in range(1, len(profiles) + 1):
+            candidate = profiles[(current.index + offset) % len(profiles)]
+            if candidate.key in attempted_keys:
+                continue
+            if self._flow_profile_is_quota_blocked(candidate):
+                continue
+            return candidate
+        return None
+
     def _is_flow_agent_quota_error(self, exc: Exception) -> bool:
         if isinstance(exc, FlowAgentQuotaError):
             return True
@@ -14096,6 +15058,19 @@ exit 1
             or ("agent" in detail and "quota limit" in detail)
             or ("come back tomorrow" in detail and "quota" in detail)
             or ("daily quota" in detail and "agent" in detail)
+        )
+
+    def _is_flow_agent_source_attachment_error(self, exc: Exception | str) -> bool:
+        detail = self._flow_agent_error_match_text(exc)
+        return any(
+            signal in detail
+            for signal in (
+                "chua keo/upload duoc anh trello",
+                "chua keo duoc anh nguon",
+                "chua upload duoc anh trello",
+                "chua xac minh duoc anh nguon",
+                "no new ready attachment visible",
+            )
         )
 
     def _flow_agent_error_match_text(self, value: Exception | str) -> str:
@@ -15391,7 +16366,7 @@ exit 1
 
             interceptor = UIInterceptor()
             interceptor.attach(page)
-            target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1)))
+            target_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(count or 1)))
 
             mode = GenerationMode.FRAME_TO_VIDEO if start_image else GenerationMode.VIDEO
             ratio = AspectRatio.PORTRAIT if aspect == "portrait" else AspectRatio.LANDSCAPE
@@ -15517,7 +16492,7 @@ exit 1
 
             interceptor = UIInterceptor()
             interceptor.attach(page)
-            target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1)))
+            target_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(count or 1)))
 
             ratio = (
                 AspectRatio.PORTRAIT
@@ -15531,7 +16506,7 @@ exit 1
             max_attempts = max(target_count, 1) + 1
             while len(images) < target_count and attempts < max_attempts:
                 remaining = target_count - len(images)
-                batch_target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, remaining))
+                batch_target = max(1, min(self._flow_agent_max_images_per_run(), remaining))
                 attempts += 1
 
                 try:
@@ -15959,7 +16934,21 @@ exit 1
         return normalize_project_id(project_value)
 
     def _normalized_config(self, config: AppConfig) -> AppConfig:
-        return normalized_app_config(config)
+        normalized = normalized_app_config(config)
+        try:
+            active_profile = self._current_flow_profile()
+            profile_project_id = self._flow_profile_project_id(active_profile, "")
+        except Exception:
+            return normalized
+        if not profile_project_id:
+            return normalized
+
+        payload = _model_dump(normalized)
+        payload["project_id"] = profile_project_id
+        payload["project_url"] = self._project_url(profile_project_id)
+        if not str(payload.get("project_name", "")).strip():
+            payload["project_name"] = active_profile.label
+        return normalized_app_config(payload)
 
     def _normalize_projects_payload(self, projects: Dict[str, Dict[str, Any]]) -> tuple[Dict[str, Dict[str, str]], bool]:
         normalized: Dict[str, Dict[str, str]] = {}
@@ -17591,7 +18580,7 @@ exit 1
             raise HTTPException(status_code=400, detail="Tối đa 4 ảnh tham chiếu cho một lượt tạo video.")
 
         if request.type in {"video", "image"}:
-            max_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT if request.type == "image" and self._flow_agent_enabled_for_request(request) else 4
+            max_count = self.FLOW_AGENT_MAX_OUTPUT_COUNT if request.type == "image" and self._flow_agent_enabled_for_request(request) else 4
             if not 1 <= int(request.count) <= max_count:
                 raise HTTPException(status_code=400, detail=f"Số lượng cho tác vụ tạo nội dung phải nằm trong khoảng 1 đến {max_count}.")
 
@@ -18208,7 +19197,7 @@ exit 1
             seen.add(media_name)
 
         images.sort(key=lambda item: str(getattr(item, "_flow_workflow_create_time", "") or ""), reverse=True)
-        return images[: max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(limit or 1)))]
+        return images[: max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(limit or 1)))]
 
     def _prompt_from_flow_request_data(self, request_data: Dict[str, Any]) -> str:
         prompt_inputs = request_data.get("promptInputs", []) if isinstance(request_data, dict) else []
@@ -18260,7 +19249,7 @@ exit 1
     ) -> List[Any]:
         from flow._api import GeneratedImage
 
-        target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or 1)))
+        target = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(target_count or 1)))
         try:
             page = await client._bm.page()
             items = await page.evaluate(
@@ -18370,7 +19359,7 @@ exit 1
         settle_s: float = 4.0,
         allow_visible_fallback: bool = False,
     ) -> List[Any]:
-        target = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(target_count or 1)))
+        target = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(target_count or 1)))
         deadline = time.monotonic() + max(5.0, float(timeout_s or 30))
         settle_window = max(1.0, float(settle_s or 4.0))
         best: List[Any] = []
@@ -18473,7 +19462,7 @@ exit 1
                     "seed": random.randint(0, 2**31 - 1),
                     "imageInputs": list(image_inputs),
                 }
-                for _ in range(max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1))))
+                for _ in range(max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(count or 1))))
             ],
         }
         data = await client._api._fetch(
@@ -18541,7 +19530,7 @@ exit 1
         request: CreateJobRequest,
         reference_media_names: List[str],
     ) -> List[Any]:
-        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1)))
+        target_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(request.count or 1)))
         if reference_media_names:
             return await self._generate_image_edit_result(
                 client,
@@ -18577,7 +19566,7 @@ exit 1
                 raise RuntimeError(
                     "Flow API dang chan nhanh ghep nhieu anh, nen em chua the fallback UI an toan cho hon 1 anh tham chieu."
                 )
-            target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1)))
+            target_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(request.count or 1)))
             flow_agent_enabled = self._flow_agent_enabled_for_request(request)
             source_workflow_id = str(request.workflow_id or "").strip()
             if flow_agent_enabled and reference_media_names:
@@ -18751,7 +19740,7 @@ exit 1
             request.prompt,
             model=self._image_ui_model_label(request.model),
             aspect=request.aspect,
-            count=max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(request.count or 1))),
+            count=max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(request.count or 1))),
             timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
         )
 
@@ -18773,16 +19762,20 @@ exit 1
 
     def _is_retryable_flow_agent_ui_error(self, detail: str) -> bool:
         normalized = str(detail or "").lower()
-        return self._is_stale_flow_agent_context_error(normalized) or any(
-            marker in normalized
-            for marker in (
-                "invalid argument",
-                "recaptcha",
-                "403",
-                "timeout",
-                "timed out",
-                "thoi gian cho",
-                "chua tra ve anh",
+        return (
+            self._is_stale_flow_agent_context_error(normalized)
+            or self._is_flow_agent_try_again_error(normalized)
+            or any(
+                marker in normalized
+                for marker in (
+                    "invalid argument",
+                    "recaptcha",
+                    "403",
+                    "timeout",
+                    "timed out",
+                    "thoi gian cho",
+                    "chua tra ve anh",
+                )
             )
         )
 
@@ -18790,6 +19783,8 @@ exit 1
         normalized = str(detail or "").lower()
         if self._is_stale_flow_agent_context_error(normalized):
             return 4.0
+        if self._is_flow_agent_try_again_error(normalized):
+            return 8.0
         return 45.0 if ("recaptcha" in normalized or "403" in normalized) else 25.0
 
     def _flow_agent_shot_specs(self) -> List[Dict[str, str]]:
@@ -18901,8 +19896,8 @@ exit 1
         ]
 
     def _flow_agent_multi_image_prompt(self, prompt: str, total: int, *, shot_offset: int = 0, full_total: int | None = None) -> str:
-        total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(total or 1)))
-        full_total = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(full_total or total)))
+        total = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(total or 1)))
+        full_total = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(full_total or total)))
         shot_offset = max(0, min(full_total - 1, int(shot_offset or 0)))
         shot_start = shot_offset + 1
         shot_end = min(full_total, shot_offset + total)
@@ -18915,6 +19910,7 @@ exit 1
             for index, shot in enumerate(shot_specs, start=1)
         )
         base = str(prompt or "").strip()
+        occasion_decor_rule = self._flow_agent_occasion_decor_rule(base)
         has_base_shot_plan = "Required shot plan:" in base
         detail_collage_match = (
             re.search(r"(?:image|shot)\s*(\d+)[^.]{0,260}(?:four-panel|four close-up|4 close-up|collage)", base, re.IGNORECASE)
@@ -18922,6 +19918,13 @@ exit 1
         )
         detail_collage_number = str(detail_collage_match.group(1)) if detail_collage_match else ""
         allows_four_panel_detail_collage = bool(detail_collage_match)
+        allows_planned_prop_text = "Planned prop text exception:" in base
+        added_readable_text_rule = (
+            "The only added readable text allowed is the exact short greeting explicitly required by the Required shot plan, "
+            "and it may appear only on that separate secondary greeting-card prop; never place it on the product or as an overlay. "
+            if allows_planned_prop_text
+            else "Do not add any readable name, initials, year, EST date, quote, slogan, label, or decorative text unless that readable text is visibly embroidered/printed on the source product image; for allowed name variants, keep the same product shape and motif exactly. "
+        )
         detail_collage_label = f"image {detail_collage_number}" if detail_collage_number else "the explicitly planned close-up detail image"
         separate_output_rule = (
             f"Each requested output must be its own separate 1:1 square image file. The explicitly planned {detail_collage_label} may be one 1:1 four-panel close-up collage; every other output must not be panels inside one canvas. "
@@ -18979,6 +19982,7 @@ exit 1
             f"{separate_output_rule}"
             f"{square_frame_rule}"
             f"{shot_plan_text}"
+            f"{occasion_decor_rule} "
             "HARD REFERENCE LOCK: use only the single attached Trello source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
             "The source image beats the filename/card title: do not infer apparel from 'tao_hinh...', do not infer a plush from an animal motif, and do not infer a pillow/banner/hoop unless that is the visible product object in the source image. "
             "Before every output, compare against the source image and preserve the exact product category, silhouette, outline shape, construction, scale, fabric/material, base color, design placement, motif, embroidery/print layout, and edge details. "
@@ -18996,7 +20000,7 @@ exit 1
             f"{self._flow_agent_colorway_text_variant_rule()} "
             f"{no_grid_rule}"
             f"{self._flow_agent_no_tag_label_rule()} "
-            "Do not add any readable name, initials, year, EST date, quote, slogan, label, or decorative text unless that readable text is visibly embroidered/printed on the source product image; for allowed name variants, keep the same product shape and motif exactly. "
+            f"{added_readable_text_rule}"
             "Use the attached Trello source product image as the reference for every output. "
             "Keep every output 1:1 square, commercial product photography, and visually identical to the same source product identity."
         )
@@ -19006,8 +20010,8 @@ exit 1
         text = str(base or "")
         if not text or "Required shot plan:" not in text:
             return ""
-        start = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(start or 1)))
-        end = max(start, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(end or start)))
+        start = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(start or 1)))
+        end = max(start, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(end or start)))
         section = text[text.find("Required shot plan:") :]
         matches = list(re.finditer(r"(?<!\d)(\d{1,2})\.\s+", section))
         if not matches:
@@ -19066,7 +20070,7 @@ exit 1
             raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
         ui_timeout_s = max(60.0, min(600.0, float(timeout_s or 300)))
-        target_count = max(1, min(self.FLOW_AGENT_TARGET_OUTPUT_COUNT, int(count or 1)))
+        target_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(count or 1)))
         aspect_value = self._parse_aspect(aspect or "square")
         ratio = (
             AspectRatio.PORTRAIT
@@ -19124,6 +20128,11 @@ exit 1
 
         agent_opened = False
         if flow_agent_enabled:
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.4)
+            except Exception:
+                pass
             agent_opened, agent_detail = await self._enable_flow_agent_mode(page)
             if job_id:
                 if agent_opened:
@@ -19237,14 +20246,25 @@ exit 1
 
         if flow_agent_enabled and (not attached_agent_source or not source_attachment_verified) and safe_reference_image_path:
             fallback_before = await self._flow_agent_panel_attachment_snapshot(page)
+            upload_call_start = len(getattr(interceptor, "_calls", []) or [])
             attached_local_source, attach_detail = await self._attach_flow_agent_source_file(page, safe_reference_image_path)
             if attached_local_source:
                 attached_agent_source = True
-                source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
-                    page,
-                    fallback_before,
-                    accept_stable_ready_after_attach=True,
+                upload_ready, upload_ready_detail = await self._wait_for_flow_agent_upload_ready(
+                    interceptor,
+                    upload_call_start,
+                    timeout_s=min(60.0, max(20.0, ui_timeout_s / 5)),
                 )
+                if upload_ready:
+                    source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
+                        page,
+                        fallback_before,
+                        accept_stable_ready_after_attach=True,
+                    )
+                    source_verify_detail = f"{upload_ready_detail}; {source_verify_detail}"
+                else:
+                    source_attachment_verified = False
+                    source_verify_detail = upload_ready_detail
             if job_id:
                 await self.store.append_log(
                     job_id,
@@ -19822,6 +20842,13 @@ exit 1
         return False, str((item_result or {}).get("detail") or "new Agent session item not found") if isinstance(item_result, dict) else "new Agent session item not found"
 
     async def _enable_flow_agent_mode(self, page: Any) -> tuple[bool, str]:
+        try:
+            state = await self._flow_agent_panel_state(page, "")
+            if state.get("visible"):
+                return True, str(state.get("detail") or "agent panel already visible")
+        except Exception:
+            pass
+
         locator_patterns = [
             re.compile(r"^\s*(Tác\s*nhân|Tac\s*nhan|Agent)\s*$", re.IGNORECASE),
         ]
@@ -19920,6 +20947,9 @@ exit 1
         ok = bool((result or {}).get("ok")) if isinstance(result, dict) else False
         detail = str((result or {}).get("detail") or "").strip() if isinstance(result, dict) else ""
         if not ok:
+            panel_opened, panel_detail = await self._open_flow_agent_panel(page, timeout_s=3.0)
+            if panel_opened:
+                return True, f"agent panel opened without toggle: {panel_detail}"
             return False, detail
         try:
             await page.mouse.click(float((result or {}).get("x")), float((result or {}).get("y")))
@@ -20053,6 +21083,15 @@ exit 1
                 detail = str(state.get("detail") or "agent panel visible")
                 if state.get("has_prompt"):
                     return True, f"{detail}; prompt already submitted", False
+                if state.get("has_prompt_in_textbox"):
+                    sent, send_detail = await self._click_flow_agent_panel_send(page)
+                    if not sent:
+                        return False, f"{detail}; prompt remains in composer; send failed: {send_detail}", True
+                    await asyncio.sleep(1.5)
+                    submitted_state = await self._flow_agent_panel_state(page, prompt)
+                    if submitted_state.get("has_prompt") or not submitted_state.get("has_prompt_in_textbox"):
+                        return True, f"{detail}; sent prompt in panel via {send_detail}", False
+                    return False, f"{detail}; prompt remains in composer after clicking {send_detail}", True
                 if not submit_if_needed:
                     return True, f"{detail}; send already clicked", False
                 if not state.get("has_textbox"):
@@ -20117,11 +21156,21 @@ exit 1
                     });
                   const text = panel.text || '';
                   const probe = String(promptProbe || '').trim();
-                  const hasPrompt = probe.length >= 16 && text.includes(probe);
+                  const composerText = textboxes
+                    .map((el) => `${el.value || ''} ${el.textContent || ''}`.replace(/\s+/g, ' ').trim())
+                    .join('\\n');
+                  const transcript = panel.el.cloneNode(true);
+                  for (const editor of transcript.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')) {
+                    editor.remove();
+                  }
+                  const transcriptText = (transcript.textContent || '').replace(/\s+/g, ' ').trim();
+                  const hasPrompt = probe.length >= 16 && transcriptText.includes(probe);
+                  const hasPromptInTextbox = probe.length >= 16 && composerText.includes(probe);
                   return {
                     visible: true,
                     has_textbox: textboxes.length > 0,
                     has_prompt: hasPrompt,
+                    has_prompt_in_textbox: hasPromptInTextbox,
                     detail: (text.match(/Phiên\\s+không\\s+có\\s+tiêu\\s+đề|Phien\\s+khong\\s+co\\s+tieu\\s+de|Chào[^\\n]{0,40}|Chao[^\\n]{0,40}/i) || ['agent panel visible'])[0],
                   };
                 }
@@ -20218,22 +21267,53 @@ exit 1
                     el.getAttribute('title') || '',
                     el.getAttribute('data-testid') || '',
                   ].join(' ').replace(/\\s+/g, ' ').trim();
-                  const buttons = [...document.querySelectorAll('button, [role="button"]')]
+                  const textboxes = [...document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                    .filter((el) => {
+                      if (!visible(el)) return false;
+                      const rect = el.getBoundingClientRect();
+                      return rect.left >= window.innerWidth * 0.35 && rect.width >= 160 && rect.height >= 18;
+                    })
+                    .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+                  const composer = textboxes[0];
+                  if (!composer) return { ok: false, detail: 'no agent panel composer' };
+                  const composerRect = composer.getBoundingClientRect();
+                  const candidates = [...document.querySelectorAll('button, [role="button"]')]
                     .filter(visible)
                     .map((el) => {
                       const rect = el.getBoundingClientRect();
                       const label = labelFor(el);
                       const inRightPanel = rect.left >= window.innerWidth * 0.35;
-                      const nearBottom = rect.top >= window.innerHeight * 0.65;
+                      const nearComposerBottom = Math.abs((rect.top + rect.height / 2) - composerRect.bottom) <= 150;
+                      const insideComposerY = rect.top >= composerRect.top + composerRect.height * 0.55
+                        && rect.bottom <= composerRect.bottom + 60;
+                      const rightZone = rect.left >= composerRect.left + composerRect.width * 0.62;
+                      const compact = rect.width <= 96 && rect.height <= 96;
                       const sendish = /arrow_forward|arrow_upward|send|gửi|gui|tạo|tao|create/i.test(label);
-                      const score = (inRightPanel ? 1000 : 0) + (nearBottom ? 300 : 0) + (sendish ? 800 : 0) + rect.right / 100;
-                      return { el, rect, label, score };
-                    })
-                    .filter((item) => item.score >= 900)
+                      const excluded = /close|cancel|dismiss|attach|add|plus|settings|tune|menu|more|delete|remove|clear|đóng|dong|hủy|huy|đính\s*kèm|dinh\s*kem|cài\s*đặt|cai\s*dat/i.test(label);
+                      const score = (inRightPanel ? 700 : -1000)
+                        + (nearComposerBottom ? 1200 : -700)
+                        + (insideComposerY ? 700 : -400)
+                        + (rightZone ? 900 : -500)
+                        + (sendish ? 1800 : 0)
+                        + (compact ? 250 : -900)
+                        + rect.right / 100;
+                      return { el, rect, label, score, excluded };
+                    });
+                  const explicitSendButtons = candidates
+                    .filter((item) =>
+                      !item.excluded
+                      && /arrow_forward|arrow_upward|send|gửi|gui|tạo|tao|create/i.test(item.label)
+                      && item.rect.left >= window.innerWidth * 0.35
+                      && item.rect.top >= window.innerHeight * 0.55
+                      && item.rect.width <= 96
+                      && item.rect.height <= 96
+                    )
+                    .sort((a, b) => (b.rect.right - a.rect.right) || (b.rect.bottom - a.rect.bottom));
+                  const buttons = candidates
+                    .filter((item) => !item.excluded && item.score >= 2600)
                     .sort((a, b) => b.score - a.score);
-                  const target = buttons[0];
+                  const target = explicitSendButtons[0] || buttons[0];
                   if (!target) return { ok: false, detail: 'no agent panel send button' };
-                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
                   return {
                     ok: true,
                     x: target.rect.left + target.rect.width / 2,
@@ -20429,7 +21509,7 @@ exit 1
                         })
                         .filter(({ label, rect }) => label.length <= 120 && isApproveLabel(label) && rect.width <= 420 && rect.height <= 140)
                         .sort((a, b) => ((a.rect.width * a.rect.height) - (b.rect.width * b.rect.height)) || (b.rect.right - a.rect.right));
-                      const waiting = approvalTextPattern.test(bodyText);
+                      const bodyMentionsApproval = approvalTextPattern.test(bodyText);
                       const dialogRoots = deepQuery('[role="dialog"], [aria-modal="true"], mat-dialog-container, .mat-mdc-dialog-container, .cdk-overlay-pane')
                         .filter(visible)
                         .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
@@ -20438,7 +21518,7 @@ exit 1
                         const text = `${root.label || ''} ${root.el?.innerText || ''}`;
                         return approvalTextPattern.test(text);
                       });
-                      const approvalTextRoots = waiting
+                      const approvalTextRoots = bodyMentionsApproval
                         ? deepQuery('section, aside, form, div, [role="group"], [role="alertdialog"], [role="status"]')
                             .filter(visible)
                             .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el), text: el.innerText || el.textContent || '' }))
@@ -20453,6 +21533,11 @@ exit 1
                         : [];
                       const approvalRoots = [...approvalDialogRoots, ...approvalTextRoots]
                         .filter(({ el }, index, arr) => arr.findIndex((item) => item.el === el) === index);
+                      const waiting = approvalDialogRoots.length > 0 || approvalTextRoots.some((root) =>
+                        deepQuery('button, [role="button"], [tabindex], a', root.el)
+                          .filter(visible)
+                          .some((el) => isApprovalActionLabel(labelFor(el)))
+                      );
                       const dialogFallbackButtons = waiting
                         ? approvalRoots.flatMap((root) =>
                             deepQuery('button, [role="button"], [tabindex], a', root.el)
@@ -20941,6 +22026,36 @@ exit 1
         current_count = self._flow_agent_attachment_ready_count(last_snapshot)
         current_composer_count = self._flow_agent_attachment_composer_ready_count(last_snapshot)
         return False, f"no new ready attachment visible {before_count}->{current_count}, composer {before_composer_count}->{current_composer_count}; {last_snapshot.get('detail') or ''}"
+
+    async def _wait_for_flow_agent_upload_ready(
+        self,
+        interceptor: Any,
+        start_index: int,
+        *,
+        timeout_s: float = 45.0,
+    ) -> tuple[bool, str]:
+        deadline = asyncio.get_running_loop().time() + max(2.0, float(timeout_s or 45.0))
+        last_detail = "waiting for Flow Agent source upload"
+        while asyncio.get_running_loop().time() < deadline:
+            calls = list(getattr(interceptor, "_calls", []) or [])[max(0, int(start_index or 0)) :]
+            upload_calls = [
+                call
+                for call in calls
+                if any(token in str(getattr(call, "tail", "") or "").lower() for token in ("uploadimage", "uploadmedia"))
+            ]
+            for call in reversed(upload_calls):
+                tail = str(getattr(call, "tail", "") or "uploadImage")
+                response = getattr(call, "resp", None)
+                if response is None:
+                    last_detail = f"{tail} still uploading"
+                    continue
+                status = int(getattr(call, "status", 0) or 0)
+                if status not in (200, 201):
+                    return False, f"{tail} failed [{status or 'unknown'}]"
+                await asyncio.sleep(1.5)
+                return True, f"{tail} completed [{status}]"
+            await asyncio.sleep(0.25)
+        return False, f"{last_detail}; no completed uploadImage response in {int(timeout_s)}s"
 
     async def _attach_flow_agent_source_file(self, page: Any, image_path: str) -> tuple[bool, str]:
         source = Path(str(image_path or "")).expanduser()

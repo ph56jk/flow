@@ -10,7 +10,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from .paths import DOWNLOADS_DIR, STATIC_DIR, UPLOADS_DIR, ensure_app_dirs
+from .paths import DOWNLOADS_DIR, PROJECT_ROOT, STATIC_DIR, UPLOADS_DIR, ensure_app_dirs
 from .schemas import (
     ArtifactOpenRequest,
     CleanupRequest,
@@ -31,7 +31,13 @@ from .service import FlowWebService
 from .store import StateStore
 
 
-ENV_FILE = Path(__file__).resolve().parent.parent / ".env.local"
+ENV_FILE = Path(
+    os.path.expandvars(
+        os.path.expanduser(os.environ.get("FLOW_ENV_FILE", "").strip())
+    )
+) if os.environ.get("FLOW_ENV_FILE", "").strip() else PROJECT_ROOT / ".env.local"
+if not ENV_FILE.is_absolute():
+    ENV_FILE = (PROJECT_ROOT / ENV_FILE).resolve()
 
 
 def _strip_env_quotes(value: str) -> str:
@@ -83,6 +89,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+ensure_app_dirs()
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/files/uploads", StaticFiles(directory=UPLOADS_DIR), name="uploads")
 app.mount("/files/downloads", StaticFiles(directory=DOWNLOADS_DIR), name="downloads")
@@ -102,7 +109,10 @@ async def index() -> HTMLResponse:
 
 @app.get("/api/health")
 async def health() -> Dict[str, str]:
-    return {"status": "ok"}
+    return {
+        "status": "ok",
+        "instance": os.environ.get("FLOW_WORKER_NAME", "primary").strip() or "primary",
+    }
 
 
 @app.get("/api/state")

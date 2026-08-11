@@ -104,7 +104,7 @@ For UI and automation stories, also include:
 - Likely files: `flow_web/static/app.js`, `flow_web/service.py`, `flow_web/schemas.py`, `tests/test_flow_web_smoke.py`.
 - Reuse existing helpers such as Flow Agent mode switching, auto approval, project image scanning, Trello candidate rendering, and Telegram review queues.
 - Background verification should prefer headless Playwright or the in-app browser without foreground interruption.
-- The current configured Flow project should point at `https://labs.google/fx/vi/tools/flow/project/5966d10d-cc72-40a8-9063-5d49fb5da44b`.
+- The configured Flow project should point at `https://labs.google/fx/vi/tools/flow/project/PROJECT_ID`.
 
 ## Success Metrics
 - From a valid Trello card image, the user can start an Agent-based run and receive 4 generated images.

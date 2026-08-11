@@ -118,7 +118,7 @@
   "metadata": {
     "source": "tasks/prd-flow-agent-automation-v2.md",
     "createdAt": "2026-05-21",
-    "projectUrl": "https://labs.google/fx/vi/tools/flow/project/5966d10d-cc72-40a8-9063-5d49fb5da44b",
+    "projectUrl": "https://labs.google/fx/vi/tools/flow/project/PROJECT_ID",
     "qualityGates": [
       "node --check flow_web/static/app.js",
       "./.venv/bin/python -m unittest tests.test_flow_web_smoke -q",

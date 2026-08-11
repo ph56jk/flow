@@ -1,7 +1,7 @@
 param(
     [string]$TaskName = "HAVI Flow Tool Web AutoStart",
     [string]$AppHost = "127.0.0.1",
-    [int]$Port = 8000,
+    [int]$Port = 1506,
     [string]$DailyAt = "07:00",
     [switch]$OpenBrowser
 )

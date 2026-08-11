@@ -3,10 +3,12 @@
 .pw-browsers/
 .playwright-cli/
 .env.local
+.env.worker-*.local
 .codex/
 __pycache__/
 .pytest_cache/
 *.pyc
+._*
 flow_web_ui.egg-info/
 flow_v2.egg-info/
 dist/
@@ -17,6 +19,11 @@ data/uploads/*
 data/downloads/*
 data/flow-profiles/*
 data/state.json
+data/state.before-*.json
+data/state.corrupt-*.json
+data/state.restored-*.json
+data/trello-title-description-backups.json
+data/workers/
 data/_state_dump.json
 .flow-web.log
 .flow-web.pid
@@ -24,6 +31,11 @@ logs/
 !data/uploads/.gitkeep
 !data/downloads/.gitkeep
 !data/flow-profiles/.gitkeep
+
+# Local account helpers and editable rule workbooks contain operator data.
+scripts/login_flow_*acc*.ps1
+Flow_Tool_Rules_Current_Work_*.xlsx
+data/*Rules*Manual*.xlsx
 
 # Beads / Dolt files (added by bd init)
 .dolt/

@@ -114,6 +114,12 @@ $excludeDirs = @(
     ".venv",
     "dist",
     "data",
+    "logs",
+    "tests",
+    "docs",
+    "tasks",
+    "tools",
+    ".agents",
     ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
@@ -123,14 +129,19 @@ $excludeDirs = @(
     ".beads-server",
     ".ralph-tui",
     ".ralph-output",
+    "_bmad",
     "_bmad-output",
+    "flow_v2.egg-info",
     "__pycache__"
 )
 $excludeFiles = @(
     ".env.local",
+    "*.xlsx",
+    "*.xls",
     "*.pyc",
     "*.pyo",
-    "*.log"
+    "*.log",
+    "prd.json"
 )
 
 Invoke-RobocopyMirror -Source $root -Destination $OutputDir -ExcludeDirs $excludeDirs -ExcludeFiles $excludeFiles
@@ -166,7 +177,7 @@ if (-not $SkipChromium) {
 $launcherCmd = @'
 @echo off
 setlocal
-powershell -ExecutionPolicy Bypass -File "%~dp0scripts\run_flow_web_portable.ps1"
+powershell -ExecutionPolicy Bypass -File "%~dp0scripts\run_flow_web_portable.ps1" -Port 3169
 '@
 Set-Content -Path (Join-Path $OutputDir "Flow v2.cmd") -Value $launcherCmd -Encoding ASCII
 
@@ -175,7 +186,15 @@ Flow v2 - Windows Portable
 
 1. Giai nen thu muc nay vao o dia con trong.
 2. Double click file 'Flow v2.cmd'.
-3. App se mo tai http://127.0.0.1:8000
+3. App se mo tai http://127.0.0.1:3169
+
+Cap nhat rule ve sau:
+1. Dat file 'flow-rule-update-*.zip' canh file 'Cap-nhat-rule.cmd' hoac trong thu muc 'updates'.
+2. Double click 'Cap-nhat-rule.cmd'.
+3. Neu Auto dang chay, updater se cho tac vu hien tai xong roi moi backup, cap nhat va mo lai tool.
+4. Sau khi cap nhat, bat lai Auto lien tuc khi can.
+
+Updater khong thay doi tai khoan, profile trinh duyet, lich su, anh da tai hay cau hinh Trello.
 
 Ban nay da kem san:
 - Python portable

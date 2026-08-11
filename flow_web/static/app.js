@@ -32,6 +32,7 @@ const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
 const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
 let promptSourceAutoPreviewStarted = false;
 let automationSubmitInFlight = false;
+let stateLoadPromise = null;
 const AUTOMATION_MODULE_TYPE_CONFIG = {
   source: {
     label: "Flow Agent",
@@ -438,21 +439,37 @@ function normalizeAutomationModule(value = {}, index = 0) {
 }
 
 function normalizeAutomationModules(parsed = {}) {
+  let modules = [];
   if (Array.isArray(parsed.modules) && parsed.modules.length) {
-    return parsed.modules.map(normalizeAutomationModule);
+    modules = parsed.modules.map(normalizeAutomationModule);
+  } else {
+    const steps = parsed.steps && typeof parsed.steps === "object" ? parsed.steps : {};
+    for (const key of AUTOMATION_STEP_ORDER) {
+      const legacy = {
+        ...(AUTOMATION_STEP_DEFAULTS[key] || {}),
+        ...(steps[key] || {}),
+        id: key,
+        type: moduleTypeForLegacyKey(key),
+      };
+      modules.push(normalizeAutomationModule(legacy, modules.length));
+    }
   }
-  const modules = [];
-  const steps = parsed.steps && typeof parsed.steps === "object" ? parsed.steps : {};
+  modules = modules.length ? modules : defaultAutomationModules();
+  const existingTypes = new Set(modules.map((module) => module.type));
   for (const key of AUTOMATION_STEP_ORDER) {
-    const legacy = {
-      ...(AUTOMATION_STEP_DEFAULTS[key] || {}),
-      ...(steps[key] || {}),
+    const requiredType = moduleTypeForLegacyKey(key);
+    if (existingTypes.has(requiredType)) {
+      continue;
+    }
+    const legacy = AUTOMATION_STEP_DEFAULTS[key] || {};
+    modules.push(createAutomationModule(requiredType, {
       id: key,
-      type: moduleTypeForLegacyKey(key),
-    };
-    modules.push(normalizeAutomationModule(legacy, modules.length));
+      title: legacy.title,
+      detail: legacy.detail,
+    }));
+    existingTypes.add(requiredType);
   }
-  return modules.length ? modules : defaultAutomationModules();
+  return modules;
 }
 
 function automationStepsFromModules(modules = []) {
@@ -3661,32 +3678,47 @@ function renderAll() {
 }
 
 async function loadState({ silent = false } = {}) {
+  if (stateLoadPromise) {
+    return stateLoadPromise;
+  }
+
+  const request = (async () => {
+    try {
+      const payload = await api("/api/state");
+      state.config = payload.config || {};
+      state.auth = payload.auth || { authenticated: false };
+      state.jobs = (payload.jobs || []).filter((job) => job.type !== "login");
+      state.outputShelf = payload.output_shelf || { items: [] };
+      state.promptAssistant = payload.prompt_assistant || null;
+      state.integrations = normalizeIntegrationState(payload.integrations || {});
+      state.trello = normalizeTrelloState(payload.trello || {});
+      state.skillLibraryCount = Array.isArray(payload.skills) ? payload.skills.length : 0;
+
+      if (state.setupOpen == null) {
+        state.setupOpen = !isReady();
+      }
+
+      renderAll();
+      maybeAutoPreviewPromptSource();
+      maybeShowTrelloWizard();
+      if (isReady() && !state.modelOptionsLoaded) {
+        void loadModelOptions();
+      }
+      if (!silent) {
+        showMessage("");
+      }
+    } catch (error) {
+      showMessage(error.message, "error");
+    }
+  })();
+
+  stateLoadPromise = request;
   try {
-    const payload = await api("/api/state");
-    state.config = payload.config || {};
-    state.auth = payload.auth || { authenticated: false };
-    state.jobs = (payload.jobs || []).filter((job) => job.type !== "login");
-    state.outputShelf = payload.output_shelf || { items: [] };
-    state.promptAssistant = payload.prompt_assistant || null;
-    state.integrations = normalizeIntegrationState(payload.integrations || {});
-    state.trello = normalizeTrelloState(payload.trello || {});
-    state.skillLibraryCount = Array.isArray(payload.skills) ? payload.skills.length : 0;
-
-    if (state.setupOpen == null) {
-      state.setupOpen = !isReady();
+    return await request;
+  } finally {
+    if (stateLoadPromise === request) {
+      stateLoadPromise = null;
     }
-
-    renderAll();
-    maybeAutoPreviewPromptSource();
-    maybeShowTrelloWizard();
-    if (isReady() && !state.modelOptionsLoaded) {
-      void loadModelOptions();
-    }
-    if (!silent) {
-      showMessage("");
-    }
-  } catch (error) {
-    showMessage(error.message, "error");
   }
 }
 
@@ -4006,8 +4038,8 @@ async function resetReadyForAiOutputs({ skipConfirm = false, quiet = false } = {
     return null;
   }
   syncAutomationFromForm();
-  const boardId = String(state.automation.trelloBoardId || state.trello?.board_id || DEFAULT_TRELLO_BOARD_URL).trim();
-  const listId = String(state.automation.trelloListId || state.trello?.list_id || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
+  const boardId = String(state.trello?.board_id || state.automation.trelloBoardId || DEFAULT_TRELLO_BOARD_URL).trim();
+  const listId = String(state.trello?.list_id || state.automation.trelloListId || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
   if (!skipConfirm) {
     const confirmed = window.confirm(
       `Reset ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} sẽ xóa ảnh output do Flow tạo trên các card trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}, giữ nguyên ảnh nguồn. Sau đó Auto sẽ chạy lại các card đó. Tiếp tục?`
@@ -4061,8 +4093,8 @@ async function resetReadyForAiOutputs({ skipConfirm = false, quiet = false } = {
 
 async function prepareReadyForAutoTrello() {
   syncAutomationFromForm();
-  const boardId = String(state.automation.trelloBoardId || state.trello?.board_id || DEFAULT_TRELLO_BOARD_URL).trim();
-  const listId = String(state.automation.trelloListId || state.trello?.list_id || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
+  const boardId = String(state.trello?.board_id || state.automation.trelloBoardId || DEFAULT_TRELLO_BOARD_URL).trim();
+  const listId = String(state.trello?.list_id || state.automation.trelloListId || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
   try {
     const status = await api("/api/trello/ready/status", {
       method: "POST",
@@ -5506,8 +5538,23 @@ function buildRetryPayload(job) {
   };
 }
 
+async function fetchFullJob(jobId) {
+  const id = String(jobId || "").trim();
+  if (!id) {
+    return null;
+  }
+  const payload = await api(`/api/jobs/${encodeURIComponent(id)}`);
+  return payload?.item || (state.jobs || []).find((item) => item.id === id) || null;
+}
+
 async function retryJob(jobId) {
-  const job = (state.jobs || []).find((item) => item.id === jobId);
+  let job = (state.jobs || []).find((item) => item.id === jobId);
+  try {
+    job = await fetchFullJob(jobId);
+  } catch (error) {
+    showMessage(error.message, "error");
+    return;
+  }
   if (!job) {
     showMessage("Không tìm thấy lượt chạy để thử lại.", "error");
     return;
@@ -5526,8 +5573,14 @@ async function retryJob(jobId) {
   }
 }
 
-function reuseJob(jobId) {
-  const job = (state.jobs || []).find((item) => item.id === jobId);
+async function reuseJob(jobId) {
+  let job = (state.jobs || []).find((item) => item.id === jobId);
+  try {
+    job = await fetchFullJob(jobId);
+  } catch (error) {
+    showMessage(error.message, "error");
+    return;
+  }
   if (!job) {
     showMessage("Không tìm thấy lượt chạy để dùng lại.", "error");
     return;
@@ -5602,7 +5655,7 @@ async function loadModelOptions() {
 
 function setupPolling() {
   window.setInterval(() => {
-    if (document.hidden) {
+    if (document.hidden || stateLoadPromise) {
       return;
     }
     loadState({ silent: true });

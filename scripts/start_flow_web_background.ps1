@@ -1,6 +1,6 @@
 param(
     [string]$AppHost = "127.0.0.1",
-    [int]$Port = 8000,
+    [int]$Port = 1506,
     [int]$StartupDelaySeconds = 0,
     [switch]$OpenBrowser
 )
