@@ -13706,6 +13706,9 @@ exit 1
     def _erp_auto_search_query(self, request: CreateJobRequest) -> str:
         generic_titles = {
             "auto_image_from_erp_task",
+            # Pre-ERP wording, still sitting in older jobs: it is a generic
+            # auto title, not somebody searching for a product called "card".
+            "auto_image_from_erp_card",
             "automation_image_from_sheet_row",
             "auto_erp_quet_card_co_anh",
             "auto_erp_ai_chay_den_het_ready_for_ai",
