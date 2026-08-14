@@ -9449,6 +9449,16 @@ exit 1
             # accepting "no watermark" as the answer.
             repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, source_bytes)
             if not repair.repaired:
+                if repair.image:
+                    # It found a mark and could not finish it off. Keep the
+                    # better file, but say so instead of calling it clean.
+                    await self._store_cleaned_artifact(artifact, source_path, repair.image)
+                    artifact.watermark_status = "metadata_only"
+                    artifact.watermark_error = (
+                        f"Ảnh vẫn còn watermark Gemini sau khi vá (cường độ {repair.strength:.2f})."
+                    )
+                    artifact.watermark_repair = repair.reason
+                    return
                 artifact.watermark_status = "skipped"
                 artifact.watermark_error = "Ảnh không có watermark Gemini nên giữ nguyên bản gốc."
                 return
@@ -9471,13 +9481,35 @@ exit 1
                 artifact.watermark_error = ""
                 artifact.watermark_repair = repair.reason
                 return
-            await self._store_cleaned_artifact(artifact, source_path, cleaned)
+            await self._store_cleaned_artifact(artifact, source_path, repair.image or cleaned)
             # The metadata-only file is still the better one to keep, but the
             # run must not claim the visible watermark is gone.
             artifact.watermark_status = "metadata_only"
             artifact.watermark_error = (
-                "Bộ xử lý chỉ gỡ được metadata AI, watermark hiển thị vẫn còn nguyên trên ảnh."
+                "Bộ xử lý chỉ gỡ được metadata AI, watermark hiển thị vẫn còn trên ảnh"
+                + (f" (cường độ {repair.strength:.2f})." if repair.image else ".")
             )
+            artifact.watermark_repair = repair.reason
+            return
+
+        # removelogo changed pixels, which is not the same as having removed the
+        # mark: a partly-erased sparkle used to be filed as clean and shipped.
+        # Measure the file that would go out and only call it clean if it is.
+        residual = await asyncio.to_thread(watermark_repair.measure_image_bytes, cleaned)
+        if residual >= watermark_repair.MIN_STRENGTH:
+            repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, cleaned)
+            if repair.repaired and repair.image:
+                await self._store_cleaned_artifact(artifact, source_path, repair.image)
+                artifact.watermark_status = "cleaned"
+                artifact.watermark_error = ""
+                artifact.watermark_repair = repair.reason
+                return
+            await self._store_cleaned_artifact(artifact, source_path, repair.image or cleaned)
+            artifact.watermark_status = "metadata_only"
+            artifact.watermark_error = (
+                f"Ảnh vẫn còn watermark Gemini sau khi xử lý (cường độ {repair.strength:.2f})."
+            )
+            artifact.watermark_repair = repair.reason
             return
 
         await self._store_cleaned_artifact(artifact, source_path, cleaned)
@@ -10026,7 +10058,9 @@ exit 1
                 job_id,
                 f"Ảnh {index + 1} đã nâng độ phân giải{size_text} ({upscaled.source}) trước khi upload ERP.",
             )
-            return upscaled.bytes, upscaled.mime_type or mime_type
+            return await self._erp_unmarked_bytes(
+                job_id, index, upscaled.bytes, upscaled.mime_type or mime_type
+            )
         if upscaled.failure_reason:
             # No local upscale as a consolation prize: a stretched file is
             # bigger and just as blurry, so the original goes up and the log
@@ -10036,7 +10070,38 @@ exit 1
                 f"Ảnh {index + 1} giữ nguyên độ phân giải gốc, không resize giả 2K "
                 f"vì nâng 2K không thành: {upscaled.failure_reason}",
             )
-        return file_bytes, mime_type
+        return await self._erp_unmarked_bytes(job_id, index, file_bytes, mime_type)
+
+    async def _erp_unmarked_bytes(
+        self,
+        job_id: str,
+        index: int,
+        data: bytes,
+        mime_type: str,
+    ) -> tuple[bytes, str]:
+        """Last check before the bytes leave: no Gemini mark on the way out.
+
+        The 2K pass sends the picture back through Google, which stamps the
+        sparkle onto the result - an image cleaned on disk can arrive at the
+        card marked again. So the file is measured here, at the door, and
+        repaired if the mark is back.
+        """
+        strength = await asyncio.to_thread(watermark_repair.measure_image_bytes, data)
+        if strength < watermark_repair.MIN_STRENGTH:
+            return data, mime_type
+        repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, data)
+        if repair.repaired and repair.image:
+            await self.store.append_log(
+                job_id,
+                f"Ảnh {index + 1} bị đóng lại watermark Gemini sau khi nâng 2K, đã vá trước khi upload ERP "
+                f"(cường độ {strength:.2f} → dưới ngưỡng).",
+            )
+            return repair.image, "image/png"
+        await self.store.append_log(
+            job_id,
+            f"Ảnh {index + 1} vẫn còn watermark Gemini khi upload ERP (cường độ {repair.strength:.2f}): {repair.reason}",
+        )
+        return (repair.image or data), ("image/png" if repair.image else mime_type)
 
     async def _erp_artifact_file_bytes(
         self,
@@ -15371,11 +15436,21 @@ exit 1
             raise HTTPException(status_code=404, detail="Không tìm thấy lượt chạy để xử lý lại watermark.")
 
         artifacts = list(job.artifacts or [])
-        targets = [
-            index
-            for index, artifact in enumerate(artifacts)
-            if str(artifact.watermark_status or "") in {"metadata_only", "failed", "skipped"}
-        ]
+        targets: List[int] = []
+        for index, artifact in enumerate(artifacts):
+            if str(artifact.watermark_status or "") in {"metadata_only", "failed", "skipped"}:
+                targets.append(index)
+                continue
+            # An image filed as clean can still carry the mark, because earlier
+            # runs trusted the cleaner instead of measuring what came back.
+            # Believe the file, not the label.
+            source = self._artifact_local_file(artifact)
+            if source is None:
+                continue
+            data = await asyncio.to_thread(source.read_bytes)
+            strength = await asyncio.to_thread(watermark_repair.measure_image_bytes, data)
+            if strength >= watermark_repair.MIN_STRENGTH:
+                targets.append(index)
         if not targets:
             return {"job_id": job_id, "retried": 0, "cleaned": 0, "remaining": 0}
 
@@ -15392,6 +15467,11 @@ exit 1
             data = await asyncio.to_thread(original.read_bytes)
             repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, data)
             if not repair.repaired:
+                if repair.image:
+                    # Better than before but still marked: keep the better file
+                    # and leave the image flagged for the reviewer.
+                    await self._store_cleaned_artifact(artifact, original, repair.image)
+                    artifact.watermark_status = "metadata_only"
                 artifact.watermark_error = repair.reason
                 continue
             await self._store_cleaned_artifact(artifact, original, repair.image)

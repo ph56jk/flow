@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from pathlib import Path
 
 from fastapi import HTTPException
 
@@ -152,6 +153,10 @@ class RetryWatermarkServiceTest(TempAppPathsMixin, unittest.TestCase):
         # pixels as the download it came from.
         flagged = self.downloads_dir / "demo-clean.png"
         flagged.write_bytes(original.read_bytes())
+        # A genuinely clean picture, so the "leave clean images alone" case is
+        # tested against a file that really has no mark on it.
+        spotless = self.downloads_dir / "spotless.png"
+        spotless.write_bytes(_encode(_synthetic(strength=0.0)))
         job = JobRecord(
             id="job-retry",
             type="image",
@@ -163,7 +168,7 @@ class RetryWatermarkServiceTest(TempAppPathsMixin, unittest.TestCase):
                     watermark_status="metadata_only",
                     watermark_error="Bộ xử lý chỉ gỡ được metadata AI.",
                 ),
-                JobArtifact(local_path=str(original), mime_type="image/png", watermark_status="cleaned"),
+                JobArtifact(local_path=str(spotless), mime_type="image/png", watermark_status="cleaned"),
             ],
         )
         return asyncio.run(self.store.add_job(job))
@@ -182,6 +187,58 @@ class RetryWatermarkServiceTest(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("bộ vá cục bộ", job.artifacts[0].watermark_repair)
         # The already-clean image must not be touched by a retry.
         self.assertEqual(job.artifacts[1].watermark_status, "cleaned")
+
+    def test_retry_believes_the_file_not_the_cleaned_label(self) -> None:
+        # An earlier run marked this image cleaned without measuring what came
+        # back, and it shipped to the client still carrying the mark. The retry
+        # has to catch that, or "đã sạch" means nothing.
+        marked = self.downloads_dir / "mislabelled.png"
+        marked.write_bytes(_encode(_synthetic()))
+        asyncio.run(
+            self.store.add_job(
+                JobRecord(
+                    id="job-mislabelled",
+                    type="image",
+                    status="completed",
+                    artifacts=[
+                        JobArtifact(local_path=str(marked), mime_type="image/png", watermark_status="cleaned")
+                    ],
+                )
+            )
+        )
+
+        summary = asyncio.run(self.service.retry_job_watermarks("job-mislabelled"))
+
+        self.assertEqual(1, summary["retried"])
+        self.assertEqual(1, summary["cleaned"])
+        job = self.store.get_job("job-mislabelled")
+        data = Path(job.artifacts[0].local_path).read_bytes()
+        self.assertLess(watermark_repair.measure_image_bytes(data), watermark_repair.MIN_STRENGTH)
+
+    def test_the_upload_door_cleans_an_image_the_2k_pass_re_marked(self) -> None:
+        # The 2K upscale sends the picture back through Google, which stamps the
+        # sparkle onto the result. A file cleaned on disk can therefore arrive at
+        # the ERP card marked again, so the bytes are measured at the door.
+        asyncio.run(
+            self.store.add_job(JobRecord(id="job-door", type="image", status="completed", artifacts=[]))
+        )
+        marked = _encode(_synthetic())
+
+        data, mime = asyncio.run(self.service._erp_unmarked_bytes("job-door", 0, marked, "image/png"))
+
+        self.assertEqual("image/png", mime)
+        self.assertLess(watermark_repair.measure_image_bytes(data), watermark_repair.MIN_STRENGTH)
+
+    def test_the_upload_door_leaves_a_clean_image_byte_for_byte(self) -> None:
+        asyncio.run(
+            self.store.add_job(JobRecord(id="job-door-2", type="image", status="completed", artifacts=[]))
+        )
+        clean = _encode(_synthetic(strength=0.0))
+
+        data, mime = asyncio.run(self.service._erp_unmarked_bytes("job-door-2", 0, clean, "image/jpeg"))
+
+        self.assertEqual(clean, data)
+        self.assertEqual("image/jpeg", mime)
 
     def test_retry_is_a_no_op_when_nothing_is_flagged(self) -> None:
         job = JobRecord(

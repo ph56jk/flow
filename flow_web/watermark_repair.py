@@ -47,6 +47,10 @@ SMOOTH_TEXTURE = 1.2
 # Square exports only, within the export sizes Flow and Trello actually produce.
 MIN_SOURCE_SCALE = 0.75
 MAX_SOURCE_SCALE = 2.25
+# A strong mark does not always come out in one pass: the fitted profile removes
+# most of it and leaves a measurable remainder. Repeat on the result until the
+# measurement clears, rather than trusting a single pass.
+MAX_PASSES = 4
 
 
 @dataclass
@@ -282,12 +286,44 @@ def _dering(kit: _Kit, image, alpha_map):
     return kit.np.clip(out, 0, 255)
 
 
+def _reference_view(kit: _Kit, image):
+    """The image at the resolution the template was measured in."""
+    height, width = image.shape[:2]
+    if (width, height) == (REFERENCE_SIZE, REFERENCE_SIZE):
+        return image
+    return kit.cv2.resize(image, (REFERENCE_SIZE, REFERENCE_SIZE), interpolation=kit.cv2.INTER_AREA)
+
+
+def measure_image_bytes(data: bytes) -> float:
+    """Overlay strength of an encoded image, or 0.0 when it cannot be measured.
+
+    This is the check any caller can run on a file it is about to hand over:
+    below ``MIN_STRENGTH`` and there is no Gemini mark left on the picture.
+    """
+    kit = _kit_or_none()
+    if kit is None or not data:
+        return 0.0
+    array = kit.np.frombuffer(data, dtype=kit.np.uint8)
+    image = kit.cv2.imdecode(array, kit.cv2.IMREAD_COLOR)
+    if image is None:
+        return 0.0
+    height, width = image.shape[:2]
+    if abs(width - height) > max(width, height) * 0.02:
+        return 0.0
+    return measure_strength(kit, _reference_view(kit, image))
+
+
 def repair_image_bytes(data: bytes) -> RepairResult:
     """Remove the Gemini sparkle from one encoded image.
 
+    Repeats until the mark stops measuring, because a strong overlay routinely
+    survives one fitted pass at a strength that is still plainly visible.
+
     Returns ``repaired=False`` with a reason for anything it will not touch -
     an unsupported export, a missing image stack, or a picture whose measured
-    overlay strength says there is no watermark there.
+    overlay strength says there is no watermark there - and also when the mark
+    is still measurable after the last pass, so that the caller flags the image
+    instead of shipping it as clean.
     """
     kit = _kit_or_none()
     if kit is None:
@@ -307,31 +343,51 @@ def repair_image_bytes(data: bytes) -> RepairResult:
     if not MIN_SOURCE_SCALE <= source_scale <= MAX_SOURCE_SCALE:
         return RepairResult(False, 0.0, "Kích thước ảnh nằm ngoài dải export Gemini đã kiểm chứng.")
 
-    work = image
-    if (width, height) != (REFERENCE_SIZE, REFERENCE_SIZE):
-        work = kit.cv2.resize(image, (REFERENCE_SIZE, REFERENCE_SIZE), interpolation=kit.cv2.INTER_AREA)
-
-    strength = measure_strength(kit, work)
-    if strength < MIN_STRENGTH:
+    first_strength = measure_strength(kit, _reference_view(kit, image))
+    if first_strength < MIN_STRENGTH:
         return RepairResult(
             False,
-            strength,
-            f"Không đo được watermark Gemini (cường độ {strength:.2f} < {MIN_STRENGTH:.2f}).",
+            first_strength,
+            f"Không đo được watermark Gemini (cường độ {first_strength:.2f} < {MIN_STRENGTH:.2f}).",
         )
 
-    profile = _best_profile(kit, work, strength)
-    alpha_map = _template(kit, *profile)
-    fixed = _unblend(kit, image, alpha_map)
-    if _neighbour_texture(kit, work) < SMOOTH_TEXTURE:
-        fixed = _flatten(kit, fixed, alpha_map)
-    fixed = _dering(kit, fixed, alpha_map)
+    fixed = image
+    residual = first_strength
+    payload = b""
+    passes = 0
+    while passes < MAX_PASSES and residual >= MIN_STRENGTH:
+        work = _reference_view(kit, fixed)
+        profile = _best_profile(kit, work, residual)
+        alpha_map = _template(kit, *profile)
+        fixed = _unblend(kit, fixed, alpha_map)
+        if _neighbour_texture(kit, work) < SMOOTH_TEXTURE:
+            fixed = _flatten(kit, fixed, alpha_map)
+        fixed = _dering(kit, fixed, alpha_map)
+        fixed = kit.np.clip(fixed, 0, 255)
+        passes += 1
+        ok, encoded = kit.cv2.imencode(".png", fixed.astype("uint8"))
+        if not ok:
+            return RepairResult(False, first_strength, "Không mã hóa được ảnh sau khi vá watermark.")
+        payload = encoded.tobytes()
+        # Measured on the encoded file, not on the working array: the file is
+        # what ships, and rounding on the way out moves the number.
+        residual = measure_image_bytes(payload)
 
-    ok, encoded = kit.cv2.imencode(".png", kit.np.clip(fixed, 0, 255).astype("uint8"))
-    if not ok:
-        return RepairResult(False, strength, "Không mã hóa được ảnh sau khi vá watermark.")
+    if not payload:
+        return RepairResult(False, first_strength, "Không mã hóa được ảnh sau khi vá watermark.")
+    rounds = "" if passes == 1 else f" sau {passes} lượt"
+    if residual >= MIN_STRENGTH:
+        # The picture did improve, so the bytes are handed back anyway; the
+        # caller decides what to do with an image that is still marked.
+        return RepairResult(
+            False,
+            residual,
+            f"Vá{rounds} nhưng watermark Gemini vẫn đo được (cường độ {residual:.2f} ≥ {MIN_STRENGTH:.2f}).",
+            payload,
+        )
     return RepairResult(
         True,
-        profile[0],
-        f"Đã vá watermark Gemini bằng bộ vá cục bộ (cường độ {profile[0]:.2f}).",
-        encoded.tobytes(),
+        first_strength,
+        f"Đã vá watermark Gemini bằng bộ vá cục bộ{rounds} (cường độ {first_strength:.2f} → {residual:.2f}).",
+        payload,
     )
