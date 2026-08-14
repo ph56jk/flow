@@ -2679,6 +2679,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         with patch.object(
             self.service,
+            "_erp_source_comment_id",
+            return_value="cmt-1",
+        ) as source_comment, patch.object(
+            self.service,
             "_erp_attach_file_bytes",
             return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
         ) as attach_bytes:
@@ -2688,7 +2692,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("source-card", attach_bytes.call_args.args[2])
         self.assertEqual("source-card", result["task_id"])
         self.assertEqual("source-card", result["source_task_id"])
-        self.assertEqual(["source-att"], result["source_attachment_ids"])
+        # The declared source attachment is what locates the comment thread,
+        # and the image is posted as a reply inside it.
+        self.assertEqual(["source-att"], source_comment.call_args.args[3])
+        self.assertEqual("cmt-1", attach_bytes.call_args.args[7])
 
     def test_flow_upsample_payload_requests_2k_resolution(self) -> None:
         from PIL import Image
@@ -3133,9 +3140,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 ERPConfigUpdateRequest(
                     api_key="key",
                     api_secret="secret",
-                    project_id="https://erp.com/b/board123/demo-board",
+                    project_id="PROJ-0049",
                     task_id="https://erp.com/c/abc123/demo-card",
-                    upload_mode="url",
                 )
             )
         )
@@ -3143,15 +3149,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(result["configured"])
         self.assertTrue(result["credentials_saved"])
         self.assertNotIn("api_key", result)
-        self.assertNotIn("token", result)
-        self.assertEqual("board123", result["project_id"])
+        self.assertNotIn("api_secret", result)
+        self.assertEqual("PROJ-0049", result["project_id"])
         self.assertEqual("abc123", result["task_id"])
-        self.assertEqual("url", result["upload_mode"])
 
         saved = self.store.snapshot().erp_config
         self.assertEqual("key", saved.api_key)
-        self.assertEqual("token", saved.token)
-        self.assertEqual("board123", saved.project_id)
+        self.assertEqual("secret", saved.api_secret)
+        self.assertEqual("PROJ-0049", saved.project_id)
         self.assertEqual("abc123", saved.task_id)
 
     def test_update_erp_config_persists_creds_to_env_local_file(self) -> None:
@@ -3173,7 +3178,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 self.service.update_erp_config(
                     ERPConfigUpdateRequest(
                         api_key="wizard-key",
-                        token="wizard-token",
+                        api_secret="wizard-secret",
                         project_id="PROJ-0032",
                         persist_to_env=True,
                     )
@@ -3183,7 +3188,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             self.assertTrue(env_file.exists())
             contents = env_file.read_text(encoding="utf-8")
             self.assertIn("ERP_API_KEY=wizard-key", contents)
-            self.assertIn("ERP_TOKEN=wizard-token", contents)
+            self.assertIn("ERP_API_SECRET=wizard-secret", contents)
             self.assertIn("ERP_PROJECT_ID=PROJ-0032", contents)
             # Process env is also updated so the running app picks it up without restart.
             self.assertEqual("wizard-key", os.environ.get("ERP_API_KEY", ""))
@@ -3212,7 +3217,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 self.service.update_erp_config(
                     ERPConfigUpdateRequest(
                         api_key="new-key",
-                        token="new-token",
+                        api_secret="new-secret",
                         project_id="PROJ-0033",
                         persist_to_env=True,
                     )
@@ -3231,7 +3236,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(contents.count("ERP_API_KEY="), 1)
         self.assertIn("ERP_API_KEY=new-key", contents)
         # New keys that weren't in the file before are appended cleanly.
-        self.assertIn("ERP_TOKEN=new-token", contents)
+        self.assertIn("ERP_API_SECRET=new-secret", contents)
         self.assertIn("ERP_PROJECT_ID=PROJ-0033", contents)
 
     def test_erp_config_snapshot_falls_back_to_env_vars(self) -> None:
@@ -3249,7 +3254,6 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "ERP_PROJECT_ID": "PROJ-0031",
                 "ERP_TASK_ID": "https://erp.com/c/envcard/demo",
                 "ERP_STATUS_ID": "envlist",
-                "ERP_UPLOAD_MODE": "url",
             },
             clear=False,
         ):
@@ -3258,23 +3262,22 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(envonly["configured"])
         self.assertTrue(envonly["credentials_saved"])
         self.assertEqual("env", envonly["credentials_source"])
-        self.assertEqual("PROJ-0031", envonly["project_id"])
+        # App bị khoá vào đúng một ERP Project nên project_id mặc định trong
+        # state thắng env; env chỉ điền vào những ô state để trống.
+        self.assertEqual(self.service.ERP_PROJECT_ID, envonly["project_id"])
         self.assertEqual("envcard", envonly["task_id"])
         self.assertEqual("envlist", envonly["status"])
-        # upload_mode trong state.json mặc định "file" — env chỉ override khi
-        # state thực sự để trống, khớp với logic trong _archive_erp_artifacts.
-        self.assertIn(envonly["upload_mode"], {"file", "url"})
-        # Snapshot không bao giờ leak api_key/token raw
+        # Snapshot không bao giờ leak api_key/api_secret raw
         self.assertNotIn("api_key", envonly)
-        self.assertNotIn("token", envonly)
+        self.assertNotIn("api_secret", envonly)
 
     def test_erp_config_snapshot_prefers_state_over_env(self) -> None:
         asyncio.run(
             self.service.update_erp_config(
                 ERPConfigUpdateRequest(
                     api_key="state-key",
-                    token="state-token",
-                    project_id="https://erp.com/b/stateboard/demo",
+                    api_secret="state-secret",
+                    project_id="PROJ-0031",
                 )
             )
         )
@@ -3288,16 +3291,20 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         # State vẫn ưu tiên trước env nên credentials_source = "state".
         self.assertEqual("state", snap["credentials_source"])
         self.assertTrue(snap["credentials_saved"])
-        self.assertEqual("stateboard", snap["project_id"])
+        self.assertEqual("PROJ-0031", snap["project_id"])
 
-    def test_erp_archive_uses_app_saved_config(self) -> None:
+    def test_erp_archive_refuses_a_job_that_names_no_task(self) -> None:
+        """A job without a Task of its own must not inherit the saved one.
+
+        Each idea writes to its own card, so falling back to whatever card the
+        config happens to hold would drop one idea's images onto another's.
+        """
         asyncio.run(
             self.service.update_erp_config(
                 ERPConfigUpdateRequest(
                     api_key="key",
                     api_secret="secret",
                     task_id="https://erp.com/c/abc123/demo-card",
-                    upload_mode="url",
                 )
             )
         )
@@ -3313,21 +3320,23 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                 "ERP_API_SECRET": "",
                 "ERP_TASK_ID": "",
                 "ERP_STATUS_ID": "",
-                "ERP_UPLOAD_MODE": "file",
             },
             clear=False,
         ), patch.object(
             self.service,
             "_erp_attach_url",
-            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://erp.example/att-1"},
-        ) as attach_url:
+        ) as attach_url, patch.object(
+            self.service,
+            "_erp_attach_file_bytes",
+        ) as attach_bytes:
             result = asyncio.run(self.service._archive_erp_artifacts(job.id, request, [artifact]))
 
-        attach_url.assert_called_once()
-        self.assertEqual("abc123", attach_url.call_args.args[2])
-        self.assertEqual("https://example.com/cat.jpg", attach_url.call_args.args[3])
+        attach_url.assert_not_called()
+        attach_bytes.assert_not_called()
         self.assertTrue(result["configured"])
-        self.assertEqual(1, result["sent"])
+        self.assertEqual(0, result["sent"])
+        self.assertEqual(1, result["failed"])
+        self.assertEqual("source_task_missing", result["error"])
 
     def test_erp_resolve_board_list_id_defaults_to_ready_for_ai(self) -> None:
         lists = [
