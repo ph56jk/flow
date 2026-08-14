@@ -13,6 +13,10 @@ dependencies = [
     "uvicorn[standard]>=0.30.0,<1.0.0",
     "python-multipart>=0.0.9,<1.0.0",
     "pillow>=10.0.0,<13.0.0",
+    # Used by flow_web/watermark_repair.py. The module degrades to "khong va
+    # duoc" if they are missing, so the app still starts without them.
+    "numpy>=1.26,<3.0",
+    "opencv-python-headless>=4.9,<6.0",
     "flow-py @ https://github.com/eddie-fqh/flow-py/archive/bd01679304d6fccc4c96fea3b33151c2e9e836f4.zip",
 ]
 
@@ -23,3 +27,6 @@ dev = [
 
 [tool.setuptools.packages.find]
 include = ["flow_web*"]
+
+[tool.setuptools.package-data]
+flow_web = ["data/*.npy", "static/*"]
