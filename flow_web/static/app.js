@@ -20,7 +20,7 @@ const REFERENCE_ROLE_OPTIONS = [
 const AUTOMATION_STORAGE_KEY = "flow-web-automation-dashboard-v1";
 const AUTOMATION_CONFIG_VERSION = 1;
 const DEFAULT_PROMPT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1I8J4jkj2p_H2hsbDgh-kzc0WqUFWtmqR0gYqbE9Zp4U/edit?gid=2137274733#gid=2137274733";
-const DEFAULT_ERP_PROJECT_URL = "PROJ-0049";
+const DEFAULT_ERP_PROJECT_URL = "PROJ-0013";
 
 // The app still touches exactly one ERP Project at a time; the owner just picks
 // which one instead of being locked to the project this app shipped with.
@@ -3624,6 +3624,32 @@ function openDashboardReviewTab() {
   }, 0);
 }
 
+// Reviewers who work on the ERP card never open this dashboard, so the same
+// queue can be pushed onto the card and the answers read back from there.
+function dashboardErpReviewRow(job) {
+  if (!job?.input?.erp_enabled) {
+    return "";
+  }
+  const review = job.result?.erp_review;
+  const published = review && typeof review.items === "object" ? Object.keys(review.items).length : 0;
+  const taskId = String(review?.task_id || job.input?.erp_output_task_id || job.input?.erp_task_id || "").trim();
+  const note = published
+    ? `Đã đăng ${published} ảnh lên Task ${taskId} để duyệt. Người duyệt trả lời "DUYỆT" hoặc "BỎ" ngay dưới ảnh.`
+    : `Đăng ảnh chờ duyệt lên Task ${taskId || "ERP"} để duyệt ngay trên thẻ.`;
+  return `
+    <div class="dashboard-review-erp" data-dashboard-review-job="${escapeHtml(job.id)}">
+      <div>
+        <strong>Duyệt trên ERP</strong>
+        <small>${escapeHtml(note)}</small>
+      </div>
+      <div class="card-actions">
+        <button type="button" class="secondary-button" data-erp-review="publish" data-job-id="${escapeHtml(job.id)}">Đăng ảnh lên ERP</button>
+        <button type="button" class="ghost-button card-button" data-erp-review="sync" data-job-id="${escapeHtml(job.id)}">Đọc kết quả duyệt</button>
+      </div>
+    </div>
+  `;
+}
+
 function renderDashboardReviewQueue() {
   if (!elements.dashboardReviewQueue) {
     return;
@@ -3717,6 +3743,7 @@ function renderDashboardReviewQueue() {
               <p class="dashboard-review-idea-source">${escapeHtml(ideaSource)}</p>
               <p>${escapeHtml(truncate(job.input?.prompt || "", 180) || "Không có prompt")}</p>
               <div class="dashboard-review-artifact-grid">${decisions}</div>
+              ${dashboardErpReviewRow(job)}
               <div class="dashboard-review-add" data-dashboard-review-job="${escapeHtml(job.id)}">
                 <div>
                   <strong>Thêm ảnh vào bộ idea</strong>
@@ -4713,6 +4740,34 @@ async function submitDashboardApproval(jobId, artifactIndex, status) {
     showMessage(decision === "approved" ? "Đã duyệt ảnh trên dashboard." : "Đã từ chối ảnh trên dashboard.", "success");
   } catch (error) {
     showMessage(error.message, "error");
+  }
+}
+
+async function runErpReviewAction(jobId, action, button) {
+  const path = action === "sync" ? "sync" : "publish";
+  button.disabled = true;
+  try {
+    const payload = await api(`/api/jobs/${encodeURIComponent(jobId)}/erp-review/${path}`, { method: "POST" });
+    await loadState({ silent: true });
+    if (path === "publish") {
+      showMessage(
+        payload.published
+          ? `Đã đăng ${payload.published} ảnh lên Task ${payload.task_id} để duyệt trên ERP.`
+          : "Không có ảnh mới cần đăng lên ERP.",
+        payload.failed ? "error" : "success",
+      );
+    } else {
+      showMessage(
+        payload.decided
+          ? `Đã nhận ${payload.decided} quyết định từ ERP. Còn ${payload.pending} ảnh chờ duyệt.`
+          : "Chưa có ai trả lời DUYỆT hoặc BỎ trên ERP.",
+        "success",
+      );
+    }
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -6304,6 +6359,11 @@ elements.dashboardReviewQueue?.addEventListener("click", (event) => {
   if (addTarget) {
     const container = addTarget.closest("[data-dashboard-review-job]");
     void submitDashboardArtifact(addTarget.dataset.jobId || "", container, addTarget);
+    return;
+  }
+  const erpTarget = event.target.closest("[data-erp-review]");
+  if (erpTarget) {
+    void runErpReviewAction(erpTarget.dataset.jobId || "", erpTarget.dataset.erpReview || "", erpTarget);
     return;
   }
   const actionTarget = event.target.closest("[data-dashboard-approval]");

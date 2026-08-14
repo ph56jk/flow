@@ -75,10 +75,13 @@ async def lifespan(app: FastAPI):
     store = StateStore()
     app.state.flow_service = FlowWebService(store)
     sync_task = asyncio.create_task(app.state.flow_service.ensure_media_skill_library())
+    # Reviewers answer on the ERP card, so the decisions have to be fetched
+    # here instead of waiting for somebody to open this app.
+    erp_review_task = asyncio.create_task(app.state.flow_service.watch_erp_reviews())
     try:
         yield
     finally:
-        for task in (sync_task,):
+        for task in (sync_task, erp_review_task):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
@@ -173,6 +176,26 @@ async def apply_dashboard_approval(
         payload.reviewer,
     )
     return {"approval": approval}
+
+
+@app.post("/api/jobs/{job_id}/approvals/reopen")
+async def reopen_watermark_rejections(request: Request, job_id: str) -> Dict[str, Any]:
+    return await service(request).reopen_watermark_rejections(job_id)
+
+
+@app.post("/api/jobs/{job_id}/erp-review/publish")
+async def publish_erp_review(request: Request, job_id: str) -> Dict[str, Any]:
+    return await service(request).publish_erp_review(job_id)
+
+
+@app.post("/api/jobs/{job_id}/erp-review/sync")
+async def sync_erp_review(request: Request, job_id: str) -> Dict[str, Any]:
+    return await service(request).sync_erp_review(job_id)
+
+
+@app.post("/api/jobs/{job_id}/watermark/retry")
+async def retry_job_watermarks(request: Request, job_id: str) -> Dict[str, Any]:
+    return await service(request).retry_job_watermarks(job_id)
 
 
 @app.post("/api/jobs/{job_id}/artifacts")

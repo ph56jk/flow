@@ -36,6 +36,7 @@ from fastapi import HTTPException, UploadFile
 from .messages import humanize_flow_error
 from .paths import DATA_DIR, DOWNLOADS_DIR, PROJECT_ROOT, UPLOADS_DIR, ensure_app_dirs
 from .shot_rules import PRODUCT_SHOT_RULE_PRIORITY, PRODUCT_SHOT_RULES
+from . import watermark_repair
 from .schemas import (
     AppConfig,
     ArtifactOpenRequest,
@@ -196,7 +197,7 @@ class FlowWebService:
     }
     ERP_BASE_URL = "https://erp.havigroup.llc"
     ERP_GRAPHQL_PATH = "/api/method/hvg_workspace.graphql.endpoint.graphql"
-    ERP_PROJECT_ID = "PROJ-0049"
+    ERP_PROJECT_ID = "PROJ-0013"
     ERP_TIMEOUT_S = 30
     ERP_UPSCALE_LONG_EDGE_PX = 2048
     ERP_AI_TITLE_BACKUP_FILE_NAME = "erp-title-description-backups.json"
@@ -205,7 +206,7 @@ class FlowWebService:
     DEFAULT_ERP_SOURCE_LIST_NAME = "Open"
     DEFAULT_ERP_EXTRA_SOURCE_LIST_NAMES = ()
     DEFAULT_ERP_REVIEW_LIST_NAME = ""
-    DEFAULT_ERP_PROJECT_URL = "PROJ-0049"
+    DEFAULT_ERP_PROJECT_URL = "PROJ-0013"
     DEFAULT_ERP_SOURCE_LIST_ID = "Open"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
     DEFAULT_IMAGE_MODEL = "GEMINI_3_PRO_IMAGE"
@@ -9411,21 +9412,35 @@ exit 1
                 mime_type,
                 source_path.name,
             )
-        except RemoveLogoNoWatermarkError:
-            artifact.watermark_status = "skipped"
-            artifact.watermark_error = "Ảnh không có watermark Gemini nên giữ nguyên bản gốc."
+        except RemoveLogoNoWatermarkError as exc:
+            # removelogo's template detector misses the sparkle on linen, knit,
+            # and flat walls. Measure the overlay strength ourselves before
+            # accepting "no watermark" as the answer.
+            repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, source_bytes)
+            if not repair.repaired:
+                artifact.watermark_status = "skipped"
+                artifact.watermark_error = "Ảnh không có watermark Gemini nên giữ nguyên bản gốc."
+                return
+            cleaned = repair.image
+            await self._store_cleaned_artifact(artifact, source_path, cleaned)
+            artifact.watermark_status = "cleaned"
+            artifact.watermark_error = ""
+            artifact.watermark_repair = repair.reason
             return
         if not cleaned:
             raise RuntimeError("Bộ xử lý removelogo trả về file rỗng.")
 
-        destination = self._download_root() / f"{source_path.stem}-clean.png"
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(destination.write_bytes, cleaned)
-
-        artifact.local_path = str(destination)
-        artifact.public_url = self._public_download_url(str(destination))
-        artifact.mime_type = "image/png"
         if await asyncio.to_thread(self._removelogo_left_pixels_untouched, source_bytes, cleaned):
+            # removelogo stripped the AI metadata but left the visible mark. Try
+            # the local repair on the metadata-clean file before giving up.
+            repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, cleaned)
+            if repair.repaired:
+                await self._store_cleaned_artifact(artifact, source_path, repair.image)
+                artifact.watermark_status = "cleaned"
+                artifact.watermark_error = ""
+                artifact.watermark_repair = repair.reason
+                return
+            await self._store_cleaned_artifact(artifact, source_path, cleaned)
             # The metadata-only file is still the better one to keep, but the
             # run must not claim the visible watermark is gone.
             artifact.watermark_status = "metadata_only"
@@ -9433,8 +9448,24 @@ exit 1
                 "Bộ xử lý chỉ gỡ được metadata AI, watermark hiển thị vẫn còn nguyên trên ảnh."
             )
             return
+
+        await self._store_cleaned_artifact(artifact, source_path, cleaned)
         artifact.watermark_status = "cleaned"
         artifact.watermark_error = ""
+
+    async def _store_cleaned_artifact(
+        self,
+        artifact: JobArtifact,
+        source_path: Path,
+        cleaned: bytes,
+    ) -> None:
+        """Point the artifact at the watermark-free PNG next to its original."""
+        destination = self._download_root() / f"{source_path.stem}-clean.png"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(destination.write_bytes, cleaned)
+        artifact.local_path = str(destination)
+        artifact.public_url = self._public_download_url(str(destination))
+        artifact.mime_type = "image/png"
 
     async def _remove_flow_watermarks(
         self,
@@ -9780,14 +9811,30 @@ exit 1
                     job_id,
                     "Không tìm thấy comment ảnh nguồn trên ERP nên ảnh sẽ nằm ở comment thường thay vì trong thread trả lời.",
                 )
+        # Images published for review already sit on this card, as the exact
+        # file this step would upload. Re-sending them would put a second copy
+        # under the reviewer's own thread, so the published one is reused.
+        review = result.get("erp_review") if isinstance(result.get("erp_review"), dict) else {}
+        review_items = review.get("items") if isinstance(review.get("items"), dict) else {}
+        if str(review.get("task_id") or "") != task_id:
+            review_items = {}
+        already_sent = self._erp_already_sent_attachments(job_id, result, task_id, artifacts)
         attachments: List[Dict[str, Any]] = []
         failed = 0
+        reused = 0
         uploaded_files = 0
         # Images that reached the card as a bare Flow URL still carry the
         # Gemini watermark, so the closing summary has to count them apart
         # from the cleaned files instead of reporting a clean run.
         url_fallbacks = 0
         for index, artifact in approved:
+            published = review_items.get(str(index))
+            if not (isinstance(published, dict) and str(published.get("url") or "").strip()):
+                published = already_sent.get(str(index))
+            if isinstance(published, dict) and str(published.get("url") or "").strip():
+                attachments.append(self._erp_attachment_summary(published))
+                reused += 1
+                continue
             # Prefer the cleaned local file: attaching artifact.url hands ERP
             # the original Flow image with its Gemini watermark still on it.
             # The company ERP credential currently has no file-upload right
@@ -9813,35 +9860,7 @@ exit 1
             # here keeps the URL comment as a fallback, not the first choice.
             if local_file is not None or has_https_url:
                 try:
-                    file_bytes, mime_type = await self._erp_artifact_file_bytes(job_id, artifact, index, artifact_url)
-                    # Flow hands back whatever size it generated, so the 2K pass
-                    # runs here, right before the bytes leave for ERP. A failed
-                    # upscale must never cost the image: keep the original and
-                    # carry on, exactly like a failed watermark strip does.
-                    try:
-                        upscaled = await self._upsample_artifact_bytes(artifact, artifact_url)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        upscaled = ImageUpscaleResult(failure_reason=humanize_flow_error(str(exc)))
-                    if upscaled.bytes:
-                        file_bytes = upscaled.bytes
-                        mime_type = upscaled.mime_type or mime_type
-                        width, height = upscaled.target_size
-                        size_text = f" lên {width}x{height}" if width and height else ""
-                        await self.store.append_log(
-                            job_id,
-                            f"Ảnh {index + 1} đã nâng độ phân giải{size_text} ({upscaled.source}) trước khi upload ERP.",
-                        )
-                    elif upscaled.failure_reason:
-                        # No local upscale as a consolation prize: a stretched
-                        # file is bigger and just as blurry, so the original
-                        # goes up and the log says why it stayed that size.
-                        await self.store.append_log(
-                            job_id,
-                            f"Ảnh {index + 1} giữ nguyên độ phân giải gốc, không resize giả 2K "
-                            f"vì nâng 2K không thành: {upscaled.failure_reason}",
-                        )
+                    file_bytes, mime_type = await self._erp_outgoing_file_bytes(job_id, artifact, index, artifact_url)
                     attachment = await self._erp_attach_file_bytes_with_cover_fallback(
                         job_id,
                         index,
@@ -9894,7 +9913,9 @@ exit 1
         summary = (
             f"ERP đã ghi {len(attachments)} ảnh đã duyệt vào Task {task_id} "
             + (f"trong thread trả lời của comment ảnh nguồn {parent_comment} " if parent_comment else "")
-            + f"({uploaded_files} ảnh upload từ file cục bộ đã xử lý watermark); "
+            + f"({uploaded_files} ảnh upload từ file cục bộ đã xử lý watermark"
+            + (f", {reused} ảnh dùng lại comment đã đăng để duyệt trên ERP" if reused else "")
+            + "); "
             f"{len(artifacts) - len(approved)} ảnh bị từ chối không được ghi."
         )
         if url_fallbacks:
@@ -9906,6 +9927,7 @@ exit 1
             "configured": True,
             "sent": len(attachments),
             "uploaded_files": uploaded_files,
+            "reused_review_comments": reused,
             "url_fallbacks": url_fallbacks,
             "failed": failed,
             "task_id": task_id,
@@ -9914,6 +9936,76 @@ exit 1
             "approved": len(approved),
             "rejected": len(artifacts) - len(approved),
         }
+
+    def _erp_already_sent_attachments(
+        self,
+        job_id: str,
+        result: Dict[str, Any],
+        task_id: str,
+        artifacts: List[JobArtifact],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Images an earlier archive run already put on this same card.
+
+        The attachment name carries the image number, so a second run - after
+        images were re-opened for review, say - can tell exactly which
+        pictures are on the card already and must not be posted twice.
+        """
+        previous = result.get("erp") if isinstance(result.get("erp"), dict) else {}
+        if str(previous.get("task_id") or "") != task_id:
+            return {}
+        by_name: Dict[str, Dict[str, Any]] = {}
+        for item in previous.get("attachments") or []:
+            if isinstance(item, dict) and str(item.get("url") or "").strip():
+                by_name[str(item.get("name") or "").strip()] = item
+        sent: Dict[str, Dict[str, Any]] = {}
+        for index, artifact in enumerate(artifacts):
+            match = by_name.get(self._erp_attachment_name(job_id, artifact, index))
+            if match:
+                sent[str(index)] = match
+        return sent
+
+    async def _erp_outgoing_file_bytes(
+        self,
+        job_id: str,
+        artifact: JobArtifact,
+        index: int,
+        artifact_url: str,
+    ) -> tuple[bytes, str]:
+        """The exact bytes that go to ERP: cleaned file, upscaled to 2K.
+
+        Both the review pass and the archive pass send the same file, so the
+        picture a reviewer approves on the card is the picture that stays on
+        the card - no second upload, no different resolution after the fact.
+        """
+        file_bytes, mime_type = await self._erp_artifact_file_bytes(job_id, artifact, index, artifact_url)
+        # Flow hands back whatever size it generated, so the 2K pass runs here,
+        # right before the bytes leave for ERP. A failed upscale must never
+        # cost the image: keep the original and carry on, exactly like a failed
+        # watermark strip does.
+        try:
+            upscaled = await self._upsample_artifact_bytes(artifact, artifact_url)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            upscaled = ImageUpscaleResult(failure_reason=humanize_flow_error(str(exc)))
+        if upscaled.bytes:
+            width, height = upscaled.target_size
+            size_text = f" lên {width}x{height}" if width and height else ""
+            await self.store.append_log(
+                job_id,
+                f"Ảnh {index + 1} đã nâng độ phân giải{size_text} ({upscaled.source}) trước khi upload ERP.",
+            )
+            return upscaled.bytes, upscaled.mime_type or mime_type
+        if upscaled.failure_reason:
+            # No local upscale as a consolation prize: a stretched file is
+            # bigger and just as blurry, so the original goes up and the log
+            # says why it stayed that size.
+            await self.store.append_log(
+                job_id,
+                f"Ảnh {index + 1} giữ nguyên độ phân giải gốc, không resize giả 2K "
+                f"vì nâng 2K không thành: {upscaled.failure_reason}",
+            )
+        return file_bytes, mime_type
 
     async def _erp_artifact_file_bytes(
         self,
@@ -15234,14 +15326,562 @@ exit 1
             "artifact_index": artifact_index,
         }
 
+    async def retry_job_watermarks(self, job_id: str) -> Dict[str, Any]:
+        """Re-run the watermark pass over the images that still carry a mark.
+
+        A run finishes with some images flagged ``metadata_only`` or ``failed``
+        whenever removelogo could not see the sparkle. Once the cleaner improves,
+        the reviewer needs a way to fix those images without regenerating the
+        whole idea - the pictures are already approved-or-pending in the queue
+        and re-running the job would replace them with different ones.
+        """
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy lượt chạy để xử lý lại watermark.")
+
+        artifacts = list(job.artifacts or [])
+        targets = [
+            index
+            for index, artifact in enumerate(artifacts)
+            if str(artifact.watermark_status or "") in {"metadata_only", "failed", "skipped"}
+        ]
+        if not targets:
+            return {"job_id": job_id, "retried": 0, "cleaned": 0, "remaining": 0}
+
+        cleaned = 0
+        for index in targets:
+            artifact = artifacts[index]
+            source = self._artifact_local_file(artifact)
+            if source is None:
+                continue
+            # Always start from the untouched download: a -clean.png that only
+            # had its metadata stripped is the same pixels, but re-reading the
+            # original keeps this repeatable however the file got there.
+            original = self._original_download_for(source)
+            data = await asyncio.to_thread(original.read_bytes)
+            repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, data)
+            if not repair.repaired:
+                artifact.watermark_error = repair.reason
+                continue
+            await self._store_cleaned_artifact(artifact, original, repair.image)
+            artifact.watermark_status = "cleaned"
+            artifact.watermark_error = ""
+            artifact.watermark_repair = repair.reason
+            cleaned += 1
+            await self.store.append_log(job_id, f"Ảnh {index + 1} đã được vá watermark bằng bộ vá cục bộ.")
+
+        await self.store.replace_artifacts(job_id, artifacts)
+        remaining = sum(
+            1 for artifact in artifacts if str(artifact.watermark_status or "") in {"metadata_only", "failed"}
+        )
+        await self.store.append_log(
+            job_id,
+            f"Đã xử lý lại watermark cho {cleaned}/{len(targets)} ảnh còn dấu."
+            + (f" Còn {remaining} ảnh chưa sạch." if remaining else ""),
+        )
+        return {"job_id": job_id, "retried": len(targets), "cleaned": cleaned, "remaining": remaining}
+
+    def _original_download_for(self, path: Path) -> Path:
+        """The download a ``-clean.png`` came from, or the file itself."""
+        if not path.name.endswith("-clean.png"):
+            return path
+        stem = path.name[: -len("-clean.png")]
+        for extension in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
+            candidate = path.with_name(stem + extension)
+            if candidate.is_file():
+                return candidate
+        return path
+
+    # ── Duyệt ảnh ngay trên ERP ───────────────────────────────────────────
+    # The people who approve these images work on the ERP card, not on this
+    # dashboard. Publishing every pending image as its own comment and reading
+    # the replies turns the card itself into the approve/reject gate, while
+    # each decision still goes through apply_dashboard_approval so the ERP
+    # write stays gated in exactly one place.
+
+    ERP_REVIEW_PREFIX = "FLOW_V2_REVIEW"
+    ERP_REVIEW_INSTRUCTION = 'Trả lời comment này "DUYỆT" để lấy ảnh, hoặc "BỎ" để loại.'
+    # Reject is matched first on purpose: "không duyệt" contains "duyệt", and a
+    # reviewer who writes both words is refusing the image, not approving it.
+    ERP_REVIEW_REJECT_WORDS = (
+        "không duyệt", "khong duyet", "ko duyệt", "ko duyet",
+        "không đồng ý", "khong dong y", "không ok", "khong ok",
+        "bỏ", "bo", "loại", "loai", "hủy", "huỷ", "huy",
+        "từ chối", "tu choi", "xấu", "xau", "reject", "rejected", "no",
+    )
+    ERP_REVIEW_APPROVE_WORDS = (
+        "duyệt", "duyet", "đồng ý", "dong y", "được", "duoc", "đẹp", "dep",
+        "ok", "oke", "okie", "okay", "approve", "approved", "yes",
+    )
+    ERP_REVIEW_REJECT_MARKS = ("❌", "👎", "🚫", "✖", "✗")
+    ERP_REVIEW_APPROVE_MARKS = ("✅", "👍", "☑", "✔", "✓")
+
+    def _erp_review_tag(self, job_id: str, index: int) -> str:
+        """The machine-readable marker that ties a comment to one image."""
+        return f"[{self.ERP_REVIEW_PREFIX} {job_id}#{index}]"
+
+    def _erp_review_body(self, job_id: str, index: int, total: int) -> str:
+        return (
+            f"{self._erp_review_tag(job_id, index)} Ảnh {index + 1}/{total} chờ duyệt\n\n"
+            f"{self.ERP_REVIEW_INSTRUCTION}"
+        )
+
+    def _erp_plain_text(self, content: Any) -> str:
+        """Comment bodies arrive as editor HTML; decisions are read as text."""
+        text = re.sub(r"<[^>]+>", " ", str(content or ""))
+        return re.sub(r"\s+", " ", unescape(text)).strip()
+
+    def _erp_review_decision(self, content: Any) -> str:
+        """Read approve/reject out of one reply, or "" when it says neither."""
+        lowered = self._erp_plain_text(content).lower()
+        if not lowered:
+            return ""
+        if any(mark in lowered for mark in self.ERP_REVIEW_REJECT_MARKS):
+            return "rejected"
+        if any(mark in lowered for mark in self.ERP_REVIEW_APPROVE_MARKS):
+            return "approved"
+
+        def says(words: tuple[str, ...]) -> bool:
+            return any(re.search(rf"(?<!\w){re.escape(word)}(?!\w)", lowered) for word in words)
+
+        if says(self.ERP_REVIEW_REJECT_WORDS):
+            return "rejected"
+        if says(self.ERP_REVIEW_APPROVE_WORDS):
+            return "approved"
+        return ""
+
+    def _erp_review_context(self, job_id: str) -> tuple[Any, CreateJobRequest, str, str, str]:
+        """Resolve the job, its request and the ERP card its review lives on."""
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy lượt chạy để duyệt trên ERP.")
+        if job.type != "image" or not job.artifacts:
+            raise HTTPException(status_code=400, detail="Chỉ lượt tạo ảnh mới có ảnh để duyệt trên ERP.")
+        try:
+            request = CreateJobRequest(**(job.input or {}))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="Không đọc được cấu hình của lượt chạy này.") from exc
+        if not request.erp_enabled:
+            raise HTTPException(status_code=400, detail="Lượt chạy này không bật ghi ERP nên không duyệt trên ERP được.")
+        key, token = self._erp_credentials()
+        if not key or not token:
+            raise HTTPException(status_code=400, detail="Chưa thiết lập ERP API key/secret.")
+        task_id = self._erp_output_task_id(request)
+        if not task_id:
+            raise HTTPException(status_code=400, detail="Không xác định được Task ERP của lượt chạy này.")
+        return job, request, key, token, task_id
+
+    def _erp_publish_review_comment(
+        self,
+        key: str,
+        token: str,
+        task_id: str,
+        content: str,
+        file_bytes: bytes,
+        mime_type: str,
+        name: str,
+    ) -> Dict[str, Any]:
+        """Post one image with a review body of our own wording.
+
+        ``_erp_attach_file_bytes`` writes a fixed ``[FLOW_V2_ARTIFACT]`` body,
+        which says nothing to a reviewer; the review comment has to carry the
+        marker and the instruction line instead.
+        """
+        hosted_path = self._erp_upload_file(key, token, task_id, file_bytes, mime_type, name)
+        payload = self._erp_graphql(
+            "mutation AddTaskComment($name: String!, $content: String!, $attachments: [String!]) "
+            "{ addTaskComment(name: $name, content: $content, attachments: $attachments) }",
+            {"name": task_id, "content": content, "attachments": [hosted_path]},
+            "AddTaskComment",
+            key=key,
+            token=token,
+        )
+        comment = payload.get("addTaskComment")
+        comment = comment if isinstance(comment, dict) else {}
+        url = f"{self._erp_base_url()}{hosted_path}"
+        return {
+            "comment": str(comment.get("name") or "").strip(),
+            "id": url,
+            "url": url,
+            "name": name,
+            "mimeType": mime_type,
+            "linked": int(comment.get("linked") or 0) >= 1,
+        }
+
+    def _erp_review_comment_index(self, detail: Dict[str, Any], job_id: str) -> Dict[str, Dict[str, Any]]:
+        """Map every review comment already on the card to its image index."""
+        pattern = re.compile(rf"\[{re.escape(self.ERP_REVIEW_PREFIX)}\s+([^\]#\s]+)#(\d+)\]")
+        found: Dict[str, Dict[str, Any]] = {}
+        for comment in (detail.get("comments") if isinstance(detail, dict) else None) or []:
+            if not isinstance(comment, dict):
+                continue
+            match = pattern.search(self._erp_plain_text(comment.get("content")))
+            if match is None or match.group(1) != job_id:
+                continue
+            found.setdefault(match.group(2), comment)
+        return found
+
+    async def publish_erp_review(self, job_id: str) -> Dict[str, Any]:
+        """Put every undecided image on the ERP card as its own review comment."""
+        job, request, key, token, task_id = self._erp_review_context(job_id)
+        self._erp_required_project_id(request.erp_project_id)
+        await asyncio.to_thread(self._erp_assert_task_in_project, key, token, task_id)
+
+        result = dict(job.result or {})
+        approvals = result.get("dashboard_approvals") if isinstance(result.get("dashboard_approvals"), dict) else {}
+        review = dict(result.get("erp_review") or {}) if isinstance(result.get("erp_review"), dict) else {}
+        # A review published against a different card tells us nothing about
+        # this one, so its bookkeeping is dropped rather than trusted.
+        items: Dict[str, Any] = (
+            dict(review.get("items") or {}) if str(review.get("task_id") or "") == task_id else {}
+        )
+        detail = await asyncio.to_thread(self._erp_task_detail, key, token, task_id)
+        on_card = self._erp_review_comment_index(detail, job_id)
+
+        artifacts = list(job.artifacts or [])
+        total = len(artifacts)
+        published = 0
+        failed = 0
+        for index, artifact in enumerate(artifacts):
+            key_text = str(index)
+            decided = str((approvals.get(key_text) or {}).get("status") or "")
+            if decided in {"approved", "rejected"}:
+                continue
+            existing = items.get(key_text) if isinstance(items.get(key_text), dict) else None
+            if existing and str(existing.get("comment") or ""):
+                continue
+            if key_text in on_card:
+                # Posted by an earlier run whose bookkeeping never landed -
+                # adopt the comment instead of putting a second copy up.
+                items[key_text] = {
+                    "comment": str(on_card[key_text].get("name") or ""),
+                    "id": "",
+                    "url": "",
+                    "name": self._erp_attachment_name(job_id, artifact, index),
+                }
+                continue
+            artifact_url = str(artifact.url or artifact.public_url or "").strip()
+            try:
+                file_bytes, mime_type = await self._erp_outgoing_file_bytes(job_id, artifact, index, artifact_url)
+                posted = await asyncio.to_thread(
+                    self._erp_publish_review_comment,
+                    key,
+                    token,
+                    task_id,
+                    self._erp_review_body(job_id, index, total),
+                    file_bytes,
+                    mime_type,
+                    self._erp_attachment_name(job_id, artifact, index),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                failed += 1
+                await self.store.append_log(
+                    job_id,
+                    f"Không đăng được ảnh {index + 1} lên ERP để duyệt: {humanize_flow_error(str(exc))}",
+                )
+                continue
+            items[key_text] = posted
+            published += 1
+
+        if published and any(not str((item or {}).get("comment") or "") for item in items.values()):
+            # addTaskComment does not always echo the comment id back, and the
+            # sync pass needs one per image to read its replies.
+            detail = await asyncio.to_thread(self._erp_task_detail, key, token, task_id)
+            for key_text, comment in self._erp_review_comment_index(detail, job_id).items():
+                entry = items.get(key_text)
+                if isinstance(entry, dict) and not str(entry.get("comment") or ""):
+                    entry["comment"] = str(comment.get("name") or "")
+
+        result["erp_review"] = {
+            "task_id": task_id,
+            "items": items,
+            "instruction": self.ERP_REVIEW_INSTRUCTION,
+            "updated_at": utc_now(),
+        }
+        await self.store.patch_job(job_id, result=result)
+        pending = sum(
+            1
+            for index in range(total)
+            if str((approvals.get(str(index)) or {}).get("status") or "") not in {"approved", "rejected"}
+        )
+        if published:
+            await self.store.append_log(
+                job_id,
+                f"Đã đăng {published} ảnh lên ERP Task {task_id} để duyệt. {self.ERP_REVIEW_INSTRUCTION}",
+            )
+        return {
+            "job_id": job_id,
+            "task_id": task_id,
+            "published": published,
+            "failed": failed,
+            "pending": pending,
+            "items": len(items),
+        }
+
+    async def sync_erp_review(self, job_id: str) -> Dict[str, Any]:
+        """Read the replies under each review comment and record the decisions."""
+        job, request, key, token, task_id = self._erp_review_context(job_id)
+        result = dict(job.result or {})
+        review = result.get("erp_review") if isinstance(result.get("erp_review"), dict) else {}
+        items = review.get("items") if isinstance(review.get("items"), dict) else {}
+        if not items or str(review.get("task_id") or "") != task_id:
+            raise HTTPException(status_code=409, detail="Chưa đăng ảnh lên ERP để duyệt nên chưa có gì để đồng bộ.")
+
+        approvals = result.get("dashboard_approvals") if isinstance(result.get("dashboard_approvals"), dict) else {}
+        detail = await asyncio.to_thread(self._erp_task_detail, key, token, task_id)
+        by_index = self._erp_review_comment_index(detail, job_id)
+
+        applied: List[Dict[str, Any]] = []
+        for index in range(len(job.artifacts or [])):
+            key_text = str(index)
+            if str((approvals.get(key_text) or {}).get("status") or "") in {"approved", "rejected"}:
+                continue
+            comment = by_index.get(key_text)
+            if comment is None:
+                entry = items.get(key_text) if isinstance(items.get(key_text), dict) else {}
+                wanted = str((entry or {}).get("comment") or "")
+                comment = next(
+                    (
+                        item
+                        for item in (detail.get("comments") or [])
+                        if isinstance(item, dict) and str(item.get("name") or "") == wanted and wanted
+                    ),
+                    None,
+                )
+            if comment is None:
+                continue
+            decision, reviewer = self._erp_reply_decision(comment)
+            if not decision:
+                continue
+            try:
+                await self.apply_dashboard_approval(
+                    job_id,
+                    index,
+                    decision,
+                    reviewer or "Người duyệt trên ERP",
+                    source="erp",
+                )
+            except HTTPException as exc:
+                if exc.status_code != 409:
+                    raise
+                continue
+            applied.append({"artifact_index": index, "status": decision, "reviewer": reviewer})
+            await self._erp_confirm_review_decision(
+                job_id,
+                key,
+                token,
+                task_id,
+                str(comment.get("name") or ""),
+                index,
+                decision,
+            )
+
+        latest = self.store.get_job(job_id)
+        latest_approvals = (latest.result or {}).get("dashboard_approvals") if latest is not None else {}
+        latest_approvals = latest_approvals if isinstance(latest_approvals, dict) else {}
+        pending = sum(
+            1
+            for index in range(len(job.artifacts or []))
+            if str((latest_approvals.get(str(index)) or {}).get("status") or "") not in {"approved", "rejected"}
+        )
+        if applied:
+            approved = sum(1 for item in applied if item["status"] == "approved")
+            await self.store.append_log(
+                job_id,
+                f"Đã đọc {len(applied)} quyết định duyệt từ ERP Task {task_id} "
+                f"({approved} duyệt, {len(applied) - approved} bỏ). Còn {pending} ảnh chờ duyệt.",
+            )
+        return {
+            "job_id": job_id,
+            "task_id": task_id,
+            "applied": applied,
+            "decided": len(applied),
+            "pending": pending,
+        }
+
+    def _is_tool_watermark_rejection(self, entry: Any) -> bool:
+        """True when this tool, not a person, turned the image down."""
+        if not isinstance(entry, dict) or str(entry.get("status") or "") != "rejected":
+            return False
+        if str(entry.get("source") or "") == "watermark_gate":
+            return True
+        reviewer = str(((entry.get("reviewer") or {}) if isinstance(entry.get("reviewer"), dict) else {}).get("name") or "")
+        return reviewer.startswith("Flow v2") and "watermark" in reviewer.lower()
+
+    async def reopen_watermark_rejections(self, job_id: str) -> Dict[str, Any]:
+        """Put images this tool refused for a watermark back in the queue.
+
+        A person's decision is final. A rejection written by the tool because
+        the picture still carried a Gemini mark is not a review at all: once
+        the mark is gone nobody has actually looked at that image, so it goes
+        back to the reviewers instead of staying lost.
+        """
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy lượt chạy để mở lại quyết định.")
+        result = dict(job.result or {})
+        approvals = dict(result.get("dashboard_approvals") or {})
+        history = list(result.get("reopened_approvals") or [])
+        reopened: List[int] = []
+        for index, artifact in enumerate(job.artifacts or []):
+            entry = approvals.get(str(index))
+            if not self._is_tool_watermark_rejection(entry):
+                continue
+            if str(artifact.watermark_status or "") != "cleaned":
+                continue
+            history.append({**entry, "reopened_at": utc_now()})
+            approvals.pop(str(index), None)
+            reopened.append(index)
+        if not reopened:
+            return {"job_id": job_id, "reopened": [], "pending": self._approval_summary(approvals, len(job.artifacts or [])).get("pending", 0)}
+
+        result["dashboard_approvals"] = approvals
+        result["reopened_approvals"] = history
+        summary = self._approval_summary(approvals, len(job.artifacts or []))
+        result["dashboard_approval_summary"] = summary
+        self._sync_automation_approval_execution(
+            result,
+            summary,
+            len(job.artifacts or []),
+            summary_key="dashboard_approval_summary",
+        )
+        await self.store.patch_job(job_id, result=result)
+        await self.store.append_log(
+            job_id,
+            f"Đã mở lại {len(reopened)} ảnh từng bị từ chối vì watermark (nay đã sạch) để người duyệt xem lại: "
+            + ", ".join(f"ảnh {index + 1}" for index in reopened)
+            + ".",
+        )
+        return {"job_id": job_id, "reopened": reopened, "pending": summary.get("pending", 0)}
+
+    ERP_REVIEW_POLL_DEFAULT_S = 90
+
+    def _erp_review_poll_seconds(self) -> int:
+        raw = os.getenv("ERP_REVIEW_POLL_SECONDS", "").strip()
+        if not raw:
+            return self.ERP_REVIEW_POLL_DEFAULT_S
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return self.ERP_REVIEW_POLL_DEFAULT_S
+
+    def erp_review_jobs_to_sync(self) -> List[str]:
+        """Jobs whose ERP card still holds images nobody has answered yet."""
+        pending_jobs: List[str] = []
+        for job in list(self.store.snapshot().jobs or []):
+            result = job.result if isinstance(job.result, dict) else {}
+            review = result.get("erp_review") if isinstance(result.get("erp_review"), dict) else {}
+            items = review.get("items") if isinstance(review.get("items"), dict) else {}
+            if not items:
+                continue
+            approvals = result.get("dashboard_approvals") if isinstance(result.get("dashboard_approvals"), dict) else {}
+            undecided = [
+                key
+                for key in items
+                if str((approvals.get(key) or {}).get("status") or "") not in {"approved", "rejected"}
+            ]
+            if undecided:
+                pending_jobs.append(job.id)
+        return pending_jobs
+
+    async def watch_erp_reviews(self) -> None:
+        """Read the ERP cards on a timer so a reply is all a reviewer has to do.
+
+        Without this the decisions only arrive when somebody presses a button
+        in this app - which is the one place the reviewers never open.
+        """
+        interval = self._erp_review_poll_seconds()
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            for job_id in self.erp_review_jobs_to_sync():
+                try:
+                    await self.sync_erp_review(job_id)
+                except asyncio.CancelledError:
+                    raise
+                except HTTPException:
+                    continue
+                except Exception as exc:
+                    log.warning("Không đọc được kết quả duyệt ERP của %s: %s", job_id, exc)
+
+    def _erp_reply_decision(self, comment: Dict[str, Any]) -> tuple[str, str]:
+        """The first decisive human reply under a review comment.
+
+        First, not last: a decision is immutable once recorded, so reading the
+        earliest reply is what keeps a re-sync from ever changing an answer.
+        """
+        replies = comment.get("replies") if isinstance(comment, dict) else None
+        ordered = [item for item in (replies or []) if isinstance(item, dict)]
+        ordered.sort(key=lambda item: str(item.get("creation") or ""))
+        for reply in ordered:
+            body = str(reply.get("content") or "")
+            # Our own review and confirmation comments are not votes.
+            if self.ERP_REVIEW_PREFIX in body or "FLOW_V2" in body:
+                continue
+            if reply.get("is_bot"):
+                continue
+            decision = self._erp_review_decision(body)
+            if decision:
+                return decision, str(reply.get("by_name") or reply.get("comment_by") or "").strip()
+        return "", ""
+
+    async def _erp_confirm_review_decision(
+        self,
+        job_id: str,
+        key: str,
+        token: str,
+        task_id: str,
+        parent_comment: str,
+        index: int,
+        decision: str,
+    ) -> None:
+        """Answer the reviewer on the card so the decision is visible there."""
+        if not parent_comment:
+            return
+        mark = "✅ Đã duyệt" if decision == "approved" else "❌ Đã bỏ"
+        body = (
+            f"[{self.ERP_REVIEW_PREFIX}_RESULT] {mark} ảnh {index + 1}."
+            + (
+                ""
+                if decision == "approved"
+                else " Ảnh vẫn giữ trên thẻ để đối chiếu, không ghi vào kết quả cuối."
+            )
+        )
+        try:
+            await asyncio.to_thread(
+                self._erp_reply_comment,
+                key,
+                token,
+                task_id,
+                body,
+                parent_comment=parent_comment,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.store.append_log(
+                job_id,
+                f"Đã ghi nhận quyết định ảnh {index + 1} nhưng không trả lời được trên ERP: "
+                f"{humanize_flow_error(str(exc))}",
+            )
+
     async def apply_dashboard_approval(
         self,
         job_id: str,
         artifact_index: int,
         status: str,
         reviewer: str = "",
+        source: str = "dashboard",
     ) -> Dict[str, Any]:
-        """Record a local review decision and resume the ERP step when ready."""
+        """Record a review decision and resume the ERP step when ready.
+
+        ``source`` only labels where the decision came in from - the dashboard
+        or a reply on the ERP card. Both surfaces land here, so the immutable
+        one-decision-per-image rule holds across them.
+        """
         decision = str(status or "").strip().lower()
         if decision not in {"approved", "rejected"}:
             raise HTTPException(status_code=400, detail="Trạng thái duyệt phải là approved hoặc rejected.")
@@ -15267,7 +15907,7 @@ exit 1
             "artifact_index": artifact_index,
             "status": decision,
             "reviewer": {"name": reviewer_name},
-            "source": "dashboard",
+            "source": str(source or "dashboard"),
             "updated_at": utc_now(),
         }
         approvals[key] = approval
@@ -15283,7 +15923,8 @@ exit 1
         await self.store.patch_job(job_id, result=result)
 
         label = "đã duyệt" if decision == "approved" else "đã từ chối"
-        await self.store.append_log(job_id, f"{reviewer_name} {label} ảnh {artifact_index + 1} trên dashboard.")
+        surface = "trên ERP" if str(source or "") == "erp" else "trên dashboard"
+        await self.store.append_log(job_id, f"{reviewer_name} {label} ảnh {artifact_index + 1} {surface}.")
         if approval_module_id and summary.get("pending") == 0:
             await self._resume_automation_after_approval(job_id, approval_module_id)
         return approval
