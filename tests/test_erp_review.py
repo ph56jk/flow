@@ -399,6 +399,24 @@ class ErpReviewFlowTests(unittest.TestCase):
         self.assertEqual(0, result["failed"])
         self.assertEqual(1, result["rejected"])
 
+    def test_the_dashboard_payload_still_carries_the_review_state(self) -> None:
+        # The browser gets the compacted jobs, so anything the review queue reads
+        # has to survive compaction - otherwise a decided image reads as pending
+        # and the ERP row never learns which card the images went to.
+        self._job()
+        self._publish()
+        self._answer(0, "duyệt")
+        self._sync()
+
+        job = next(item for item in self.service.get_state_payload()["jobs"] if item["id"] == "job-erp")
+        result = job["result"]
+
+        self.assertEqual("approved", result["dashboard_approvals"]["0"]["status"])
+        self.assertEqual(1, result["dashboard_approval_summary"]["approved"])
+        self.assertEqual(self.TASK, result["erp_review"]["task_id"])
+        self.assertEqual({"0", "1", "2"}, set(result["erp_review"]["items"]))
+        self.assertTrue(result["erp_review"]["items"]["0"]["url"])
+
 
 if __name__ == "__main__":
     unittest.main()

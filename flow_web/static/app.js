@@ -3624,6 +3624,48 @@ function openDashboardReviewTab() {
   }, 0);
 }
 
+// A rejection this tool wrote because the picture still carried a watermark is
+// not a person's verdict, so it can be taken back once the image comes back
+// clean. A human "Từ chối" never shows up here.
+function dashboardToolRejectionCount(job) {
+  const approvals = job?.result?.dashboard_approvals;
+  if (!approvals || typeof approvals !== "object") {
+    return 0;
+  }
+  return Object.entries(approvals).filter(([index, item]) => {
+    if (String(item?.status || "").toLowerCase() !== "rejected") {
+      return false;
+    }
+    const artifact = (job.artifacts || [])[Number(index)];
+    if (String(artifact?.watermark_status || "") !== "cleaned") {
+      return false;
+    }
+    if (String(item?.source || "") === "watermark_gate") {
+      return true;
+    }
+    const reviewer = String(item?.reviewer?.name || "");
+    return reviewer.startsWith("Flow v2") && reviewer.toLowerCase().includes("watermark");
+  }).length;
+}
+
+function dashboardReopenRow(job) {
+  const reopenable = dashboardToolRejectionCount(job);
+  if (!reopenable) {
+    return "";
+  }
+  return `
+    <div class="dashboard-review-erp" data-dashboard-reopen-job="${escapeHtml(job.id)}">
+      <div>
+        <strong>Mở lại ảnh bị công cụ loại</strong>
+        <small>${escapeHtml(`${reopenable} ảnh bị loại vì còn watermark, nay đã sạch. Mở lại để người duyệt tự quyết định.`)}</small>
+      </div>
+      <div class="card-actions">
+        <button type="button" class="secondary-button" data-erp-review="reopen" data-job-id="${escapeHtml(job.id)}">Mở lại ${reopenable} ảnh</button>
+      </div>
+    </div>
+  `;
+}
+
 // Reviewers who work on the ERP card never open this dashboard, so the same
 // queue can be pushed onto the card and the answers read back from there.
 function dashboardErpReviewRow(job) {
@@ -3743,6 +3785,7 @@ function renderDashboardReviewQueue() {
               <p class="dashboard-review-idea-source">${escapeHtml(ideaSource)}</p>
               <p>${escapeHtml(truncate(job.input?.prompt || "", 180) || "Không có prompt")}</p>
               <div class="dashboard-review-artifact-grid">${decisions}</div>
+              ${dashboardReopenRow(job)}
               ${dashboardErpReviewRow(job)}
               <div class="dashboard-review-add" data-dashboard-review-job="${escapeHtml(job.id)}">
                 <div>
@@ -4744,12 +4787,26 @@ async function submitDashboardApproval(jobId, artifactIndex, status) {
 }
 
 async function runErpReviewAction(jobId, action, button) {
-  const path = action === "sync" ? "sync" : "publish";
+  const path = action === "sync" ? "sync" : action === "reopen" ? "reopen" : "publish";
+  const endpoint =
+    path === "reopen"
+      ? `/api/jobs/${encodeURIComponent(jobId)}/approvals/reopen`
+      : `/api/jobs/${encodeURIComponent(jobId)}/erp-review/${path}`;
   button.disabled = true;
   try {
-    const payload = await api(`/api/jobs/${encodeURIComponent(jobId)}/erp-review/${path}`, { method: "POST" });
+    const payload = await api(endpoint, { method: "POST" });
     await loadState({ silent: true });
-    if (path === "publish") {
+    if (path === "reopen") {
+      // The API answers with the list of image indexes, and an empty array is
+      // truthy in JS - count it, do not test it.
+      const reopened = Array.isArray(payload.reopened) ? payload.reopened.length : 0;
+      showMessage(
+        reopened
+          ? `Đã mở lại ${reopened} ảnh để người duyệt quyết định.`
+          : "Không có ảnh nào bị công cụ loại để mở lại.",
+        "success",
+      );
+    } else if (path === "publish") {
       showMessage(
         payload.published
           ? `Đã đăng ${payload.published} ảnh lên Task ${payload.task_id} để duyệt trên ERP.`

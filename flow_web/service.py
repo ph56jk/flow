@@ -541,6 +541,11 @@ class FlowWebService:
             "auto_start_frame_path",
             "auto_start_frame_public_url",
             "auto_start_frame_prompt",
+            # The review queue reads its verdicts from here. Drop these and every
+            # image looks undecided in the dashboard even after it was approved.
+            "dashboard_approvals",
+            "dashboard_approval_summary",
+            "watermark",
         }
         compact: Dict[str, Any] = {}
         for key in allowed_keys:
@@ -551,7 +556,33 @@ class FlowWebService:
         execution = payload.get("automation_execution")
         if isinstance(execution, dict):
             compact["automation_execution"] = self._compact_automation_execution_payload(execution)
+        review = payload.get("erp_review")
+        if isinstance(review, dict):
+            compact["erp_review"] = self._compact_erp_review_payload(review)
         return compact
+
+    def _compact_erp_review_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Enough of the ERP review to render the row, without the comment bodies.
+
+        The dashboard only needs to say which card the images went to and how
+        many are waiting there; the stored copy keeps the rest.
+        """
+        items = payload.get("items")
+        compact_items: Dict[str, Any] = {}
+        if isinstance(items, dict):
+            for index, item in items.items():
+                if not isinstance(item, dict):
+                    continue
+                compact_items[str(index)] = {
+                    "url": self._state_text_preview(str(item.get("url") or ""), 400),
+                    "comment": self._state_text_preview(str(item.get("comment") or ""), 400),
+                }
+        return {
+            "task_id": str(payload.get("task_id") or ""),
+            "updated_at": str(payload.get("updated_at") or ""),
+            "instruction": self._state_text_preview(str(payload.get("instruction") or ""), 200),
+            "items": compact_items,
+        }
 
     def _compact_artifact_payload(self, artifact: Dict[str, Any]) -> Dict[str, Any]:
         compact = dict(artifact)
