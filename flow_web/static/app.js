@@ -3588,6 +3588,23 @@ function dashboardArtifactPreview(artifact) {
   return String(artifact?.public_url || artifact?.url || "").trim();
 }
 
+// The reviewer is the last person to see the image before it reaches ERP, so
+// an image the watermark pass could not fully clean has to say so here rather
+// than pass as ordinary. Only the states worth acting on get a badge.
+function dashboardWatermarkNotice(artifact) {
+  const state = String(artifact?.watermark_status || "").trim();
+  if (state === "metadata_only") {
+    return { state: "error", label: "Còn watermark Gemini" };
+  }
+  if (state === "failed") {
+    return { state: "error", label: "Chưa xử lý được watermark" };
+  }
+  if (state === "skipped") {
+    return { state: "pending", label: "Bỏ qua xử lý watermark" };
+  }
+  return null;
+}
+
 function renderDashboardReviewQueue() {
   if (!elements.dashboardReviewQueue) {
     return;
@@ -3628,12 +3645,18 @@ function renderDashboardReviewQueue() {
             const preview = dashboardArtifactPreview(artifact);
             const title = artifact.media_name || artifact.label || `Ảnh ${artifactIndex + 1}`;
             const statusLabel = status === "approved" ? "Đã duyệt" : status === "rejected" ? "Đã từ chối" : "Chờ duyệt";
+            const watermark = dashboardWatermarkNotice(artifact);
             return `
               <article class="dashboard-review-artifact" data-status="${escapeHtml(status)}">
                 ${preview ? `<img src="${escapeHtml(preview)}" alt="${escapeHtml(title)}" />` : `<div class="dashboard-review-placeholder">Chưa có preview</div>`}
                 <div class="dashboard-review-artifact-copy">
                   <strong>${escapeHtml(title)}</strong>
                   <span class="status-pill" data-state="${escapeHtml(status === "approved" ? "ready" : status === "rejected" ? "error" : "pending")}">${escapeHtml(statusLabel)}</span>
+                  ${
+                    watermark
+                      ? `<span class="status-pill" data-state="${escapeHtml(watermark.state)}" title="${escapeHtml(artifact.watermark_error || "")}">${escapeHtml(watermark.label)}</span>`
+                      : ""
+                  }
                 </div>
                 ${
                   status === "pending"
