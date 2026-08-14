@@ -28,7 +28,7 @@ class ERPConfig(BaseModel):
     api_key: str = ""
     api_secret: str = ""
     base_url: str = "https://erp.havigroup.llc"
-    project_id: str = "PROJ-0049"
+    project_id: str = "PROJ-0013"
     task_id: str = ""
     status: str = ""
     updated_at: str = ""
@@ -116,6 +116,9 @@ class JobArtifact(BaseModel):
     # "skipped" (nothing to remove) or "failed" (original bytes kept).
     watermark_status: str = ""
     watermark_error: str = ""
+    # Set when the local fallback repair - not removelogo - was what removed the
+    # visible sparkle, so a reviewer can tell the two cleaners apart.
+    watermark_repair: str = ""
 
 
 class JobRecoveryAction(BaseModel):
@@ -277,7 +280,7 @@ class ERPConfigUpdateRequest(BaseModel):
     api_key: str = ""
     api_secret: str = ""
     base_url: str = "https://erp.havigroup.llc"
-    project_id: str = "PROJ-0049"
+    project_id: str = "PROJ-0013"
     task_id: str = ""
     status: str = ""
     clear_credentials: bool = False
@@ -301,7 +304,7 @@ class ERPIdeaBatchRequest(BaseModel):
 
 
 class ResetReadyERPRequest(BaseModel):
-    erp_project_id: str = "PROJ-0049"
+    erp_project_id: str = "PROJ-0013"
     erp_status_id: str = ""
 
 

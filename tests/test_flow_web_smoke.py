@@ -7103,11 +7103,13 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ):
             await self.service._run_flow_job(job.id, request)
 
-        find_card.assert_called_once_with("key", "token", "PROJ-0049", "list-1")
+        # The board link names another project; the app still only touches the
+        # one project it is configured for.
+        find_card.assert_called_once_with("key", "token", "PROJ-0013", "list-1")
         download_images.assert_called_once()
         self.assertEqual("card-from-board", download_images.call_args.args[2])
         generated_request = captured["request"]
-        self.assertEqual("PROJ-0049", generated_request.erp_project_id)
+        self.assertEqual("PROJ-0013", generated_request.erp_project_id)
         self.assertEqual("card-from-board", generated_request.erp_task_id)
         self.assertEqual("card-from-board", generated_request.erp_source_task_id)
         # The Task the images will go back to is settled here, but nothing is
@@ -7117,7 +7119,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("card-from-board", saved.input["erp_task_id"])
         self.assertEqual("card-from-board", saved.input["erp_source_task_id"])
         erp_source_node = next(node for node in saved.result["automation_execution"]["nodes"] if node["id"] == "erp-source-1")
-        self.assertEqual("PROJ-0049", erp_source_node["output"]["project_id"])
+        self.assertEqual("PROJ-0013", erp_source_node["output"]["project_id"])
         self.assertEqual("card-from-board", erp_source_node["output"]["task_id"])
 
     async def test_erp_source_rejects_explicit_card_outside_ready_list(self) -> None:
@@ -7767,7 +7769,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             await self.service._tasks[batch.id]
 
         self.assertEqual(
-            [("key", "token", "PROJ-0049", "ready-list")] * 3,
+            [("key", "token", "PROJ-0013", "ready-list")] * 3,
             [call.args for call in image_cards.call_args_list],
         )
         self.assertEqual([("bear prompt", "card-bear"), ("hoop prompt", "card-hoop")], seen)

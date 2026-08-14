@@ -351,7 +351,7 @@ class StateStore:
             api_key=str(payload.get("api_key") or "").strip(),
             api_secret=str(payload.get("api_secret") or payload.get("token") or "").strip(),
             base_url=base_url,
-            project_id=str(payload.get("project_id") or "PROJ-0049").strip() or "PROJ-0049",
+            project_id=str(payload.get("project_id") or "PROJ-0013").strip() or "PROJ-0013",
             task_id=str(payload.get("task_id") or "").strip(),
             status=str(payload.get("status") or "").strip(),
             updated_at=str(payload.get("updated_at") or "").strip(),
