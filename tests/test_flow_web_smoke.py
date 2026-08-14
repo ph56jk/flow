@@ -572,29 +572,16 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Emma", title)
         self.assertIn("Hand Embroidered Linen Drawstring Bag", title)
 
-    def test_auto_erp_ai_title_missing_gemini_records_error_on_item(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
-        card = {
-            "id": "card-no-gemini-title",
-            "shortLink": "no-gemini-title",
-            "idList": "ready",
-            "name": "embroidered drawstring pouch",
-            "desc": "Buyer note: handmade linen bag.",
-            "url": "https://erp.example/c/no-gemini-title",
-            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag.jpeg", "mimeType": "image/jpeg"}],
-            "_selected_attachment_ids": ["att-title"],
-        }
 
-        with patch.object(self.service, "_gemini_api_key", return_value=""):
-            items = self.service._erp_ai_prompt_items_for_image_cards([card], request, 40)
 
-        self.assertEqual(1, len(items))
-        self.assertIn("Gemini", card["_ai_title_error"])
-        self.assertIn("Gemini", items[0]["ai_title_error"])
-        self.assertEqual("", items[0]["ai_suggested_title"])
-        self.assertIn("Drawstring Bag category", items[0]["design_analysis"])
 
-    def test_auto_erp_enrichment_writes_ai_title_to_description(self) -> None:
+    def test_auto_erp_enrichment_never_rewrites_the_erp_description(self) -> None:
+        """ERP write-back is append-only.
+
+        Visual analysis is allowed to shape the Flow prompt, but the Task
+        description belongs to whoever wrote it — the app only ever appends
+        comments, so no enrichment may PUT over it.
+        """
         request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
         card = {
             "id": "card-ai-title",
@@ -626,73 +613,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             },
         ), patch.object(
             self.service,
-            "_gemini_suggest_erp_product_title",
-            return_value={
-                "title": "Personalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch",
-                "product_type": "Drawstring Bag",
-                "reason": "source is an embroidered pouch",
-            },
-        ) as suggest_title, patch.object(
-            self.service,
             "_erp_put_json",
-            return_value={
-                "desc": "Buyer note: keep lavender embroidery.\n\nPersonalized Linen Drawstring Bag with Lavender Embroidery, Handmade Jewelry Pouch"
-            },
         ) as put_json:
             self.service._flow_operator_enrich_card_with_visual_product_rule(request, card)
 
-        suggest_title.assert_called_once()
-        put_json.assert_called_once()
+        put_json.assert_not_called()
         self.assertEqual("drawstring_bag", card["_visual_product_rule_key"])
-        self.assertIn("Personalized Linen Drawstring Bag", card["_ai_suggested_title"])
-        self.assertTrue(Path(card["_ai_title_backup_path"]).is_file())
-
-    def test_auto_erp_ai_title_falls_back_when_gemini_returns_no_text(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from ERP card", count=12)
-        card = {
-            "id": "card-ai-title-fallback",
-            "shortLink": "ai-title-fallback",
-            "idList": "ready",
-            "name": "Hand-embroidered_drawstring_bag_pale_sage.jpeg",
-            "desc": "",
-            "url": "https://erp.example/c/ai-title-fallback",
-            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag_pale_sage.jpeg", "mimeType": "image/jpeg"}],
-            "_selected_attachment_ids": ["att-title"],
-        }
-
-        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
-            self.service,
-            "_erp_credentials",
-            return_value=("erp-key", "erp-token"),
-        ), patch.object(
-            self.service,
-            "_erp_download_attachment_bytes",
-            return_value=(b"image-bytes", "image/jpeg"),
-        ), patch.object(
-            self.service,
-            "_gemini_classify_erp_source_product_rule",
-            return_value={
-                "product_rule_key": "drawstring_bag",
-                "confidence": 0.95,
-                "visible_product": "embroidered linen drawstring bag",
-                "reason": "visible pouch with cords",
-            },
-        ), patch.object(
-            self.service,
-            "_gemini_suggest_erp_product_title",
-            side_effect=RuntimeError("Gemini không trả về nội dung AI product title."),
-        ), patch.object(
-            self.service,
-            "_erp_put_json",
-            return_value={"desc": "Hand Embroidered Linen Drawstring Bag, Handmade Jewelry Pouch Gift"},
-        ) as put_json:
-            self.service._flow_operator_enrich_card_with_visual_product_rule(request, card)
-
-        put_json.assert_called_once()
-        self.assertIn("Hand Embroidered", card["_ai_suggested_title"])
-        self.assertIn("Drawstring Bag", card["_ai_suggested_title"])
-        self.assertIn("_ai_title_fallback_reason", card)
-        self.assertTrue(Path(card["_ai_title_backup_path"]).is_file())
 
     def test_auto_erp_pennant_card_keeps_banner_category(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from ERP card", count=4)
@@ -3338,24 +3264,24 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["failed"])
         self.assertEqual("source_task_missing", result["error"])
 
-    def test_erp_resolve_board_list_id_defaults_to_ready_for_ai(self) -> None:
+    def test_erp_resolve_board_list_id_defaults_to_open(self) -> None:
         lists = [
             {"id": "ideas-list", "name": "Ideas"},
-            {"id": "ready-list", "name": "Ready for AI"},
+            {"id": "open-list", "name": "Open"},
         ]
 
         with patch.object(self.service, "_erp_project_lists", return_value=lists):
             self.assertEqual(
-                "ready-list",
-                self.service._erp_resolve_board_list_id("key", "token", "board123", ""),
+                "open-list",
+                self.service._erp_resolve_board_list_id("key", "token", "PROJ-0049", ""),
             )
             self.assertEqual(
                 "ideas-list",
-                self.service._erp_resolve_board_list_id("key", "token", "board123", "Ideas"),
+                self.service._erp_resolve_board_list_id("key", "token", "PROJ-0049", "Ideas"),
             )
             self.assertEqual(
-                "ready-list",
-                self.service._erp_resolve_board_list_id("key", "token", "board123", "ready-list"),
+                "open-list",
+                self.service._erp_resolve_board_list_id("key", "token", "PROJ-0049", "open-list"),
             )
 
     def test_erp_image_card_scan_requires_list_scope(self) -> None:
@@ -3717,7 +3643,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ):
             summary = self.service._auto_erp_ready_for_ai_summary(request)
 
-        self.assertIn("Ready for AI co 4 card", summary)
+        self.assertIn("Open co 4 card", summary)
         self.assertIn("1 card da co du anh output theo rule nen Auto se bo qua", summary)
         self.assertIn("2 card co anh nguon va khi chay se tao moi du bo theo rule", summary)
         self.assertIn("1 card chua co anh nguon", summary)
@@ -4034,17 +3960,17 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
                     ["flow-output"],
                 )
 
-    def test_erp_matching_hint_defaults_to_ready_list(self) -> None:
-        request = CreateJobRequest(type="image", prompt="", erp_project_id="https://erp.com/b/board123/demo")
+    def test_erp_matching_hint_defaults_to_open_status(self) -> None:
+        request = CreateJobRequest(type="image", prompt="", erp_project_id="PROJ-0049")
         items = [{"product_key": "shirt", "product": "Shirt", "prompt": "prompt"}]
-        card = {"id": "ready-card", "name": "shirt", "shortLink": "ready", "url": "https://erp.com/c/ready", "idList": "ready-list"}
+        card = {"id": "open-card", "name": "shirt", "shortLink": "open", "url": "https://erp.com/c/open", "idList": "open-list"}
 
         with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
             self.service,
             "_erp_project_lists",
             return_value=[
                 {"id": "ideas-list", "name": "Ideas"},
-                {"id": "ready-list", "name": "Ready for AI"},
+                {"id": "open-list", "name": "Open"},
             ],
         ), patch.object(
             self.service,
@@ -4053,14 +3979,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         ) as match_card, patch.object(
             self.service,
             "_erp_status_name",
-            return_value="Ready for AI",
+            return_value="Open",
         ):
             hint = self.service._erp_matching_image_card_hint(request, items)
 
-        match_card.assert_called_once_with("key", "token", "board123", items, "ready-list")
-        self.assertEqual("ready-card", hint["task_id"])
-        self.assertEqual("ready-list", hint["status"])
-        self.assertEqual("Ready for AI", hint["list_name"])
+        match_card.assert_called_once_with("key", "token", "PROJ-0049", items, "open-list")
+        self.assertEqual("open-card", hint["task_id"])
+        self.assertEqual("open-list", hint["status"])
+        self.assertEqual("Open", hint["list_name"])
 
     def test_erp_source_task_hint_ignores_explicit_card_outside_ready_list(self) -> None:
         request = CreateJobRequest(
@@ -4140,8 +4066,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             )
 
         self.assertEqual("local", result["engine"])
-        self.assertIn("Ready for AI", result["answer"])
-        self.assertIn("attachment", result["answer"].lower())
+        self.assertIn("trạng thái Open", result["answer"])
+        self.assertIn("url ảnh https", result["answer"].lower())
         self.assertTrue(result["suggested_actions"])
         self.assertNotIn("gem-key", result["context_summary"])
 
@@ -4161,7 +4087,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertTrue(run_action["requires_confirmation"])
         filter_action = next(action for action in actions if action.get("action") == "apply_product_filter")
         self.assertEqual("gấu", filter_action["payload"]["value"])
-        self.assertIn("Ready for AI", result["context_summary"])
+        self.assertIn("trạng thái Open", result["context_summary"])
 
     def test_user_assistant_limits_auto_erp_when_user_asks_for_test(self) -> None:
         with patch.dict(os.environ, {"GEMINI_API_KEY": "", "GOOGLE_API_KEY": "", "GOOGLE_GENAI_API_KEY": ""}, clear=False):
@@ -4200,12 +4126,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         card_action = next(action for action in result["suggested_actions"] if action.get("action") == "set_erp_task")
         self.assertEqual("abc12345", card_action["payload"]["value"])
-        self.assertIn("không tự chọn card khác", card_action["detail"])
+        self.assertIn("không tự chọn Task khác", card_action["detail"])
 
     def test_user_assistant_reports_erp_candidate_outside_ready(self) -> None:
         asyncio.run(
             self.store.replace_erp_config(
-                ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list")
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -4257,7 +4183,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
     def test_user_assistant_can_pin_ready_erp_candidate(self) -> None:
         asyncio.run(
             self.store.replace_erp_config(
-                ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list")
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -4302,12 +4228,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("att-bear", pin_action["payload"]["attachment_id"])
         self.assertTrue(pin_action["payload"]["run_after_select"])
         self.assertTrue(pin_action["label"].startswith("Chọn & chạy"))
-        self.assertIn("ảnh attachment cũ nhất", pin_action["detail"])
+        self.assertIn("URL ảnh đầu tiên", pin_action["detail"])
 
     def test_user_assistant_searches_child_shirt_candidates_by_synonym(self) -> None:
         asyncio.run(
             self.store.replace_erp_config(
-                ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list")
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -4346,12 +4272,12 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         action_names = [action.get("action") for action in result["suggested_actions"]]
         self.assertIn("apply_product_filter", action_names)
         self.assertNotIn("run_auto_erp", action_names)
-        self.assertIn("chưa ở Ready for AI", result["answer"])
+        self.assertIn("chưa ở Open", result["answer"])
 
     def test_user_assistant_searches_doll_candidates_by_vietnamese_alias(self) -> None:
         asyncio.run(
             self.store.replace_erp_config(
-                ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list")
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -4396,7 +4322,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
     def test_user_assistant_does_not_match_generic_shirt_for_child_shirt_query(self) -> None:
         asyncio.run(
             self.store.replace_erp_config(
-                ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list")
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
         cards_payload = [
@@ -4448,7 +4374,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
     def test_user_assistant_removes_run_auto_when_no_erp_candidate(self) -> None:
         asyncio.run(
             self.store.replace_erp_config(
-                ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list")
+                ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
             )
         )
 
@@ -8179,7 +8105,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
     async def test_continuous_auto_erp_forces_configured_ready_list_over_stale_graph(self) -> None:
         await self.store.replace_erp_config(
-            ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list")
+            ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list")
         )
         request = CreateJobRequest(
             type="image",
@@ -8396,7 +8322,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
     async def test_auto_erp_rejects_explicit_card_outside_ready(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", generation_timeout_s=300, poll_interval_s=1.0))
-        await self.store.replace_erp_config(ERPConfig(api_key="key", token="token", project_id="PROJ-0049", status="ready-list"))
+        await self.store.replace_erp_config(ERPConfig(api_key="key", api_secret="secret", project_id="PROJ-0049", status="ready-list"))
         request = PromptBatchRequest(
             job=CreateJobRequest(
                 type="image",
