@@ -15772,6 +15772,7 @@ exit 1
         result["reopened_approvals"] = history
         summary = self._approval_summary(approvals, len(job.artifacts or []))
         result["dashboard_approval_summary"] = summary
+        self._rearm_erp_delivery_after_reopen(result)
         self._sync_automation_approval_execution(
             result,
             summary,
@@ -15786,6 +15787,30 @@ exit 1
             + ".",
         )
         return {"job_id": job_id, "reopened": reopened, "pending": summary.get("pending", 0)}
+
+    def _rearm_erp_delivery_after_reopen(self, result: Dict[str, Any]) -> bool:
+        """Let the archive step run once more for the images just re-opened.
+
+        The pipeline skips a module it has already finished, so a card that was
+        archived with eight images would never receive the ninth. Archiving is
+        duplicate-proof - it reuses the comment already on the card - so the
+        step can safely be armed again.
+        """
+        execution = result.get("automation_execution")
+        if not isinstance(execution, dict) or not isinstance(execution.get("nodes"), list):
+            return False
+        rearmed = False
+        for node in execution["nodes"]:
+            if not isinstance(node, dict) or node.get("type") != "erp":
+                continue
+            if str(node.get("status") or "") != "completed":
+                continue
+            node["status"] = "pending"
+            node.pop("completed_at", None)
+            rearmed = True
+        if rearmed:
+            execution["completed"] = False
+        return rearmed
 
     ERP_REVIEW_POLL_DEFAULT_S = 90
 

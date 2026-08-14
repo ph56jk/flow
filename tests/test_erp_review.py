@@ -330,6 +330,34 @@ class ErpReviewFlowTests(unittest.TestCase):
         # And the re-opened image goes back onto the card for a real answer.
         self.assertEqual(2, self._publish()["published"])
 
+    def test_reopen_arms_the_delivery_step_again(self) -> None:
+        # The card was already archived once. Without re-arming the ERP step the
+        # re-opened image would be approved and then never delivered, because a
+        # finished module is skipped when the pipeline resumes.
+        job = self._job()
+        for artifact in job.artifacts:
+            artifact.watermark_status = "cleaned"
+        self.loop.run_until_complete(self.store.replace_artifacts("job-erp", list(job.artifacts)))
+        result = {
+            "automation_execution": {
+                "nodes": [
+                    {"id": "approval-1", "type": "approval", "status": "completed"},
+                    {"id": "erp-1", "type": "erp", "status": "completed", "completed_at": "2026-08-14 10:00:00"},
+                ],
+                "completed": True,
+            }
+        }
+        self.loop.run_until_complete(self.store.patch_job("job-erp", result=result))
+        self._reject_by_tool(1)
+
+        self.loop.run_until_complete(self.service.reopen_watermark_rejections("job-erp"))
+
+        nodes = self.store.get_job("job-erp").result["automation_execution"]["nodes"]
+        erp_node = next(node for node in nodes if node["type"] == "erp")
+        self.assertEqual("pending", erp_node["status"])
+        self.assertNotIn("completed_at", erp_node)
+        self.assertFalse(self.store.get_job("job-erp").result["automation_execution"]["completed"])
+
     def test_reopen_leaves_an_image_that_is_still_marked(self) -> None:
         job = self._job()
         job.artifacts[1].watermark_status = "metadata_only"
