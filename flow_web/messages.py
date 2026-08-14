@@ -48,8 +48,25 @@ def humanize_flow_error(message: str) -> str:
 
     lowered = raw.lower()
 
-    if "processsingleton" in raw or "singletonlock" in lowered or "profile directory is already in use" in lowered:
+    # Playwright words the same lock three different ways depending on how the
+    # profile is held; the cửa sổ đăng nhập Flow itself trips the third one.
+    if (
+        "processsingleton" in raw
+        or "singletonlock" in lowered
+        or "profile directory is already in use" in lowered
+        or "profile is already in use" in lowered
+        or "opening in existing browser session" in lowered
+    ):
         result = "Chromium đang mở với hồ sơ Flow hiện tại. Chủ nhân hãy đóng cửa sổ Chromium hoặc Chrome dùng cho Flow rồi thử lại."
+        return "".join(prefixes) + result
+
+    # Frappe caps attachments per Task, so a card reused for many runs starts
+    # rejecting uploads with a wall of raw traceback JSON.
+    if "attachmentlimitreached" in lowered.replace(" ", ""):
+        result = (
+            "Task trên ERP đã chạm giới hạn số tệp đính kèm. Chủ nhân hãy xóa bớt ảnh cũ trên card "
+            "hoặc nâng giới hạn đính kèm của Task rồi chạy lại."
+        )
         return "".join(prefixes) + result
 
     if "something went wrong" in lowered:
@@ -58,6 +75,18 @@ def humanize_flow_error(message: str) -> str:
 
     if "not authenticated" in lowered or "authentication" in lowered and "required" in lowered:
         result = "Phiên đăng nhập Google Flow không còn hiệu lực. Chủ nhân hãy đăng nhập lại."
+        return "".join(prefixes) + result
+
+    # Without a Bearer token the Flow API falls back to the bare API key and
+    # answers with a Google Cloud doc link, which tells the owner nothing about
+    # the one thing that actually fixes it: signing in to Flow again.
+    if "api keys are not supported by this api" in lowered or (
+        "http 401" in lowered and "oauth2 access token" in lowered
+    ):
+        result = (
+            "Phiên đăng nhập Google Flow đã hết hạn nên không lấy được token. "
+            "Chủ nhân hãy bấm Đăng nhập Flow trên bảng điều khiển rồi chạy lại."
+        )
         return "".join(prefixes) + result
 
     if "permission denied" in lowered or "forbidden" in lowered:

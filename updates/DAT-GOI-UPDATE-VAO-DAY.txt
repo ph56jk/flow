@@ -6,4 +6,4 @@ Updater se:
 - Xac minh checksum va chi cap nhat file rule duoc phep.
 - Mo lai Flow v2.
 
-Tai khoan, profile, lich su, anh va cau hinh Trello khong bi thay doi.
+Tai khoan, profile, lich su, anh va cau hinh ERP khong bi thay doi.

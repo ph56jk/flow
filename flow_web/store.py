@@ -21,7 +21,7 @@ from .schemas import (
     JobRetrySnapshot,
     SkillRecord,
     StateSnapshot,
-    TrelloConfig,
+    ERPConfig,
     normalized_app_config,
     utc_now,
 )
@@ -45,7 +45,7 @@ class StateStore:
         self._lock = asyncio.Lock()
         self._state = self._load()
         self._normalize_saved_config()
-        self._normalize_saved_trello_config()
+        self._normalize_saved_erp_config()
         self._normalize_saved_integration_config()
         self._normalize_saved_jobs()
         self._repair_incomplete_jobs()
@@ -59,11 +59,11 @@ class StateStore:
             await self._save_locked()
         return self._state.config
 
-    async def replace_trello_config(self, config: TrelloConfig) -> TrelloConfig:
+    async def replace_erp_config(self, config: ERPConfig) -> ERPConfig:
         async with self._lock:
-            self._state.trello_config = self._normalize_trello_config(config)
+            self._state.erp_config = self._normalize_erp_config(config)
             await self._save_locked()
-        return self._state.trello_config
+        return self._state.erp_config
 
     async def replace_integration_config(self, config: IntegrationConfig) -> IntegrationConfig:
         async with self._lock:
@@ -322,11 +322,11 @@ class StateStore:
             encoding="utf-8",
         )
 
-    def _normalize_saved_trello_config(self) -> None:
-        normalized = self._normalize_trello_config(self._state.trello_config)
-        if _model_dump(normalized) == _model_dump(self._state.trello_config):
+    def _normalize_saved_erp_config(self) -> None:
+        normalized = self._normalize_erp_config(self._state.erp_config)
+        if _model_dump(normalized) == _model_dump(self._state.erp_config):
             return
-        self._state.trello_config = normalized
+        self._state.erp_config = normalized
         STATE_FILE.write_text(
             json.dumps(_model_dump(self._state), indent=2),
             encoding="utf-8",
@@ -342,24 +342,18 @@ class StateStore:
             encoding="utf-8",
         )
 
-    def _normalize_trello_config(self, config: TrelloConfig) -> TrelloConfig:
+    def _normalize_erp_config(self, config: ERPConfig) -> ERPConfig:
         payload = _model_dump(config)
-        upload_mode = str(payload.get("upload_mode") or "file").strip().lower()
-        if upload_mode not in {"file", "url"}:
-            upload_mode = "file"
-        # ``upscale_to_2k`` was added later; legacy state.json không có khoá này
-        # nên dùng default True, nhưng nếu user đã chọn False thì phải tôn
-        # trọng — không re-default lại True khi normalize.
-        raw_upscale = payload.get("upscale_to_2k", True)
-        return TrelloConfig(
+        base_url = str(payload.get("base_url") or "https://erp.havigroup.llc").strip().rstrip("/")
+        if base_url != "https://erp.havigroup.llc":
+            base_url = "https://erp.havigroup.llc"
+        return ERPConfig(
             api_key=str(payload.get("api_key") or "").strip(),
-            token=str(payload.get("token") or "").strip(),
-            board_id=str(payload.get("board_id") or "").strip(),
-            card_id=str(payload.get("card_id") or "").strip(),
-            list_id=str(payload.get("list_id") or "").strip(),
-            upload_mode=upload_mode,
-            set_cover=payload.get("set_cover") is not False,
-            upscale_to_2k=raw_upscale is not False,
+            api_secret=str(payload.get("api_secret") or payload.get("token") or "").strip(),
+            base_url=base_url,
+            project_id=str(payload.get("project_id") or "PROJ-0049").strip() or "PROJ-0049",
+            task_id=str(payload.get("task_id") or "").strip(),
+            status=str(payload.get("status") or "").strip(),
             updated_at=str(payload.get("updated_at") or "").strip(),
         )
 
@@ -371,6 +365,8 @@ class StateStore:
             telegram_bot_token=str(payload.get("telegram_bot_token") or "").strip(),
             telegram_chat_id=str(payload.get("telegram_chat_id") or "").strip(),
             playwright_browsers_path=str(payload.get("playwright_browsers_path") or "").strip(),
+            removelogo_url=str(payload.get("removelogo_url") or "").strip().rstrip("/"),
+            removelogo_enabled=payload.get("removelogo_enabled") is not False,
             updated_at=str(payload.get("updated_at") or "").strip(),
         )
 

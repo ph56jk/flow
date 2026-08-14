@@ -13,14 +13,17 @@ import random
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from html import unescape
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -63,7 +66,7 @@ from .schemas import (
     PromptBatchRequest,
     PromptCreateRequest,
     ProjectEntry,
-    ResetReadyTrelloRequest,
+    ResetReadyERPRequest,
     ReplayCleanupRequest,
     PublicSkillSnapshot,
     SkillCreateRequest,
@@ -71,8 +74,9 @@ from .schemas import (
     SkillRecord,
     StoryboardPlanRequest,
     StoryboardScene,
-    TrelloConfig,
-    TrelloConfigUpdateRequest,
+    ERPConfig,
+    ERPConfigUpdateRequest,
+    ERPIdeaBatchRequest,
     UserAssistantRequest,
     WorkspaceJobCounts,
     WorkspaceSnapshot,
@@ -112,6 +116,14 @@ class ImageUpscaleResult:
 
 class FlowAgentQuotaError(RuntimeError):
     """Raised when the current Google Flow Agent browser profile hits its quota."""
+
+
+class RemoveLogoNoWatermarkError(RuntimeError):
+    """Raised when removelogo finds no Gemini watermark to remove.
+
+    Not a failure: the image is already clean, so the run keeps the original
+    bytes instead of reporting that something went wrong.
+    """
 
 
 def _model_dump(model: Any) -> Dict[str, Any]:
@@ -171,17 +183,30 @@ class FlowWebService:
     FLOW_AGENT_BATCH_PAUSE_MAX_S = 120
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
     TELEGRAM_TIMEOUT_S = 20
-    TRELLO_API_BASE_URL = "https://api.trello.com/1"
-    TRELLO_TIMEOUT_S = 30
-    TRELLO_UPSCALE_LONG_EDGE_PX = 2048
-    TRELLO_AI_TITLE_BACKUP_FILE_NAME = "trello-title-description-backups.json"
-    TRELLO_AI_TITLE_BEGIN_MARKER = "<!-- FLOW_AI_TITLE_START -->"
-    TRELLO_AI_TITLE_END_MARKER = "<!-- FLOW_AI_TITLE_END -->"
-    DEFAULT_TRELLO_SOURCE_LIST_NAME = "Ready for AI"
-    DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES = ()
-    DEFAULT_TRELLO_REVIEW_LIST_NAME = "Content Review"
-    DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026"
-    DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7"
+    # Local Gemini watermark processor (removelogo): POST {base}/process with
+    # the raw image bytes, get cleaned PNG bytes back. See its README.
+    REMOVE_LOGO_BASE_URL = "http://127.0.0.1:8788"
+    REMOVE_LOGO_TIMEOUT_S = 180
+    REMOVE_LOGO_HEALTH_TIMEOUT_S = 5
+    REMOVE_LOGO_INPUT_MIME_TYPES = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/bmp": ".bmp",
+    }
+    ERP_BASE_URL = "https://erp.havigroup.llc"
+    ERP_GRAPHQL_PATH = "/api/method/hvg_workspace.graphql.endpoint.graphql"
+    ERP_PROJECT_ID = "PROJ-0049"
+    ERP_TIMEOUT_S = 30
+    ERP_UPSCALE_LONG_EDGE_PX = 2048
+    ERP_AI_TITLE_BACKUP_FILE_NAME = "erp-title-description-backups.json"
+    ERP_AI_TITLE_BEGIN_MARKER = "<!-- FLOW_AI_TITLE_START -->"
+    ERP_AI_TITLE_END_MARKER = "<!-- FLOW_AI_TITLE_END -->"
+    DEFAULT_ERP_SOURCE_LIST_NAME = "Open"
+    DEFAULT_ERP_EXTRA_SOURCE_LIST_NAMES = ()
+    DEFAULT_ERP_REVIEW_LIST_NAME = ""
+    DEFAULT_ERP_PROJECT_URL = "PROJ-0049"
+    DEFAULT_ERP_SOURCE_LIST_ID = "Open"
     DEFAULT_VIDEO_MODEL = "Veo 3.1 - Fast"
     DEFAULT_IMAGE_MODEL = "GEMINI_3_PRO_IMAGE"
     IMAGE_MODEL_LABELS = {
@@ -312,8 +337,8 @@ class FlowWebService:
         self._shared_browser: Any | None = None
         self._shared_browser_profile_key = ""
         self._active_flow_profile_index = 0
-        self._trello_source_downloads: Dict[str, Dict[str, Any]] = {}
-        self._trello_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
+        self._erp_source_downloads: Dict[str, Dict[str, Any]] = {}
+        self._erp_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
         self._cleanup_state_cache: tuple[float, str, CleanupAssistantSnapshot] | None = None
         self._flow_profile_quota_blocked_until: Dict[str, float] = self._valid_flow_profile_quota_blocks(
             self.store.snapshot().flow_profile_quota_blocked_until
@@ -353,7 +378,7 @@ class FlowWebService:
             "projects": projects,
             "auth": auth,
             "integrations": self._integration_config_snapshot(snapshot.integration_config),
-            "trello": self._trello_config_snapshot(snapshot.trello_config),
+            "erp": self._erp_config_snapshot(snapshot.erp_config),
             "workspace": workspace,
             "output_shelf": output_shelf,
             "replay_pack": replay_pack,
@@ -449,12 +474,13 @@ class FlowWebService:
             "prompt_product_key",
             "prompt_index",
             "prompt_notes",
-            "trello_board_id",
-            "trello_card_id",
-            "trello_list_id",
-            "trello_attachment_ids",
-            "trello_source_card_id",
-            "trello_source_attachment_ids",
+            "erp_project_id",
+            "erp_task_id",
+            "erp_status_id",
+            "erp_attachment_ids",
+            "erp_source_task_id",
+            "erp_source_attachment_ids",
+            "erp_output_task_id",
             "flow_agent_enabled",
             "flow_agent_auto_approve",
         }
@@ -608,6 +634,13 @@ class FlowWebService:
         if not request.clear_telegram_bot_token:
             telegram_bot_token = telegram_bot_token or current.telegram_bot_token
 
+        removelogo_url = self._sanitize_removelogo_url(request.removelogo_url)
+        if not request.clear_removelogo_url:
+            removelogo_url = removelogo_url or current.removelogo_url
+        removelogo_enabled = (
+            current.removelogo_enabled if request.removelogo_enabled is None else bool(request.removelogo_enabled)
+        )
+
         gemini_model = self._sanitize_gemini_model(request.gemini_model or current.gemini_model or self.GEMINI_DEFAULT_MODEL)
         config = IntegrationConfig(
             gemini_api_key=gemini_api_key,
@@ -615,6 +648,8 @@ class FlowWebService:
             telegram_bot_token=telegram_bot_token,
             telegram_chat_id=request.telegram_chat_id.strip(),
             playwright_browsers_path=request.playwright_browsers_path.strip(),
+            removelogo_url=removelogo_url,
+            removelogo_enabled=removelogo_enabled,
             updated_at=utc_now(),
         )
         saved = await self.store.replace_integration_config(config)
@@ -622,7 +657,7 @@ class FlowWebService:
         return self._integration_config_snapshot(saved)
 
     def _integration_config_snapshot(self, config: IntegrationConfig) -> Dict[str, Any]:
-        # Same .env.local fallback rationale as _trello_config_snapshot: chủ
+        # Same .env.local fallback rationale as _erp_config_snapshot: chủ
         # nhân set 1 lần qua .env.local thì UI vẫn báo "Đã lưu" dù
         # data/state.json bị reset.
         state_gemini_api_key = str(config.gemini_api_key or "").strip()
@@ -666,6 +701,12 @@ class FlowWebService:
                 "chat_id": telegram_chat_id,
                 "credentials_source": telegram_source,
             },
+            "removelogo": {
+                "enabled": self._removelogo_enabled(config),
+                "base_url": self._removelogo_base_url(config),
+                "base_url_saved": bool(str(config.removelogo_url or "").strip()),
+                "credentials_source": "state" if str(config.removelogo_url or "").strip() else "env",
+            },
             "runtime": {
                 "playwright_browsers_path": runtime_playwright_path,
                 "playwright_browsers_path_set": bool(runtime_playwright_path),
@@ -686,49 +727,52 @@ class FlowWebService:
             "updated_at": config.updated_at,
         }
 
-    async def update_trello_config(self, request: TrelloConfigUpdateRequest) -> Dict[str, Any]:
-        current = self.store.snapshot().trello_config
+    async def update_erp_config(self, request: ERPConfigUpdateRequest) -> Dict[str, Any]:
+        current = self.store.snapshot().erp_config
         api_key = request.api_key.strip()
-        token = request.token.strip()
+        api_secret = request.api_secret.strip()
         if not request.clear_credentials:
             api_key = api_key or current.api_key
-            token = token or current.token
+            api_secret = api_secret or current.api_secret
 
-        upload_mode = request.upload_mode.strip().lower() or current.upload_mode or "file"
-        if upload_mode not in {"file", "url"}:
-            upload_mode = "file"
+        project_id = self._normalize_erp_project_id(request.project_id) or self.ERP_PROJECT_ID
+        if not re.fullmatch(r"PROJ-\d{4,}", project_id):
+            raise HTTPException(
+                status_code=400,
+                detail="Mã ERP Project phải có dạng PROJ-0013; app chỉ thao tác trong đúng project này.",
+            )
+        task_id = self._normalize_erp_task_id(request.task_id)
+        status = self._normalize_erp_id(request.status)
+        base_url = str(request.base_url or current.base_url or self.ERP_BASE_URL).strip().rstrip("/")
+        if base_url != self.ERP_BASE_URL:
+            raise HTTPException(status_code=400, detail=f"Chỉ được dùng ERP endpoint {self.ERP_BASE_URL}.")
 
-        board_id = self._normalize_trello_board_id(request.board_id)
-        card_id = self._normalize_trello_card_id(request.card_id)
-        list_id = self._normalize_trello_id(request.list_id)
-
-        config = TrelloConfig(
+        config = ERPConfig(
             api_key=api_key,
-            token=token,
-            board_id=board_id,
-            card_id=card_id,
-            list_id=list_id,
-            upload_mode=upload_mode,
-            set_cover=request.set_cover,
-            upscale_to_2k=bool(request.upscale_to_2k),
+            api_secret=api_secret,
+            base_url=base_url,
+            project_id=project_id,
+            task_id=task_id,
+            status=status,
             updated_at=utc_now(),
         )
-        saved = await self.store.replace_trello_config(config)
+        saved = await self.store.replace_erp_config(config)
 
         persist_result: Dict[str, Any] = {"persisted_to_env": False}
         if request.persist_to_env and not request.clear_credentials:
             persist_payload = {
-                "TRELLO_API_KEY": api_key,
-                "TRELLO_TOKEN": token,
-                "TRELLO_BOARD_ID": board_id,
-                "TRELLO_CARD_ID": card_id,
-                "TRELLO_LIST_ID": list_id,
+                "ERP_API_KEY": api_key,
+                "ERP_API_SECRET": api_secret,
+                "ERP_BASE_URL": base_url,
+                "ERP_PROJECT_ID": project_id,
+                "ERP_TASK_ID": task_id,
+                "ERP_STATUS_ID": status,
             }
             persist_result = self._persist_env_local(
                 {key: value for key, value in persist_payload.items() if value}
             )
 
-        snapshot = self._trello_config_snapshot(saved)
+        snapshot = self._erp_config_snapshot(saved)
         snapshot.update(persist_result)
         return snapshot
 
@@ -779,7 +823,7 @@ class FlowWebService:
             env_path.parent.mkdir(parents=True, exist_ok=True)
             env_path.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
         except OSError as exc:
-            log.warning("Failed to persist Trello creds to %s: %s", env_path, exc)
+            log.warning("Failed to persist ERP creds to %s: %s", env_path, exc)
             return {
                 "persisted_to_env": False,
                 "persist_error": str(exc),
@@ -795,46 +839,38 @@ class FlowWebService:
             "env_file": str(env_path),
         }
 
-    def _trello_config_snapshot(self, config: TrelloConfig) -> Dict[str, Any]:
+    def _erp_config_snapshot(self, config: ERPConfig) -> Dict[str, Any]:
         # Fall back to environment variables (loaded from `.env.local` on
         # startup) so the UI's "Đã lưu / Cần thiết lập" badges reflect
         # credentials that live outside ``data/state.json``. This lets chủ
-        # nhân set up Trello once via .env.local and skip re-entering creds
+        # nhân set up ERP once via .env.local and skip re-entering creds
         # every time state.json is reset.
-        api_key = str(config.api_key or "").strip() or os.getenv("TRELLO_API_KEY", "").strip()
-        token = str(config.token or "").strip() or os.getenv("TRELLO_TOKEN", "").strip()
-        board_id = self._normalize_trello_board_id(
-            str(config.board_id or "").strip() or os.getenv("TRELLO_BOARD_ID", "").strip()
+        api_key = str(config.api_key or "").strip() or os.getenv("ERP_API_KEY", "").strip()
+        api_secret = str(config.api_secret or "").strip() or os.getenv("ERP_API_SECRET", "").strip()
+        base_url = str(config.base_url or "").strip().rstrip("/") or self.ERP_BASE_URL
+        project_id = self._normalize_erp_project_id(
+            str(config.project_id or "").strip() or os.getenv("ERP_PROJECT_ID", "").strip()
         )
-        card_id = self._normalize_trello_card_id(
-            str(config.card_id or "").strip() or os.getenv("TRELLO_CARD_ID", "").strip()
+        task_id = self._normalize_erp_task_id(
+            str(config.task_id or "").strip() or os.getenv("ERP_TASK_ID", "").strip()
         )
-        list_id = self._normalize_trello_id(
-            str(config.list_id or "").strip() or os.getenv("TRELLO_LIST_ID", "").strip()
+        status = self._normalize_erp_id(
+            str(config.status or "").strip() or os.getenv("ERP_STATUS_ID", "").strip()
         )
-        upload_mode = (
-            str(config.upload_mode or "").strip().lower()
-            or os.getenv("TRELLO_UPLOAD_MODE", "").strip().lower()
-            or "file"
-        )
-        if upload_mode not in {"file", "url"}:
-            upload_mode = "file"
         env_credentials_used = (
             (not str(config.api_key or "").strip() and bool(api_key))
-            or (not str(config.token or "").strip() and bool(token))
+            or (not str(config.api_secret or "").strip() and bool(api_secret))
         )
         return {
-            "configured": bool(api_key and token and (board_id or card_id or list_id)),
-            "credentials_saved": bool(api_key and token),
+            "configured": bool(api_key and api_secret and project_id),
+            "credentials_saved": bool(api_key and api_secret),
             "api_key_saved": bool(api_key),
-            "token_saved": bool(token),
-            "credentials_source": "env" if env_credentials_used else ("state" if api_key and token else ""),
-            "board_id": board_id,
-            "card_id": card_id,
-            "list_id": list_id,
-            "upload_mode": upload_mode,
-            "set_cover": config.set_cover is not False,
-            "upscale_to_2k": bool(getattr(config, "upscale_to_2k", True)),
+            "api_secret_saved": bool(api_secret),
+            "credentials_source": "env" if env_credentials_used else ("state" if api_key and api_secret else ""),
+            "base_url": base_url,
+            "project_id": project_id,
+            "task_id": task_id,
+            "status": status,
             "updated_at": config.updated_at,
         }
 
@@ -1046,13 +1082,13 @@ class FlowWebService:
         product_column = product_name_column or product_key_column
         index_column = self._find_prompt_source_column(columns, {"promptindex", "index", "stt"})
         notes_column = self._find_prompt_source_column(columns, {"notes", "note", "ghichu"})
-        trello_card_column = self._find_prompt_source_column(
+        erp_task_column = self._find_prompt_source_column(
             columns,
-            {"trellocard", "trellocardid", "trellocardurl", "card", "cardid", "cardurl", "sourcecard", "sourcecardurl"},
+            {"erpcard", "erpcardid", "erpcardurl", "card", "cardid", "cardurl", "sourcecard", "sourcecardurl"},
         )
-        trello_list_column = self._find_prompt_source_column(
+        erp_status_column = self._find_prompt_source_column(
             columns,
-            {"trellolist", "trellolistid", "list", "listid", "sourcelist"},
+            {"erplist", "erplistid", "list", "listid", "sourcelist"},
         )
 
         if not prompt_column:
@@ -1081,8 +1117,8 @@ class FlowWebService:
                     "product_name": product_name,
                     "index": str(row.get(index_column) or "").strip() if index_column else "",
                     "notes": str(row.get(notes_column) or "").strip() if notes_column else "",
-                    "trello_card_id": str(row.get(trello_card_column) or "").strip() if trello_card_column else "",
-                    "trello_list_id": str(row.get(trello_list_column) or "").strip() if trello_list_column else "",
+                    "erp_task_id": str(row.get(erp_task_column) or "").strip() if erp_task_column else "",
+                    "erp_status_id": str(row.get(erp_status_column) or "").strip() if erp_status_column else "",
                 }
             )
 
@@ -1170,6 +1206,11 @@ class FlowWebService:
             local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
             base = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
             return base / "ms-playwright"
+        if sys.platform == "darwin":
+            # macOS keeps the cache under ~/Library/Caches, so pointing at the
+            # Linux path made the app re-download Chromium on every run and
+            # never see the copy Playwright had already installed.
+            return Path.home() / "Library" / "Caches" / "ms-playwright"
         return Path.home() / ".cache" / "ms-playwright"
 
     def _ensure_playwright_browsers_available(self) -> None:
@@ -1215,7 +1256,64 @@ class FlowWebService:
                 authenticated = False
         if not authenticated:
             authenticated = self._flow_profile_has_auth_cookies(active_profile.path)
+        # Both checks above only prove a cookie store exists on disk. A store
+        # whose Flow session has long expired still passes them, so the
+        # dashboard would report "đã đăng nhập" while every job dies with 401.
+        if authenticated and self._flow_session_cookie_expired(active_profile.path):
+            authenticated = False
         return AuthStatus(authenticated=authenticated)
+
+    # next-auth names the Flow session cookie differently over https and http.
+    FLOW_SESSION_COOKIE_NAMES = ("__Secure-next-auth.session-token", "next-auth.session-token")
+    # Chromium stores cookie expiry in microseconds since 1601-01-01.
+    _CHROME_EPOCH_OFFSET_S = 11644473600
+
+    def _flow_session_cookie_expired(self, profile_dir: Path | None = None) -> bool:
+        """Report whether the profile is readable but holds no live Flow session.
+
+        Only cookie names and expiry stamps are read, never a cookie value.
+        Anything that leaves real doubt — a locked store, an unexpected schema,
+        no store at all — answers ``False`` so an unreadable profile can never
+        flip a perfectly good session to "signed out".
+        """
+        try:
+            from flow._storage import PROFILE_DIR
+        except Exception:
+            return False
+
+        profile_dir = Path(profile_dir or PROFILE_DIR)
+        now = time.time()
+        read_any = False
+        for candidate in (
+            profile_dir / "Default" / "Cookies",
+            profile_dir / "Default" / "Network" / "Cookies",
+        ):
+            if not candidate.is_file():
+                continue
+            with tempfile.TemporaryDirectory() as work_dir:
+                copy = Path(work_dir) / "cookies.db"
+                try:
+                    # Chromium keeps the live store locked, so query a snapshot.
+                    shutil.copyfile(candidate, copy)
+                    connection = sqlite3.connect(str(copy))
+                    try:
+                        rows = connection.execute(
+                            "SELECT name, expires_utc, has_expires FROM cookies "
+                            "WHERE host_key LIKE '%labs.google%'"
+                        ).fetchall()
+                    finally:
+                        connection.close()
+                except (OSError, sqlite3.Error):
+                    continue
+            read_any = True
+            for name, expires_utc, has_expires in rows:
+                if str(name) not in self.FLOW_SESSION_COOKIE_NAMES:
+                    continue
+                if not has_expires:
+                    return False
+                if (int(expires_utc or 0) / 1_000_000) - self._CHROME_EPOCH_OFFSET_S > now:
+                    return False
+        return read_any
 
     def _flow_profile_has_auth_cookies(self, profile_dir: Path | None = None) -> bool:
         try:
@@ -2132,6 +2230,179 @@ class FlowWebService:
         self._tasks[job.id] = asyncio.create_task(self._run_flow_job(job.id, request))
         return job
 
+    # ── Idea fan-out: one child card of the breakdown = one idea = one job ──
+
+    def _html_to_text(self, value: Any) -> str:
+        text = re.sub(r"<br\s*/?>|</p>|</div>|</li>", "\n", str(value or ""), flags=re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = unescape(text)
+        return "\n".join(line.strip() for line in text.splitlines() if line.strip()).strip()
+
+    def _erp_idea_text(self, child_detail: Dict[str, Any]) -> str:
+        subject = str(child_detail.get("subject") or "").strip()
+        description = self._html_to_text(
+            child_detail.get("description_md") or child_detail.get("description") or ""
+        )
+        return "\n".join(part for part in (subject, description) if part).strip()
+
+    def _erp_idea_prompt(self, parent_detail: Dict[str, Any], child_detail: Dict[str, Any]) -> str:
+        context = self._html_to_text(
+            parent_detail.get("description_md") or parent_detail.get("description") or ""
+        )
+        idea = self._erp_idea_text(child_detail)
+        lines = [
+            "Ảnh đính kèm là ảnh sản phẩm gốc của thẻ idea; giữ đúng sản phẩm đó.",
+            f"Ý tưởng cần thể hiện: {idea}" if idea else "",
+            f"Bối cảnh dự án: {context}" if context else "",
+            "Hãy tạo ảnh content cho đúng ý tưởng này.",
+        ]
+        return "\n".join(line for line in lines if line)
+
+    def _erp_task_has_flow_output(self, detail: Dict[str, Any]) -> bool:
+        for comment in detail.get("comments") or []:
+            if not isinstance(comment, dict):
+                continue
+            bodies = [comment.get("content")]
+            bodies.extend(
+                reply.get("content") for reply in (comment.get("replies") or []) if isinstance(reply, dict)
+            )
+            if any("FLOW_V2_ARTIFACT" in str(body or "") for body in bodies):
+                return True
+        return False
+
+    async def enqueue_erp_idea_jobs(self, request: ERPIdeaBatchRequest) -> Dict[str, Any]:
+        """Queue one image job per child card of an "Idea" card.
+
+        The parent card carries the product image the user uploaded; each child
+        card carries one idea. Every job reads the parent's image, generates the
+        images for its own idea, and — after the dashboard approval — writes
+        them back onto its own child card.
+        """
+        key, token = self._erp_credentials()
+        if not key or not token:
+            raise HTTPException(status_code=400, detail="Chưa thiết lập ERP API key/API secret.")
+        erp_config = self.store.snapshot().erp_config
+        parent_id = self._normalize_erp_task_id(request.task_id or erp_config.task_id)
+        if not parent_id:
+            raise HTTPException(status_code=400, detail="Thiếu ERP Task ID của thẻ Idea cha.")
+        project_id = self._erp_allowed_project_id()
+        await asyncio.to_thread(self._erp_assert_task_in_project, key, token, parent_id)
+        parent_detail = await asyncio.to_thread(self._erp_task_detail, key, token, parent_id)
+
+        source_attachments, _ = self._erp_source_and_flow_output_attachments(
+            self._erp_extract_task_attachments(parent_detail)
+        )
+        if not source_attachments:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Thẻ {parent_id} chưa có ảnh idea nào để làm ảnh nguồn (kể cả ảnh bìa).",
+            )
+        source_attachment_id = self._normalize_erp_id(str(source_attachments[0].get("id") or ""))
+
+        wanted = {self._normalize_erp_task_id(item) for item in (request.child_task_ids or []) if str(item).strip()}
+        children = [
+            child
+            for child in (parent_detail.get("children") or [])
+            if isinstance(child, dict) and self._normalize_erp_task_id(str(child.get("name") or ""))
+        ]
+        if wanted:
+            children = [child for child in children if self._normalize_erp_task_id(str(child.get("name"))) in wanted]
+        if not children:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Thẻ {parent_id} chưa có thẻ con nào trong phần Phân rã công việc để chạy.",
+            )
+
+        parent_status = self._normalize_erp_id(str(parent_detail.get("status") or ""))
+        count = int(request.count or 0) or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
+        queued: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        entries: List[tuple[str, CreateJobRequest]] = []
+        for child in children:
+            child_id = self._normalize_erp_task_id(str(child.get("name")))
+            child_detail = await asyncio.to_thread(self._erp_task_detail, key, token, child_id)
+            if not request.include_done and self._erp_task_has_flow_output(child_detail):
+                skipped.append({"task_id": child_id, "subject": str(child.get("subject") or ""), "reason": "đã có ảnh Flow"})
+                continue
+            child_request = CreateJobRequest(
+                type="image",
+                prompt=self._erp_idea_prompt(parent_detail, child_detail),
+                count=count,
+                model=request.model or "",
+                aspect=request.aspect or "square",
+                title=f"Idea {str(child.get('subject') or child_id)[:40]} ({child_id})",
+                erp_enabled=True,
+                erp_project_id=project_id,
+                erp_status_id=parent_status,
+                erp_task_id=parent_id,
+                erp_source_task_id=parent_id,
+                erp_source_attachment_ids=[source_attachment_id] if source_attachment_id else [],
+                # The images belong to the idea, not to the parent Idea card.
+                erp_output_task_id=child_id,
+                automation_graph={
+                    "version": 1,
+                    "edges": [],
+                    "modules": [
+                        {
+                            "id": "erp_source",
+                            "type": "erp_source",
+                            "enabled": True,
+                            "settings": {
+                                "erpTask": parent_id,
+                                "erpStatus": parent_status,
+                                "erpAttachmentLimit": 1,
+                            },
+                        },
+                        {"id": "flow", "type": "flow", "enabled": True},
+                        {"id": "erp", "type": "erp", "enabled": True},
+                    ],
+                },
+            )
+            job = JobRecord(
+                type="image",
+                status="queued",
+                title=child_request.title,
+                input=_model_dump(child_request),
+            )
+            await self.store.add_job(job)
+            await self.store.append_log(
+                job.id,
+                f"Idea từ thẻ con {child_id} ({child.get('subject') or ''}); ảnh nguồn lấy từ thẻ cha {parent_id}, "
+                f"ảnh tạo ra sẽ nằm trong comment của chính thẻ {child_id} sau khi được duyệt.",
+            )
+            entries.append((job.id, child_request))
+            queued.append({"job_id": job.id, "task_id": child_id, "subject": str(child.get("subject") or "")})
+
+        if entries:
+            # One browser, one Flow session: the ideas run one after another.
+            asyncio.create_task(self._run_erp_idea_jobs(entries))
+        return {
+            "parent_task_id": parent_id,
+            "project_id": project_id,
+            "count": count,
+            "source_attachment_id": source_attachment_id,
+            "queued": queued,
+            "skipped": skipped,
+        }
+
+    async def _run_erp_idea_jobs(self, entries: List[tuple[str, CreateJobRequest]]) -> None:
+        for job_id, child_request in entries:
+            current = asyncio.current_task()
+            if current is not None:
+                # Registering the running job keeps the dashboard stop button
+                # working while the rest of the ideas are still queued.
+                self._tasks[job_id] = current
+            try:
+                await self._run_flow_job(job_id, child_request)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # _run_flow_job already recorded the failure on the job itself.
+                await self.store.append_log(job_id, f"Idea job dừng bất thường: {humanize_flow_error(str(exc))}")
+            finally:
+                if self._tasks.get(job_id) is current:
+                    self._tasks.pop(job_id, None)
+
     async def enqueue_prompt_batch(self, request: PromptBatchRequest) -> JobRecord:
         config = self._normalized_config(self.store.snapshot().config)
         profiles = self._flow_profile_specs() if self._should_keep_flow_browser_open(config) else []
@@ -2148,8 +2419,8 @@ class FlowWebService:
             raise HTTPException(status_code=400, detail="Batch prompt từ sheet hiện chỉ hỗ trợ tạo ảnh.")
 
         raw_limit = int(request.limit or 0)
-        continuous = bool(request.auto_trello and request.continuous)
-        run_until_empty = bool(request.auto_trello and (request.run_until_empty or raw_limit <= 0))
+        continuous = bool(request.auto_erp and request.continuous)
+        run_until_empty = bool(request.auto_erp and (request.run_until_empty or raw_limit <= 0))
         limit = (
             max(1, min(self.MAX_PROMPT_BATCH_ITEMS, raw_limit or self.MAX_PROMPT_BATCH_ITEMS))
             if not run_until_empty
@@ -2157,25 +2428,25 @@ class FlowWebService:
         )
         source_item_count = len(request.items or [])
         items = self._prompt_batch_items(request.items, max(limit, source_item_count))
-        if not items and not request.auto_trello:
+        if not items and not request.auto_erp:
             raise HTTPException(
                 status_code=400,
-                detail="Hãy nhập lệnh, hoặc bật Auto Trello để Tác nhân Flow tự viết prompt từ card có ảnh.",
+                detail="Hãy nhập lệnh, hoặc bật Auto ERP để Tác nhân Flow tự viết prompt từ card có ảnh.",
             )
-        if request.auto_trello:
-            base_request = self._auto_trello_flow_agent_request(base_request)
+        if request.auto_erp:
+            base_request = self._auto_erp_flow_agent_request(base_request)
             if not items and run_until_empty:
                 payload = _model_dump(base_request)
-                self._clear_auto_trello_search_filter(payload)
+                self._clear_auto_erp_search_filter(payload)
                 base_request = CreateJobRequest(**payload)
         if continuous:
-            base_request, trello_source_hint = await self._continuous_auto_trello_base_request(base_request)
-            batch_key = self._continuous_auto_trello_batch_key(base_request, trello_source_hint)
+            base_request, erp_source_hint = await self._continuous_auto_erp_base_request(base_request)
+            batch_key = self._continuous_auto_erp_batch_key(base_request, erp_source_hint)
             async with self._prompt_batch_lock:
                 active_batch = self._active_prompt_batch_by_key(batch_key)
                 if active_batch is not None:
                     return active_batch
-                title = str(request.title or "").strip() or "Auto AI Trello: chờ sản phẩm mới liên tục"
+                title = str(request.title or "").strip() or "Auto AI ERP: chờ sản phẩm mới liên tục"
                 poll_interval_s = max(1, min(300, int(request.poll_interval_s or 30)))
                 batch_job = JobRecord(
                     type="batch_image",
@@ -2190,7 +2461,7 @@ class FlowWebService:
                         "poll_interval_s": poll_interval_s,
                         "job": _model_dump(base_request),
                         "items": items,
-                        "trello_source_hint": trello_source_hint,
+                        "erp_source_hint": erp_source_hint,
                         "batch_key": batch_key,
                     },
                     result={
@@ -2199,7 +2470,7 @@ class FlowWebService:
                         "failed": 0,
                         "remaining": 0,
                         "child_job_ids": [],
-                        "trello_source_hint": trello_source_hint,
+                        "erp_source_hint": erp_source_hint,
                         "batch_key": batch_key,
                         "run_until_empty": True,
                         "continuous": True,
@@ -2209,27 +2480,27 @@ class FlowWebService:
                 )
                 await self.store.add_job(batch_job)
                 self._tasks[batch_job.id] = asyncio.create_task(
-                    self._run_continuous_auto_trello_batch(batch_job.id, base_request, items, poll_interval_s)
+                    self._run_continuous_auto_erp_batch(batch_job.id, base_request, items, poll_interval_s)
                 )
                 return batch_job
-        if request.auto_trello:
-            base_request, items, trello_source_hint = await self._expand_prompt_batch_with_trello_images(
+        if request.auto_erp:
+            base_request, items, erp_source_hint = await self._expand_prompt_batch_with_erp_images(
                 base_request,
                 items,
                 0 if run_until_empty else limit,
             )
         else:
-            base_request, items, trello_source_hint = await self._align_prompt_batch_with_trello_source(base_request, items)
+            base_request, items, erp_source_hint = await self._align_prompt_batch_with_erp_source(base_request, items)
 
         if not items:
-            raise HTTPException(status_code=400, detail="Không tìm thấy card Trello có ảnh trong list nguồn để gửi cho Tác nhân Flow.")
-        if not request.auto_trello and trello_source_hint.get("card_id") and len(items) > 1:
+            raise HTTPException(status_code=400, detail="Không tìm thấy ERP Task có URL ảnh HTTPS trong trạng thái nguồn để gửi cho Tác nhân Flow.")
+        if not request.auto_erp and erp_source_hint.get("task_id") and len(items) > 1:
             items = items[:1]
         if run_until_empty:
             limit = len(items)
         else:
             items = items[:limit]
-        batch_key = self._prompt_batch_key(base_request, items, trello_source_hint)
+        batch_key = self._prompt_batch_key(base_request, items, erp_source_hint)
         async with self._prompt_batch_lock:
             active_batch = self._active_prompt_batch_by_key(batch_key)
             if active_batch is not None:
@@ -2249,20 +2520,20 @@ class FlowWebService:
             title = (
                 str(request.title or "").strip()
                 or (
-                    f"Auto Trello Flow Agent: tạo {flow_agent_count_label} ảnh cho {len(items)} card"
-                    if request.auto_trello and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
-                    else f"Auto Trello Flow Agent: chạy đến hết {trello_source_hint.get('list_name') or self._trello_source_scope_label()} ({len(items)} card)"
-                    if request.auto_trello and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
-                    else f"Auto Trello AI: tạo {len(items)} ảnh từ card có ảnh"
-                    if request.auto_trello and not run_until_empty and any(item.get("generated_by_ai") for item in items)
-                    else f"Auto Trello AI: chạy đến hết {trello_source_hint.get('list_name') or self._trello_source_scope_label()} ({len(items)} card)"
-                    if request.auto_trello and run_until_empty and any(item.get("generated_by_ai") for item in items)
-                    else f"Auto Trello: tạo {len(items)} ảnh từ card có ảnh"
-                    if request.auto_trello and not run_until_empty
-                    else f"Auto Trello: chạy đến hết {trello_source_hint.get('list_name') or self._trello_source_scope_label()} ({len(items)} card)"
-                    if request.auto_trello and run_until_empty
-                    else f"Chạy {len(items)} prompt cho card {trello_source_hint.get('card_name')}"
-                    if trello_source_hint.get("card_name")
+                    f"Auto ERP Flow Agent: tạo {flow_agent_count_label} ảnh cho {len(items)} card"
+                    if request.auto_erp and not run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+                    else f"Auto ERP Flow Agent: chạy đến hết {erp_source_hint.get('list_name') or self._erp_source_scope_label()} ({len(items)} card)"
+                    if request.auto_erp and run_until_empty and any(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items)
+                    else f"Auto ERP AI: tạo {len(items)} ảnh từ card có ảnh"
+                    if request.auto_erp and not run_until_empty and any(item.get("generated_by_ai") for item in items)
+                    else f"Auto ERP AI: chạy đến hết {erp_source_hint.get('list_name') or self._erp_source_scope_label()} ({len(items)} card)"
+                    if request.auto_erp and run_until_empty and any(item.get("generated_by_ai") for item in items)
+                    else f"Auto ERP: tạo {len(items)} ảnh từ card có ảnh"
+                    if request.auto_erp and not run_until_empty
+                    else f"Auto ERP: chạy đến hết {erp_source_hint.get('list_name') or self._erp_source_scope_label()} ({len(items)} card)"
+                    if request.auto_erp and run_until_empty
+                    else f"Chạy {len(items)} prompt cho card {erp_source_hint.get('task_name')}"
+                    if erp_source_hint.get("task_name")
                     else f"Chạy batch {len(items)} prompt từ sheet"
                 )
             )
@@ -2277,7 +2548,7 @@ class FlowWebService:
                     "run_until_empty": run_until_empty,
                     "job": _model_dump(base_request),
                     "items": items,
-                    "trello_source_hint": trello_source_hint,
+                    "erp_source_hint": erp_source_hint,
                     "batch_key": batch_key,
                 },
                 result={
@@ -2285,7 +2556,7 @@ class FlowWebService:
                     "completed": 0,
                     "failed": 0,
                     "child_job_ids": [],
-                    "trello_source_hint": trello_source_hint,
+                    "erp_source_hint": erp_source_hint,
                     "batch_key": batch_key,
                     "run_until_empty": run_until_empty,
                 },
@@ -2311,14 +2582,14 @@ class FlowWebService:
                     "product_name": str(item.product_name or "").strip(),
                     "index": str(item.index or "").strip(),
                     "notes": str(item.notes or "").strip(),
-                    "trello_card_id": str(item.trello_card_id or "").strip(),
-                    "trello_list_id": str(item.trello_list_id or "").strip(),
-                    "trello_attachment_ids": self._normalize_trello_attachment_ids(item.trello_attachment_ids),
-                    "trello_source_card_id": self._normalize_trello_card_id(
-                        str(item.trello_source_card_id or item.trello_card_id or "").strip()
+                    "erp_task_id": str(item.erp_task_id or "").strip(),
+                    "erp_status_id": str(item.erp_status_id or "").strip(),
+                    "erp_attachment_ids": self._normalize_erp_attachment_ids(item.erp_attachment_ids),
+                    "erp_source_task_id": self._normalize_erp_task_id(
+                        str(item.erp_source_task_id or item.erp_task_id or "").strip()
                     ),
-                    "trello_source_attachment_ids": self._normalize_trello_attachment_ids(
-                        item.trello_source_attachment_ids or item.trello_attachment_ids
+                    "erp_source_attachment_ids": self._normalize_erp_attachment_ids(
+                        item.erp_source_attachment_ids or item.erp_attachment_ids
                     ),
                 }
             )
@@ -2326,12 +2597,12 @@ class FlowWebService:
                 break
         return normalized
 
-    async def _align_prompt_batch_with_trello_source(
+    async def _align_prompt_batch_with_erp_source(
         self,
         base_request: CreateJobRequest,
         items: List[Dict[str, Any]],
     ) -> tuple[CreateJobRequest, List[Dict[str, Any]], Dict[str, Any]]:
-        if not items or any(str(item.get("trello_card_id") or "").strip() for item in items):
+        if not items or any(str(item.get("erp_task_id") or "").strip() for item in items):
             return base_request, items, {}
 
         graph = self._automation_graph_payload(base_request)
@@ -2339,7 +2610,7 @@ class FlowWebService:
             (
                 item
                 for item in graph["modules"]
-                if item["enabled"] and item["type"] == "trello_source"
+                if item["enabled"] and item["type"] == "erp_source"
             ),
             None,
         )
@@ -2347,30 +2618,30 @@ class FlowWebService:
             return base_request, items, {}
 
         module_request = self._request_with_automation_module_settings(base_request, module)
-        source_hint = await asyncio.to_thread(self._trello_source_card_hint, module_request)
+        source_hint = await asyncio.to_thread(self._erp_source_task_hint, module_request)
         if not source_hint:
-            source_hint = await asyncio.to_thread(self._trello_matching_image_card_hint, module_request, items)
+            source_hint = await asyncio.to_thread(self._erp_matching_image_card_hint, module_request, items)
         if not source_hint:
             return base_request, items, {}
 
-        matched = [item for item in items if self._prompt_batch_item_matches_trello_source(item, source_hint)]
+        matched = [item for item in items if self._prompt_batch_item_matches_erp_source(item, source_hint)]
         if not matched:
-            source_label = source_hint.get("card_name") or source_hint.get("card_id") or "card Trello đang ở list nguồn"
+            source_label = source_hint.get("task_name") or source_hint.get("task_id") or "card ERP đang ở list nguồn"
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Card Trello nguồn là {source_label}, nhưng sheet chưa có prompt Active khớp Product_Key/Product_Name. "
-                    "Hãy đổi tên card theo Product_Key trong sheet, điền ô Lọc sản phẩm, hoặc thêm cột Trello_Card/Card_URL vào sheet."
+                    f"Card ERP nguồn là {source_label}, nhưng sheet chưa có prompt Active khớp Product_Key/Product_Name. "
+                    "Hãy đổi tên card theo Product_Key trong sheet, điền ô Lọc sản phẩm, hoặc thêm cột ERP_Task/Card_URL vào sheet."
                 ),
             )
 
         payload = _model_dump(base_request)
-        payload["trello_card_id"] = payload.get("trello_card_id") or str(source_hint.get("card_id") or "")
-        if source_hint.get("list_id"):
-            payload["trello_list_id"] = payload.get("trello_list_id") or str(source_hint.get("list_id") or "")
+        payload["erp_task_id"] = payload.get("erp_task_id") or str(source_hint.get("task_id") or "")
+        if source_hint.get("status"):
+            payload["erp_status_id"] = payload.get("erp_status_id") or str(source_hint.get("status") or "")
         return CreateJobRequest(**payload), matched, source_hint
 
-    async def _expand_prompt_batch_with_trello_images(
+    async def _expand_prompt_batch_with_erp_images(
         self,
         base_request: CreateJobRequest,
         items: List[Dict[str, Any]],
@@ -2382,17 +2653,17 @@ class FlowWebService:
             (
                 item
                 for item in graph["modules"]
-                if item["enabled"] and item["type"] == "trello_source"
+                if item["enabled"] and item["type"] == "erp_source"
             ),
             None,
         )
         if module is None:
-            raise HTTPException(status_code=400, detail="Auto Trello cần bật cục Trello Image Source.")
+            raise HTTPException(status_code=400, detail="Auto ERP cần bật cục ERP Task Source.")
 
         module_request = self._request_with_automation_module_settings(base_request, module)
         try:
             expanded_items, discovery = await asyncio.to_thread(
-                self._trello_prompt_items_for_image_cards,
+                self._erp_prompt_items_for_image_cards,
                 module_request,
                 items,
                 limit,
@@ -2402,13 +2673,13 @@ class FlowWebService:
             raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
 
         payload = _model_dump(base_request)
-        if discovery.get("board_id"):
-            payload["trello_board_id"] = payload.get("trello_board_id") or str(discovery.get("board_id") or "")
-        if discovery.get("list_id"):
-            payload["trello_list_id"] = str(discovery.get("list_id") or "")
+        if discovery.get("project_id"):
+            payload["erp_project_id"] = payload.get("erp_project_id") or str(discovery.get("project_id") or "")
+        if discovery.get("status"):
+            payload["erp_status_id"] = str(discovery.get("status") or "")
         return CreateJobRequest(**payload), expanded_items, discovery
 
-    async def _continuous_auto_trello_base_request(
+    async def _continuous_auto_erp_base_request(
         self,
         base_request: CreateJobRequest,
     ) -> tuple[CreateJobRequest, Dict[str, Any]]:
@@ -2417,43 +2688,43 @@ class FlowWebService:
             (
                 item
                 for item in graph["modules"]
-                if item["enabled"] and item["type"] == "trello_source"
+                if item["enabled"] and item["type"] == "erp_source"
             ),
             None,
         )
         if module is None:
-            raise HTTPException(status_code=400, detail="Auto AI Trello liên tục cần bật cục Trello Image Source.")
+            raise HTTPException(status_code=400, detail="Auto AI ERP liên tục cần bật cục ERP Task Source.")
 
         def _resolve_scope() -> Dict[str, Any]:
-            key, token = self._trello_credentials()
+            key, token = self._erp_credentials()
             if not key or not token:
-                raise RuntimeError("Auto AI Trello liên tục cần API key/token Trello để quét card mới.")
-            trello_config = self.store.snapshot().trello_config
-            board_id = self._normalize_trello_board_id(
-                trello_config.board_id
-                or base_request.trello_board_id
-                or os.getenv("TRELLO_BOARD_ID", "")
+                raise RuntimeError("Auto AI ERP liên tục cần API key/API secret để quét Task mới.")
+            erp_config = self.store.snapshot().erp_config
+            project_id = self._normalize_erp_project_id(
+                erp_config.project_id
+                or base_request.erp_project_id
+                or os.getenv("ERP_PROJECT_ID", "")
             )
-            if not board_id:
-                raise RuntimeError("Auto AI Trello liên tục cần Board URL/Board ID để tìm card mới.")
-            raw_list_id = self._normalize_trello_id(
-                trello_config.list_id
-                or os.getenv("TRELLO_LIST_ID", "")
-                or self._default_trello_source_list_name()
+            if not project_id:
+                raise RuntimeError("Auto AI ERP liên tục cần một ERP Project (ví dụ PROJ-0013) để tìm Task mới.")
+            raw_list_id = self._normalize_erp_id(
+                erp_config.status
+                or os.getenv("ERP_STATUS_ID", "")
+                or self._default_erp_source_list_name()
             )
-            list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
+            list_ids = self._erp_auto_source_list_ids(key, token, project_id, raw_list_id)
             if not list_ids:
                 raise RuntimeError(
-                    f"Auto AI Trello liên tục chỉ quét cột {self._trello_source_scope_label()}. "
-                    "Hãy chọn đúng list trong cục Trello Image Source."
+                    f"Auto AI ERP liên tục chỉ quét cột {self._erp_source_scope_label()}. "
+                    "Hãy chọn đúng trạng thái nguồn trong cục ERP Task Source."
                 )
-            list_names = [self._trello_list_name(key, token, item) for item in list_ids]
+            list_names = [self._erp_status_name(key, token, item) for item in list_ids]
             return {
-                "mode": "auto_trello_continuous",
-                "board_id": board_id,
-                "list_id": list_ids[0],
+                "mode": "auto_erp_continuous",
+                "project_id": project_id,
+                "status": list_ids[0],
                 "list_ids": list_ids,
-                "list_name": self._trello_source_scope_label(list_names),
+                "list_name": self._erp_source_scope_label(list_names),
                 "list_names": [name for name in list_names if name],
                 "match_mode": "flow_agent",
                 "prompt_mode": "flow_agent",
@@ -2465,46 +2736,46 @@ class FlowWebService:
             raise HTTPException(status_code=400, detail=humanize_flow_error(str(exc))) from exc
 
         payload = _model_dump(base_request)
-        self._force_auto_trello_flow_agent_policy(payload)
-        payload["trello_board_id"] = str(discovery.get("board_id") or "")
-        payload["trello_list_id"] = str(discovery.get("list_id") or "")
-        payload["trello_card_id"] = ""
-        payload["trello_attachment_ids"] = []
-        payload["trello_source_card_id"] = ""
-        payload["trello_source_attachment_ids"] = []
-        self._sync_trello_scope_into_automation_graph(
+        self._force_auto_erp_flow_agent_policy(payload)
+        payload["erp_project_id"] = str(discovery.get("project_id") or "")
+        payload["erp_status_id"] = str(discovery.get("status") or "")
+        payload["erp_task_id"] = ""
+        payload["erp_attachment_ids"] = []
+        payload["erp_source_task_id"] = ""
+        payload["erp_source_attachment_ids"] = []
+        self._sync_erp_scope_into_automation_graph(
             payload,
-            board_id=payload["trello_board_id"],
-            list_id=payload["trello_list_id"],
-            card_id="",
+            project_id=payload["erp_project_id"],
+            status=payload["erp_status_id"],
+            task_id="",
             attachment_ids=[],
             clear_card=True,
         )
         return CreateJobRequest(**payload), discovery
 
-    def _auto_trello_flow_agent_request(self, request: CreateJobRequest) -> CreateJobRequest:
+    def _auto_erp_flow_agent_request(self, request: CreateJobRequest) -> CreateJobRequest:
         payload = _model_dump(request)
-        self._force_auto_trello_flow_agent_policy(payload)
+        self._force_auto_erp_flow_agent_policy(payload)
         return CreateJobRequest(**payload)
 
-    def _clear_auto_trello_search_filter(self, payload: Dict[str, Any]) -> None:
+    def _clear_auto_erp_search_filter(self, payload: Dict[str, Any]) -> None:
         payload["prompt_product"] = ""
         payload["prompt_product_key"] = ""
         payload["prompt_notes"] = ""
-        payload["trello_card_id"] = ""
-        payload["trello_attachment_ids"] = []
-        payload["trello_source_card_id"] = ""
-        payload["trello_source_attachment_ids"] = []
-        self._sync_trello_scope_into_automation_graph(
+        payload["erp_task_id"] = ""
+        payload["erp_attachment_ids"] = []
+        payload["erp_source_task_id"] = ""
+        payload["erp_source_attachment_ids"] = []
+        self._sync_erp_scope_into_automation_graph(
             payload,
-            board_id=str(payload.get("trello_board_id") or "").strip(),
-            list_id=str(payload.get("trello_list_id") or "").strip(),
-            card_id="",
+            project_id=str(payload.get("erp_project_id") or "").strip(),
+            status=str(payload.get("erp_status_id") or "").strip(),
+            task_id="",
             attachment_ids=[],
             clear_card=True,
         )
 
-    def _force_auto_trello_flow_agent_policy(self, payload: Dict[str, Any]) -> None:
+    def _force_auto_erp_flow_agent_policy(self, payload: Dict[str, Any]) -> None:
         payload["model"] = self.DEFAULT_IMAGE_MODEL
         payload["aspect"] = "square"
         payload["count"] = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
@@ -2529,13 +2800,13 @@ class FlowWebService:
             settings["flowAgentEnabled"] = True
             settings["flowAgentAutoApprove"] = True
 
-    def _sync_trello_scope_into_automation_graph(
+    def _sync_erp_scope_into_automation_graph(
         self,
         payload: Dict[str, Any],
         *,
-        board_id: str = "",
-        list_id: str = "",
-        card_id: str = "",
+        project_id: str = "",
+        status: str = "",
+        task_id: str = "",
         attachment_ids: List[str] | None = None,
         clear_card: bool = False,
     ) -> None:
@@ -2545,40 +2816,40 @@ class FlowWebService:
         modules = graph.get("modules")
         if not isinstance(modules, list):
             return
-        normalized_attachments = self._normalize_trello_attachment_ids(attachment_ids or [])
+        normalized_attachments = self._normalize_erp_attachment_ids(attachment_ids or [])
         for module in modules:
-            if not isinstance(module, dict) or module.get("type") not in {"trello_source", "trello"}:
+            if not isinstance(module, dict) or module.get("type") not in {"erp_source", "erp"}:
                 continue
             settings = module.get("settings")
             if not isinstance(settings, dict):
                 settings = {}
                 module["settings"] = settings
-            if board_id:
-                settings["trelloBoard"] = board_id
-            if list_id:
-                settings["trelloList"] = list_id
+            if project_id:
+                settings["erpProject"] = project_id
+            if status:
+                settings["erpStatus"] = status
             if clear_card:
-                settings["trelloCard"] = ""
-                settings["trelloAttachmentIds"] = []
-                settings.pop("trelloAttachmentId", None)
-            elif card_id:
-                settings["trelloCard"] = card_id
-                settings["trelloAttachmentIds"] = normalized_attachments
-                settings.pop("trelloAttachmentId", None)
+                settings["erpTask"] = ""
+                settings["erpAttachmentIds"] = []
+                settings.pop("erpAttachmentId", None)
+            elif task_id:
+                settings["erpTask"] = task_id
+                settings["erpAttachmentIds"] = normalized_attachments
+                settings.pop("erpAttachmentId", None)
 
-    def _continuous_auto_trello_batch_key(self, request: CreateJobRequest, trello_source_hint: Dict[str, Any]) -> str:
-        board_id = str(trello_source_hint.get("board_id") or request.trello_board_id or "").strip()
-        list_id = str(trello_source_hint.get("list_id") or request.trello_list_id or "").strip()
-        query = self._compact_match_text(self._trello_auto_search_query(request))
-        return "|".join(["continuous_auto_trello", board_id, list_id, query]).strip("|")
+    def _continuous_auto_erp_batch_key(self, request: CreateJobRequest, erp_source_hint: Dict[str, Any]) -> str:
+        project_id = str(erp_source_hint.get("project_id") or request.erp_project_id or "").strip()
+        status = str(erp_source_hint.get("status") or request.erp_status_id or "").strip()
+        query = self._compact_match_text(self._erp_auto_search_query(request))
+        return "|".join(["continuous_auto_erp", project_id, status, query]).strip("|")
 
-    def _prompt_batch_item_matches_trello_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
-        item_card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
-        source_card_id = self._normalize_trello_card_id(str(source_hint.get("card_id") or ""))
+    def _prompt_batch_item_matches_erp_source(self, item: Dict[str, Any], source_hint: Dict[str, Any]) -> bool:
+        item_card_id = self._normalize_erp_task_id(str(item.get("erp_task_id") or ""))
+        source_task_id = self._normalize_erp_task_id(str(source_hint.get("task_id") or ""))
         if item_card_id:
-            return bool(source_card_id and item_card_id == source_card_id)
+            return bool(source_task_id and item_card_id == source_task_id)
 
-        source_terms = [source_hint.get("card_name")]
+        source_terms = [source_hint.get("task_name")]
         source_text = " ".join(self._compact_match_text(value) for value in source_terms if value)
         if not source_text:
             return False
@@ -2603,34 +2874,34 @@ class FlowWebService:
         self,
         request: CreateJobRequest,
         items: List[Dict[str, Any]],
-        trello_source_hint: Dict[str, Any],
+        erp_source_hint: Dict[str, Any],
     ) -> str:
-        card_id = str(trello_source_hint.get("card_id") or request.trello_card_id or "").strip()
-        list_id = str(trello_source_hint.get("list_id") or request.trello_list_id or "").strip()
+        task_id = str(erp_source_hint.get("task_id") or request.erp_task_id or "").strip()
+        status = str(erp_source_hint.get("status") or request.erp_status_id or "").strip()
         rows = ",".join(str(item.get("row") or "") for item in items)
         prompt_keys = ",".join(str(item.get("product_key") or item.get("product") or "") for item in items)
-        item_card_ids = ",".join(str(item.get("trello_card_id") or "") for item in items)
-        source_card_ids = ",".join(str(item.get("trello_source_card_id") or "") for item in items)
-        attachment_ids = ",".join(self._normalize_trello_attachment_ids(request.trello_attachment_ids))
-        source_attachment_ids = ",".join(self._normalize_trello_attachment_ids(request.trello_source_attachment_ids))
+        item_card_ids = ",".join(str(item.get("erp_task_id") or "") for item in items)
+        source_task_ids = ",".join(str(item.get("erp_source_task_id") or "") for item in items)
+        attachment_ids = ",".join(self._normalize_erp_attachment_ids(request.erp_attachment_ids))
+        source_attachment_ids = ",".join(self._normalize_erp_attachment_ids(request.erp_source_attachment_ids))
         item_attachment_ids = ",".join(
-            ",".join(self._normalize_trello_attachment_ids(item.get("trello_attachment_ids")))
+            ",".join(self._normalize_erp_attachment_ids(item.get("erp_attachment_ids")))
             for item in items
         )
         item_source_attachment_ids = ",".join(
-            ",".join(self._normalize_trello_attachment_ids(item.get("trello_source_attachment_ids")))
+            ",".join(self._normalize_erp_attachment_ids(item.get("erp_source_attachment_ids")))
             for item in items
         )
         return "|".join(
             [
-                card_id,
-                list_id,
+                task_id,
+                status,
                 attachment_ids,
                 source_attachment_ids,
                 rows,
                 prompt_keys,
                 item_card_ids,
-                source_card_ids,
+                source_task_ids,
                 item_attachment_ids,
                 item_source_attachment_ids,
             ]
@@ -2649,11 +2920,11 @@ class FlowWebService:
 
     def _prompt_batch_child_title(self, item: Dict[str, Any], index: int, total: int) -> str:
         if item.get("flow_agent_instruction") or item.get("generated_by_flow_agent"):
-            label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
+            label = str(item.get("erp_task_name") or item.get("product") or "").strip() or f"Card {index + 1}"
             image_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(item.get("flow_agent_image_count") or self.FLOW_AGENT_DEFAULT_IMAGE_COUNT)))
             return f"Flow Agent {index + 1}/{total} · {label} · {image_count} ảnh"[:120]
         if item.get("generated_by_ai"):
-            label = str(item.get("trello_card_name") or item.get("product") or "").strip() or f"Card {index + 1}"
+            label = str(item.get("erp_task_name") or item.get("product") or "").strip() or f"Card {index + 1}"
             shot_label = str(item.get("shot_label") or "").strip()
             suffix = f" · {shot_label}" if shot_label else ""
             return f"AI {index + 1}/{total} · {label}{suffix}"[:120]
@@ -2677,7 +2948,7 @@ class FlowWebService:
             payload["count"] = image_count
             payload["flow_agent_enabled"] = True
             payload["flow_agent_auto_approve"] = True
-            self._force_auto_trello_flow_agent_policy(payload)
+            self._force_auto_erp_flow_agent_policy(payload)
             payload["count"] = image_count
             graph = payload.get("automation_graph")
             modules = graph.get("modules") if isinstance(graph, dict) else []
@@ -2686,29 +2957,29 @@ class FlowWebService:
                     settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
                     settings["imageCount"] = image_count
                     module["settings"] = settings
-        if item.get("trello_card_id"):
-            payload["trello_card_id"] = str(item.get("trello_card_id") or "").strip()
-        if item.get("trello_list_id"):
-            payload["trello_list_id"] = str(item.get("trello_list_id") or "").strip()
-        if item.get("trello_attachment_ids"):
-            payload["trello_attachment_ids"] = self._normalize_trello_attachment_ids(item.get("trello_attachment_ids"))
-        source_card_id = self._normalize_trello_card_id(
-            str(item.get("trello_source_card_id") or item.get("trello_card_id") or "").strip()
+        if item.get("erp_task_id"):
+            payload["erp_task_id"] = str(item.get("erp_task_id") or "").strip()
+        if item.get("erp_status_id"):
+            payload["erp_status_id"] = str(item.get("erp_status_id") or "").strip()
+        if item.get("erp_attachment_ids"):
+            payload["erp_attachment_ids"] = self._normalize_erp_attachment_ids(item.get("erp_attachment_ids"))
+        source_task_id = self._normalize_erp_task_id(
+            str(item.get("erp_source_task_id") or item.get("erp_task_id") or "").strip()
         )
-        source_attachment_ids = self._normalize_trello_attachment_ids(
-            item.get("trello_source_attachment_ids") or item.get("trello_attachment_ids") or []
+        source_attachment_ids = self._normalize_erp_attachment_ids(
+            item.get("erp_source_attachment_ids") or item.get("erp_attachment_ids") or []
         )
-        if source_card_id:
-            payload["trello_source_card_id"] = source_card_id
+        if source_task_id:
+            payload["erp_source_task_id"] = source_task_id
         if source_attachment_ids:
-            payload["trello_source_attachment_ids"] = source_attachment_ids
-        if item.get("trello_card_id") or item.get("trello_list_id"):
-            self._sync_trello_scope_into_automation_graph(
+            payload["erp_source_attachment_ids"] = source_attachment_ids
+        if item.get("erp_task_id") or item.get("erp_status_id"):
+            self._sync_erp_scope_into_automation_graph(
                 payload,
-                board_id=str(payload.get("trello_board_id") or "").strip(),
-                list_id=str(payload.get("trello_list_id") or "").strip(),
-                card_id=str(payload.get("trello_card_id") or "").strip(),
-                attachment_ids=self._normalize_trello_attachment_ids(payload.get("trello_attachment_ids") or []),
+                project_id=str(payload.get("erp_project_id") or "").strip(),
+                status=str(payload.get("erp_status_id") or "").strip(),
+                task_id=str(payload.get("erp_task_id") or "").strip(),
+                attachment_ids=self._normalize_erp_attachment_ids(payload.get("erp_attachment_ids") or []),
             )
         return CreateJobRequest(**payload)
 
@@ -2727,7 +2998,7 @@ class FlowWebService:
         existing = self.store.get_job(batch_id)
         existing_input = existing.input if existing is not None and isinstance(existing.input, dict) else {}
         existing_result = existing.result if existing is not None and isinstance(existing.result, dict) else {}
-        trello_source_hint = existing_result.get("trello_source_hint") or existing_input.get("trello_source_hint") or {}
+        erp_source_hint = existing_result.get("erp_source_hint") or existing_input.get("erp_source_hint") or {}
         batch_key = str(existing_result.get("batch_key") or existing_input.get("batch_key") or "").strip()
         run_until_empty = bool(existing_result.get("run_until_empty") or existing_input.get("run_until_empty"))
         continuous = bool(existing_result.get("continuous") or existing_input.get("continuous"))
@@ -2741,8 +3012,8 @@ class FlowWebService:
             "current_index": current_index,
             "current_child_job_id": current_child_job_id,
         }
-        if trello_source_hint:
-            result["trello_source_hint"] = trello_source_hint
+        if erp_source_hint:
+            result["erp_source_hint"] = erp_source_hint
         if batch_key:
             result["batch_key"] = batch_key
         if run_until_empty:
@@ -2762,100 +3033,100 @@ class FlowWebService:
             result=result,
         )
 
-    def _prompt_batch_auto_trello_mode(self, batch_id: str) -> bool:
+    def _prompt_batch_auto_erp_mode(self, batch_id: str) -> bool:
         job = self.store.get_job(batch_id)
         if job is None:
             return False
         job_input = job.input if isinstance(job.input, dict) else {}
         job_result = job.result if isinstance(job.result, dict) else {}
-        trello_source_hint = job_result.get("trello_source_hint") or job_input.get("trello_source_hint") or {}
-        return str(trello_source_hint.get("mode") or "").strip() == "auto_trello"
+        erp_source_hint = job_result.get("erp_source_hint") or job_input.get("erp_source_hint") or {}
+        return str(erp_source_hint.get("mode") or "").strip() == "auto_erp"
 
-    def _auto_trello_live_scan_request(self, request: CreateJobRequest, *, preserve_card: bool = False) -> CreateJobRequest:
+    def _auto_erp_live_scan_request(self, request: CreateJobRequest, *, preserve_card: bool = False) -> CreateJobRequest:
         payload = _model_dump(request)
-        self._force_auto_trello_flow_agent_policy(payload)
+        self._force_auto_erp_flow_agent_policy(payload)
         if preserve_card:
-            card_id = self._normalize_trello_card_id(str(payload.get("trello_source_card_id") or payload.get("trello_card_id") or ""))
-            attachment_ids = self._normalize_trello_attachment_ids(
-                payload.get("trello_source_attachment_ids") or payload.get("trello_attachment_ids") or []
+            task_id = self._normalize_erp_task_id(str(payload.get("erp_source_task_id") or payload.get("erp_task_id") or ""))
+            attachment_ids = self._normalize_erp_attachment_ids(
+                payload.get("erp_source_attachment_ids") or payload.get("erp_attachment_ids") or []
             )
-            if card_id:
-                payload["trello_card_id"] = card_id
-                payload["trello_source_card_id"] = card_id
+            if task_id:
+                payload["erp_task_id"] = task_id
+                payload["erp_source_task_id"] = task_id
             if attachment_ids:
-                payload["trello_attachment_ids"] = attachment_ids
-                payload["trello_source_attachment_ids"] = attachment_ids
-            self._sync_trello_scope_into_automation_graph(
+                payload["erp_attachment_ids"] = attachment_ids
+                payload["erp_source_attachment_ids"] = attachment_ids
+            self._sync_erp_scope_into_automation_graph(
                 payload,
-                board_id=str(payload.get("trello_board_id") or "").strip(),
-                list_id=str(payload.get("trello_list_id") or "").strip(),
-                card_id=card_id,
+                project_id=str(payload.get("erp_project_id") or "").strip(),
+                status=str(payload.get("erp_status_id") or "").strip(),
+                task_id=task_id,
                 attachment_ids=attachment_ids,
             )
         else:
-            payload["trello_card_id"] = ""
-            payload["trello_attachment_ids"] = []
-            payload["trello_source_card_id"] = ""
-            payload["trello_source_attachment_ids"] = []
-            self._sync_trello_scope_into_automation_graph(
+            payload["erp_task_id"] = ""
+            payload["erp_attachment_ids"] = []
+            payload["erp_source_task_id"] = ""
+            payload["erp_source_attachment_ids"] = []
+            self._sync_erp_scope_into_automation_graph(
                 payload,
-                board_id=str(payload.get("trello_board_id") or "").strip(),
-                list_id=str(payload.get("trello_list_id") or "").strip(),
-                card_id="",
+                project_id=str(payload.get("erp_project_id") or "").strip(),
+                status=str(payload.get("erp_status_id") or "").strip(),
+                task_id="",
                 attachment_ids=[],
                 clear_card=True,
             )
         return CreateJobRequest(**payload)
 
-    def _auto_trello_live_seed_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _auto_erp_live_seed_items(self, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if not items:
             return []
         if all(item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items):
             return []
         return items
 
-    async def _next_live_auto_trello_prompt_item(
+    async def _next_live_auto_erp_prompt_item(
         self,
         batch_id: str,
         base_request: CreateJobRequest,
         seed_items: List[Dict[str, Any]],
         attempted_card_ids: set[str],
     ) -> tuple[CreateJobRequest, Dict[str, Any], Dict[str, Any]]:
-        preserve_card = bool(self._normalize_trello_card_id(base_request.trello_card_id))
-        scan_request = self._auto_trello_live_scan_request(base_request, preserve_card=preserve_card)
-        live_seed_items = self._auto_trello_live_seed_items(seed_items)
+        preserve_card = bool(self._normalize_erp_task_id(base_request.erp_task_id))
+        scan_request = self._auto_erp_live_scan_request(base_request, preserve_card=preserve_card)
+        live_seed_items = self._auto_erp_live_seed_items(seed_items)
         scan_limit = 0 if len(attempted_card_ids) >= self.MAX_PROMPT_BATCH_ITEMS else max(1, len(attempted_card_ids) + 1)
         try:
-            scan_request, live_items, discovery = await self._expand_prompt_batch_with_trello_images(
+            scan_request, live_items, discovery = await self._expand_prompt_batch_with_erp_images(
                 scan_request,
                 live_seed_items,
                 scan_limit,
             )
         except HTTPException as exc:
             detail = self._flow_error_detail(exc)
-            if self._auto_trello_waitable_empty_error(detail):
+            if self._auto_erp_waitable_empty_error(detail):
                 await self.store.append_log(
                     batch_id,
-                    f"Không còn card hợp lệ trong {self._trello_source_scope_label()} khi quét lại trước card tiếp theo: {detail}",
+                    f"Không còn card hợp lệ trong {self._erp_source_scope_label()} khi quét lại trước card tiếp theo: {detail}",
                 )
                 return scan_request, {}, {}
             raise
 
         for item in live_items:
-            card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
-            if card_id and card_id in attempted_card_ids:
+            task_id = self._normalize_erp_task_id(str(item.get("erp_task_id") or ""))
+            if task_id and task_id in attempted_card_ids:
                 continue
             return scan_request, item, discovery
 
         if live_items:
             await self.store.append_log(
                 batch_id,
-                f"Tất cả card còn thấy trong {self._trello_source_scope_label()} đã được thử trong batch này; không lặp lại card cũ.",
+                f"Tất cả card còn thấy trong {self._erp_source_scope_label()} đã được thử trong batch này; không lặp lại card cũ.",
             )
         else:
             await self.store.append_log(
                 batch_id,
-                f"Không còn card hợp lệ trong {self._trello_source_scope_label()} khi quét lại trước card tiếp theo.",
+                f"Không còn card hợp lệ trong {self._erp_source_scope_label()} khi quét lại trước card tiếp theo.",
             )
         return scan_request, {}, discovery
 
@@ -2867,7 +3138,7 @@ class FlowWebService:
         uses_flow_agent = self._flow_agent_enabled_for_request(base_request) or any(
             item.get("flow_agent_instruction") or item.get("generated_by_flow_agent") for item in items
         )
-        live_auto_trello = self._prompt_batch_auto_trello_mode(batch_id) and uses_flow_agent
+        live_auto_erp = self._prompt_batch_auto_erp_mode(batch_id) and uses_flow_agent
         attempted_card_ids: set[str] = set()
         await self.store.patch_job(batch_id, status="running")
         await self.store.append_log(
@@ -2876,10 +3147,10 @@ class FlowWebService:
             if uses_flow_agent
             else f"Bắt đầu vòng lặp {total} prompt active từ sheet.",
         )
-        if live_auto_trello:
+        if live_auto_erp:
             await self.store.append_log(
                 batch_id,
-                f"Auto Trello sẽ quét lại {self._trello_source_scope_label()} trước mỗi card, khóa card_id và ảnh nguồn từ Trello trước khi gửi Flow Agent.",
+                f"Auto ERP sẽ quét lại {self._erp_source_scope_label()} trước mỗi card, khóa task_id và ảnh nguồn từ ERP trước khi gửi Flow Agent.",
             )
 
         try:
@@ -2889,8 +3160,8 @@ class FlowWebService:
                     break
                 child_base_request = base_request
                 live_discovery: Dict[str, Any] = {}
-                if live_auto_trello:
-                    child_base_request, live_item, live_discovery = await self._next_live_auto_trello_prompt_item(
+                if live_auto_erp:
+                    child_base_request, live_item, live_discovery = await self._next_live_auto_erp_prompt_item(
                         batch_id,
                         base_request,
                         items,
@@ -2911,8 +3182,8 @@ class FlowWebService:
                         break
                     item = live_item
                 child_request = self._prompt_batch_child_request(child_base_request, item, index, total)
-                item_card_id = self._normalize_trello_card_id(child_request.trello_card_id)
-                if live_auto_trello and item_card_id:
+                item_card_id = self._normalize_erp_task_id(child_request.erp_task_id)
+                if live_auto_erp and item_card_id:
                     attempted_card_ids.add(item_card_id)
                 self._validate_job_request(child_request)
                 child_job = JobRecord(
@@ -2932,7 +3203,7 @@ class FlowWebService:
                     current_index=index + 1,
                     current_child_job_id=child_job.id,
                     extra={
-                        **({"trello_source_hint": live_discovery} if live_discovery else {}),
+                        **({"erp_source_hint": live_discovery} if live_discovery else {}),
                         **({"seen_card_ids": sorted(attempted_card_ids)} if attempted_card_ids else {}),
                     },
                 )
@@ -2956,12 +3227,12 @@ class FlowWebService:
                 if uses_flow_agent and ai_title:
                     await self.store.append_log(
                         batch_id,
-                        f"Da ghi AI title vao mo ta Trello cho card {index + 1}/{total}: {ai_title}",
+                        f"Da ghi AI title vao mo ta ERP cho card {index + 1}/{total}: {ai_title}",
                     )
                 elif uses_flow_agent and ai_title_error:
                     await self.store.append_log(
                         batch_id,
-                        f"Chua ghi AI title vao mo ta Trello cho card {index + 1}/{total}: {ai_title_error}",
+                        f"Chua ghi AI title vao mo ta ERP cho card {index + 1}/{total}: {ai_title_error}",
                     )
 
                 await self._run_flow_job(child_job.id, child_request)
@@ -2974,8 +3245,8 @@ class FlowWebService:
                         if uses_flow_agent
                         else f"Prompt {index + 1}/{total} đã tạo ảnh và gửi qua các module sau Flow.",
                     )
-                    if live_auto_trello:
-                        await self._stop_prompt_batch_after_trello_upload(batch_id, saved_child)
+                    if live_auto_erp:
+                        await self._stop_prompt_batch_after_erp_upload(batch_id, saved_child)
                 else:
                     failed += 1
                     detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
@@ -3071,12 +3342,12 @@ class FlowWebService:
         input_payload = job.input if isinstance(job.input, dict) else {}
         return bool(result.get("stop_requested") or input_payload.get("stop_requested"))
 
-    def _child_job_completed_trello_upload(self, job: JobRecord | None) -> bool:
+    def _child_job_completed_erp_upload(self, job: JobRecord | None) -> bool:
         if job is None or job.status != "completed":
             return False
         result = job.result if isinstance(job.result, dict) else {}
-        trello = result.get("trello") if isinstance(result.get("trello"), dict) else {}
-        if not trello:
+        erp = result.get("erp") if isinstance(result.get("erp"), dict) else {}
+        if not erp:
             return False
 
         def as_int(value: Any) -> int:
@@ -3085,15 +3356,15 @@ class FlowWebService:
             except (TypeError, ValueError):
                 return 0
 
-        sent = as_int(trello.get("sent"))
-        failed = as_int(trello.get("failed"))
+        sent = as_int(erp.get("sent"))
+        failed = as_int(erp.get("failed"))
         artifact_count = as_int(result.get("count"))
         if sent <= 0 or failed > 0:
             return False
         return artifact_count <= 0 or sent >= artifact_count
 
-    async def _stop_prompt_batch_after_trello_upload(self, batch_id: str, child_job: JobRecord | None) -> bool:
-        if not self._child_job_completed_trello_upload(child_job):
+    async def _stop_prompt_batch_after_erp_upload(self, batch_id: str, child_job: JobRecord | None) -> bool:
+        if not self._child_job_completed_erp_upload(child_job):
             return False
         already_requested = self._prompt_batch_stop_requested(batch_id)
         job = self.store.get_job(batch_id)
@@ -3109,37 +3380,60 @@ class FlowWebService:
         if not already_requested:
             await self.store.append_log(
                 batch_id,
-                "Da upload anh len Trello xong; app tu dung Auto Trello de khong chay card tiep theo.",
+                "Đã ghi URL artifact đã duyệt vào comment ERP; app tự dừng Auto ERP để không chạy Task tiếp theo.",
             )
         return True
 
+    async def request_stop_job(self, job_id: str) -> JobRecord:
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy tác vụ này.")
+        result = dict(job.result or {})
+        result["stop_requested"] = True
+        result["continuous"] = bool(result.get("continuous") or (job.input or {}).get("continuous"))
+        if job.type == "batch_image":
+            if job.status in {"queued", "running", "polling"}:
+                updated = await self.store.patch_job(job_id, result=result)
+                await self.store.append_log(job_id, "Đã nhận lệnh dừng auto. App sẽ không nhận thêm card mới sau tác vụ hiện tại.")
+                return updated
+            updated = await self.store.patch_job(job_id, result=result)
+            await self.store.append_log(job_id, "Job auto này đã dừng từ trước.")
+            return updated
+        if job.status not in {"queued", "running"}:
+            return job
+        task = self._tasks.get(job_id)
+        if task is not None and not task.done():
+            task.cancel()
+        updated = await self.store.patch_job(job_id, status="cancelled", result=result)
+        await self.store.append_log(job_id, "Đã nhận lệnh dừng. Tác vụ Flow đang được huỷ.")
+        return updated
+
     async def request_stop_prompt_batch(self, job_id: str) -> JobRecord:
+        """Compatibility alias for integrations using the original batch-only API."""
         job = self.store.get_job(job_id)
         if job is None:
             raise HTTPException(status_code=404, detail="Không tìm thấy job auto này.")
         if job.type != "batch_image":
-            raise HTTPException(status_code=400, detail="Chỉ có thể dừng job Auto Trello/batch.")
-        result = dict(job.result or {})
-        result["stop_requested"] = True
-        result["continuous"] = bool(result.get("continuous") or (job.input or {}).get("continuous"))
-        if job.status in {"queued", "running", "polling"}:
-            updated = await self.store.patch_job(job_id, result=result)
-            await self.store.append_log(job_id, "Đã nhận lệnh dừng auto. App sẽ không nhận thêm card mới sau tác vụ hiện tại.")
-            return updated
-        updated = await self.store.patch_job(job_id, result=result)
-        await self.store.append_log(job_id, "Job auto này đã dừng từ trước.")
-        return updated
+            raise HTTPException(status_code=400, detail="Chỉ có thể dừng job Auto ERP/batch.")
+        return await self.request_stop_job(job_id)
 
-    def _auto_trello_waitable_empty_error(self, detail: str) -> bool:
+    def _auto_erp_waitable_empty_error(self, detail: str) -> bool:
         normalized = self._strip_accents(str(detail or "")).lower()
-        return "chua tim thay card" in normalized or "khong tim thay card" in normalized
+        return any(
+            signal in normalized
+            for signal in (
+                "chua tim thay card",
+                "khong tim thay card",
+                "chua tim thay task co anh phu hop",
+            )
+        )
 
-    def _auto_trello_should_stop_on_child_error(self, detail: str) -> bool:
+    def _auto_erp_should_stop_on_child_error(self, detail: str) -> bool:
         normalized = self._strip_accents(str(detail or "")).lower()
         stop_signals = (
-            "chua keo/upload duoc anh trello",
+            "chua keo/upload duoc anh erp",
             "chua keo duoc anh nguon",
-            "chua upload duoc anh trello",
+            "chua upload duoc anh erp",
             "chua xac minh duoc anh nguon",
             "khong thay attachment moi",
             "khong dung anh nguon",
@@ -3149,97 +3443,97 @@ class FlowWebService:
         )
         return any(signal in normalized for signal in stop_signals)
 
-    async def reset_ready_trello_outputs(self, request: ResetReadyTrelloRequest) -> Dict[str, Any]:
-        key, token = self._trello_credentials()
+    async def reset_ready_erp_outputs(self, request: ResetReadyERPRequest) -> Dict[str, Any]:
+        key, token = self._erp_credentials()
         if not key or not token:
-            raise HTTPException(status_code=400, detail="Chưa thiết lập Trello API key/token.")
-        board_id, list_ids = await self._ready_trello_board_and_lists(request, key, token)
+            raise HTTPException(status_code=400, detail="Chưa thiết lập ERP API key/API secret.")
+        project_id, list_ids = await self._ready_erp_project_and_lists(request, key, token)
         try:
-            result = await asyncio.to_thread(self._reset_ready_trello_outputs_sync, key, token, board_id, list_ids)
+            result = await asyncio.to_thread(self._reset_ready_erp_outputs_sync, key, token, project_id, list_ids)
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
         return result
 
-    async def ready_trello_status(self, request: ResetReadyTrelloRequest) -> Dict[str, Any]:
-        key, token = self._trello_credentials()
+    async def ready_erp_status(self, request: ResetReadyERPRequest) -> Dict[str, Any]:
+        key, token = self._erp_credentials()
         if not key or not token:
-            raise HTTPException(status_code=400, detail="Chưa thiết lập Trello API key/token.")
-        board_id, list_ids = await self._ready_trello_board_and_lists(request, key, token)
+            raise HTTPException(status_code=400, detail="Chưa thiết lập ERP API key/API secret.")
+        project_id, list_ids = await self._ready_erp_project_and_lists(request, key, token)
         try:
-            return await asyncio.to_thread(self._ready_trello_status_sync, key, token, board_id, list_ids)
+            return await asyncio.to_thread(self._ready_erp_status_sync, key, token, project_id, list_ids)
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
 
-    async def _ready_trello_board_and_lists(
+    async def _ready_erp_project_and_lists(
         self,
-        request: ResetReadyTrelloRequest,
+        request: ResetReadyERPRequest,
         key: str,
         token: str,
     ) -> tuple[str, List[str]]:
-        trello_config = self.store.snapshot().trello_config
-        assigned_board_id = self._normalize_trello_board_id(os.getenv("TRELLO_BOARD_ID", ""))
-        assigned_list_value = str(os.getenv("TRELLO_LIST_ID", "") or "").strip()
-        board_id = self._normalize_trello_board_id(
+        erp_config = self.store.snapshot().erp_config
+        assigned_board_id = self._normalize_erp_project_id(os.getenv("ERP_PROJECT_ID", ""))
+        assigned_list_value = str(os.getenv("ERP_STATUS_ID", "") or "").strip()
+        project_id = self._normalize_erp_project_id(
             assigned_board_id
-            or request.trello_board_id
-            or trello_config.board_id
-            or self.DEFAULT_TRELLO_BOARD_URL
+            or request.erp_project_id
+            or erp_config.project_id
+            or self.DEFAULT_ERP_PROJECT_URL
         )
-        raw_list_id = self._normalize_trello_id(
+        raw_list_id = self._normalize_erp_id(
             assigned_list_value
-            or request.trello_list_id
-            or trello_config.list_id
-            or self.DEFAULT_TRELLO_SOURCE_LIST_ID
+            or request.erp_status_id
+            or erp_config.status
+            or self.DEFAULT_ERP_SOURCE_LIST_ID
         )
-        if not board_id:
-            raise HTTPException(status_code=400, detail="Chưa có board Trello để kiểm tra.")
+        if not project_id:
+            raise HTTPException(status_code=400, detail="Chưa có board ERP để kiểm tra.")
         try:
             if assigned_list_value:
                 # Reset Ready is destructive. Keep it inside the list assigned
                 # to this process even if the browser sends stale localStorage.
                 list_ids = []
-                for value in self._split_trello_list_values(assigned_list_value):
+                for value in self._split_erp_status_values(assigned_list_value):
                     resolved = await asyncio.to_thread(
-                        self._trello_resolve_board_list_id,
+                        self._erp_resolve_board_list_id,
                         key,
                         token,
-                        board_id,
+                        project_id,
                         value,
                     )
-                    normalized = self._normalize_trello_id(resolved)
+                    normalized = self._normalize_erp_id(resolved)
                     if normalized and normalized not in list_ids:
                         list_ids.append(normalized)
             else:
                 list_ids = await asyncio.to_thread(
-                    self._trello_auto_source_list_ids,
+                    self._erp_auto_source_list_ids,
                     key,
                     token,
-                    board_id,
+                    project_id,
                     raw_list_id,
                 )
             if not list_ids:
-                raise RuntimeError(f"Không tìm thấy list {self._trello_source_scope_label()} trên board Trello.")
+                raise RuntimeError(f"Không tìm thấy list {self._erp_source_scope_label()} trên board ERP.")
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
-        return board_id, list_ids
+        return project_id, list_ids
 
-    def _ready_trello_status_sync(self, key: str, token: str, board_id: str, list_ids: List[str]) -> Dict[str, Any]:
+    def _ready_erp_status_sync(self, key: str, token: str, project_id: str, list_ids: List[str]) -> Dict[str, Any]:
         normalized_list_ids = {
-            self._normalize_trello_id(str(item or ""))
+            self._normalize_erp_id(str(item or ""))
             for item in list_ids
-            if self._normalize_trello_id(str(item or ""))
+            if self._normalize_erp_id(str(item or ""))
         }
         if not normalized_list_ids:
             return {
                 "ok": True,
-                "board_id": board_id,
-                "list_id": "",
+                "project_id": project_id,
+                "status": "",
                 "list_ids": [],
                 "cards_seen": 0,
                 "complete": 0,
@@ -3247,11 +3541,11 @@ class FlowWebService:
                 "without_source": 0,
                 "target_output_count": self.FLOW_AGENT_TARGET_OUTPUT_COUNT,
                 "cards": [],
-                "message": f"{self._trello_source_scope_label()} chưa có list hợp lệ để kiểm tra.",
+                "message": f"{self._erp_source_scope_label()} chưa có list hợp lệ để kiểm tra.",
             }
-        scope_label = self._trello_source_scope_label_for_ids(list_ids)
-        payload = self._trello_get_json(
-            f"boards/{quote(board_id, safe='')}/cards",
+        scope_label = self._erp_source_scope_label_for_ids(list_ids)
+        payload = self._erp_get_json(
+            f"boards/{quote(project_id, safe='')}/cards",
             key,
             token,
             fields={
@@ -3266,29 +3560,29 @@ class FlowWebService:
             for card in (payload if isinstance(payload, list) else [])
             if isinstance(card, dict)
             and not card.get("closed")
-            and self._normalize_trello_id(str(card.get("idList") or "")) in normalized_list_ids
+            and self._normalize_erp_id(str(card.get("idList") or "")) in normalized_list_ids
         ]
         complete = 0
         eligible = 0
         no_source = 0
         card_summaries: List[Dict[str, Any]] = []
         for card in cards:
-            card_id = self._normalize_trello_card_id(str(card.get("id") or ""))
-            if not card_id:
+            task_id = self._normalize_erp_task_id(str(card.get("id") or ""))
+            if not task_id:
                 continue
-            attachments = self._trello_card_attachments_or_fetch(
+            attachments = self._erp_task_attachments_or_fetch(
                 card,
                 key,
                 token,
-                card_id,
+                task_id,
                 field_names="id,name,mimeType,date",
             )
             image_attachments = [
                 item
                 for item in attachments
-                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+                if isinstance(item, dict) and self._erp_attachment_is_image(item)
             ]
-            sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+            sources, outputs = self._erp_source_and_flow_output_attachments(image_attachments)
             output_count = len(outputs)
             card["_image_attachments"] = sources
             card["_flow_output_count"] = output_count
@@ -3307,10 +3601,10 @@ class FlowWebService:
                 no_source += 1
             card_summaries.append(
                 {
-                    "id": card_id,
+                    "id": task_id,
                     "name": str(card.get("name") or "").strip(),
                     "url": str(card.get("url") or "").strip(),
-                    "list_id": self._normalize_trello_id(str(card.get("idList") or "")),
+                    "status": self._normalize_erp_id(str(card.get("idList") or "")),
                     "status": status,
                     "source_count": len(sources),
                     "output_count": output_count,
@@ -3320,8 +3614,8 @@ class FlowWebService:
             )
         return {
             "ok": True,
-            "board_id": board_id,
-            "list_id": list_ids[0] if list_ids else "",
+            "project_id": project_id,
+            "status": list_ids[0] if list_ids else "",
             "list_ids": list_ids,
             "cards_seen": len(cards),
             "complete": complete,
@@ -3336,35 +3630,35 @@ class FlowWebService:
             ),
         }
 
-    def _trello_card_attachments_or_fetch(
+    def _erp_task_attachments_or_fetch(
         self,
         card: Dict[str, Any],
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         *,
         field_names: str = "id,name,url,mimeType,date",
     ) -> List[Dict[str, Any]]:
         if "attachments" in card:
             attachments = card.get("attachments")
             return attachments if isinstance(attachments, list) else []
-        attachments_payload = self._trello_get_json(
-            f"cards/{quote(card_id, safe='')}/attachments",
+        attachments_payload = self._erp_get_json(
+            f"cards/{quote(task_id, safe='')}/attachments",
             key,
             token,
             fields={"fields": field_names},
         )
         return attachments_payload if isinstance(attachments_payload, list) else []
 
-    def _reset_ready_trello_outputs_sync(self, key: str, token: str, board_id: str, list_ids: List[str]) -> Dict[str, Any]:
+    def _reset_ready_erp_outputs_sync(self, key: str, token: str, project_id: str, list_ids: List[str]) -> Dict[str, Any]:
         normalized_list_ids = {
-            self._normalize_trello_id(str(item or ""))
+            self._normalize_erp_id(str(item or ""))
             for item in list_ids
-            if self._normalize_trello_id(str(item or ""))
+            if self._normalize_erp_id(str(item or ""))
         }
-        scope_label = self._trello_source_scope_label_for_ids(list_ids)
-        payload = self._trello_get_json(
-            f"boards/{quote(board_id, safe='')}/cards",
+        scope_label = self._erp_source_scope_label_for_ids(list_ids)
+        payload = self._erp_get_json(
+            f"boards/{quote(project_id, safe='')}/cards",
             key,
             token,
             fields={"fields": "id,name,idList,closed,url", "filter": "open"},
@@ -3374,7 +3668,7 @@ class FlowWebService:
             for card in (payload if isinstance(payload, list) else [])
             if isinstance(card, dict)
             and not card.get("closed")
-            and self._normalize_trello_id(str(card.get("idList") or "")) in normalized_list_ids
+            and self._normalize_erp_id(str(card.get("idList") or "")) in normalized_list_ids
         ]
         deleted = 0
         reset_cards: List[Dict[str, Any]] = []
@@ -3383,11 +3677,11 @@ class FlowWebService:
         failed: List[Dict[str, Any]] = []
 
         for card in cards:
-            card_id = self._normalize_trello_card_id(str(card.get("id") or ""))
-            if not card_id:
+            task_id = self._normalize_erp_task_id(str(card.get("id") or ""))
+            if not task_id:
                 continue
-            attachments_payload = self._trello_get_json(
-                f"cards/{quote(card_id, safe='')}/attachments",
+            attachments_payload = self._erp_get_json(
+                f"cards/{quote(task_id, safe='')}/attachments",
                 key,
                 token,
                 fields={"fields": "id,name,mimeType,date"},
@@ -3396,9 +3690,9 @@ class FlowWebService:
             image_attachments = [
                 item
                 for item in attachments
-                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+                if isinstance(item, dict) and self._erp_attachment_is_image(item)
             ]
-            source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+            source_attachments, flow_outputs = self._erp_source_and_flow_output_attachments(image_attachments)
             if not source_attachments:
                 no_source += 1
                 continue
@@ -3409,11 +3703,11 @@ class FlowWebService:
             card_deleted = 0
             card_failed: List[str] = []
             for attachment in flow_outputs:
-                attachment_id = self._normalize_trello_id(str(attachment.get("id") or ""))
+                attachment_id = self._normalize_erp_id(str(attachment.get("id") or ""))
                 if not attachment_id:
                     continue
                 try:
-                    self._trello_delete_attachment(key, token, card_id, attachment_id)
+                    self._erp_delete_attachment(key, token, task_id, attachment_id)
                     deleted += 1
                     card_deleted += 1
                 except Exception as exc:
@@ -3421,7 +3715,7 @@ class FlowWebService:
             if card_deleted:
                 reset_cards.append(
                     {
-                        "id": card_id,
+                        "id": task_id,
                         "name": str(card.get("name") or "").strip(),
                         "url": str(card.get("url") or "").strip(),
                         "deleted": card_deleted,
@@ -3430,7 +3724,7 @@ class FlowWebService:
             if card_failed:
                 failed.append(
                     {
-                        "id": card_id,
+                        "id": task_id,
                         "name": str(card.get("name") or "").strip(),
                         "errors": card_failed[:3],
                     }
@@ -3438,8 +3732,8 @@ class FlowWebService:
 
         return {
             "ok": not failed,
-            "board_id": board_id,
-            "list_id": list_ids[0] if list_ids else "",
+            "project_id": project_id,
+            "status": list_ids[0] if list_ids else "",
             "list_ids": list_ids,
             "cards_seen": len(cards),
             "cards_reset": len(reset_cards),
@@ -3454,40 +3748,40 @@ class FlowWebService:
             ),
         }
 
-    def _continuous_auto_trello_idle_message(self, request: CreateJobRequest, poll_interval_s: int) -> str:
+    def _continuous_auto_erp_idle_message(self, request: CreateJobRequest, poll_interval_s: int) -> str:
         summary = ""
         try:
-            summary = self._auto_trello_ready_for_ai_summary(request)
+            summary = self._auto_erp_ready_for_ai_summary(request)
         except Exception as exc:
             summary = f"Chưa đọc được chi tiết board: {humanize_flow_error(str(exc))[:120]}."
         detail = f" {summary}" if summary else ""
-        return f"Chưa có card mới cần chạy trong {self._trello_source_scope_label()}.{detail} App sẽ quét lại sau {poll_interval_s}s."
+        return f"Chưa có card mới cần chạy trong {self._erp_source_scope_label()}.{detail} App sẽ quét lại sau {poll_interval_s}s."
 
-    def _auto_trello_ready_for_ai_summary(self, request: CreateJobRequest) -> str:
-        key, token = self._trello_credentials()
+    def _auto_erp_ready_for_ai_summary(self, request: CreateJobRequest) -> str:
+        key, token = self._erp_credentials()
         if not key or not token:
-            return "Trello chưa có key/token để quét chi tiết."
-        trello_config = self.store.snapshot().trello_config
-        board_id = self._normalize_trello_board_id(
-            request.trello_board_id
-            or trello_config.board_id
-            or os.getenv("TRELLO_BOARD_ID", "")
+            return "ERP chưa có API key/API secret để quét chi tiết."
+        erp_config = self.store.snapshot().erp_config
+        project_id = self._normalize_erp_project_id(
+            request.erp_project_id
+            or erp_config.project_id
+            or os.getenv("ERP_PROJECT_ID", "")
         )
-        raw_list_id = self._normalize_trello_id(
-            request.trello_list_id
-            or trello_config.list_id
-            or os.getenv("TRELLO_LIST_ID", "")
+        raw_list_id = self._normalize_erp_id(
+            request.erp_status_id
+            or erp_config.status
+            or os.getenv("ERP_STATUS_ID", "")
         )
-        if not board_id:
-            return "Chưa có board Trello để kiểm tra."
-        list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
+        if not project_id:
+            return "Chưa có Project ERP để kiểm tra."
+        list_ids = self._erp_auto_source_list_ids(key, token, project_id, raw_list_id)
         if not list_ids:
-            return f"Chưa tìm thấy list {self._trello_source_scope_label()} để kiểm tra."
+            return f"Chưa tìm thấy trạng thái {self._erp_source_scope_label()} để kiểm tra."
         normalized_list_ids = set(list_ids)
-        scope_label = self._trello_source_scope_label_for_ids(list_ids)
+        scope_label = self._erp_source_scope_label_for_ids(list_ids)
 
-        payload = self._trello_get_json(
-            f"boards/{quote(board_id, safe='')}/cards",
+        payload = self._erp_get_json(
+            f"boards/{quote(project_id, safe='')}/cards",
             key,
             token,
             fields={"fields": "id,name,idList,closed", "filter": "open"},
@@ -3497,7 +3791,7 @@ class FlowWebService:
             for card in (payload if isinstance(payload, list) else [])
             if isinstance(card, dict)
             and not card.get("closed")
-            and self._normalize_trello_id(str(card.get("idList") or "")) in normalized_list_ids
+            and self._normalize_erp_id(str(card.get("idList") or "")) in normalized_list_ids
         ]
         if not cards:
             return f"{scope_label} hiện chưa có card nào."
@@ -3507,11 +3801,11 @@ class FlowWebService:
         no_output = 0
         no_source = 0
         for card in cards:
-            card_id = str(card.get("id") or "").strip()
-            if not card_id:
+            task_id = str(card.get("id") or "").strip()
+            if not task_id:
                 continue
-            attachments_payload = self._trello_get_json(
-                f"cards/{quote(card_id, safe='')}/attachments",
+            attachments_payload = self._erp_get_json(
+                f"cards/{quote(task_id, safe='')}/attachments",
                 key,
                 token,
                 fields={"fields": "id,name,mimeType,date"},
@@ -3520,9 +3814,9 @@ class FlowWebService:
             images = [
                 item
                 for item in attachments
-                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+                if isinstance(item, dict) and self._erp_attachment_is_image(item)
             ]
-            sources, outputs = self._trello_source_and_flow_output_attachments(images)
+            sources, outputs = self._erp_source_and_flow_output_attachments(images)
             output_count = len(outputs)
             card["_image_attachments"] = sources
             card["_flow_output_count"] = output_count
@@ -3547,7 +3841,7 @@ class FlowWebService:
             parts.append(f"{no_source} card chua co anh nguon hop le")
         return "; ".join(parts) + "."
 
-    async def _sleep_continuous_auto_trello(self, batch_id: str, poll_interval_s: int) -> None:
+    async def _sleep_continuous_auto_erp(self, batch_id: str, poll_interval_s: int) -> None:
         remaining = max(1.0, float(poll_interval_s or 30))
         while remaining > 0:
             if self._prompt_batch_stop_requested(batch_id):
@@ -3556,7 +3850,7 @@ class FlowWebService:
             await asyncio.sleep(chunk)
             remaining -= chunk
 
-    async def _run_continuous_auto_trello_batch(
+    async def _run_continuous_auto_erp_batch(
         self,
         batch_id: str,
         base_request: CreateJobRequest,
@@ -3573,7 +3867,7 @@ class FlowWebService:
         await self.store.patch_job(batch_id, status="running")
         await self.store.append_log(
             batch_id,
-            f"Auto AI Trello liên tục đã bật. App sẽ quét {self._trello_source_scope_label()} mỗi {poll_interval_s}s cho tới khi chủ nhân bấm Dừng.",
+            f"Auto AI ERP liên tục đã bật. App sẽ quét {self._erp_source_scope_label()} mỗi {poll_interval_s}s cho tới khi chủ nhân bấm Dừng.",
         )
 
         try:
@@ -3582,14 +3876,14 @@ class FlowWebService:
                 await self.store.set_progress_hint(
                     batch_id,
                     stage="polling",
-                    detail=f"Đang quét {self._trello_source_scope_label()} lần {cycles}; có card mới sẽ chạy ngay.",
+                    detail=f"Đang quét {self._erp_source_scope_label()} lần {cycles}; có card mới sẽ chạy ngay.",
                 )
                 existing = self.store.get_job(batch_id)
                 existing_result = dict(existing.result or {}) if existing is not None else {}
                 stored_seen_card_ids = [
-                    self._normalize_trello_card_id(str(item or ""))
+                    self._normalize_erp_task_id(str(item or ""))
                     for item in existing_result.get("seen_card_ids", [])
-                    if self._normalize_trello_card_id(str(item or ""))
+                    if self._normalize_erp_task_id(str(item or ""))
                 ]
                 seen_card_ids.update(stored_seen_card_ids)
                 existing_result.update(
@@ -3606,7 +3900,7 @@ class FlowWebService:
                 await self.store.patch_job(batch_id, result=existing_result)
 
                 try:
-                    scan_request, items, discovery = await self._expand_prompt_batch_with_trello_images(
+                    scan_request, items, discovery = await self._expand_prompt_batch_with_erp_images(
                         base_request,
                         seed_items,
                         1,
@@ -3614,12 +3908,12 @@ class FlowWebService:
                     )
                 except HTTPException as exc:
                     detail = self._flow_error_detail(exc)
-                    if self._auto_trello_waitable_empty_error(detail):
+                    if self._auto_erp_waitable_empty_error(detail):
                         idle_cycles += 1
                         if idle_cycles == 1 or idle_cycles % 10 == 0:
                             await self.store.append_log(
                                 batch_id,
-                                self._continuous_auto_trello_idle_message(base_request, poll_interval_s),
+                                self._continuous_auto_erp_idle_message(base_request, poll_interval_s),
                             )
                         await self._patch_prompt_batch_result(
                             batch_id,
@@ -3636,14 +3930,14 @@ class FlowWebService:
                                 "seen_card_ids": sorted(seen_card_ids),
                             },
                         )
-                        await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
+                        await self._sleep_continuous_auto_erp(batch_id, poll_interval_s)
                         continue
                     raise
 
                 skipped_missing_rule_ids = [
-                    self._normalize_trello_card_id(str(item or ""))
+                    self._normalize_erp_task_id(str(item or ""))
                     for item in discovery.get("skipped_missing_product_rule_card_ids", [])
-                    if self._normalize_trello_card_id(str(item or ""))
+                    if self._normalize_erp_task_id(str(item or ""))
                 ]
                 skipped_missing_rule_count = int(
                     discovery.get("skipped_missing_product_rule_cards") or len(skipped_missing_rule_ids)
@@ -3665,9 +3959,9 @@ class FlowWebService:
                     )
 
                 skipped_complete_ids = [
-                    self._normalize_trello_card_id(str(item or ""))
+                    self._normalize_erp_task_id(str(item or ""))
                     for item in discovery.get("skipped_complete_card_ids", [])
-                    if self._normalize_trello_card_id(str(item or ""))
+                    if self._normalize_erp_task_id(str(item or ""))
                 ]
                 skipped_complete_count = int(
                     discovery.get("skipped_complete_cards") or len(skipped_complete_ids)
@@ -3683,7 +3977,7 @@ class FlowWebService:
                 fresh_items: List[Dict[str, Any]] = []
                 skipped_seen = 0
                 for item_offset, item in enumerate(items):
-                    item_card_id = self._normalize_trello_card_id(str(item.get("trello_card_id") or ""))
+                    item_card_id = self._normalize_erp_task_id(str(item.get("erp_task_id") or ""))
                     if item_card_id and item_card_id in seen_card_ids:
                         skipped_seen += 1
                         continue
@@ -3699,7 +3993,7 @@ class FlowWebService:
                     if idle_cycles == 1 or idle_cycles % 10 == 0:
                         await self.store.append_log(
                             batch_id,
-                            self._continuous_auto_trello_idle_message(base_request, poll_interval_s),
+                            self._continuous_auto_erp_idle_message(base_request, poll_interval_s),
                         )
                     await self._patch_prompt_batch_result(
                         batch_id,
@@ -3716,14 +4010,14 @@ class FlowWebService:
                                 "seen_card_ids": sorted(seen_card_ids),
                             },
                         )
-                    await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
+                    await self._sleep_continuous_auto_erp(batch_id, poll_interval_s)
                     continue
 
                 idle_cycles = 0
                 planned_total += len(items)
                 await self.store.append_log(
                     batch_id,
-                    f"Tìm thấy {len(items)} card mới trong {self._trello_source_scope_label()}. Bắt đầu xử lý lô này.",
+                    f"Tìm thấy {len(items)} card mới trong {self._erp_source_scope_label()}. Bắt đầu xử lý lô này.",
                 )
 
                 for item in items:
@@ -3731,7 +4025,7 @@ class FlowWebService:
                         break
                     item_index = completed + failed + 1
                     child_request = self._prompt_batch_child_request(scan_request, item, item_index - 1, planned_total)
-                    item_card_id = self._normalize_trello_card_id(child_request.trello_card_id)
+                    item_card_id = self._normalize_erp_task_id(child_request.erp_task_id)
                     if item_card_id:
                         seen_card_ids.add(item_card_id)
                     self._validate_job_request(child_request)
@@ -3764,25 +4058,25 @@ class FlowWebService:
                     if ai_title:
                         await self.store.append_log(
                             batch_id,
-                            f"Da ghi AI title vao mo ta Trello cho card {item_index}/{planned_total}: {ai_title}",
+                            f"Da ghi AI title vao mo ta ERP cho card {item_index}/{planned_total}: {ai_title}",
                         )
                     elif ai_title_error:
                         await self.store.append_log(
                             batch_id,
-                            f"Chua ghi AI title vao mo ta Trello cho card {item_index}/{planned_total}: {ai_title_error}",
+                            f"Chua ghi AI title vao mo ta ERP cho card {item_index}/{planned_total}: {ai_title_error}",
                         )
 
                     await self._run_flow_job(child_job.id, child_request)
                     saved_child = self.store.get_job(child_job.id)
                     if saved_child is not None and saved_child.status == "completed":
                         completed += 1
-                        await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} đã xong và ảnh đã gửi về Trello.")
-                        await self._stop_prompt_batch_after_trello_upload(batch_id, saved_child)
+                        await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} đã xong và ảnh đã gửi về ERP.")
+                        await self._stop_prompt_batch_after_erp_upload(batch_id, saved_child)
                     else:
                         failed += 1
                         detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
                         await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} bị lỗi: {detail}")
-                        if self._auto_trello_should_stop_on_child_error(detail):
+                        if self._auto_erp_should_stop_on_child_error(detail):
                             current_batch = self.store.get_job(batch_id)
                             current_result = dict(current_batch.result or {}) if current_batch is not None else {}
                             current_result["stop_requested"] = True
@@ -3791,7 +4085,7 @@ class FlowWebService:
                             await self.store.patch_job(batch_id, result=current_result)
                             await self.store.append_log(
                                 batch_id,
-                                "Auto AI Trello tự dừng vì lỗi an toàn ảnh nguồn/Flow Agent; app không nhận card mới để tránh reset tab đang chạy hoặc tạo sai ảnh.",
+                                "Auto AI ERP tự dừng vì lỗi an toàn ảnh nguồn/Flow Agent; app không nhận card mới để tránh reset tab đang chạy hoặc tạo sai ảnh.",
                             )
 
                     await self._patch_prompt_batch_result(
@@ -3809,7 +4103,7 @@ class FlowWebService:
 
                 if not self._prompt_batch_stop_requested(batch_id):
                     await self.store.append_log(batch_id, f"Đã xử lý xong lô hiện tại. App tiếp tục chờ card mới sau {poll_interval_s}s.")
-                    await self._sleep_continuous_auto_trello(batch_id, poll_interval_s)
+                    await self._sleep_continuous_auto_erp(batch_id, poll_interval_s)
 
             await self._patch_prompt_batch_result(
                 batch_id,
@@ -3822,11 +4116,11 @@ class FlowWebService:
                 extra={"seen_card_ids": sorted(seen_card_ids)},
             )
             await self.store.patch_job(batch_id, status="completed", error="")
-            await self.store.append_log(batch_id, f"Đã dừng Auto AI Trello liên tục: {completed} card xong, {failed} card lỗi.")
+            await self.store.append_log(batch_id, f"Đã dừng Auto AI ERP liên tục: {completed} card xong, {failed} card lỗi.")
         except Exception as exc:
             detail = self._flow_error_detail(exc)
             await self.store.patch_job(batch_id, status="failed", error=detail)
-            await self.store.append_log(batch_id, f"Auto AI Trello liên tục thất bại: {detail}")
+            await self.store.append_log(batch_id, f"Auto AI ERP liên tục thất bại: {detail}")
 
     async def create_skill(self, request: SkillCreateRequest) -> SkillRecord:
         fields_set = self._fields_set(request)
@@ -3977,15 +4271,15 @@ class FlowWebService:
         cleaned = re.sub(r"\s+", " ", str(instruction or "").strip())
         if product_filter:
             return (
-                f"Dựa trên ảnh sản phẩm nguồn từ Trello card, tạo/chỉnh ảnh thương mại về {product_filter}. "
+                f"Dựa trên ảnh sản phẩm nguồn từ ERP card, tạo/chỉnh ảnh thương mại về {product_filter}. "
                 "Giữ sản phẩm gốc đúng hình dáng, chất liệu và chi tiết chính; chỉ thay bối cảnh, styling, ánh sáng và bố cục theo prompt."
             )
         if cleaned:
             return (
-                f"Dựa trên ảnh sản phẩm nguồn từ Trello card, thực hiện yêu cầu: {cleaned}. "
+                f"Dựa trên ảnh sản phẩm nguồn từ ERP card, thực hiện yêu cầu: {cleaned}. "
                 "Giữ sản phẩm gốc đúng nhận diện, tạo ảnh mới bằng Google Flow theo phong cách thương mại rõ ràng."
             )
-        return "Dựa trên ảnh sản phẩm nguồn từ Trello card, tạo ảnh thương mại sạch, thật, dễ duyệt và sẵn sàng lưu lại Trello."
+        return "Dựa trên ảnh sản phẩm nguồn từ ERP card, tạo ảnh thương mại sạch, thật, dễ duyệt và sẵn sàng lưu lại ERP."
 
     def _local_flow_operator_prompt(self, instruction: str, product_filter: str) -> str:
         target = self.FLOW_AGENT_DEFAULT_IMAGE_COUNT
@@ -3993,9 +4287,9 @@ class FlowWebService:
         user_text = re.sub(r"\s+", " ", str(instruction or "").strip())
         parts = [
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
-            "First analyze the selected Trello attachment/reference image: product category, silhouette, material, print or embroidery, color, proportions, and any handmade cues.",
+            "First analyze the selected ERP attachment/reference image: product category, silhouette, material, print or embroidery, color, proportions, and any handmade cues.",
             f"Then write your own internal image prompts and generate exactly {target} commercial product images{product_text}.",
-            "Use the selected Trello attachment as the exact source product reference; preserve product identity, shape, design, colors, and material texture.",
+            "Use the selected ERP attachment as the exact source product reference; preserve product identity, shape, design, colors, and material texture.",
             "Only change scene, styling, lighting, composition, model/background, and merchandising context.",
             "The image set should include: detail/craft proof close-up, full product hero, lifestyle use scene, flat lay/gift-ready merchandising, hands sewing/embroidering, and four pastel fabric colorway variation shots when the product is fabric-based.",
             "If the product appears hand embroidered, one image must clearly prove it with visible thread texture and raised stitches.",
@@ -4033,7 +4327,7 @@ class FlowWebService:
             f"{collage_rule}"
             "For each shot, state the product placement, background, props, lighting, camera angle, and the source details that must stay unchanged. "
             "The attached source image is the authority: keep the same product object type, silhouette, construction, proportions, motif/design placement, readable text/name, colors, fabric texture, and handmade irregularities. "
-            "Only if the source image visibly contains an embroidered/personalized name and the Required shot plan, Trello description, or colorway/multi-color shot requires variants may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
+            "Only if the source image visibly contains an embroidered/personalized name and the Required shot plan, ERP description, or colorway/multi-color shot requires variants may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
             f"{self._flow_agent_colorway_text_variant_rule()} "
             "Every output must make stitched or embroidered areas look genuinely hand embroidered: raised thread, tactile fibers, clear stitch direction, crisp edges, and natural thread shadows; never make it flat printed, painted, digital, vinyl, or sticker-like. "
             f"{self._flow_agent_embroidery_clarity_rule()} "
@@ -4073,13 +4367,12 @@ class FlowWebService:
         self,
         context: Dict[str, Any],
         product_filter: str,
-        trello_candidates: List[Dict[str, Any]],
+        erp_candidates: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
         flow = context.get("flow", {})
-        trello = context.get("trello", {})
-        telegram = context.get("telegram", {})
-        ready_candidates = [item for item in trello_candidates if item.get("in_ready_list")]
-        source_scope = self._trello_source_scope_label()
+        erp = context.get("erp", {})
+        ready_candidates = [item for item in erp_candidates if item.get("in_ready_list")]
+        source_scope = self._erp_source_scope_label()
         source_detail = (
             f"Đã thấy {len(ready_candidates)} card khớp trong {source_scope}."
             if ready_candidates
@@ -4087,9 +4380,9 @@ class FlowWebService:
         )
         return [
             {
-                "label": "Tìm ảnh Trello",
+                "label": "Tìm ảnh ERP",
                 "detail": source_detail,
-                "status": "sẵn sàng" if trello.get("configured") else "cần Trello",
+                "status": "sẵn sàng" if erp.get("configured") else "cần ERP",
             },
             {
                 "label": "Tác nhân Flow viết prompt",
@@ -4106,14 +4399,14 @@ class FlowWebService:
                 "status": "sẵn sàng" if flow.get("project_set") and flow.get("authenticated") else "cần mở Flow",
             },
             {
-                "label": "Duyệt trên Trello",
-                "detail": "Ảnh tạo xong upload thẳng về đúng card đang chạy để chủ nhân duyệt trực tiếp trên Trello.",
-                "status": "sẵn sàng" if trello.get("configured") else "cần Trello",
+                "label": "Duyệt trên dashboard",
+                "detail": "Dashboard hiển thị từng artifact để duyệt; ảnh chưa duyệt không được ghi vào ERP.",
+                "status": "sẵn sàng" if erp.get("configured") else "cần ERP",
             },
             {
-                "label": "Lưu lại Trello",
-                "detail": "Ảnh được duyệt upload về đúng card nguồn, không lưu sang card khác.",
-                "status": "sẵn sàng" if trello.get("configured") else "cần Trello",
+                "label": "Comment ERP Task",
+                "detail": "Chỉ URL artifact HTTPS đã duyệt được thêm vào comment của đúng Task nguồn.",
+                "status": "sẵn sàng" if erp.get("configured") else "cần ERP",
             },
         ]
 
@@ -4149,9 +4442,9 @@ class FlowWebService:
                 "requires_confirmation": False,
             },
             {
-                "label": "Kiểm tra nguồn ảnh Trello",
-                "detail": "Mở cục Trello Image Source để chắc chắn ảnh lấy từ attachment của đúng card.",
-                "action": "select_trello_source",
+                "label": "Kiểm tra nguồn ảnh ERP",
+                "detail": "Mở cục ERP Task Source để chắc chắn URL ảnh lấy từ đúng Task.",
+                "action": "select_erp_source",
                 "requires_confirmation": False,
             },
             {
@@ -4172,7 +4465,7 @@ class FlowWebService:
                 0,
                 {
                     "label": f"Lọc sản phẩm: {product_filter}",
-                    "detail": "Gắn bộ lọc này trước khi quét Trello/Sheet để giảm rủi ro lấy nhầm ảnh.",
+                    "detail": "Gắn bộ lọc này trước khi quét ERP/Sheet để giảm rủi ro lấy nhầm ảnh.",
                     "action": "apply_product_filter",
                     "payload": {"value": product_filter},
                     "requires_confirmation": False,
@@ -4182,17 +4475,17 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Chạy automation Flow",
-                    "detail": f"Quét {self._trello_source_scope_label()}, lấy ảnh đúng card, nhờ Tác nhân Flow viết prompt và tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh, rồi upload về đúng card Trello để duyệt.",
-                    "action": "run_auto_trello",
+                    "detail": f"Quét trạng thái {self._erp_source_scope_label()}, lấy ảnh từ đúng Task, nhờ Tác nhân Flow tạo ảnh, chờ duyệt trên dashboard rồi thêm URL artifact vào comment Task.",
+                    "action": "run_auto_erp",
                     "payload": {"limit": 1, "test_mode": True} if "test" in self._normalize_skill_token(instruction) else {},
                     "requires_confirmation": True,
                 }
             )
         actions.append(
             {
-                "label": "Duyệt trực tiếp Trello",
-                "detail": "Không cần đồng bộ Telegram: ảnh đã tạo sẽ nằm ngay trong attachment của card Trello nguồn.",
-                "action": "select_trello_source",
+                "label": "Mở duyệt trên dashboard",
+                "detail": "Artefact chờ duyệt hiển thị ngay trên dashboard; chỉ sau đó app mới gọi GraphQL addTaskComment.",
+                "action": "open_dashboard_review",
                 "requires_confirmation": False,
             }
         )
@@ -4202,7 +4495,7 @@ class FlowWebService:
         self,
         instruction: str,
         context: Dict[str, Any],
-        trello_candidates: List[Dict[str, Any]],
+        erp_candidates: List[Dict[str, Any]],
         *,
         run_mode: str = "plan",
     ) -> Dict[str, Any]:
@@ -4211,14 +4504,14 @@ class FlowWebService:
         return {
             "title": "Flow AI Operator",
             "summary": (
-                "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn Trello/Sheet, chuẩn bị lệnh cho Tác nhân Google Flow, "
-                f"để Flow Agent tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh rồi upload ngay về đúng card Trello để duyệt."
+                "AI operator sẽ hiểu yêu cầu, chọn đúng nguồn ERP/Sheet, chuẩn bị lệnh cho Tác nhân Google Flow, "
+                f"để Flow Agent tự viết prompt/tạo ảnh, chờ duyệt trên dashboard, rồi thêm URL artifact vào comment của đúng ERP Task."
             ),
-            "intent": "trello_sheet_flow_telegram_automation",
+            "intent": "erp_sheet_flow_dashboard_review_automation",
             "product_filter": product_filter,
             "mode": "image",
             "flow_prompt": flow_prompt,
-            "steps": self._flow_operator_steps(context, product_filter, trello_candidates),
+            "steps": self._flow_operator_steps(context, product_filter, erp_candidates),
             "suggested_actions": self._flow_operator_actions(instruction, flow_prompt, product_filter, run_mode=run_mode),
             "requires_confirmation": self._flow_operator_wants_run(instruction, run_mode),
         }
@@ -4233,8 +4526,8 @@ class FlowWebService:
             [
                 "Bạn là Flow AI Operator trong app Flow v2.",
                 "Nhiệm vụ: biến yêu cầu người dùng thành kế hoạch automation có thể thao tác Google Flow.",
-                f"Quy trình bắt buộc: Trello {self._trello_source_scope_label()} attachment -> app chọn đúng card/ảnh -> ưu tiên nút Tác nhân/Agent trong Google Flow -> Flow Agent tự viết prompt và tạo/chỉnh đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh bằng ảnh nguồn đúng card -> Telegram duyệt -> upload ảnh duyệt về đúng card Trello.",
-                "Bạn không được yêu cầu secret trong chat và không in API key/token/cookie.",
+                f"Quy trình bắt buộc: ảnh URL HTTPS trên ERP Task trong trạng thái {self._erp_source_scope_label()} -> app chọn đúng Task/ảnh -> Tác nhân Google Flow tạo/chỉnh ảnh -> duyệt trên dashboard -> GraphQL thêm URL artifact vào comment của đúng Task.",
+                "Bạn không được yêu cầu secret trong chat và không in API key/API secret/cookie.",
                 "Trả về duy nhất JSON object, không markdown.",
                 "Schema JSON:",
                 '{"title": str, "summary": str, "product_filter": str, "flow_prompt": str, "steps": [{"label": str, "detail": str, "status": str}], "safety_notes": [str]}',
@@ -4358,19 +4651,19 @@ class FlowWebService:
 
         context = self._user_assistant_context_snapshot()
         product_filter = self._extract_user_assistant_product_filter(instruction)
-        trello_candidates: List[Dict[str, Any]] = []
-        trello_candidate_error = ""
-        trello_candidate_scan_attempted = bool(product_filter and context.get("trello", {}).get("configured"))
-        if trello_candidate_scan_attempted:
+        erp_candidates: List[Dict[str, Any]] = []
+        erp_candidate_error = ""
+        erp_candidate_scan_attempted = bool(product_filter and context.get("erp", {}).get("configured"))
+        if erp_candidate_scan_attempted:
             try:
-                trello_candidates = await asyncio.to_thread(self._user_assistant_trello_candidates, product_filter)
+                erp_candidates = await asyncio.to_thread(self._user_assistant_erp_candidates, product_filter)
             except Exception as exc:
-                trello_candidate_error = str(exc)[:180]
-        if trello_candidate_scan_attempted:
-            context["trello_candidate_scan"] = self._format_user_assistant_trello_candidate_context(trello_candidates, product_filter)
+                erp_candidate_error = str(exc)[:180]
+        if erp_candidate_scan_attempted:
+            context["erp_candidate_scan"] = self._format_user_assistant_erp_candidate_context(erp_candidates, product_filter)
         context_summary = self._format_user_assistant_context(context, ui_context)
 
-        local_plan = self._local_flow_operator_plan(instruction, context, trello_candidates, run_mode=run_mode)
+        local_plan = self._local_flow_operator_plan(instruction, context, erp_candidates, run_mode=run_mode)
         plan = local_plan
         engine = "local"
         engine_label = "Nội bộ"
@@ -4398,8 +4691,8 @@ class FlowWebService:
             "engine": engine,
             "engine_label": engine_label,
             "model": model,
-            "trello_candidates": trello_candidates,
-            "trello_candidates_error": trello_candidate_error,
+            "erp_candidates": erp_candidates,
+            "erp_candidates_error": erp_candidate_error,
             "context_summary": context_summary,
             "fallback_reason": fallback_reason,
         }
@@ -4407,7 +4700,7 @@ class FlowWebService:
     def _user_assistant_context_snapshot(self) -> Dict[str, Any]:
         snapshot = self.store.snapshot()
         config = self._normalized_config(snapshot.config)
-        trello = self._trello_config_snapshot(snapshot.trello_config)
+        erp = self._erp_config_snapshot(snapshot.erp_config)
         integrations = self._integration_config_snapshot(snapshot.integration_config)
         try:
             auth = self.get_auth_status()
@@ -4428,14 +4721,12 @@ class FlowWebService:
                 "workflow_set": bool(config.active_workflow_id),
                 "authenticated": bool(auth.authenticated),
             },
-            "trello": {
-                "configured": bool(trello.get("configured")),
-                "credentials_saved": bool(trello.get("credentials_saved")),
-                "board_id_set": bool(trello.get("board_id")),
-                "card_id_set": bool(trello.get("card_id")),
-                "list_id_set": bool(trello.get("list_id")),
-                "upload_mode": trello.get("upload_mode") or "file",
-                "upscale_to_2k": trello.get("upscale_to_2k") is not False,
+            "erp": {
+                "configured": bool(erp.get("configured")),
+                "credentials_saved": bool(erp.get("credentials_saved")),
+                "project_id_set": bool(erp.get("project_id")),
+                "task_id_set": bool(erp.get("task_id")),
+                "status_set": bool(erp.get("status")),
             },
             "telegram": {
                 "configured": bool(integrations.get("telegram", {}).get("configured")),
@@ -4457,33 +4748,32 @@ class FlowWebService:
                 "latest_failed_title": str(getattr(getattr(latest_failed, "error_snapshot", None), "title", "") or "")[:140],
             },
             "workflow": {
-                "product_source": f"Trello card attachment trong list {self._trello_source_scope_label()}",
-                "prompt_source": "Tác nhân Google Flow tự viết prompt theo card Trello; Google Sheet/CSV chỉ là tùy chọn",
-                "flow_step": "Google Flow dùng ảnh nguồn từ đúng card và prompt do chính Tác nhân Flow viết để tạo/chỉnh ảnh",
-                "approval_step": "Người dùng duyệt trực tiếp trong attachment của card Trello nguồn",
-                "archive_step": "Ảnh tạo xong upload lại đúng Trello card nguồn",
+                "product_source": f"URL ảnh HTTPS trên ERP Task trong trạng thái {self._erp_source_scope_label()}",
+                "prompt_source": "Tác nhân Google Flow tự viết prompt theo ERP Task; Google Sheet/CSV chỉ là tùy chọn",
+                "flow_step": "Google Flow dùng ảnh nguồn từ đúng Task và prompt do chính Tác nhân Flow viết để tạo/chỉnh ảnh",
+                "approval_step": "Dashboard duyệt từng artifact trước khi ghi ERP",
+                "archive_step": "GraphQL thêm URL artifact đã duyệt vào comment của đúng ERP Task nguồn",
             },
         }
 
     def _format_user_assistant_context(self, context: Dict[str, Any], ui_context: str = "") -> str:
         flow = context.get("flow", {})
-        trello = context.get("trello", {})
-        telegram = context.get("telegram", {})
+        erp = context.get("erp", {})
         gemini = context.get("gemini", {})
         jobs = context.get("jobs", {})
         lines = [
-            f"Quy trình chuẩn: Trello {self._trello_source_scope_label()} card attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh -> upload lại đúng card Trello để duyệt trực tiếp.",
-            f"Nơi lấy sản phẩm: ảnh sản phẩm gốc nằm trong attachment của từng Trello card ở list {self._trello_source_scope_label()}; Google Sheet/CSV chỉ là tùy chọn nếu muốn dùng prompt có sẵn.",
-            f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}; Auto AI Trello dùng Tác nhân Flow nên không bắt buộc workflow mặc định ({'workflow chỉnh sửa đã chọn' if flow.get('workflow_set') else 'workflow chỉnh sửa đang để trống'}).",
-            f"Trello: {'đã cấu hình' if trello.get('configured') else 'chưa đủ cấu hình'}, board {'có' if trello.get('board_id_set') else 'chưa có'}, card mặc định {'có' if trello.get('card_id_set') else 'không'}, list mặc định {'có' if trello.get('list_id_set') else 'không'}, lưu kiểu {trello.get('upload_mode') or 'file'}.",
-            f"Telegram: {'đã cấu hình tùy chọn' if telegram.get('configured') else 'không bắt buộc cho Auto Trello'}.",
+            f"Quy trình chuẩn: ERP Task nguồn có URL ảnh HTTPS -> Tác nhân Google Flow tạo ảnh -> duyệt trên dashboard -> GraphQL thêm URL artifact vào comment đúng Task.",
+            f"Nơi lấy sản phẩm: URL ảnh HTTPS công khai trên ERP Task ở trạng thái {self._erp_source_scope_label()}; Google Sheet/CSV chỉ là tùy chọn nếu muốn dùng prompt có sẵn.",
+            f"Flow: project {'đã lưu' if flow.get('project_set') else 'chưa lưu'}, {'đã đăng nhập' if flow.get('authenticated') else 'chưa thấy phiên đăng nhập'}; Auto AI ERP dùng Tác nhân Flow nên không bắt buộc workflow mặc định ({'workflow chỉnh sửa đã chọn' if flow.get('workflow_set') else 'workflow chỉnh sửa đang để trống'}).",
+            f"ERP: {'đã cấu hình' if erp.get('configured') else 'chưa đủ cấu hình'}, Project {'có' if erp.get('project_id_set') else 'chưa có'}, Task mặc định {'có' if erp.get('task_id_set') else 'không'}, trạng thái nguồn {'có' if erp.get('status_set') else 'không'}.",
+            "Duyệt artefact: thực hiện trực tiếp trên dashboard trước khi app ghi ERP.",
             f"AI: {'Gemini ' + str(gemini.get('model') or '') if gemini.get('configured') else 'trợ lý nội bộ'}.",
             f"Jobs: {jobs.get('active', 0)} đang chạy, {jobs.get('completed', 0)} xong, {jobs.get('failed', 0)} lỗi; job mới nhất {jobs.get('latest_type') or 'chưa có'} / {jobs.get('latest_status') or 'chưa có'}.",
         ]
         cleaned_ui_context = re.sub(r"\s+", " ", str(ui_context or "").strip())
         if cleaned_ui_context:
             lines.append(f"Ngữ cảnh UI: {cleaned_ui_context[: self.USER_ASSISTANT_CONTEXT_LIMIT]}")
-        candidate_scan = str(context.get("trello_candidate_scan") or "").strip()
+        candidate_scan = str(context.get("erp_candidate_scan") or "").strip()
         if candidate_scan:
             lines.append(candidate_scan)
         return "\n".join(lines)
@@ -4504,10 +4794,10 @@ class FlowWebService:
             if not match:
                 continue
             value = re.sub(r"\s+", " ", match.group(1)).strip(" .,:;\"'")
-            if value.startswith(("http://", "https://")) or "trello.com/" in value.lower():
+            if value.startswith(("http://", "https://")) or "erp.havigroup.llc/" in value.lower():
                 continue
             value = re.sub(
-                r"\b(?:cho tôi|cho toi|của tôi|cua toi|rồi|roi|xong|nhé|nhe|giúp|giup|đi|di|auto|trello|flow|telegram|sheet)\b.*$",
+                r"\b(?:cho tôi|cho toi|của tôi|cua toi|rồi|roi|xong|nhé|nhe|giúp|giup|đi|di|auto|erp|flow|telegram|sheet)\b.*$",
                 "",
                 value,
                 flags=re.IGNORECASE,
@@ -4565,8 +4855,8 @@ class FlowWebService:
         stripped = self._strip_accents(cleaned).lower()
         generic_exact = {
             "auto",
-            "auto_trello",
-            "auto_ai_trello",
+            "auto_erp",
+            "auto_ai_erp",
             "board",
             "card",
             "flow",
@@ -4577,7 +4867,7 @@ class FlowWebService:
             "sheet",
             "tao",
             "tao_anh",
-            "trello",
+            "erp",
         }
         generic_compact = {item.replace("_", "") for item in generic_exact}
         if normalized in generic_exact or compact in generic_compact:
@@ -4590,7 +4880,7 @@ class FlowWebService:
             "khong chay",
             "ready for ai",
             "tao anh",
-            "trello ready",
+            "erp ready",
         )
         if any(phrase in stripped for phrase in generic_phrases):
             return ""
@@ -4610,7 +4900,7 @@ class FlowWebService:
             "ready",
             "tao",
             "test",
-            "trello",
+            "erp",
         }
         tokens = set(self._tokenize_match_words(cleaned))
         if tokens and tokens <= generic_tokens:
@@ -4655,29 +4945,29 @@ class FlowWebService:
             return 1
         return None
 
-    def _extract_user_assistant_trello_card_hint(self, question: str) -> str:
+    def _extract_user_assistant_erp_task_hint(self, question: str) -> str:
         raw = re.sub(r"\s+", " ", str(question or "").strip())
         if not raw:
             return ""
-        url_match = re.search(r"https?://(?:www\.)?trello\.com/c/[^\s,;]+", raw, flags=re.IGNORECASE)
+        url_match = re.search(r"https?://(?:www\.)?erp\.com/c/[^\s,;]+", raw, flags=re.IGNORECASE)
         if url_match:
-            return self._normalize_trello_card_id(url_match.group(0))
+            return self._normalize_erp_task_id(url_match.group(0))
         card_match = re.search(
-            r"(?:card|thẻ|the)\s*(?:trello)?\s*(?:id|là|la|=|:)?\s*([a-zA-Z0-9_-]{6,32})",
+            r"(?:card|thẻ|the)\s*(?:erp)?\s*(?:id|là|la|=|:)?\s*([a-zA-Z0-9_-]{6,32})",
             raw,
             flags=re.IGNORECASE,
         )
         if card_match:
-            return self._normalize_trello_card_id(card_match.group(1))
+            return self._normalize_erp_task_id(card_match.group(1))
         return ""
 
     def _user_assistant_suggested_actions(self, question: str, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         normalized = self._normalize_skill_token(question)
         flow = context.get("flow", {})
-        trello = context.get("trello", {})
+        erp = context.get("erp", {})
         telegram = context.get("telegram", {})
         product_filter = self._extract_user_assistant_product_filter(question)
-        trello_card_hint = self._extract_user_assistant_trello_card_hint(question)
+        erp_task_hint = self._extract_user_assistant_erp_task_hint(question)
         requested_limit = self._extract_user_assistant_batch_limit(question)
         test_run = requested_limit == 1 or any(term in normalized for term in ("test", "thu", "kiem_tra", "demo", "mot_san_pham", "1_san_pham"))
         actions: List[Dict[str, Any]] = []
@@ -4686,7 +4976,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Lập kế hoạch Flow AI",
-                    "detail": "AI operator sẽ viết prompt, chọn nguồn Trello/Sheet và đưa các nút thao tác Flow theo đúng quy trình.",
+                    "detail": "AI operator sẽ viết prompt, chọn nguồn ERP/Sheet và đưa các nút thao tác Flow theo đúng quy trình.",
                     "action": "plan_flow_ai_operator",
                     "payload": {"instruction": question},
                     "requires_confirmation": False,
@@ -4701,47 +4991,39 @@ class FlowWebService:
                     "requires_confirmation": False,
                 }
             )
-        if not trello.get("credentials_saved") or not trello.get("board_id_set"):
+        if not erp.get("credentials_saved") or not erp.get("project_id_set"):
             actions.append(
                 {
-                    "label": "Lưu Trello",
-                    "detail": "Dán API key, token và board URL trong Trello storage để app lấy ảnh và upload lại đúng card.",
+                    "label": "Lưu ERP",
+                    "detail": "Dán API key/API secret trong HaviGroup ERP, chọn Project rồi chọn Task nguồn; artefact sẽ được duyệt trên dashboard trước khi app ghi ảnh vào comment Task.",
                 }
             )
-        if not telegram.get("configured"):
-            actions.append(
-                {
-                    "label": "Lưu Telegram",
-                    "detail": "Dán bot token và chat id để ảnh tạo xong được gửi sang Telegram chờ duyệt.",
-                }
-            )
-
         if product_filter:
             actions.append(
                 {
                     "label": f"Lọc sản phẩm: {product_filter}",
-                    "detail": "Điền từ khóa này để app tìm đúng card Trello; Tác nhân Flow sẽ tự viết prompt nếu không dùng Sheet.",
+                    "detail": "Điền từ khóa này để app tìm đúng ERP Task; Tác nhân Flow sẽ tự viết prompt nếu không dùng Sheet.",
                     "action": "apply_product_filter",
                     "payload": {"value": product_filter},
                     "requires_confirmation": False,
                 }
             )
-        if trello_card_hint:
+        if erp_task_hint:
             actions.append(
                 {
-                    "label": f"Chọn card Trello: {trello_card_hint}",
-                    "detail": "Ghim đúng card Trello này làm nguồn ảnh để app không tự chọn card khác.",
-                    "action": "set_trello_card",
-                    "payload": {"value": trello_card_hint},
+                    "label": f"Chọn ERP Task: {erp_task_hint}",
+                    "detail": "Ghim đúng ERP Task này làm nguồn ảnh để app không tự chọn Task khác.",
+                    "action": "set_erp_task",
+                    "payload": {"value": erp_task_hint},
                     "requires_confirmation": False,
                 }
             )
-        if any(term in normalized for term in ("trello", "ready", "card", "list", "anh", "nham")):
+        if any(term in normalized for term in ("erp", "ready", "card", "list", "anh", "nham")):
             actions.append(
                 {
-                    "label": f"Soát {self._trello_source_scope_label()}",
-                    "detail": f"Chỉ để card cần chạy trong list {self._trello_source_scope_label()}; ảnh nguồn phải nằm trong attachment của chính card đó.",
-                    "action": "select_trello_source",
+                    "label": f"Soát {self._erp_source_scope_label()}",
+                    "detail": f"Chỉ để card cần chạy trong list {self._erp_source_scope_label()}; ảnh nguồn phải nằm trong attachment của chính card đó.",
+                    "action": "select_erp_source",
                     "requires_confirmation": False,
                 }
             )
@@ -4749,7 +5031,7 @@ class FlowWebService:
             actions.append(
                 {
                     "label": "Soát prompt sheet",
-                    "detail": "Sheet giờ là tùy chọn. Nếu dùng Sheet, prompt cần Active=TRUE và khớp Product_Key/Product_Name hoặc Trello_Card/Card_URL.",
+                    "detail": "Sheet giờ là tùy chọn. Nếu dùng Sheet, prompt cần Active=TRUE và khớp Product_Key/Product_Name hoặc ERP_Task/Card_URL.",
                     "action": "preview_prompt_source",
                     "requires_confirmation": False,
                 }
@@ -4757,9 +5039,9 @@ class FlowWebService:
         if any(term in normalized for term in ("duyet", "telegram", "approve", "chap_thuan")):
             actions.append(
                 {
-                    "label": "Duyệt trên Trello",
-                    "detail": "Auto Trello sẽ upload ảnh tạo xong vào attachment của đúng card; chủ nhân duyệt trực tiếp trên Trello.",
-                    "action": "select_trello_source",
+                "label": "Duyệt trên dashboard",
+                "detail": "Artefact hiện ngay trên dashboard. Chỉ URL artifact được duyệt mới được comment vào đúng ERP Task.",
+                "action": "open_dashboard_review",
                     "requires_confirmation": False,
                 }
             )
@@ -4770,13 +5052,13 @@ class FlowWebService:
                 payload["test_mode"] = True
             actions.append(
                 {
-                    "label": "Chạy Auto Trello",
+                    "label": "Chạy Auto ERP",
                     "detail": (
-                        "Test mode: chỉ chạy 1 prompt/card đầu tiên để kiểm tra sản phẩm thật, Flow và Trello."
+                        "Test mode: chỉ chạy 1 prompt/Task đầu tiên để kiểm tra sản phẩm thật, Flow, dashboard review và ERP."
                         if test_run
-                        else f"App sẽ quét card {self._trello_source_scope_label()} có ảnh, nhờ Tác nhân Flow tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh rồi upload về đúng card Trello."
+                        else f"App sẽ quét Task ở trạng thái {self._erp_source_scope_label()} có URL ảnh HTTPS, nhờ Tác nhân Flow tạo ảnh, chờ duyệt trên dashboard rồi comment URL artifact vào đúng Task ERP."
                     ),
-                    "action": "run_auto_trello",
+                    "action": "run_auto_erp",
                     "payload": payload,
                     "requires_confirmation": True,
                 }
@@ -4785,35 +5067,35 @@ class FlowWebService:
         if not actions:
             actions.append(
                 {
-                    "label": "Chạy Auto Trello",
-                    "detail": "Khi Flow và Trello sẵn sàng, bấm Auto Trello để app tự tìm card, gửi Tác nhân Flow viết prompt và chạy hàng loạt.",
-                    "action": "run_auto_trello",
+                    "label": "Chạy Auto ERP",
+                    "detail": "Khi Flow và ERP sẵn sàng, bấm Auto ERP để app tự tìm card, gửi Tác nhân Flow viết prompt và chạy hàng loạt.",
+                    "action": "run_auto_erp",
                     "requires_confirmation": True,
                 }
             )
 
         return self._dedupe_assistant_actions(actions, limit=8)
 
-    def _user_assistant_trello_candidates(self, query: str, limit: int = 8) -> List[Dict[str, Any]]:
+    def _user_assistant_erp_candidates(self, query: str, limit: int = 8) -> List[Dict[str, Any]]:
         query = re.sub(r"\s+", " ", str(query or "").strip())
         if not query:
             return []
-        key, token = self._trello_credentials()
+        key, token = self._erp_credentials()
         if not key or not token:
             return []
 
-        trello_config = self.store.snapshot().trello_config
-        board_id = self._normalize_trello_board_id(trello_config.board_id or os.getenv("TRELLO_BOARD_ID", ""))
-        if not board_id:
+        erp_config = self.store.snapshot().erp_config
+        project_id = self._normalize_erp_project_id(erp_config.project_id or os.getenv("ERP_PROJECT_ID", ""))
+        if not project_id:
             return []
 
-        raw_list_id = trello_config.list_id or os.getenv("TRELLO_LIST_ID", "")
-        source_list_ids = set(self._trello_auto_source_list_ids(key, token, board_id, raw_list_id))
-        lists = self._trello_board_lists(key, token, board_id)
-        list_names = {self._normalize_trello_id(str(item.get("id") or "")): str(item.get("name") or "").strip() for item in lists}
+        raw_list_id = erp_config.status or os.getenv("ERP_STATUS_ID", "")
+        source_list_ids = set(self._erp_auto_source_list_ids(key, token, project_id, raw_list_id))
+        lists = self._erp_project_lists(key, token, project_id)
+        list_names = {self._normalize_erp_id(str(item.get("id") or "")): str(item.get("name") or "").strip() for item in lists}
 
-        payload = self._trello_get_json(
-            f"boards/{quote(board_id, safe='')}/cards",
+        payload = self._erp_get_json(
+            f"boards/{quote(project_id, safe='')}/cards",
             key,
             token,
             fields={
@@ -4827,10 +5109,10 @@ class FlowWebService:
         query_key = self._compact_match_text(query)
         query_alias_keys = [
             self._compact_match_text(alias)
-            for alias in self._trello_query_aliases(query)
+            for alias in self._erp_query_aliases(query)
             if self._compact_match_text(alias)
         ]
-        query_groups = self._user_assistant_trello_query_groups(query)
+        query_groups = self._user_assistant_erp_query_groups(query)
         candidates: List[Dict[str, Any]] = []
 
         def candidate_score(
@@ -4887,14 +5169,14 @@ class FlowWebService:
             all_image_attachments = [
                 item
                 for item in card.get("attachments") or []
-                if isinstance(item, dict) and self._trello_attachment_is_image(item)
+                if isinstance(item, dict) and self._erp_attachment_is_image(item)
             ]
-            image_attachments, _generated_attachments = self._trello_source_and_flow_output_attachments(all_image_attachments)
+            image_attachments, _generated_attachments = self._erp_source_and_flow_output_attachments(all_image_attachments)
             if not image_attachments:
                 continue
             card["_image_attachments"] = image_attachments
 
-            card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+            card_list_id = self._normalize_erp_id(str(card.get("idList") or ""))
             list_name = list_names.get(card_list_id) or card_list_id or "Không rõ list"
             in_ready_list = bool(source_list_ids and card_list_id in source_list_ids)
             score = candidate_score(card, image_attachments, in_ready_list, list_name)
@@ -4902,16 +5184,16 @@ class FlowWebService:
                 continue
             candidates.append(
                 {
-                    "card_id": str(card.get("id") or "").strip(),
+                    "task_id": str(card.get("id") or "").strip(),
                     "short_link": str(card.get("shortLink") or "").strip(),
                     "name": str(card.get("name") or "").strip(),
                     "url": str(card.get("url") or "").strip(),
-                    "list_id": card_list_id,
+                    "status": card_list_id,
                     "list_name": list_name,
                     "in_ready_list": in_ready_list,
                     "image_count": len(image_attachments),
                     "image_names": [str(item.get("name") or "").strip() for item in image_attachments[:3] if str(item.get("name") or "").strip()],
-                    "image_previews": self._trello_candidate_image_previews(str(card.get("id") or "").strip(), image_attachments),
+                    "image_previews": self._erp_candidate_image_previews(str(card.get("id") or "").strip(), image_attachments),
                     "_score": score,
                 }
             )
@@ -4922,14 +5204,14 @@ class FlowWebService:
             cleaned.append({key: value for key, value in item.items() if not key.startswith("_")})
         return cleaned
 
-    def _trello_candidate_image_previews(
+    def _erp_candidate_image_previews(
         self,
-        card_id: str,
+        task_id: str,
         image_attachments: List[Dict[str, Any]],
         limit: int = 4,
     ) -> List[Dict[str, str]]:
         previews: List[Dict[str, str]] = []
-        normalized_card_id = self._normalize_trello_card_id(card_id)
+        normalized_card_id = self._normalize_erp_task_id(task_id)
         for attachment in image_attachments[: max(1, min(6, int(limit or 4)))]:
             if not isinstance(attachment, dict):
                 continue
@@ -4938,7 +5220,7 @@ class FlowWebService:
             preview_url = url
             if normalized_card_id and attachment_id:
                 preview_url = (
-                    f"/api/trello/cards/{quote(normalized_card_id, safe='')}/attachments/"
+                    f"/api/erp/tasks/{quote(normalized_card_id, safe='')}/attachments/"
                     f"{quote(attachment_id, safe='')}/preview"
                 )
             previews.append(
@@ -4955,7 +5237,7 @@ class FlowWebService:
         stripped = self._strip_accents(str(value or "")).lower()
         return [token for token in re.findall(r"[a-z0-9]+", stripped) if token]
 
-    def _user_assistant_trello_query_groups(self, query: str) -> List[List[str]]:
+    def _user_assistant_erp_query_groups(self, query: str) -> List[List[str]]:
         tokens = [token for token in self._tokenize_match_words(query) if len(token) > 1]
         groups: List[List[str]] = []
         if tokens:
@@ -5004,25 +5286,25 @@ class FlowWebService:
             unique.append(cleaned)
         return unique
 
-    def _format_user_assistant_trello_candidate_context(self, candidates: List[Dict[str, Any]], query: str) -> str:
+    def _format_user_assistant_erp_candidate_context(self, candidates: List[Dict[str, Any]], query: str) -> str:
         if not candidates:
-            return f"Trello scan theo '{query}': chưa thấy card có attachment ảnh khớp trên board."
+            return f"ERP scan theo '{query}': chưa thấy card có attachment ảnh khớp trên board."
         ready = [item for item in candidates if item.get("in_ready_list")]
-        source_scope = self._trello_source_scope_label()
+        source_scope = self._erp_source_scope_label()
         lines = [
-            f"Trello scan theo '{query}': tìm thấy {len(candidates)} card có ảnh; {len(ready)} card đang ở {source_scope}.",
+            f"ERP scan theo '{query}': tìm thấy {len(candidates)} card có ảnh; {len(ready)} card đang ở {source_scope}.",
         ]
         for item in candidates[:5]:
             status = f"đúng {source_scope}" if item.get("in_ready_list") else f"chưa ở {source_scope}"
             lines.append(
                 "- "
-                + f"{item.get('name') or item.get('short_link') or item.get('card_id')} "
+                + f"{item.get('name') or item.get('short_link') or item.get('task_id')} "
                 + f"({item.get('list_name') or 'Không rõ list'}, {item.get('image_count') or 0} ảnh, {status}) "
                 + f"{item.get('url') or ''}"
             )
         return "\n".join(lines)
 
-    def _append_user_assistant_trello_candidate_notice(
+    def _append_user_assistant_erp_candidate_notice(
         self,
         answer: str,
         candidates: List[Dict[str, Any]],
@@ -5033,35 +5315,35 @@ class FlowWebService:
         if not query or (not candidates and not scan_attempted):
             return answer
         ready = [item for item in candidates if item.get("in_ready_list")]
-        source_scope = self._trello_source_scope_label()
+        source_scope = self._erp_source_scope_label()
         if not candidates:
             notice = (
-                f"Trello scan: app chưa tìm thấy card có attachment ảnh khớp '{query}' trên board. "
-                f"App sẽ không chạy Auto Trello cho tới khi có card đúng trong {source_scope} hoặc chủ nhân chọn/dán link card rõ ràng."
+                f"ERP scan: app chưa tìm thấy card có attachment ảnh khớp '{query}' trên board. "
+                f"App sẽ không chạy Auto ERP cho tới khi có card đúng trong {source_scope} hoặc chủ nhân chọn/dán link card rõ ràng."
             )
         elif ready:
             ready_names = ", ".join(str(item.get("name") or item.get("short_link") or "").strip() for item in ready[:3] if item)
             notice = (
-                f"Trello scan: app tìm thấy {len(ready)} card khớp '{query}' đang ở {source_scope}"
+                f"ERP scan: app tìm thấy {len(ready)} card khớp '{query}' đang ở {source_scope}"
                 + (f": {ready_names}." if ready_names else ".")
                 + " Hãy bấm đúng thumbnail ảnh để khóa chính xác attachment trước khi chạy."
             )
         else:
             first = candidates[0]
             notice = (
-                f"Trello scan: app tìm thấy card khớp '{query}' là {first.get('name') or first.get('short_link')} "
+                f"ERP scan: app tìm thấy card khớp '{query}' là {first.get('name') or first.get('short_link')} "
                 f"đang ở list {first.get('list_name') or 'khác'}, chưa ở {source_scope}. "
-                "Chủ nhân có thể bấm đúng thumbnail ảnh ngay trong app; sau khi chọn, Auto Trello sẽ dùng chính attachment đó mà không cần kéo list."
+                "Chủ nhân có thể bấm đúng thumbnail ảnh ngay trong app; sau khi chọn, Auto ERP sẽ dùng chính attachment đó mà không cần kéo list."
             )
         if notice in answer:
             return answer
         return f"{notice}\n\n{answer}".strip()
 
-    def _refine_user_assistant_actions_for_trello_candidates(
+    def _refine_user_assistant_actions_for_erp_candidates(
         self,
         actions: List[Dict[str, Any]],
         candidates: List[Dict[str, Any]],
-        trello_card_hint: str,
+        erp_task_hint: str,
         *,
         scan_attempted: bool = False,
         query: str = "",
@@ -5071,7 +5353,7 @@ class FlowWebService:
         ready = [item for item in candidates if item.get("in_ready_list")]
         refined: List[Dict[str, Any]] = []
         for action in actions:
-            if action.get("action") == "run_auto_trello" and not trello_card_hint:
+            if action.get("action") == "run_auto_erp" and not erp_task_hint:
                 if not ready or len(ready) > 1:
                     continue
             refined.append(action)
@@ -5079,14 +5361,14 @@ class FlowWebService:
         if not candidates:
             refined.append(
                 {
-                    "label": f"Chưa thấy card: {query}" if query else "Chưa thấy card Trello",
-                    "detail": "AI đã quét Trello nhưng chưa thấy card có ảnh khớp. Hãy nhập tên sản phẩm rõ hơn hoặc dán link card Trello cụ thể.",
+                    "label": f"Chưa thấy Task: {query}" if query else "Chưa thấy ERP Task",
+                    "detail": "AI đã quét ERP nhưng chưa thấy Task có URL ảnh HTTPS khớp. Hãy nhập tên sản phẩm rõ hơn hoặc chọn Task ERP cụ thể.",
                 }
             )
             return refined[:10]
 
         for item in candidates[:5]:
-            value = str(item.get("short_link") or item.get("card_id") or item.get("url") or "").strip()
+            value = str(item.get("short_link") or item.get("task_id") or item.get("url") or "").strip()
             if not value:
                 continue
             in_ready = bool(item.get("in_ready_list"))
@@ -5098,19 +5380,19 @@ class FlowWebService:
                     break
             refined.append(
                 {
-                    "label": f"{'Chọn & chạy' if first_attachment_id else 'Chọn card'}: {item.get('name') or value}",
+                    "label": f"{'Chọn & chạy' if first_attachment_id else 'Chọn Task'}: {item.get('name') or value}",
                     "detail": (
-                        f"Card có {item.get('image_count') or 0} ảnh attachment; "
+                        f"Task có {item.get('image_count') or 0} URL ảnh; "
                         + (
-                            "app sẽ tự dùng ảnh attachment cũ nhất để chạy."
+                            "app sẽ dùng URL ảnh đầu tiên để chạy."
                             if first_attachment_id
-                            else (f"đang ở {self._trello_source_scope_label()}." if in_ready else "app sẽ chạy trực tiếp card đã chọn, không tự lấy card khác.")
+                            else (f"đang ở {self._erp_source_scope_label()}." if in_ready else "app sẽ chạy trực tiếp Task đã chọn, không tự lấy Task khác.")
                         )
                     ),
-                    "action": "set_trello_card",
+                    "action": "set_erp_task",
                     "payload": {
                         "value": value,
-                        "list_id": item.get("list_id") or "",
+                        "status": item.get("status") or "",
                         **(
                             {"attachment_id": first_attachment_id, "run_after_select": True}
                             if first_attachment_id
@@ -5129,52 +5411,52 @@ class FlowWebService:
 
         if self._flow_operator_requested(f"{question} {ui_context}"):
             parts.append(
-                "Flow AI Operator là lớp AI trong app dùng để hiểu yêu cầu của chủ nhân, chọn đúng Trello card/ảnh, mở đúng project Flow và gửi lệnh cho Tác nhân Google Flow tự viết prompt."
+                "Flow AI Operator là lớp AI trong app dùng để hiểu yêu cầu, chọn đúng ERP Task/ảnh, mở đúng project Flow và gửi lệnh cho Tác nhân Google Flow tự viết prompt."
             )
             parts.append(
-                "Nó không tự lấy secret từ chat. Khi cần tạo thật, app vẫn yêu cầu xác nhận trước khi chạy Auto Trello để tránh lấy nhầm card hoặc tạo hàng loạt ngoài ý muốn."
+                "Nó không tự lấy secret từ chat. Khi cần tạo thật, app vẫn yêu cầu xác nhận trước khi chạy Auto ERP để tránh lấy nhầm Task hoặc tạo hàng loạt ngoài ý muốn."
             )
-        elif any(term in normalized for term in ("trello", "ready", "card", "list", "attachment", "anh", "nham")):
+        elif any(term in normalized for term in ("erp", "ready", "card", "list", "attachment", "anh", "nham")):
             parts.append(
-                f"Luồng Trello chuẩn là: app chỉ quét list {self._trello_source_scope_label()}, lấy ảnh attachment nằm trên chính card đó, gửi lệnh cho Tác nhân Flow tự viết prompt/tạo ảnh, rồi upload ảnh tạo xong về lại đúng card nguồn để duyệt trực tiếp."
+                f"Luồng ERP chuẩn là: app chỉ quét trạng thái {self._erp_source_scope_label()} trong Project {self._erp_allowed_project_id()}, lấy ảnh trên chính Task, gửi lệnh cho Tác nhân Flow tạo ảnh, chờ duyệt trên dashboard, rồi GraphQL thêm URL artifact vào comment đúng Task nguồn."
             )
             parts.append(
-                f"Nếu thấy lấy nhầm ảnh, hãy kiểm tra card có còn nằm trong {self._trello_source_scope_label()} không, card đó có attachment ảnh thật không, và bộ lọc/card ghim có trỏ đúng sản phẩm không."
+                f"Nếu thấy lấy nhầm ảnh, hãy kiểm tra Task có còn ở trạng thái {self._erp_source_scope_label()} không, Task có URL ảnh HTTPS hợp lệ không, và bộ lọc/Task ghim có trỏ đúng sản phẩm không."
             )
         elif any(term in normalized for term in ("sheet", "prompt", "active", "product", "loc")):
             parts.append(
-                "Sheet không còn bắt buộc. Nếu chủ nhân không dán Sheet, app sẽ dùng card Trello và attachment để nhờ Tác nhân Flow tự viết prompt; nếu vẫn dùng Sheet thì Active=TRUE và Product_Key/Product_Name/Card_URL giúp khớp chính xác hơn."
+                "Sheet không còn bắt buộc. Nếu không dán Sheet, app sẽ dùng ERP Task và URL ảnh HTTPS để nhờ Tác nhân Flow tự viết prompt; nếu vẫn dùng Sheet thì Active=TRUE và Product_Key/Product_Name/Task_URL giúp khớp chính xác hơn."
             )
             parts.append(
                 "Các dòng đã dùng nên được đánh dấu Used/Used_At nếu sheet có cột đó, để vòng lặp không chạy lại cùng prompt."
             )
         elif any(term in normalized for term in ("telegram", "duyet", "approve", "chap_thuan")):
             parts.append(
-                "Auto Trello hiện duyệt trực tiếp trên Trello: ảnh tạo xong được upload vào attachment của đúng card. Telegram chỉ còn là tùy chọn nếu chủ nhân bật riêng."
+                "Auto ERP hiển thị artefact ngay trên dashboard để duyệt. Ảnh bị từ chối hoặc còn chờ quyết định sẽ không được ghi vào ERP; chỉ URL artifact đã duyệt mới được thêm vào comment Task."
             )
             parts.append(
-                "Nếu không thấy nút duyệt hoạt động, kiểm tra bot token, chat id, và bấm refresh/đồng bộ approval trong app."
+                "Nếu không thấy ảnh chờ duyệt, bấm Refresh trên dashboard và kiểm tra lượt chạy đã tạo artefact hay chưa."
             )
         elif any(term in normalized for term in ("flow", "google", "dang_nhap", "project", "recaptcha", "tao_anh", "edit")):
             parts.append(
                 "Flow vẫn là nơi tạo/chỉnh ảnh chính. App mở project Flow bằng phiên trình duyệt đã đăng nhập, đẩy prompt và ảnh nguồn vào Flow, rồi chờ kết quả tải về."
             )
             parts.append(
-                "Nếu Flow tạo ảnh mới thay vì chỉnh ảnh đã chọn, hãy kiểm tra module Trello Image Source có lấy được attachment không và chế độ tạo ảnh đang nhận reference image từ card."
+                "Nếu Flow tạo ảnh mới thay vì chỉnh ảnh đã chọn, hãy kiểm tra module ERP Task Source có lấy được URL ảnh không và chế độ tạo ảnh đang nhận reference image từ Task."
             )
         elif any(term in normalized for term in ("windows", "mac", "ubuntu", "cai", "install", "chay")):
             parts.append(
                 "App là web local nên chạy được trên macOS, Windows và Ubuntu nếu có Python 3.11+, Node để kiểm tra frontend, và Playwright browser được cài đúng thư mục."
             )
             parts.append(
-                "Trên Windows nên chạy bằng PowerShell/venv, không phụ thuộc biến env thủ công vì Trello và Gemini đều lưu được trong giao diện app."
+                "Trên Windows nên chạy bằng PowerShell/venv, không phụ thuộc biến env thủ công vì ERP và Gemini đều lưu được trong giao diện app."
             )
         else:
             parts.append(
-                "Mình có thể hỗ trợ ngay trong app về Trello, Google Sheet tùy chọn, Google Flow, lỗi vòng lặp và cách chạy hàng loạt. Với những việc app đã có nút sẵn, trợ lý sẽ đưa nút thực thi để làm luôn trong giao diện."
+                "Mình có thể hỗ trợ ngay trong app về ERP, Google Sheet tùy chọn, Google Flow, lỗi vòng lặp và cách chạy hàng loạt. Với những việc app đã có nút sẵn, trợ lý sẽ đưa nút thực thi để làm luôn trong giao diện."
             )
             parts.append(
-                f"Để chạy đúng luồng, cần có card ở {self._trello_source_scope_label()}, ảnh attachment trên card, Flow đã đăng nhập, Trello đã lưu, rồi bấm Auto Trello. Sheet prompt chỉ là tùy chọn."
+                f"Để chạy đúng luồng, cần có Task ở trạng thái {self._erp_source_scope_label()} với URL ảnh HTTPS, Flow đã đăng nhập và ERP đã lưu, rồi bấm Auto ERP. Sheet prompt chỉ là tùy chọn."
             )
 
         parts.append(f"Trạng thái app hiện tại: {context_summary}")
@@ -5184,14 +5466,14 @@ class FlowWebService:
         prompt_text = "\n".join(
             [
                 "Bạn là trợ lý vận hành trong app Flow v2, trả lời bằng tiếng Việt dễ hiểu cho người không rành kỹ thuật.",
-                f"Nhiệm vụ: hướng dẫn người dùng dùng app tự động lấy ảnh từ Trello, gửi lệnh cho Tác nhân Google Flow tự viết prompt/tạo đủ {self.FLOW_AGENT_TARGET_OUTPUT_COUNT} ảnh, rồi upload ảnh tạo xong về đúng card Trello để duyệt trực tiếp.",
+                "Nhiệm vụ: hướng dẫn người dùng lấy URL ảnh HTTPS từ ERP Task, gửi lệnh cho Tác nhân Google Flow tạo ảnh, duyệt trên dashboard, rồi dùng GraphQL addTaskComment để thêm URL artifact đã duyệt vào đúng Task.",
                 "Nếu người dùng nói về AI của Flow, Flow AI, automation operator, hãy giải thích rằng app có Flow AI Operator: AI lập kế hoạch, chọn đúng card/ảnh và đưa các nút thao tác thật; prompt ảnh cuối do Tác nhân trong Google Flow viết.",
-                f"Bạn phải hiểu nguồn sản phẩm là attachment ảnh trên Trello card trong list {self._trello_source_scope_label()}. Prompt ảnh cuối do Tác nhân Google Flow viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
-                "Không được yêu cầu người dùng chọn workflow mặc định để chạy Auto AI Trello; workflow mặc định chỉ hữu ích cho luồng chỉnh/sửa ảnh cũ, còn Auto AI Trello chạy bằng project Flow + Tác nhân Flow + ảnh Trello.",
+                f"Bạn phải hiểu nguồn sản phẩm là URL ảnh HTTPS trên ERP Task ở trạng thái {self._erp_source_scope_label()}. Prompt ảnh cuối do Tác nhân Google Flow viết tự động; Google Sheet/CSV/paste chỉ là tùy chọn nếu người dùng muốn prompt có sẵn.",
+                "Không được yêu cầu người dùng chọn workflow mặc định để chạy Auto AI ERP; workflow mặc định chỉ hữu ích cho luồng chỉnh/sửa ảnh cũ, còn Auto AI ERP chạy bằng project Flow + Tác nhân Flow + ảnh ERP.",
                 "Nếu người dùng yêu cầu app làm việc gì, hãy nói app sẽ dùng các nút hành động kèm theo câu trả lời; không bịa hành động ngoài khả năng hiện có.",
-                "Không yêu cầu người dùng dán secret vào chat. Không in API key, token, cookie hay biến môi trường.",
+                "Không yêu cầu người dùng dán secret vào chat. Không in API key, API secret, cookie hay biến môi trường.",
                 "Trả lời ngắn, thực dụng, ưu tiên các bước người dùng bấm được trong giao diện.",
-                f"Nếu người dùng hỏi lỗi lấy nhầm ảnh, nhấn mạnh {self._trello_source_scope_label()} và attachment phải nằm trên chính card nguồn.",
+                f"Nếu người dùng hỏi lỗi lấy nhầm ảnh, nhấn mạnh trạng thái {self._erp_source_scope_label()} và URL ảnh HTTPS phải nằm trên chính Task nguồn.",
                 "Nếu trạng thái cho thấy thiếu cấu hình, nói rõ thiếu phần nào.",
                 "Không dùng markdown bảng. Có thể dùng các dòng ngắn.",
                 "",
@@ -5287,25 +5569,25 @@ class FlowWebService:
 
         context = self._user_assistant_context_snapshot()
         product_filter = self._extract_user_assistant_product_filter(question)
-        trello_card_hint = self._extract_user_assistant_trello_card_hint(question)
-        trello_candidates: List[Dict[str, Any]] = []
-        trello_candidate_error = ""
-        trello_candidate_scan_attempted = bool(product_filter and context.get("trello", {}).get("configured"))
-        if trello_candidate_scan_attempted:
+        erp_task_hint = self._extract_user_assistant_erp_task_hint(question)
+        erp_candidates: List[Dict[str, Any]] = []
+        erp_candidate_error = ""
+        erp_candidate_scan_attempted = bool(product_filter and context.get("erp", {}).get("configured"))
+        if erp_candidate_scan_attempted:
             try:
-                trello_candidates = await asyncio.to_thread(self._user_assistant_trello_candidates, product_filter)
+                erp_candidates = await asyncio.to_thread(self._user_assistant_erp_candidates, product_filter)
             except Exception as exc:
-                trello_candidate_error = str(exc)[:180]
-        if trello_candidate_scan_attempted:
-            context["trello_candidate_scan"] = self._format_user_assistant_trello_candidate_context(trello_candidates, product_filter)
+                erp_candidate_error = str(exc)[:180]
+        if erp_candidate_scan_attempted:
+            context["erp_candidate_scan"] = self._format_user_assistant_erp_candidate_context(erp_candidates, product_filter)
         context_summary = self._format_user_assistant_context(context, ui_context)
         local_answer = self._local_user_assistant_reply(question, context, ui_context)
         actions = self._user_assistant_suggested_actions(question, context)
-        actions = self._refine_user_assistant_actions_for_trello_candidates(
+        actions = self._refine_user_assistant_actions_for_erp_candidates(
             actions,
-            trello_candidates,
-            trello_card_hint,
-            scan_attempted=trello_candidate_scan_attempted,
+            erp_candidates,
+            erp_task_hint,
+            scan_attempted=erp_candidate_scan_attempted,
             query=product_filter,
         )
         flow_operator_plan: Dict[str, Any] = {}
@@ -5354,11 +5636,11 @@ class FlowWebService:
             except Exception as exc:
                 fallback_reason = str(exc)[:180]
                 model = ""
-        answer = self._append_user_assistant_trello_candidate_notice(
+        answer = self._append_user_assistant_erp_candidate_notice(
             answer,
-            trello_candidates,
+            erp_candidates,
             product_filter,
-            scan_attempted=trello_candidate_scan_attempted,
+            scan_attempted=erp_candidate_scan_attempted,
         )
 
         return {
@@ -5368,8 +5650,8 @@ class FlowWebService:
             "model": model,
             "suggested_actions": actions,
             "flow_operator_plan": flow_operator_plan,
-            "trello_candidates": trello_candidates,
-            "trello_candidates_error": trello_candidate_error,
+            "erp_candidates": erp_candidates,
+            "erp_candidates_error": erp_candidate_error,
             "context_summary": context_summary,
             "fallback_reason": fallback_reason,
         }
@@ -6882,10 +7164,17 @@ exit 1
         for index, raw_module in enumerate(raw_modules or []):
             module = raw_module if isinstance(raw_module, dict) else {}
             module_type = re.sub(r"[^a-z0-9_]+", "", str(module.get("type") or "custom").strip().lower()) or "custom"
+            # Dashboard review is the only supported review surface. Ignore
+            # imported legacy Telegram nodes so a client payload can never
+            # trigger an outbound Telegram request.
+            if module_type == "telegram":
+                continue
             module_id = str(module.get("id") or f"{module_type}_{index + 1}").strip() or f"{module_type}_{index + 1}"
             title = str(module.get("title") or self._automation_module_default_title(module_type)).strip()
             detail = str(module.get("detail") or "").strip()
             settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
+            if module_type == "approval":
+                settings = {**settings, "approvalMode": "dashboard"}
             modules.append(
                 {
                     "id": module_id,
@@ -6910,31 +7199,97 @@ exit 1
                     "index": 0,
                 }
             ]
-            if request.type == "image" and request.telegram_enabled:
+            if request.type == "image" and request.erp_enabled:
                 modules.append(
                     {
-                        "id": "telegram",
-                        "type": "telegram",
-                        "title": self._automation_module_default_title("telegram"),
-                        "detail": "Gửi ảnh để duyệt",
+                        "id": "approval",
+                        "type": "approval",
+                        "title": self._automation_module_default_title("approval"),
+                        "detail": "Chờ toàn bộ quyết định duyệt trên dashboard",
                         "enabled": True,
-                        "settings": {},
+                        "settings": {"approvalMode": "dashboard"},
                         "index": 1,
                     }
                 )
-            if request.type == "image" and request.trello_enabled:
+            if request.type == "image" and request.erp_enabled:
                 modules.append(
                     {
-                        "id": "trello",
-                        "type": "trello",
-                        "title": self._automation_module_default_title("trello"),
-                        "detail": "Lưu ảnh vào Trello",
+                        "id": "erp",
+                        "type": "erp",
+                        "title": self._automation_module_default_title("erp"),
+                        "detail": "Lưu ảnh vào ERP",
                         "enabled": True,
                         "settings": {},
                         "index": 2,
                     }
                 )
 
+        # Flow stamps a Gemini watermark on every image it returns, so the
+        # local cleanup runs for every image graph even when an older client
+        # (or an imported graph) never included the node.
+        if request.type == "image" and not any(
+            str(module.get("type") or "") == "watermark" for module in modules
+        ):
+            flow_index = next(
+                (
+                    int(module.get("index") or 0)
+                    for module in modules
+                    if str(module.get("type") or "") == "flow"
+                ),
+                -1,
+            )
+            modules.append(
+                {
+                    "id": "watermark",
+                    "type": "watermark",
+                    "title": self._automation_module_default_title("watermark"),
+                    "detail": "Xóa watermark Gemini bằng bộ xử lý cục bộ",
+                    "enabled": True,
+                    "settings": {},
+                    # Sit right behind Flow so the sort below keeps it ahead of
+                    # the review gate even when the graph is already ordered.
+                    "index": flow_index if flow_index >= 0 else len(modules),
+                }
+            )
+            modules.sort(
+                key=lambda module: (
+                    int(module.get("index") or 0),
+                    0 if str(module.get("type") or "") != "watermark" else 1,
+                )
+            )
+
+        has_enabled_erp_archive = any(
+            str(module.get("type") or "") == "erp" and bool(module.get("enabled"))
+            for module in modules
+        )
+        # Only workflows that archive to ERP need a mandatory dashboard gate.
+        # A standalone custom webhook should remain able to run immediately.
+        if request.type == "image" and request.erp_enabled and has_enabled_erp_archive:
+            enabled_types = {str(module.get("type") or "") for module in modules if module.get("enabled")}
+            if "approval" not in enabled_types:
+                modules.append(
+                    {
+                        "id": "approval",
+                        "type": "approval",
+                        "title": self._automation_module_default_title("approval"),
+                        "detail": "Chờ toàn bộ quyết định duyệt trên dashboard",
+                        "enabled": True,
+                        "settings": {"approvalMode": "dashboard"},
+                        "index": len(modules),
+                    }
+                )
+            priority = {
+                "source": 0,
+                "erp_source": 1,
+                "normalize": 2,
+                "flow": 3,
+                "watermark": 4,
+                "approval": 5,
+                "erp": 6,
+            }
+            modules.sort(key=lambda module: (priority.get(str(module.get("type") or ""), 7), int(module.get("index") or 0)))
+
+        module_ids = {str(module.get("id") or "") for module in modules}
         raw_edges = graph.get("edges") if isinstance(graph, dict) else []
         edges = [
             {
@@ -6943,7 +7298,9 @@ exit 1
                 "condition": str(edge.get("condition") or "success").strip() or "success",
             }
             for edge in (raw_edges or [])
-            if isinstance(edge, dict) and str(edge.get("source") or "").strip() and str(edge.get("target") or "").strip()
+            if isinstance(edge, dict)
+            and str(edge.get("source") or "").strip() in module_ids
+            and str(edge.get("target") or "").strip() in module_ids
         ]
         if not edges:
             enabled = [module for module in modules if module["enabled"]]
@@ -6966,12 +7323,12 @@ exit 1
     def _automation_module_default_title(self, module_type: str) -> str:
         return {
             "source": "Prompt Source",
-            "trello_source": "Trello Image Source",
+            "erp_source": "ERP Task Source",
             "normalize": "Normalize Prompt",
             "flow": "Google Flow",
-            "telegram": "Telegram Review",
-            "trello": "Trello Archive",
-            "approval": "Approval",
+            "watermark": "Remove Logo",
+            "erp": "ERP Task Comment",
+            "approval": "Dashboard Review",
             "custom": "Custom Module",
         }.get(str(module_type or "").strip().lower(), "Custom Module")
 
@@ -7080,7 +7437,7 @@ exit 1
             module_type = module["type"]
             if module_type == "flow":
                 return
-            if module_type == "trello_source":
+            if module_type == "erp_source":
                 continue
             if module_type == "source":
                 await self._set_automation_module_status(
@@ -7152,48 +7509,25 @@ exit 1
                 )
         if module.get("type") == "telegram" and settings.get("telegramChat"):
             payload["telegram_chat_id"] = str(settings.get("telegramChat") or "").strip()
-        if module.get("type") in {"trello", "trello_source"}:
-            if settings.get("trelloBoard"):
-                payload["trello_board_id"] = str(settings.get("trelloBoard") or "").strip()
-            if settings.get("trelloCard") and (
-                module.get("type") == "trello_source" or not str(payload.get("trello_card_id") or "").strip()
+        if module.get("type") in {"erp", "erp_source"}:
+            # Never trust a graph/imported setting to widen the ERP scope.
+            payload["erp_project_id"] = self._erp_allowed_project_id()
+            if settings.get("erpTask") and (
+                module.get("type") == "erp_source" or not str(payload.get("erp_task_id") or "").strip()
             ):
-                payload["trello_card_id"] = str(settings.get("trelloCard") or "").strip()
-                if module.get("type") == "trello_source":
-                    payload["trello_source_card_id"] = self._normalize_trello_card_id(payload["trello_card_id"])
-            if settings.get("trelloList"):
-                payload["trello_list_id"] = str(settings.get("trelloList") or "").strip()
-            attachment_ids = self._normalize_trello_attachment_ids(
-                settings.get("trelloAttachmentIds") or settings.get("trelloAttachmentId") or []
+                payload["erp_task_id"] = str(settings.get("erpTask") or "").strip()
+                if module.get("type") == "erp_source":
+                    payload["erp_source_task_id"] = self._normalize_erp_task_id(payload["erp_task_id"])
+            if settings.get("erpStatus"):
+                payload["erp_status_id"] = str(settings.get("erpStatus") or "").strip()
+            attachment_ids = self._normalize_erp_attachment_ids(
+                settings.get("erpAttachmentIds") or settings.get("erpAttachmentId") or []
             )
             if attachment_ids:
-                payload["trello_attachment_ids"] = attachment_ids
-                if module.get("type") == "trello_source":
-                    payload["trello_source_attachment_ids"] = attachment_ids
+                payload["erp_attachment_ids"] = attachment_ids
+                if module.get("type") == "erp_source":
+                    payload["erp_source_attachment_ids"] = attachment_ids
         return CreateJobRequest(**payload)
-
-    def _trello_direct_review_enabled(self, request: CreateJobRequest, graph: Dict[str, Any]) -> bool:
-        if request.type != "image" or not request.trello_enabled:
-            return False
-
-        has_trello_archive = any(
-            module.get("enabled") and module.get("type") == "trello"
-            for module in graph.get("modules", [])
-        )
-        if not has_trello_archive:
-            return False
-
-        approval_modes = {
-            str((module.get("settings") or {}).get("approvalMode") or "").strip().lower()
-            for module in graph.get("modules", [])
-            if module.get("enabled") and module.get("type") == "approval"
-        }
-        if "telegram" in approval_modes:
-            return False
-        if approval_modes.intersection({"trello", "direct_trello", "auto"}):
-            return True
-
-        return bool(self._normalize_trello_card_id(request.trello_card_id))
 
     async def _run_automation_post_modules(
         self,
@@ -7207,7 +7541,6 @@ exit 1
     ) -> Dict[str, Any]:
         graph = self._automation_graph_payload(request)
         next_result = dict(result)
-        direct_trello_review = self._trello_direct_review_enabled(request, graph)
         waiting_for_start = bool(str(start_after_module_id or "").strip())
         for module in graph["modules"]:
             if waiting_for_start:
@@ -7217,47 +7550,44 @@ exit 1
             if not module["enabled"]:
                 continue
             module_type = module["type"]
-            if module_type in {"source", "trello_source", "normalize", "flow"}:
+            if module_type in {"source", "erp_source", "normalize", "flow"}:
                 continue
             if skip_finished and self._automation_module_status(job_id, module["id"]) in {"completed", "skipped", "disabled"}:
                 continue
             module_request = self._request_with_automation_module_settings(request, module)
             try:
                 if module_type == "telegram":
-                    if direct_trello_review:
-                        output = {
-                            "configured": True,
-                            "skipped": True,
-                            "reason": "trello_direct_review",
-                            "detail": "Auto Trello đang duyệt trực tiếp trên card Trello nên bỏ qua Telegram.",
-                        }
-                        await self._set_automation_module_status(
-                            job_id,
-                            request,
-                            module["id"],
-                            "skipped",
-                            input_data={"artifact_count": len(artifacts), "card_id": request.trello_card_id},
-                            output=output,
-                        )
-                        next_result["telegram"] = output
-                        await self.store.append_log(
-                            job_id,
-                            f"Module {module['title']}: bỏ qua Telegram vì ảnh sẽ được duyệt trực tiếp trên Trello.",
-                        )
-                        continue
+                    # Kept only as a defensive guard for a graph created by
+                    # an older client. _automation_graph_payload normally
+                    # removes this module before it reaches the runner.
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        "skipped",
+                        input_data={"artifact_count": len(artifacts)},
+                        output={"reason": "dashboard_review_replaces_telegram"},
+                    )
+                elif module_type == "watermark":
                     await self._set_automation_module_status(
                         job_id,
                         request,
                         module["id"],
                         "running",
-                        input_data={"artifact_count": len(artifacts), "chat_id": module_request.telegram_chat_id},
+                        input_data={"artifact_count": len(artifacts)},
                     )
-                    telegram_result = await self._send_telegram_review_pack(job_id, module_request, artifacts)
-                    if telegram_result:
-                        next_result["telegram"] = telegram_result
-                    status = "completed" if telegram_result.get("configured", True) else "skipped"
-                    await self._set_automation_module_status(job_id, request, module["id"], status, output=telegram_result or {})
-                elif module_type == "trello":
+                    watermark_result = await self._remove_flow_watermarks(job_id, module_request, artifacts)
+                    if watermark_result:
+                        next_result["watermark"] = watermark_result
+                    status = "completed" if watermark_result.get("configured", True) else "skipped"
+                    await self._set_automation_module_status(
+                        job_id,
+                        request,
+                        module["id"],
+                        status,
+                        output=watermark_result or {},
+                    )
+                elif module_type == "erp":
                     await self._set_automation_module_status(
                         job_id,
                         request,
@@ -7265,65 +7595,38 @@ exit 1
                         "running",
                         input_data={
                             "artifact_count": len(artifacts),
-                            "card_id": module_request.trello_card_id,
-                            "list_id": module_request.trello_list_id,
+                            "task_id": module_request.erp_task_id,
+                            "status": module_request.erp_status_id,
                         },
                     )
-                    trello_result = await self._archive_trello_artifacts(job_id, module_request, artifacts)
-                    if trello_result:
-                        next_result["trello"] = trello_result
-                        if direct_trello_review:
-                            next_result["trello_direct_review"] = {
-                                "enabled": True,
-                                "sent": trello_result.get("sent", 0),
-                                "failed": trello_result.get("failed", 0),
-                                "card_id": trello_result.get("card_id") or module_request.trello_card_id,
-                                "card_url": trello_result.get("card_url") or "",
-                                "attachments": trello_result.get("attachments") or [],
-                            }
-                    status = "completed" if trello_result.get("configured", True) else "skipped"
-                    await self._set_automation_module_status(job_id, request, module["id"], status, output=trello_result or {})
+                    erp_result = await self._archive_erp_artifacts(job_id, module_request, artifacts)
+                    if erp_result:
+                        next_result["erp"] = erp_result
+                    status = "completed" if erp_result.get("configured", True) else "skipped"
+                    await self._set_automation_module_status(job_id, request, module["id"], status, output=erp_result or {})
                 elif module_type == "approval":
-                    if direct_trello_review:
-                        output = {
-                            "awaiting_user_approval": False,
-                            "pending": 0,
-                            "trello_direct_review": True,
-                            "card_id": request.trello_card_id,
-                            "detail": "Ảnh tạo xong sẽ nằm ngay trên card Trello đang chạy để duyệt trực tiếp.",
-                        }
-                        await self._set_automation_module_status(
-                            job_id,
-                            request,
-                            module["id"],
-                            "completed",
-                            input_data={"artifact_count": len(artifacts), "card_id": request.trello_card_id},
-                            output=output,
-                        )
-                        await self.store.append_log(
-                            job_id,
-                            f"Module {module['title']}: duyệt trực tiếp trên Trello, không chờ Telegram.",
-                        )
-                        continue
-                    waiting_for_telegram = bool(request.telegram_enabled and artifacts)
+                    # Approval is local and cannot be bypassed by a
+                    # client-provided module graph or configuration flag.
+                    waiting_for_dashboard = bool(artifacts)
                     await self._set_automation_module_status(
                         job_id,
                         request,
                         module["id"],
-                        "running" if waiting_for_telegram else "completed",
+                        "running" if waiting_for_dashboard else "completed",
                         input_data={"artifact_count": len(artifacts)},
                         output={
-                            "awaiting_user_approval": waiting_for_telegram,
-                            "pending": len(artifacts) if waiting_for_telegram else 0,
+                            "awaiting_user_approval": waiting_for_dashboard,
+                            "pending": len(artifacts) if waiting_for_dashboard else 0,
+                            "review_surface": "dashboard",
                         },
                     )
                     await self.store.append_log(
                         job_id,
-                        f"Module {module['title']}: đang chờ người dùng duyệt trên Telegram."
-                        if waiting_for_telegram
+                        f"Module {module['title']}: đang chờ người dùng duyệt trên dashboard."
+                        if waiting_for_dashboard
                         else f"Module {module['title']}: đã ghi nhận bước duyệt/log theo cấu hình.",
                     )
-                    if waiting_for_telegram:
+                    if waiting_for_dashboard:
                         return next_result
                 else:
                     await self._set_automation_module_status(
@@ -7601,7 +7904,7 @@ exit 1
                 continue
         return [artifact for index, artifact in enumerate(job.artifacts) if index in approved_indexes]
 
-    async def _request_with_trello_source_images(self, job_id: str, request: CreateJobRequest) -> CreateJobRequest:
+    async def _request_with_erp_source_images(self, job_id: str, request: CreateJobRequest) -> CreateJobRequest:
         if request.type != "image":
             return request
         graph = self._automation_graph_payload(request)
@@ -7609,7 +7912,7 @@ exit 1
             (
                 item
                 for item in graph["modules"]
-                if item["enabled"] and item["type"] == "trello_source"
+                if item["enabled"] and item["type"] == "erp_source"
             ),
             None,
         )
@@ -7617,43 +7920,61 @@ exit 1
             return request
 
         module_request = self._request_with_automation_module_settings(request, module)
-        trello_config = self.store.snapshot().trello_config
-        board_id = self._normalize_trello_board_id(
-            module_request.trello_board_id
-            or request.trello_board_id
-            or trello_config.board_id
-            or os.getenv("TRELLO_BOARD_ID", "")
+        erp_config = self.store.snapshot().erp_config
+        project_id = self._normalize_erp_project_id(
+            module_request.erp_project_id
+            or request.erp_project_id
+            or erp_config.project_id
+            or os.getenv("ERP_PROJECT_ID", "")
         )
-        card_id = self._normalize_trello_card_id(
-            module_request.trello_source_card_id
-            or request.trello_source_card_id
-            or module_request.trello_card_id
-            or request.trello_card_id
-            or trello_config.card_id
-            or os.getenv("TRELLO_CARD_ID", "")
+        task_id = self._normalize_erp_task_id(
+            module_request.erp_source_task_id
+            or request.erp_source_task_id
+            or module_request.erp_task_id
+            or request.erp_task_id
+            or erp_config.task_id
+            or os.getenv("ERP_TASK_ID", "")
         )
+        # The saved source column is what guards the *auto-discovery* sweep:
+        # without an explicit Task, the app must only pick cards out of the one
+        # column the owner nominated. A job that names its source Task has
+        # already been checked against the allowed project, and that Task may
+        # legitimately live anywhere on the board (an "Idea" card sitting in
+        # Working is the normal case), so its own column wins there.
+        job_list_id = module_request.erp_status_id or request.erp_status_id
         raw_list_id = (
-            trello_config.list_id
-            or os.getenv("TRELLO_LIST_ID", "")
-            or module_request.trello_list_id
-            or request.trello_list_id
+            (job_list_id or erp_config.status or os.getenv("ERP_STATUS_ID", ""))
+            if task_id
+            else (erp_config.status or os.getenv("ERP_STATUS_ID", "") or job_list_id)
         )
-        key, token = self._trello_credentials()
+        key, token = self._erp_credentials()
         if not key or not token:
-            raise RuntimeError("Trello Source cần API key/token Trello để lấy ảnh gốc từ card.")
-        source_list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id) if board_id else []
-        list_id = source_list_ids[0] if source_list_ids else self._normalize_trello_id(raw_list_id)
+            raise RuntimeError("ERP Source cần API key/API secret để đọc ảnh gốc từ ERP Task.")
+        # A source status is always enforced. When the form leaves it blank,
+        # use the locked default (Open) rather than accepting a Task from an
+        # arbitrary ERP status.
+        source_list_ids = (
+            self._erp_auto_source_list_ids(
+                key,
+                token,
+                project_id,
+                raw_list_id or self._default_erp_source_list_name(),
+            )
+            if project_id
+            else []
+        )
+        status = source_list_ids[0] if source_list_ids else self._normalize_erp_id(raw_list_id)
         settings = module.get("settings") if isinstance(module.get("settings"), dict) else {}
         try:
-            limit = int(settings.get("trelloAttachmentLimit") or 1)
+            limit = int(settings.get("erpAttachmentLimit") or 1)
         except (TypeError, ValueError):
             limit = 1
         limit = max(1, min(4, limit))
-        selected_attachment_ids = self._normalize_trello_attachment_ids(
-            module_request.trello_source_attachment_ids
-            or request.trello_source_attachment_ids
-            or module_request.trello_attachment_ids
-            or request.trello_attachment_ids
+        selected_attachment_ids = self._normalize_erp_attachment_ids(
+            module_request.erp_source_attachment_ids
+            or request.erp_source_attachment_ids
+            or module_request.erp_attachment_ids
+            or request.erp_attachment_ids
         )
         if selected_attachment_ids:
             limit = min(4, max(limit, len(selected_attachment_ids)))
@@ -7664,17 +7985,17 @@ exit 1
             module["id"],
             "running",
             input_data={
-                "board_id": board_id,
-                "card_id": card_id,
-                "list_id": list_id,
+                "project_id": project_id,
+                "task_id": task_id,
+                "status": status,
                 "limit": limit,
                 "attachment_ids": selected_attachment_ids,
             },
         )
 
-        if not card_id:
-            if not board_id:
-                raise RuntimeError("Trello Source cần Card ID/link card hoặc Board URL Trello có card chứa attachment ảnh.")
+        if not task_id:
+            if not project_id:
+                raise RuntimeError("ERP Source cần Task ID hoặc trạng thái nguồn trong ERP Project đã chọn có Task chứa ảnh.")
             if request.prompt_source_row:
                 prompt_item = {
                     "product_key": request.prompt_product_key,
@@ -7682,54 +8003,54 @@ exit 1
                     "product_name": request.prompt_product,
                     "notes": request.prompt_notes,
                 }
-                matched_hint = await asyncio.to_thread(self._trello_matching_image_card_hint, module_request, [prompt_item])
-                if matched_hint.get("card_id"):
-                    card_id = str(matched_hint.get("card_id") or "").strip()
-                    list_id = self._normalize_trello_id(str(matched_hint.get("list_id") or list_id or ""))
-            if request.prompt_source_row and not list_id:
+                matched_hint = await asyncio.to_thread(self._erp_matching_image_card_hint, module_request, [prompt_item])
+                if matched_hint.get("task_id"):
+                    task_id = str(matched_hint.get("task_id") or "").strip()
+                    status = self._normalize_erp_id(str(matched_hint.get("status") or status or ""))
+            if request.prompt_source_row and not status:
                 product_hint = (
                     request.prompt_product
                     or request.prompt_product_key
                     or f"dòng {request.prompt_source_row}"
                 )
                 raise RuntimeError(
-                    f"Batch sheet chưa có Trello card cụ thể và app không tìm thấy cột {self._trello_source_scope_label()} để lọc ảnh nguồn. "
-                    f"Hãy chọn list {self._trello_source_scope_label()} ở cục Trello Source hoặc thêm cột Trello_Card/Card_URL cho {product_hint}."
+                    f"Batch sheet chưa có ERP card cụ thể và app không tìm thấy cột {self._erp_source_scope_label()} để lọc ảnh nguồn. "
+                    f"Hãy chọn list {self._erp_source_scope_label()} ở cục ERP Source hoặc thêm cột ERP_Task/Card_URL cho {product_hint}."
                 )
-            if not card_id:
-                card_id = await asyncio.to_thread(self._trello_first_image_card_id_on_board, key, token, board_id, ",".join(source_list_ids or [list_id]))
-            if not card_id:
-                scope = f" trong list {list_id}" if list_id else ""
-                raise RuntimeError(f"Board Trello này chưa có card nào{scope} chứa attachment ảnh để làm ảnh tham chiếu.")
-        elif list_id or source_list_ids:
-            card_hint = await asyncio.to_thread(self._trello_card_hint_by_id, key, token, card_id)
+            if not task_id:
+                task_id = await asyncio.to_thread(self._erp_first_image_card_id_on_board, key, token, project_id, ",".join(source_list_ids or [status]))
+            if not task_id:
+                scope = f" trong list {status}" if status else ""
+                raise RuntimeError(f"Board ERP này chưa có card nào{scope} chứa attachment ảnh để làm ảnh tham chiếu.")
+        elif status or source_list_ids:
+            card_hint = await asyncio.to_thread(self._erp_task_hint_by_id, key, token, task_id)
             if not card_hint:
-                raise RuntimeError("Card Trello đã chọn không còn tồn tại hoặc không đọc được.")
-            card_list_id = self._normalize_trello_id(str(card_hint.get("list_id") or ""))
-            allowed_list_ids = set(source_list_ids or ([list_id] if list_id else []))
+                raise RuntimeError("Card ERP đã chọn không còn tồn tại hoặc không đọc được.")
+            card_list_id = self._normalize_erp_id(str(card_hint.get("status") or ""))
+            allowed_list_ids = set(source_list_ids or ([status] if status else []))
             if allowed_list_ids and card_list_id not in allowed_list_ids:
-                ready_name = self._trello_source_scope_label()
+                ready_name = self._erp_source_scope_label()
                 raise RuntimeError(
-                    f"Card Trello đã chọn không nằm trong cột {ready_name}; app đã dừng để tránh lấy nhầm ảnh từ cột khác."
+                    f"Card ERP đã chọn không nằm trong cột {ready_name}; app đã dừng để tránh lấy nhầm ảnh từ cột khác."
                 )
             if card_list_id:
-                list_id = card_list_id
+                status = card_list_id
 
         paths = await asyncio.to_thread(
-            self._download_trello_card_image_attachments,
+            self._download_erp_task_image_attachments,
             key,
             token,
-            card_id,
+            task_id,
             job_id,
             limit,
             selected_attachment_ids,
         )
         if not paths:
-            raise RuntimeError("Card Trello này chưa có attachment ảnh nào để làm ảnh tham chiếu.")
+            raise RuntimeError("Card ERP này chưa có attachment ảnh nào để làm ảnh tham chiếu.")
 
-        source_download = dict(self._trello_source_downloads.get(job_id) or {})
-        locked_source_card_id = self._normalize_trello_card_id(str(source_download.get("card_id") or card_id or ""))
-        locked_source_attachment_ids = self._normalize_trello_attachment_ids(
+        source_download = dict(self._erp_source_downloads.get(job_id) or {})
+        locked_source_task_id = self._normalize_erp_task_id(str(source_download.get("task_id") or task_id or ""))
+        locked_source_attachment_ids = self._normalize_erp_attachment_ids(
             source_download.get("attachment_ids") or selected_attachment_ids
         )
 
@@ -7747,19 +8068,19 @@ exit 1
                 for index, _ in enumerate(selected_paths)
             ],
         )
-        if board_id:
-            payload["trello_board_id"] = board_id
-        if list_id:
-            payload["trello_list_id"] = list_id
-        payload["trello_card_id"] = locked_source_card_id or card_id
-        payload["trello_attachment_ids"] = locked_source_attachment_ids
-        payload["trello_source_card_id"] = locked_source_card_id or card_id
-        payload["trello_source_attachment_ids"] = locked_source_attachment_ids
-        self._sync_trello_scope_into_automation_graph(
+        if project_id:
+            payload["erp_project_id"] = project_id
+        if status:
+            payload["erp_status_id"] = status
+        payload["erp_task_id"] = locked_source_task_id or task_id
+        payload["erp_attachment_ids"] = locked_source_attachment_ids
+        payload["erp_source_task_id"] = locked_source_task_id or task_id
+        payload["erp_source_attachment_ids"] = locked_source_attachment_ids
+        self._sync_erp_scope_into_automation_graph(
             payload,
-            board_id=board_id,
-            list_id=list_id,
-            card_id=payload["trello_card_id"],
+            project_id=project_id,
+            status=status,
+            task_id=payload["erp_task_id"],
             attachment_ids=locked_source_attachment_ids,
         )
 
@@ -7769,10 +8090,10 @@ exit 1
             module["id"],
             "completed",
             output={
-                "board_id": board_id,
-                "card_id": payload["trello_card_id"],
-                "source_card_id": payload["trello_source_card_id"],
-                "list_id": list_id,
+                "project_id": project_id,
+                "task_id": payload["erp_task_id"],
+                "source_task_id": payload["erp_source_task_id"],
+                "status": status,
                 "attachment_ids": locked_source_attachment_ids,
                 "source_attachment_ids": locked_source_attachment_ids,
                 "reference_image_count": len(selected_paths),
@@ -7780,7 +8101,7 @@ exit 1
             },
         )
         detail = "ảnh đã chọn" if selected_attachment_ids else "ảnh gốc"
-        await self.store.append_log(job_id, f"Đã lấy {len(selected_paths)} {detail} từ card Trello để đưa vào Flow.")
+        await self.store.append_log(job_id, f"Đã lấy {len(selected_paths)} {detail} từ card ERP để đưa vào Flow.")
         return CreateJobRequest(**payload)
 
     def _request_with_flow_module_settings(self, request: CreateJobRequest) -> CreateJobRequest:
@@ -7814,14 +8135,14 @@ exit 1
             return
 
         result = dict(job.result or {})
-        approvals = dict(result.get("telegram_approvals") or {})
+        approvals = dict(result.get("dashboard_approvals") or {})
         approved_artifacts = self._approved_artifacts_for_job(job, approvals)
         if not approved_artifacts:
             await self._skip_pending_automation_modules_after(
                 job_id,
                 request,
                 approval_module_id,
-                "Không có ảnh nào được duyệt trên Telegram.",
+                "Không có ảnh nào được duyệt trên dashboard.",
             )
             await self.store.append_log(job_id, "Không có ảnh nào được duyệt nên các module sau Approval đã được bỏ qua.")
             latest_job = self.store.get_job(job_id)
@@ -7830,15 +8151,21 @@ exit 1
                 await self.store.patch_job(job_id, result=latest_result)
             return
 
-        await self.store.append_log(job_id, "Telegram đã duyệt xong, tiếp tục chạy các module sau Approval.")
+        await self.store.append_log(job_id, "Dashboard đã có đủ quyết định duyệt, tiếp tục chạy các module sau Review.")
         resumed_result = await self._run_automation_post_modules(
             job_id,
             request,
-            approved_artifacts,
+            # Keep original artifact indexes. _archive_erp_artifacts maps
+            # dashboard decisions by their original index, so passing only the
+            # approved subset would misalign a rejected-first batch.
+            list(job.artifacts or []),
             result,
             start_after_module_id=approval_module_id,
             skip_finished=True,
         )
+        # Keep the review evidence produced by the dashboard decision even
+        # when a downstream runner returns only its own output payload.
+        resumed_result = {**result, **dict(resumed_result or {})}
         latest_job = self.store.get_job(job_id)
         latest_execution = (latest_job.result or {}).get("automation_execution") if latest_job is not None else None
         if latest_execution:
@@ -7852,7 +8179,7 @@ exit 1
         await self._run_automation_pre_modules(job_id, request)
         try:
             request = self._request_with_flow_module_settings(request)
-            request = await self._request_with_trello_source_images(job_id, request)
+            request = await self._request_with_erp_source_images(job_id, request)
             await self.store.patch_job(job_id, input=_model_dump(request))
             await self._set_automation_module_status(
                 job_id,
@@ -7869,17 +8196,28 @@ exit 1
             )
             await self._set_job_progress(job_id, "connecting", "Em đang khởi tạo client và kết nối tới project Flow hiện tại.")
             await self.store.append_log(job_id, "Đang khởi tạo kết nối tới Flow")
+        except asyncio.CancelledError:
+            latest = self.store.get_job(job_id)
+            if latest is not None and latest.status != "cancelled":
+                result = dict(latest.result or {})
+                result["stop_requested"] = True
+                await self.store.patch_job(job_id, status="cancelled", result=result)
+                await self.store.append_log(job_id, "Tác vụ đã được huỷ theo yêu cầu.")
+            self._tasks.pop(job_id, None)
+            raise
         except HTTPException as exc:
             detail = self._flow_error_detail(exc)
             await self._fail_active_automation_module(job_id, request, detail)
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
+            await self._report_erp_job_failure(job_id, request, detail)
             return
         except Exception as exc:
             detail = self._flow_error_detail(exc)
             await self._fail_active_automation_module(job_id, request, detail)
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
+            await self._report_erp_job_failure(job_id, request, detail)
             return
         artifacts: List[JobArtifact] = []
         result: Dict[str, Any] = {}
@@ -8266,25 +8604,37 @@ exit 1
                 result["automation_execution"] = latest_execution
             await self.store.patch_job(job_id, status="completed", result=result)
             await self.store.append_log(job_id, "Tác vụ đã hoàn tất")
+        except asyncio.CancelledError:
+            latest = self.store.get_job(job_id)
+            if latest is not None and latest.status != "cancelled":
+                result = dict(latest.result or {})
+                result["stop_requested"] = True
+                await self.store.patch_job(job_id, status="cancelled", result=result)
+                await self.store.append_log(job_id, "Tác vụ đã được huỷ theo yêu cầu.")
+            raise
         except HTTPException as exc:
             detail = self._flow_error_detail(exc)
             await self._fail_active_automation_module(job_id, request, detail)
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
+            await self._report_erp_job_failure(job_id, request, detail)
         except Exception as exc:
             detail = self._flow_error_detail(exc)
             await self._fail_active_automation_module(job_id, request, detail)
             await self.store.patch_job(job_id, status="failed", error=detail)
             await self.store.append_log(job_id, f"Tác vụ thất bại: {detail}")
+            await self._report_erp_job_failure(job_id, request, detail)
+        finally:
+            self._tasks.pop(job_id, None)
 
-    def _trello_source_validation_required(self, request: CreateJobRequest) -> bool:
-        if request.type != "image" or not request.trello_enabled:
+    def _erp_source_validation_required(self, request: CreateJobRequest) -> bool:
+        if request.type != "image" or not request.erp_enabled:
             return False
         graph = self._automation_graph_payload(request)
         return any(
             isinstance(module, dict)
             and module.get("enabled")
-            and module.get("type") == "trello_source"
+            and module.get("type") == "erp_source"
             for module in graph.get("modules", [])
         )
 
@@ -8297,11 +8647,11 @@ exit 1
             }
         }
 
-    def _trello_ai_title_backup_path(self) -> Path:
-        return DATA_DIR / self.TRELLO_AI_TITLE_BACKUP_FILE_NAME
+    def _erp_ai_title_backup_path(self) -> Path:
+        return DATA_DIR / self.ERP_AI_TITLE_BACKUP_FILE_NAME
 
-    def _trello_ai_title_backup_entries(self) -> List[Dict[str, Any]]:
-        backup_path = self._trello_ai_title_backup_path()
+    def _erp_ai_title_backup_entries(self) -> List[Dict[str, Any]]:
+        backup_path = self._erp_ai_title_backup_path()
         if not backup_path.is_file():
             return []
         try:
@@ -8310,18 +8660,18 @@ exit 1
             return []
         return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
 
-    def _trello_description_has_ai_title_block(self, description: str) -> bool:
+    def _erp_description_has_ai_title_block(self, description: str) -> bool:
         text = str(description or "")
-        return self.TRELLO_AI_TITLE_BEGIN_MARKER in text and self.TRELLO_AI_TITLE_END_MARKER in text
+        return self.ERP_AI_TITLE_BEGIN_MARKER in text and self.ERP_AI_TITLE_END_MARKER in text
 
-    def _trello_description_has_backed_up_ai_title(self, card: Dict[str, Any]) -> bool:
-        card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+    def _erp_description_has_backed_up_ai_title(self, card: Dict[str, Any]) -> bool:
+        task_id = self._normalize_erp_task_id(str(card.get("id") or card.get("shortLink") or ""))
         description = str(card.get("desc") or "")
-        if not card_id or not description.strip():
+        if not task_id or not description.strip():
             return False
         description_lines = {line.strip() for line in description.splitlines() if line.strip()}
-        for entry in reversed(self._trello_ai_title_backup_entries()):
-            if self._normalize_trello_card_id(str(entry.get("card_id") or "")) != card_id:
+        for entry in reversed(self._erp_ai_title_backup_entries()):
+            if self._normalize_erp_task_id(str(entry.get("task_id") or "")) != task_id:
                 continue
             title = self._sanitize_ai_product_title(str(entry.get("title") or ""))
             if title and title in description_lines:
@@ -8331,12 +8681,10 @@ exit 1
                 return True
         return False
 
-    def _trello_should_write_ai_title_description(self, card: Dict[str, Any]) -> bool:
-        if not isinstance(card, dict):
-            return False
-        if self._trello_description_has_ai_title_block(str(card.get("desc") or "")):
-            return False
-        return not self._trello_description_has_backed_up_ai_title(card)
+    def _erp_should_write_ai_title_description(self, card: Dict[str, Any]) -> bool:
+        # The ERP integration is append-only by design.  Product analysis can
+        # inform the Flow prompt, but it must never rewrite a Task description.
+        return False
 
     def _sanitize_ai_product_title(self, title: str, *, max_length: int = 140) -> str:
         cleaned = re.sub(r"\s+", " ", str(title or "")).strip().strip('"').strip("'").strip()
@@ -8349,7 +8697,7 @@ exit 1
             trimmed = trimmed.rsplit(" ", 1)[0].rstrip(" ,;:-")
         return trimmed or cleaned[:max_length].rstrip()
 
-    def _trello_description_with_ai_title(
+    def _erp_description_with_ai_title(
         self,
         description: str,
         *,
@@ -8360,7 +8708,7 @@ exit 1
         updated_at: str = "",
     ) -> str:
         existing = str(description or "").strip()
-        if self._trello_description_has_ai_title_block(existing):
+        if self._erp_description_has_ai_title_block(existing):
             return existing
         safe_title = self._sanitize_ai_product_title(title)
         if not safe_title:
@@ -8368,12 +8716,12 @@ exit 1
         block = safe_title
         return f"{existing}\n\n{block}".strip() if existing else block
 
-    def _write_trello_ai_title_description_backup(
+    def _write_erp_ai_title_description_backup(
         self,
         *,
-        card_id: str,
-        card_name: str,
-        card_url: str,
+        task_id: str,
+        task_name: str,
+        task_url: str,
         old_description: str,
         new_description: str,
         title: str,
@@ -8381,16 +8729,16 @@ exit 1
         embroidery_design: str = "",
     ) -> str:
         ensure_app_dirs()
-        backup_path = self._trello_ai_title_backup_path()
-        entries = self._trello_ai_title_backup_entries()
+        backup_path = self._erp_ai_title_backup_path()
+        entries = self._erp_ai_title_backup_entries()
         backup_id = uuid.uuid4().hex
         entries.append(
             {
                 "backup_id": backup_id,
                 "created_at": utc_now(),
-                "card_id": str(card_id or "").strip(),
-                "card_name": str(card_name or "").strip(),
-                "card_url": str(card_url or "").strip(),
+                "task_id": str(task_id or "").strip(),
+                "task_name": str(task_name or "").strip(),
+                "task_url": str(task_url or "").strip(),
                 "title": self._sanitize_ai_product_title(title),
                 "product_type": str(product_type or "").strip(),
                 "embroidery_design": str(embroidery_design or "").strip(),
@@ -8696,10 +9044,10 @@ exit 1
             )
         return self._sanitize_ai_product_title(f"{safe_design} Embroidered {safe_title}")
 
-    def _fallback_trello_product_title(
+    def _fallback_erp_product_title(
         self,
         *,
-        card_name: str,
+        task_name: str,
         attachment_name: str,
         product_rule_key: str,
         visible_product: str = "",
@@ -8709,7 +9057,7 @@ exit 1
             str(product_rule.get("display_name") or visible_product or product_rule_key or "Handmade Embroidered Product"),
             max_length=80,
         )
-        phrases = self._fallback_title_phrases(attachment_name, visible_product, card_name)
+        phrases = self._fallback_title_phrases(attachment_name, visible_product, task_name)
         material = phrases["material"]
         embroidery_design = phrases["embroidery_design"]
         design_prefix = (
@@ -8737,15 +9085,15 @@ exit 1
             "title": self._sanitize_ai_product_title(title),
             "product_type": self._sanitize_ai_product_title(fallback_product_type, max_length=80),
             "embroidery_design": self._sanitize_ai_product_title(embroidery_design, max_length=80),
-            "reason": "Fallback title from HAVI product rule and Trello card context.",
+            "reason": "Fallback title from HAVI product rule and ERP card context.",
         }
 
-    def _gemini_suggest_trello_product_title(
+    def _gemini_suggest_erp_product_title(
         self,
         *,
         image_bytes: bytes,
         mime_type: str,
-        card_name: str,
+        task_name: str,
         attachment_name: str,
         card_description: str,
         product_rule_key: str,
@@ -8765,13 +9113,13 @@ exit 1
                 "Never use the actual personalized name or initials as the title's design hook and never set embroidery_design to a personal name, initials, monogram, Custom Name, Personalized Name, Initial Letter, or readable stitched text.",
                 "The title must directly mention the visible motif/theme/design when one is identifiable. Do not write only generic phrases like handmade embroidery, custom embroidery, or personalized unless no visual theme can be identified.",
                 "The title must describe the visible product category, material/fabric, exact embroidery motif/theme/design, use case, and gift/search keywords when accurate.",
-                "Do not invent a different product category. Do not mention AI, Google Flow, Trello, Nano Banana, image generation, mockup, or photo.",
+                "Do not invent a different product category. Do not mention AI, Google Flow, ERP, Nano Banana, image generation, mockup, or photo.",
                 "If readable personalized text/name is visible on the product, treat it only as a customization detail; at most use 'personalized' or 'custom' as a secondary keyword, but do not include the actual name/initials.",
                 "If the embroidery motif/theme cannot be identified beyond text personalization, set embroidery_design to Decorative Embroidery or Themed Embroidery instead of using the name/initials.",
                 "Keep the title natural, ecommerce-ready, and at most 140 characters.",
                 'Return JSON only: {"title":"...","product_type":"...","embroidery_design":"...","reason":"..."}',
                 f"Known HAVI product rule: {display_name or product_rule_key or 'unknown'}",
-                f"Card name: {card_name}",
+                f"Card name: {task_name}",
                 f"Attachment name: {attachment_name}",
                 f"Card description: {card_description[:1200]}",
             ]
@@ -8836,7 +9184,7 @@ exit 1
                 title,
                 visible_product,
                 attachment_name,
-                card_name,
+                task_name,
                 card_description,
             )
             embroidery_design = phrases["embroidery_design"]
@@ -8849,7 +9197,7 @@ exit 1
             "reason": reason,
         }
 
-    def _write_trello_ai_title_to_description(
+    def _write_erp_ai_title_to_description(
         self,
         *,
         key: str,
@@ -8857,35 +9205,35 @@ exit 1
         card: Dict[str, Any],
         title_payload: Dict[str, str],
     ) -> Dict[str, str]:
-        card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
-        if not card_id:
-            raise RuntimeError("Missing Trello card id for AI title description update.")
+        task_id = self._normalize_erp_task_id(str(card.get("id") or card.get("shortLink") or ""))
+        if not task_id:
+            raise RuntimeError("Missing ERP card id for AI title description update.")
         old_description = str(card.get("desc") or "")
-        if self._trello_description_has_ai_title_block(old_description):
+        if self._erp_description_has_ai_title_block(old_description):
             return {"status": "exists", "title": "", "backup_path": ""}
         title = self._sanitize_ai_product_title(str(title_payload.get("title") or ""))
         if not title:
-            raise RuntimeError("Missing AI title for Trello description update.")
+            raise RuntimeError("Missing AI title for ERP description update.")
         product_type = str(title_payload.get("product_type") or "").strip()
-        new_description = self._trello_description_with_ai_title(
+        new_description = self._erp_description_with_ai_title(
             old_description,
             title=title,
             product_type=product_type,
             embroidery_design=str(title_payload.get("embroidery_design") or "").strip(),
             model=self._gemini_model(),
         )
-        backup_path = self._write_trello_ai_title_description_backup(
-            card_id=card_id,
-            card_name=str(card.get("name") or ""),
-            card_url=str(card.get("url") or ""),
+        backup_path = self._write_erp_ai_title_description_backup(
+            task_id=task_id,
+            task_name=str(card.get("name") or ""),
+            task_url=str(card.get("url") or ""),
             old_description=old_description,
             new_description=new_description,
             title=title,
             product_type=product_type,
             embroidery_design=str(title_payload.get("embroidery_design") or "").strip(),
         )
-        payload = self._trello_put_json(
-            f"cards/{quote(card_id, safe='')}",
+        payload = self._erp_put_json(
+            f"cards/{quote(task_id, safe='')}",
             key,
             token,
             fields={"desc": new_description},
@@ -8896,539 +9244,678 @@ exit 1
             card["desc"] = new_description
         return {"status": "updated", "title": title, "backup_path": backup_path}
 
-    async def _artifact_validation_image_bytes(
+    # ── Local Gemini watermark processor (removelogo) ───────────────────────
+    # Every image Google Flow returns carries Google's own Gemini watermark, so
+    # each Flow artifact is sent to the local processor before a reviewer sees
+    # it on the dashboard and before ERP receives the file.  The processor is
+    # the separate removelogo service; this app only speaks its HTTP contract
+    # (POST {base}/process with raw image bytes → cleaned PNG bytes).
+
+    def _sanitize_removelogo_url(self, value: Any) -> str:
+        raw = str(value or "").strip().rstrip("/")
+        if not raw:
+            return ""
+        parsed = urlparse(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise HTTPException(
+                status_code=400,
+                detail="URL bộ xử lý removelogo phải là http(s) hợp lệ, ví dụ http://127.0.0.1:8788.",
+            )
+        return raw
+
+    def _removelogo_base_url(self, config: IntegrationConfig | None = None) -> str:
+        current = config if config is not None else self.store.snapshot().integration_config
+        configured = str(current.removelogo_url or "").strip().rstrip("/")
+        if configured:
+            return configured
+        env_url = os.getenv("REMOVE_LOGO_URL", "").strip().rstrip("/")
+        return env_url or self.REMOVE_LOGO_BASE_URL
+
+    def _removelogo_enabled(self, config: IntegrationConfig | None = None) -> bool:
+        env_value = os.getenv("REMOVE_LOGO_ENABLED", "").strip()
+        if env_value:
+            return self._config_bool(env_value, default=True)
+        current = config if config is not None else self.store.snapshot().integration_config
+        return bool(current.removelogo_enabled)
+
+    def _removelogo_input_mime(self, mime_type: str, file_name: str) -> str:
+        """Return the request mime type removelogo accepts, or "" if unsupported."""
+        mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+        if mime in self.REMOVE_LOGO_INPUT_MIME_TYPES:
+            return mime
+        guessed = str(mimetypes.guess_type(str(file_name or ""))[0] or "").strip().lower()
+        if guessed in self.REMOVE_LOGO_INPUT_MIME_TYPES:
+            return guessed
+        return ""
+
+    def _removelogo_process_bytes(
+        self,
+        base_url: str,
+        image_bytes: bytes,
+        mime_type: str,
+        file_name: str,
+    ) -> bytes:
+        request = Request(
+            f"{base_url}/process",
+            data=image_bytes,
+            method="POST",
+            headers={
+                "Content-Type": mime_type,
+                "Content-Length": str(len(image_bytes)),
+                "X-Filename": quote(str(file_name or "image"), safe=""),
+                "User-Agent": "FlowWebUI/0.1",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.REMOVE_LOGO_TIMEOUT_S) as response:
+                return response.read()
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            detail = body
+            try:
+                parsed = json.loads(body)
+                if isinstance(parsed, dict) and parsed.get("error"):
+                    detail = str(parsed["error"])
+            except Exception:
+                pass
+            if exc.code == 422:
+                # removelogo answers 422 when the image carries no Gemini
+                # watermark, which is a normal outcome, not a broken run.
+                raise RemoveLogoNoWatermarkError(detail or exc.reason) from exc
+            raise RuntimeError(
+                f"Bộ xử lý removelogo trả lỗi {exc.code}: {detail or exc.reason}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(
+                f"Không gọi được bộ xử lý removelogo tại {base_url}: {exc.reason}. "
+                "Hãy chạy `npm start` trong thư mục removelogo."
+            ) from exc
+
+    def _removelogo_health(self, base_url: str) -> Dict[str, Any]:
+        request = Request(f"{base_url}/health", headers={"User-Agent": "FlowWebUI/0.1"})
+        try:
+            with urlopen(request, timeout=self.REMOVE_LOGO_HEALTH_TIMEOUT_S) as response:
+                payload = json.loads(response.read().decode("utf-8", errors="replace"))
+                return payload if isinstance(payload, dict) else {}
+        except Exception as exc:
+            raise RuntimeError(
+                f"Bộ xử lý removelogo tại {base_url} chưa sẵn sàng: {exc}. "
+                "Hãy chạy `npm start` trong thư mục removelogo."
+            ) from exc
+
+    def _removelogo_left_pixels_untouched(self, source_bytes: bytes, cleaned_bytes: bytes) -> bool:
+        """Return True when the cleaned file has exactly the source pixels.
+
+        removelogo strips the AI provenance metadata before it looks for the
+        visible sparkle, and it answers 200 with the metadata-only file when the
+        visible pass finds nothing to repair. Without this check the run would
+        report "đã xóa watermark" for an image whose watermark is still there.
+        Any decoding problem answers False so a real clean is never downgraded.
+        """
+        if not source_bytes or not cleaned_bytes:
+            return False
+        try:
+            from PIL import Image
+        except Exception:
+            return False
+
+        try:
+            with Image.open(io.BytesIO(source_bytes)) as source_image:
+                with Image.open(io.BytesIO(cleaned_bytes)) as cleaned_image:
+                    if source_image.size != cleaned_image.size:
+                        return False
+                    return source_image.convert("RGB").tobytes() == cleaned_image.convert("RGB").tobytes()
+        except Exception:
+            return False
+
+    def _artifact_local_file(self, artifact: JobArtifact) -> Path | None:
+        local_path = str(artifact.local_path or "").strip()
+        if not local_path:
+            return None
+        path = Path(local_path).expanduser()
+        return path if path.is_file() else None
+
+    async def _clean_artifact_watermark(
         self,
         job_id: str,
         artifact: JobArtifact,
-        index: int,
-    ) -> tuple[bytes, str]:
-        artifact_url = str(artifact.url or artifact.public_url or "").strip()
-        return await self._trello_artifact_file_bytes(job_id, artifact, index, artifact_url)
-
-    def _gemini_validate_trello_source_artifacts(
-        self,
-        request: CreateJobRequest,
-        source_path: str,
-        generated_items: List[tuple[int, bytes, str]],
-    ) -> Dict[str, Any]:
-        api_key = self._gemini_api_key()
-        if not api_key:
-            raise RuntimeError("Chưa cấu hình Gemini để kiểm tra ảnh trước khi upload Trello.")
-        source_file = Path(source_path).expanduser()
-        if not source_file.is_file():
-            raise RuntimeError("Không tìm thấy ảnh nguồn Trello local để kiểm tra trước khi upload.")
-
-        source_bytes = source_file.read_bytes()
-        source_mime = mimetypes.guess_type(str(source_file))[0] or "image/jpeg"
-        prompt = "\n".join(
-            [
-                "You are a strict ecommerce QA checker before uploading generated images to Trello.",
-                "Compare SOURCE_IMAGE with each OUTPUT_IMAGE.",
-                "Accept changes in scene, camera angle, styling, props, fabric colorway, and presentation.",
-                "Reject any output whose main product category, silhouette, construction, motif/design, embroidered/printed text, personalized name, material identity, or source product family does not match the source.",
-                "Reject if the output appears to come from another Trello card or another product, even if it is visually high quality.",
-                "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",
-                "Reject if the main product changes form: for example source pillow to shirt/banner/blanket/hoop, source banner to pillow/shirt, source hoop to pillow/banner, or source apparel to pillow/banner.",
-                "Reject invented readable names/text unless the same text is visible on SOURCE_IMAGE or the Trello card instructions explicitly requested alternate personalized names.",
-                "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
-                "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
-                "bad_indexes must contain the zero-based artifact indexes shown in the OUTPUT_IMAGE_INDEX_N labels.",
-                f"Source card/product title: {request.prompt_product or request.title or ''}",
-                f"Source card key: {request.prompt_product_key or request.trello_card_id or ''}",
-            ]
-        )
-        parts: List[Dict[str, Any]] = [{"text": prompt}, {"text": "SOURCE_IMAGE"}, self._inline_gemini_image_part(source_bytes, source_mime)]
-        for index, image_bytes, mime in generated_items[: self.FLOW_AGENT_MAX_OUTPUT_COUNT]:
-            parts.append({"text": f"OUTPUT_IMAGE_INDEX_{index}"})
-            parts.append(self._inline_gemini_image_part(image_bytes, mime))
-
-        payload = {
-            "contents": [{"parts": parts}],
-            "generationConfig": {
-                "temperature": 0.0,
-                "maxOutputTokens": 512,
-                "responseMimeType": "application/json",
-            },
-        }
-        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
-        request_obj = Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key,
-            },
-            method="POST",
-        )
-        try:
-            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            try:
-                error_payload = json.loads(exc.read().decode("utf-8"))
-                message = str(error_payload.get("error", {}).get("message", "")).strip()
-            except Exception:
-                message = ""
-            raise RuntimeError(message or f"Gemini API trả về HTTP {exc.code}.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Không gọi được Gemini để kiểm tra ảnh: {exc.reason}") from exc
-
-        text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="kiểm tra ảnh")
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
-        return parsed
-
-    async def _validate_trello_source_artifacts_before_upload(
-        self,
-        job_id: str,
-        request: CreateJobRequest,
-        artifacts: List[JobArtifact],
+        artifact_index: int,
+        base_url: str,
     ) -> None:
-        if not self._trello_source_validation_required(request):
+        """Replace one artifact's local file with the watermark-free PNG.
+
+        A failure never raises: the artifact keeps its original bytes and
+        carries the reason so the dashboard and the ERP step can see it.
+        """
+        source_path = self._artifact_local_file(artifact)
+        if source_path is None:
+            local_path = await self._materialize_artifact_file(job_id, artifact, artifact_index)
+            source_path = Path(local_path).expanduser() if local_path else None
+            if source_path is None or not source_path.is_file():
+                artifact.watermark_status = "failed"
+                artifact.watermark_error = "Không tải được ảnh gốc về máy để xử lý watermark."
+                return
+
+        mime_type = self._removelogo_input_mime(artifact.mime_type, source_path.name)
+        if not mime_type:
+            artifact.watermark_status = "skipped"
+            artifact.watermark_error = "Định dạng ảnh không nằm trong PNG/JPEG/WebP/BMP nên bỏ qua."
             return
-        source_path = next((str(path or "").strip() for path in request.reference_image_paths or [] if str(path or "").strip()), "")
-        if not source_path:
-            raise RuntimeError("Trello Source thiếu ảnh nguồn local, app đã dừng trước khi upload để tránh nhầm sản phẩm.")
-        if not artifacts:
-            raise RuntimeError("Flow chưa có ảnh generated hợp lệ, app đã dừng trước khi upload Trello.")
 
-        generated_items: List[tuple[int, bytes, str]] = []
-        for index, artifact in enumerate(artifacts[: self.FLOW_AGENT_MAX_OUTPUT_COUNT]):
-            image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
-            generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
-
-        chunk_size = 4
-        validation_warnings: List[str] = []
-        for chunk_start in range(0, len(generated_items), chunk_size):
-            chunk = generated_items[chunk_start : chunk_start + chunk_size]
-            result: Dict[str, Any] | None = None
-            last_validation_error: Exception | None = None
-            for attempt in range(2):
-                try:
-                    result = await asyncio.to_thread(
-                        self._gemini_validate_trello_source_artifacts,
-                        request,
-                        source_path,
-                        chunk,
-                    )
-                    break
-                except Exception as exc:
-                    last_validation_error = exc
-                    detail = humanize_flow_error(str(exc))
-                    retryable_parse_error = "json" in detail.lower() or "nội dung" in detail.lower() or "noi dung" in detail.lower()
-                    if attempt == 0 and retryable_parse_error:
-                        await self.store.append_log(
-                            job_id,
-                            f"Gemini chưa trả JSON kiểm tra ảnh ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}, app thử lại lần 2: {detail[:180]}",
-                        )
-                        await asyncio.sleep(2.0)
-                        continue
-                    break
-            if result is None:
-                warning = humanize_flow_error(str(last_validation_error or "")) or "Gemini không trả về kết quả kiểm tra ảnh hợp lệ."
-                validation_warnings.append(warning)
-                await self.store.append_log(
-                    job_id,
-                    (
-                        f"Gemini QA không ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
-                        "card nguồn đã khóa đúng nên app vẫn upload để duyệt trực tiếp trên Trello. "
-                        f"Chi tiết: {warning[:180]}"
-                    ),
-                )
-                continue
-
-            ok = bool(result.get("ok"))
-            raw_bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
-            bad_indexes = [
-                int(item)
-                for item in raw_bad_indexes
-                if isinstance(item, (int, float)) and 0 <= int(item) < self.FLOW_AGENT_MAX_OUTPUT_COUNT
-            ]
-            reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
-            if not ok or bad_indexes:
-                display_indexes = ", ".join(str(index + 1) for index in bad_indexes) or "không rõ"
-                raise RuntimeError(
-                    f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
-                )
-        if validation_warnings:
-            await self.store.append_log(
-                job_id,
-                f"Gemini QA có {len(validation_warnings)} cảnh báo kỹ thuật nhưng không báo ảnh sai; tiếp tục upload vào card Trello đã khóa.",
+        source_bytes = await asyncio.to_thread(source_path.read_bytes)
+        try:
+            cleaned = await asyncio.to_thread(
+                self._removelogo_process_bytes,
+                base_url,
+                source_bytes,
+                mime_type,
+                source_path.name,
             )
-        else:
-            await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp ảnh nguồn Trello; tiếp tục upload.")
+        except RemoveLogoNoWatermarkError:
+            artifact.watermark_status = "skipped"
+            artifact.watermark_error = "Ảnh không có watermark Gemini nên giữ nguyên bản gốc."
+            return
+        if not cleaned:
+            raise RuntimeError("Bộ xử lý removelogo trả về file rỗng.")
 
-    async def _archive_trello_artifacts(
+        destination = self._download_root() / f"{source_path.stem}-clean.png"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(destination.write_bytes, cleaned)
+
+        artifact.local_path = str(destination)
+        artifact.public_url = self._public_download_url(str(destination))
+        artifact.mime_type = "image/png"
+        if await asyncio.to_thread(self._removelogo_left_pixels_untouched, source_bytes, cleaned):
+            # The metadata-only file is still the better one to keep, but the
+            # run must not claim the visible watermark is gone.
+            artifact.watermark_status = "metadata_only"
+            artifact.watermark_error = (
+                "Bộ xử lý chỉ gỡ được metadata AI, watermark hiển thị vẫn còn nguyên trên ảnh."
+            )
+            return
+        artifact.watermark_status = "cleaned"
+        artifact.watermark_error = ""
+
+    async def _remove_flow_watermarks(
         self,
         job_id: str,
         request: CreateJobRequest,
         artifacts: List[JobArtifact],
     ) -> Dict[str, Any]:
-        if request.type != "image" or not artifacts or not request.trello_enabled:
-            return {}
+        if request.type != "image" or not artifacts:
+            return {"configured": False, "reason": "not_an_image_run"}
+        if not self._removelogo_enabled():
+            await self.store.append_log(job_id, "Bước xóa watermark Gemini đang tắt trong cấu hình nên đã bỏ qua.")
+            return {"configured": False, "reason": "disabled"}
 
-        key, token = self._trello_credentials()
-        if not key or not token:
-            return {"configured": False}
+        base_url = self._removelogo_base_url()
+        try:
+            await asyncio.to_thread(self._removelogo_health, base_url)
+        except Exception as exc:
+            detail = humanize_flow_error(str(exc))
+            for artifact in artifacts:
+                artifact.watermark_status = "failed"
+                artifact.watermark_error = detail
+            await self.store.replace_artifacts(job_id, artifacts)
+            await self.store.append_log(job_id, f"Không xóa được watermark: {detail}")
+            return {
+                "configured": True,
+                "base_url": base_url,
+                "cleaned": 0,
+                "skipped": 0,
+                "failed": len(artifacts),
+                "error": detail,
+            }
 
-        trello_config = self.store.snapshot().trello_config
-        request_card_id = self._normalize_trello_card_id(request.trello_card_id)
-        locked_source_card_id = self._normalize_trello_card_id(request.trello_source_card_id)
-        if locked_source_card_id:
-            if request_card_id and request_card_id != locked_source_card_id:
+        cleaned = 0
+        skipped = 0
+        failed = 0
+        metadata_only = 0
+        for index, artifact in enumerate(artifacts):
+            try:
+                await self._clean_artifact_watermark(job_id, artifact, index, base_url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                artifact.watermark_status = "failed"
+                artifact.watermark_error = humanize_flow_error(str(exc))
+            if artifact.watermark_status == "cleaned":
+                cleaned += 1
+            elif artifact.watermark_status == "metadata_only":
+                metadata_only += 1
                 await self.store.append_log(
                     job_id,
-                    (
-                        "Trello Archive detected a stale target card and will use the locked Trello source card "
-                        f"{locked_source_card_id} instead of {request_card_id}."
-                    ),
+                    f"Ảnh {index + 1} chưa xóa được watermark hiển thị: {artifact.watermark_error}",
                 )
-            request_card_id = locked_source_card_id
-        selected_source_attachment_ids = self._normalize_trello_attachment_ids(
-            request.trello_source_attachment_ids or request.trello_attachment_ids
-        )
-        graph = self._automation_graph_payload(request)
-        has_trello_source = any(
-            module.get("enabled") and module.get("type") == "trello_source"
-            for module in graph.get("modules", [])
-            if isinstance(module, dict)
-        )
-        if (has_trello_source or selected_source_attachment_ids) and not request_card_id:
-            await self.store.append_log(
-                job_id,
-                "Trello Archive da dung: job co Trello Image Source nhung thieu card nguon, tranh upload nham sang card/list khac.",
-            )
-            return {
-                "configured": True,
-                "sent": 0,
-                "failed": len(artifacts),
-                "error": "source_card_missing",
-            }
-        card_id = self._normalize_trello_card_id(
-            request_card_id or trello_config.card_id or os.getenv("TRELLO_CARD_ID", "")
-        )
-        list_id = self._normalize_trello_id(request.trello_list_id or trello_config.list_id or os.getenv("TRELLO_LIST_ID", ""))
-        board_id = self._normalize_trello_board_id(
-            request.trello_board_id or trello_config.board_id or os.getenv("TRELLO_BOARD_ID", "")
-        )
-        if list_id and board_id:
-            list_id = await asyncio.to_thread(self._trello_resolve_board_list_id, key, token, board_id, list_id)
-        # Generated outputs must never replace the card's existing product cover.
-        set_cover = False
-        card_url = ""
-        created_card = False
-
-        if not card_id and list_id:
-            try:
-                card_payload = await asyncio.to_thread(
-                    self._trello_create_card,
-                    key,
-                    token,
-                    list_id,
-                    self._trello_card_name(job_id, request),
-                    self._trello_card_description(job_id, request),
+            elif artifact.watermark_status == "skipped":
+                skipped += 1
+                await self.store.append_log(
+                    job_id,
+                    f"Ảnh {index + 1} bỏ qua bước xóa watermark: {artifact.watermark_error}",
                 )
-                card_id = str(card_payload.get("id") or card_payload.get("shortLink") or "").strip()
-                card_url = str(card_payload.get("shortUrl") or card_payload.get("url") or "").strip()
-                created_card = True
-                await self.store.append_log(job_id, f"Đã tạo card Trello để lưu ảnh: {card_url or card_id}")
-            except Exception as exc:
-                await self.store.append_log(job_id, f"Không tạo được card Trello: {humanize_flow_error(str(exc))}")
-                return {
-                    "configured": True,
-                    "sent": 0,
-                    "failed": len(artifacts),
-                    "error": humanize_flow_error(str(exc)),
-                }
-
-        if not card_id:
-            await self.store.append_log(job_id, "Trello đã cấu hình key/token nhưng thiếu Trello card hoặc list để lưu ảnh.")
-            return {
-                "configured": True,
-                "sent": 0,
-                "failed": len(artifacts),
-                "error": "missing_trello_target",
-            }
-
-        await self._validate_trello_source_artifacts_before_upload(job_id, request, artifacts)
-
-        upload_mode = (trello_config.upload_mode or os.getenv("TRELLO_UPLOAD_MODE", "file")).strip().lower()
-        if upload_mode not in {"file", "url"}:
-            upload_mode = "file"
-        # 2K upscaling requires re-uploading bytes, which only the "file" mode
-        # supports. When the user has explicitly chosen URL mode we keep that
-        # choice and skip upscaling instead of surprising them with a switch.
-        upscale_2k = bool(getattr(trello_config, "upscale_to_2k", True)) and upload_mode == "file"
-        stored = 0
-        failed = 0
-        attachments: List[Dict[str, Any]] = []
-        upscale_announced = False
-        total_uploads = len(artifacts)
-        await self.store.set_progress_hint(
-            job_id,
-            stage="trello_upload",
-            detail=f"Đang chuẩn bị upload {total_uploads} ảnh kết quả lên Trello.",
-        )
-        await self.store.append_log(job_id, f"Đang upload {total_uploads} ảnh kết quả lên Trello.")
-        for index, artifact in enumerate(artifacts):
-            artifact_url = str(artifact.url or artifact.public_url or "").strip()
-            artifact_local_path = str(artifact.local_path or "").strip()
-            has_local_artifact = bool(artifact_local_path and Path(artifact_local_path).expanduser().is_file())
-            if not artifact_url and not has_local_artifact:
+            else:
                 failed += 1
                 await self.store.append_log(
                     job_id,
-                    f"Bỏ qua ảnh {index + 1}/{total_uploads} vì thiếu file cục bộ hoặc URL để upload Trello.",
+                    f"Ảnh {index + 1} chưa xóa được watermark nên giữ nguyên bản gốc: {artifact.watermark_error}",
+                )
+
+        await self.store.replace_artifacts(job_id, artifacts)
+        await self.store.append_log(
+            job_id,
+            f"Đã xóa watermark Gemini cho {cleaned}/{len(artifacts)} ảnh"
+            + (f"; {failed} ảnh giữ bản gốc" if failed else "")
+            + (f"; {metadata_only} ảnh chỉ gỡ được metadata" if metadata_only else "")
+            + (f"; {skipped} ảnh bỏ qua" if skipped else "")
+            + ".",
+        )
+        return {
+            "configured": True,
+            "base_url": base_url,
+            "cleaned": cleaned,
+            "skipped": skipped,
+            "failed": failed,
+            "metadata_only": metadata_only,
+            "total": len(artifacts),
+        }
+
+    def _erp_comment(
+        self,
+        key: str,
+        token: str,
+        task_id: str,
+        content: str,
+        parent_comment: str = "",
+    ) -> Dict[str, Any]:
+        """Post a plain comment (no attachment) on an ERP Task."""
+        task_id = self._normalize_erp_task_id(task_id)
+        self._erp_assert_task_in_project(key, token, task_id)
+        if str(parent_comment or "").strip():
+            return {
+                "comment": self._erp_reply_comment(
+                    key,
+                    token,
+                    task_id,
+                    content,
+                    parent_comment=parent_comment,
+                )
+            }
+        payload = self._erp_graphql(
+            "mutation AddTaskComment($name: String!, $content: String!) { addTaskComment(name: $name, content: $content) }",
+            {"name": task_id, "content": content},
+            "AddTaskComment",
+            key=key,
+            token=token,
+        )
+        return {"comment": payload.get("addTaskComment")}
+
+    def _erp_reply_comment(
+        self,
+        key: str,
+        token: str,
+        task_id: str,
+        content: str,
+        *,
+        parent_comment: str,
+        attachments: List[str] | None = None,
+    ) -> Dict[str, Any]:
+        """Post a comment inside another comment's reply thread.
+
+        The GraphQL ``addTaskComment`` mutation exposes no parent argument, so
+        a threaded reply has to go through the same whitelisted method the ERP
+        web UI calls when a user presses "Trả lời": it takes the parent comment
+        id and re-parents the pending uploads onto the reply instead of onto
+        the Task's top-level comment list.
+        """
+        if not key or not token:
+            raise RuntimeError("Chưa thiết lập ERP API key/secret.")
+        parent = str(parent_comment or "").strip()
+        if not parent:
+            raise RuntimeError("Thiếu comment gốc để trả lời trong thread ERP.")
+        payload = json.dumps(
+            {
+                "name": self._normalize_erp_task_id(task_id),
+                "content": content,
+                "mentions": "[]",
+                "meta": "",
+                "parent": parent,
+                "attachments": [str(item).strip() for item in (attachments or []) if str(item).strip()],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = Request(
+            f"{self._erp_base_url()}/api/method/hvg_workspace.api.add_task_comment",
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "Flow-v2-HaviGroup-ERP/1.0",
+                "Authorization": f"token {key}:{token}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.ERP_TIMEOUT_S) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = self._redact_erp_secret(exc.read().decode("utf-8", errors="replace") or exc.reason, key, token)
+            raise RuntimeError(f"ERP HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(self._redact_erp_secret(exc.reason or exc, key, token)) from exc
+        try:
+            message = (json.loads(raw) if raw else {}).get("message")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("ERP trả dữ liệu comment không phải JSON.") from exc
+        return message if isinstance(message, dict) else {}
+
+    def _erp_source_comment_id(
+        self,
+        key: str,
+        token: str,
+        task_id: str,
+        attachment_ids: List[str] | None = None,
+    ) -> str:
+        """Find the comment that carries the source image of this Task.
+
+        Flow's outputs belong inside that comment's thread, so the id is
+        resolved from the live Task instead of job state: an approval gate can
+        park a job for hours and the app may restart before the ERP push runs.
+        """
+        wanted = {
+            self._normalize_erp_id(str(item))
+            for item in self._normalize_erp_attachment_ids(attachment_ids)
+        }
+        try:
+            detail = self._erp_task_detail(key, token, task_id)
+        except Exception:
+            return ""
+        comments = detail.get("comments") if isinstance(detail, dict) else None
+        fallback = ""
+        for comment in comments or []:
+            if not isinstance(comment, dict):
+                continue
+            name = str(comment.get("name") or "").strip()
+            if not name:
+                continue
+            body = str(comment.get("content") or "")
+            if "FLOW_V2_ARTIFACT" in body or "FLOW_V2_ERROR" in body:
+                continue
+            urls: List[str] = []
+            for attachment in comment.get("attachments") or []:
+                if not isinstance(attachment, dict):
+                    continue
+                url = str(attachment.get("file_url") or attachment.get("url") or "").strip()
+                if not url:
+                    continue
+                if url.startswith("/"):
+                    url = f"{self._erp_base_url()}{url}"
+                urls.append(self._normalize_erp_id(url))
+            if not urls:
+                continue
+            if wanted and wanted & set(urls):
+                return name
+            if not fallback:
+                fallback = name
+        # When the recorded attachment no longer matches (renamed or replaced),
+        # the oldest comment holding an image is still the one a human dropped
+        # the source picture into.
+        return fallback
+
+    def _erp_output_task_id(self, request: CreateJobRequest) -> str:
+        """Return the Task that receives this job's images.
+
+        Default is the card the source image came from, which keeps the single
+        card flow unchanged. The idea fan-out overrides it so the images of
+        idea "a" land on card "a" instead of piling up on the parent Idea card.
+        """
+        return self._normalize_erp_task_id(
+            str(getattr(request, "erp_output_task_id", "") or "").strip()
+            or request.erp_source_task_id
+            or request.erp_task_id
+        )
+
+    async def _report_erp_job_failure(self, job_id: str, request: CreateJobRequest, detail: str) -> None:
+        """Mirror a job failure into the ERP source Task as a comment.
+
+        Best effort only: whoever watches the Task should see why no image
+        arrived, but a broken ERP call must never mask the original failure
+        that is already recorded on the job itself.
+        """
+        if not request.erp_enabled:
+            return
+        task_id = self._erp_output_task_id(request)
+        if not task_id:
+            return
+        key, token = self._erp_credentials()
+        if not key or not token:
+            return
+        message = " ".join(str(detail or "").split())[:900] or "Không rõ nguyên nhân."
+        # The failure belongs where the images would have gone: inside the
+        # thread of the comment the source image was dropped into, or plainly
+        # on the idea card when the job writes to a card of its own.
+        parent_comment = ""
+        if task_id == self._normalize_erp_task_id(request.erp_source_task_id or request.erp_task_id):
+            parent_comment = await asyncio.to_thread(
+                self._erp_source_comment_id,
+                key,
+                token,
+                task_id,
+                list(request.erp_source_attachment_ids or request.erp_attachment_ids or []),
+            )
+        try:
+            await asyncio.to_thread(
+                self._erp_comment,
+                key,
+                token,
+                task_id,
+                f"[FLOW_V2_ERROR] {message}",
+                parent_comment,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            await self.store.append_log(
+                job_id,
+                f"Không ghi được lỗi lên ERP Task {task_id}: {humanize_flow_error(str(exc))}",
+            )
+            return
+        await self.store.append_log(job_id, f"Đã ghi lỗi của tác vụ vào comment ERP Task {task_id}.")
+
+    async def _archive_erp_artifacts(
+        self,
+        job_id: str,
+        request: CreateJobRequest,
+        artifacts: List[JobArtifact],
+    ) -> Dict[str, Any]:
+        if request.type != "image" or not artifacts or not request.erp_enabled:
+            return {}
+
+        key, token = self._erp_credentials()
+        if not key or not token:
+            return {"configured": False}
+
+        # The archive is intentionally approval-gated.  Never attach local
+        # bytes, create a replacement Task, move status, or write a comment
+        # until every dashboard decision has been resolved.
+        job = self.store.get_job(job_id)
+        result = dict(job.result or {}) if job is not None else {}
+        approvals = result.get("dashboard_approvals") if isinstance(result.get("dashboard_approvals"), dict) else {}
+        pending = [index for index in range(len(artifacts)) if str((approvals.get(str(index)) or {}).get("status") or "") not in {"approved", "rejected"}]
+        if pending:
+            return {
+                "configured": True,
+                "sent": 0,
+                "failed": 0,
+                "waiting_approval": True,
+                "pending": len(pending),
+            }
+        task_id = self._erp_output_task_id(request)
+        if not task_id:
+            return {"configured": True, "sent": 0, "failed": len(artifacts), "error": "source_task_missing"}
+        self._erp_required_project_id(request.erp_project_id)
+        await asyncio.to_thread(self._erp_assert_task_in_project, key, token, task_id)
+
+        approved = [
+            (index, artifact)
+            for index, artifact in enumerate(artifacts)
+            if str((approvals.get(str(index)) or {}).get("status") or "") == "approved"
+        ]
+        # When the images go back to the card that holds the source image, they
+        # belong in that comment's reply thread so the card keeps one thread per
+        # source instead of a flat wall of images. When the job writes to a
+        # different card (idea fan-out), the images are that card's own content
+        # and must not be buried under someone else's comment.
+        source_task_id = self._normalize_erp_task_id(request.erp_source_task_id or request.erp_task_id)
+        parent_comment = ""
+        if task_id == source_task_id:
+            parent_comment = await asyncio.to_thread(
+                self._erp_source_comment_id,
+                key,
+                token,
+                task_id,
+                list(request.erp_source_attachment_ids or request.erp_attachment_ids or []),
+            )
+            if not parent_comment:
+                await self.store.append_log(
+                    job_id,
+                    "Không tìm thấy comment ảnh nguồn trên ERP nên ảnh sẽ nằm ở comment thường thay vì trong thread trả lời.",
+                )
+        attachments: List[Dict[str, Any]] = []
+        failed = 0
+        uploaded_files = 0
+        # Images that reached the card as a bare Flow URL still carry the
+        # Gemini watermark, so the closing summary has to count them apart
+        # from the cleaned files instead of reporting a clean run.
+        url_fallbacks = 0
+        for index, artifact in approved:
+            # Prefer the cleaned local file: attaching artifact.url hands ERP
+            # the original Flow image with its Gemini watermark still on it.
+            # The company ERP credential currently has no file-upload right
+            # (POST /api/method/upload_file answers 403 and the GraphQL API
+            # exposes no attachment mutation), so the URL comment stays as the
+            # fallback instead of dropping the artifact entirely.
+            local_file = self._artifact_local_file(artifact)
+            artifact_url = str(artifact.url or artifact.public_url or "").strip()
+            has_https_url = urlparse(artifact_url).scheme == "https"
+            if local_file is None and not has_https_url:
+                failed += 1
+                await self.store.append_log(
+                    job_id,
+                    f"Không ghi ảnh {index + 1} vào ERP vì thiếu file cục bộ và URL artefact HTTPS.",
                 )
                 continue
-
-            name = self._trello_attachment_name(job_id, artifact, index)
-            try:
-                await self.store.set_progress_hint(
-                    job_id,
-                    stage="trello_upload",
-                    detail=f"Đang upload ảnh {index + 1}/{total_uploads} lên Trello.",
-                )
-                await self.store.append_log(job_id, f"Đang upload ảnh {index + 1}/{total_uploads} lên Trello.")
-                if upload_mode == "url" and artifact_url:
-                    attachment_payload = await self._trello_attach_url_with_cover_fallback(
+            name = self._erp_attachment_name(job_id, artifact, index)
+            attachment: Dict[str, Any] | None = None
+            upload_error = ""
+            # Even without a cleaned local file the bytes are worth fetching:
+            # a bare Flow URL is session-scoped and expires, so a card that
+            # only carries the link ends up with a dead image. Downloading
+            # here keeps the URL comment as a fallback, not the first choice.
+            if local_file is not None or has_https_url:
+                try:
+                    file_bytes, mime_type = await self._erp_artifact_file_bytes(job_id, artifact, index, artifact_url)
+                    # Flow hands back whatever size it generated, so the 2K pass
+                    # runs here, right before the bytes leave for ERP. A failed
+                    # upscale must never cost the image: keep the original and
+                    # carry on, exactly like a failed watermark strip does.
+                    try:
+                        upscaled = await self._upsample_artifact_bytes(artifact, artifact_url)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        upscaled = ImageUpscaleResult(failure_reason=humanize_flow_error(str(exc)))
+                    if upscaled.bytes:
+                        file_bytes = upscaled.bytes
+                        mime_type = upscaled.mime_type or mime_type
+                        width, height = upscaled.target_size
+                        size_text = f" lên {width}x{height}" if width and height else ""
+                        await self.store.append_log(
+                            job_id,
+                            f"Ảnh {index + 1} đã nâng độ phân giải{size_text} ({upscaled.source}) trước khi upload ERP.",
+                        )
+                    elif upscaled.failure_reason:
+                        # No local upscale as a consolation prize: a stretched
+                        # file is bigger and just as blurry, so the original
+                        # goes up and the log says why it stayed that size.
+                        await self.store.append_log(
+                            job_id,
+                            f"Ảnh {index + 1} giữ nguyên độ phân giải gốc, không resize giả 2K "
+                            f"vì nâng 2K không thành: {upscaled.failure_reason}",
+                        )
+                    attachment = await self._erp_attach_file_bytes_with_cover_fallback(
                         job_id,
                         index,
                         key,
                         token,
-                        card_id,
-                        artifact_url,
+                        task_id,
+                        file_bytes,
+                        mime_type,
                         name,
-                        set_cover and index == 0,
+                        False,
+                        parent_comment,
                     )
-                else:
-                    upscale_result = ImageUpscaleResult()
-                    if upscale_2k:
-                        try:
-                            upscale_result = await self._upsample_artifact_bytes(
-                                artifact,
-                                artifact_url,
-                            )
-                        except Exception as up_exc:
-                            await self.store.append_log(
-                                job_id,
-                                f"Không nâng được ảnh {index + 1} lên 2K (giữ bản gốc): {humanize_flow_error(str(up_exc))}",
-                            )
-                            upscale_result = ImageUpscaleResult()
-                        else:
-                            if upscale_result.bytes and upscale_result.source == "flow_2k" and not upscale_announced:
-                                await self.store.append_log(
-                                    job_id,
-                                    "Da dung Flow 2K that truoc khi upload len Trello.",
-                                )
-                                upscale_announced = True
-                            if upscale_result.bytes and upscale_result.source == "flow_2k":
-                                await self._persist_flow_2k_artifact_file(job_id, artifact, index, upscale_result)
-                            elif upscale_result.bytes and upscale_result.source == "local_resize":
-                                await self.store.append_log(
-                                    job_id,
-                                    (
-                                        f"Flow 2K khong tra duoc anh 2K that; da resize cuc bo anh {index + 1} "
-                                        f"({upscale_result.source_size[0]}x{upscale_result.source_size[1]} -> "
-                                        f"{upscale_result.target_size[0]}x{upscale_result.target_size[1]}) vi TRELLO_FAKE_2K_RESIZE_ENABLED dang bat."
-                                    ),
-                                )
-                            elif upscale_result.source == "flow_unavailable":
-                                detail = (
-                                    f" ({upscale_result.failure_reason})"
-                                    if upscale_result.failure_reason
-                                    else ""
-                                )
-                                await self.store.append_log(
-                                    job_id,
-                                    (
-                                        f"Flow 2K chua tra anh 2K that cho anh {index + 1}; "
-                                        f"giu anh goc va khong resize gia 2K{detail}."
-                                    ),
-                                )
-                    try:
-                        if upscale_result.bytes:
-                            source_bytes = upscale_result.bytes
-                            source_mime = upscale_result.mime_type or artifact.mime_type or "image/jpeg"
-                        else:
-                            source_bytes, source_mime = await self._trello_artifact_file_bytes(
-                                job_id,
-                                artifact,
-                                index,
-                                artifact_url,
-                            )
-                            if upscale_2k and self._trello_fake_2k_resize_enabled():
-                                ensured_bytes, ensured_mime, changed, source_size, target_size = await asyncio.to_thread(
-                                    self._ensure_image_long_edge_2k,
-                                    source_bytes,
-                                    source_mime or artifact.mime_type or "image/jpeg",
-                                )
-                                if changed:
-                                    source_bytes = ensured_bytes
-                                    source_mime = ensured_mime or "image/jpeg"
-                                    await self.store.append_log(
-                                        job_id,
-                                        (
-                                            f"Đã ép ảnh {index + 1} lên 2K cục bộ "
-                                            f"({source_size[0]}x{source_size[1]} -> {target_size[0]}x{target_size[1]}) trước khi upload Trello."
-                                        ),
-                                    )
-                        attachment_payload = await self._trello_attach_file_bytes_with_cover_fallback(
-                            job_id,
-                            index,
-                            key,
-                            token,
-                            card_id,
-                            source_bytes,
-                            source_mime or artifact.mime_type or "image/jpeg",
-                            name,
-                            set_cover and index == 0,
-                        )
-                    except Exception as file_exc:
+                    uploaded_files += 1
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    upload_error = humanize_flow_error(str(exc))
+                    if not has_https_url:
+                        failed += 1
                         await self.store.append_log(
                             job_id,
-                            f"Upload file ảnh {index + 1} lên Trello chưa được, thử attach bằng URL: {humanize_flow_error(str(file_exc))}",
+                            f"Không ghi được ảnh {index + 1} đã duyệt vào ERP: {upload_error}",
                         )
-                        attachment_payload = await self._trello_attach_url_with_cover_fallback(
-                            job_id,
-                            index,
-                            key,
-                            token,
-                            card_id,
-                            artifact_url,
-                            name,
-                            set_cover and index == 0,
-                        )
-
-                stored += 1
-                attachments.append(self._trello_attachment_summary(attachment_payload))
-                await self.store.set_progress_hint(
-                    job_id,
-                    stage="trello_upload",
-                    detail=f"Đã upload {stored}/{total_uploads} ảnh lên Trello.",
-                )
-                await self.store.append_log(job_id, f"Đã upload ảnh {index + 1}/{total_uploads} lên Trello.")
-            except Exception as exc:
-                failed += 1
-                await self.store.append_log(
-                    job_id,
-                    f"Không lưu được ảnh {index + 1} lên Trello: {humanize_flow_error(str(exc))}",
-                )
-
-        if stored:
-            if self._normalize_trello_card_id(request.trello_card_id):
-                await self.store.append_log(
-                    job_id,
-                    f"Đã lưu {stored} ảnh lên đúng card Trello đang chạy để duyệt trực tiếp.",
-                )
-            else:
-                await self.store.append_log(job_id, f"Đã lưu {stored} ảnh lên Trello.")
-        review_move: Dict[str, Any] = {}
-        if stored and board_id and card_id:
-            review_move = await self._move_trello_card_to_content_review_if_complete(
-                job_id,
-                key,
-                token,
-                board_id,
-                card_id,
+                        continue
+                    url_fallbacks += 1
+                    await self.store.append_log(
+                        job_id,
+                        f"ERP không nhận file ảnh {index + 1} ({upload_error}). "
+                        "Đã đính kèm URL artefact gốc thay thế, ảnh trên ERP vẫn còn watermark Gemini.",
+                    )
+            if attachment is None:
+                try:
+                    attachment = await asyncio.to_thread(
+                        self._erp_attach_url,
+                        key,
+                        token,
+                        task_id,
+                        artifact_url,
+                        name,
+                        False,
+                        parent_comment,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    failed += 1
+                    await self.store.append_log(job_id, f"Không ghi được ảnh {index + 1} đã duyệt vào ERP: {humanize_flow_error(str(exc))}")
+                    continue
+            attachments.append(self._erp_attachment_summary(attachment))
+        summary = (
+            f"ERP đã ghi {len(attachments)} ảnh đã duyệt vào Task {task_id} "
+            + (f"trong thread trả lời của comment ảnh nguồn {parent_comment} " if parent_comment else "")
+            + f"({uploaded_files} ảnh upload từ file cục bộ đã xử lý watermark); "
+            f"{len(artifacts) - len(approved)} ảnh bị từ chối không được ghi."
+        )
+        if url_fallbacks:
+            summary += (
+                f" Cảnh báo: {url_fallbacks} ảnh chỉ gắn được URL Flow gốc nên trên ERP vẫn còn watermark Gemini."
             )
+        await self.store.append_log(job_id, summary)
         return {
             "configured": True,
-            "sent": stored,
+            "sent": len(attachments),
+            "uploaded_files": uploaded_files,
+            "url_fallbacks": url_fallbacks,
             "failed": failed,
-            "card_id": card_id,
-            "source_card_id": locked_source_card_id or request_card_id,
-            "source_attachment_ids": selected_source_attachment_ids,
-            "card_url": card_url,
-            "created_card": created_card,
+            "task_id": task_id,
+            "source_task_id": task_id,
             "attachments": attachments,
-            "content_review": review_move,
+            "approved": len(approved),
+            "rejected": len(artifacts) - len(approved),
         }
 
-    async def _move_trello_card_to_content_review_if_complete(
-        self,
-        job_id: str,
-        key: str,
-        token: str,
-        board_id: str,
-        card_id: str,
-    ) -> Dict[str, Any]:
-        target_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
-        try:
-            card = await asyncio.to_thread(self._trello_image_card_by_id, key, token, card_id)
-            if card:
-                target_count = self._flow_operator_target_count_for_card(
-                    CreateJobRequest(type="image", title="", count=target_count),
-                    card,
-                )
-                output_count = int(card.get("_flow_output_count") or 0)
-            else:
-                output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
-            if output_count < target_count:
-                await self.store.append_log(
-                    job_id,
-                    f"Trello chua chuyen card sang Content Review vi moi thay {output_count}/{target_count} anh output, khong tinh 1 anh goc.",
-                )
-                return {
-                    "moved": False,
-                    "reason": "not_enough_outputs",
-                    "output_count": output_count,
-                    "target_output_count": target_count,
-                }
-
-            review_list_name = self._default_trello_review_list_name()
-            review_list_id = await asyncio.to_thread(
-                self._trello_content_review_list_id,
-                key,
-                token,
-                board_id,
-                review_list_name,
-            )
-            if not review_list_id:
-                await self.store.append_log(
-                    job_id,
-                    f"Trello da du {output_count}/{target_count} anh output, khong tinh 1 anh goc, nhung khong tim thay list {review_list_name}.",
-                )
-                return {
-                    "moved": False,
-                    "reason": "review_list_missing",
-                    "output_count": output_count,
-                    "target_output_count": target_count,
-                    "list_name": review_list_name,
-                }
-
-            payload = await asyncio.to_thread(
-                self._trello_move_card_to_list,
-                key,
-                token,
-                card_id,
-                review_list_id,
-            )
-            await self.store.append_log(
-                job_id,
-                f"Da du {output_count}/{target_count} anh output, khong tinh 1 anh goc, da chuyen card Trello sang {review_list_name}.",
-            )
-            return {
-                "moved": True,
-                "output_count": output_count,
-                "target_output_count": target_count,
-                "list_id": review_list_id,
-                "list_name": review_list_name,
-                "card_id": str(payload.get("id") or card_id).strip() if isinstance(payload, dict) else card_id,
-                "card_url": str(payload.get("url") or payload.get("shortUrl") or "").strip() if isinstance(payload, dict) else "",
-            }
-        except Exception as exc:
-            detail = humanize_flow_error(str(exc))
-            await self.store.append_log(job_id, f"Khong chuyen duoc card sang Content Review: {detail}")
-            return {
-                "moved": False,
-                "reason": "move_failed",
-                "error": detail,
-                "target_output_count": target_count,
-            }
-
-    async def _trello_artifact_file_bytes(
+    async def _erp_artifact_file_bytes(
         self,
         job_id: str,
         artifact: JobArtifact,
@@ -9448,30 +9935,32 @@ exit 1
 
         if artifact_url:
             return await asyncio.to_thread(self._read_remote_file, artifact_url)
-        raise RuntimeError("Không có file ảnh cục bộ hoặc URL ảnh để upload lên Trello.")
+        raise RuntimeError("Không có file ảnh cục bộ hoặc URL ảnh để upload lên ERP.")
 
-    async def _trello_attach_file_bytes_with_cover_fallback(
+    async def _erp_attach_file_bytes_with_cover_fallback(
         self,
         job_id: str,
         index: int,
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         file_bytes: bytes,
         mime_type: str,
         name: str,
         set_cover: bool,
+        parent_comment: str = "",
     ) -> Dict[str, Any]:
         try:
             return await asyncio.to_thread(
-                self._trello_attach_file_bytes,
+                self._erp_attach_file_bytes,
                 key,
                 token,
-                card_id,
+                task_id,
                 file_bytes,
                 mime_type,
                 name,
                 set_cover,
+                parent_comment,
             )
         except Exception as exc:
             detail = str(exc or "").lower()
@@ -9479,39 +9968,42 @@ exit 1
                 raise
             await self.store.append_log(
                 job_id,
-                f"Trello không set được cover cho file ảnh {index + 1}, upload lại file đó không đặt cover.",
+                f"ERP không set được cover cho file ảnh {index + 1}, upload lại file đó không đặt cover.",
             )
             return await asyncio.to_thread(
-                self._trello_attach_file_bytes,
+                self._erp_attach_file_bytes,
                 key,
                 token,
-                card_id,
+                task_id,
                 file_bytes,
                 mime_type,
                 name,
                 False,
+                parent_comment,
             )
 
-    async def _trello_attach_url_with_cover_fallback(
+    async def _erp_attach_url_with_cover_fallback(
         self,
         job_id: str,
         index: int,
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         artifact_url: str,
         name: str,
         set_cover: bool,
+        parent_comment: str = "",
     ) -> Dict[str, Any]:
         try:
             return await asyncio.to_thread(
-                self._trello_attach_url,
+                self._erp_attach_url,
                 key,
                 token,
-                card_id,
+                task_id,
                 artifact_url,
                 name,
                 set_cover,
+                parent_comment,
             )
         except Exception as exc:
             detail = str(exc or "").lower()
@@ -9519,25 +10011,26 @@ exit 1
                 raise
             await self.store.append_log(
                 job_id,
-                f"Trello không set được cover cho ảnh {index + 1}, upload lại ảnh đó không đặt cover.",
+                f"ERP không set được cover cho ảnh {index + 1}, upload lại ảnh đó không đặt cover.",
             )
             return await asyncio.to_thread(
-                self._trello_attach_url,
+                self._erp_attach_url,
                 key,
                 token,
-                card_id,
+                task_id,
                 artifact_url,
                 name,
                 False,
+                parent_comment,
             )
 
-    def _trello_credentials(self) -> tuple[str, str]:
-        config = self.store.snapshot().trello_config
-        key = str(config.api_key or "").strip() or os.getenv("TRELLO_API_KEY", "").strip()
-        token = str(config.token or "").strip() or os.getenv("TRELLO_TOKEN", "").strip()
-        return key, token
+    def _erp_credentials(self) -> tuple[str, str]:
+        config = self.store.snapshot().erp_config
+        key = str(config.api_key or "").strip() or os.getenv("ERP_API_KEY", "").strip()
+        secret = str(config.api_secret or "").strip() or os.getenv("ERP_API_SECRET", "").strip()
+        return key, secret
 
-    def _redact_trello_secret(self, value: Any, key: str = "", token: str = "") -> str:
+    def _redact_erp_secret(self, value: Any, key: str = "", token: str = "") -> str:
         text = str(value or "")
         for secret in {str(key or "").strip(), str(token or "").strip()}:
             if secret:
@@ -9546,7 +10039,7 @@ exit 1
         text = re.sub(r"(?i)\b(key|token)=([^&\s]+)", r"\1=[redacted]", text)
         return text
 
-    def _normalize_trello_id(self, value: str) -> str:
+    def _normalize_erp_id(self, value: str) -> str:
         raw = str(value or "").strip()
         if not raw:
             return ""
@@ -9558,8 +10051,8 @@ exit 1
             raw = parsed.path or raw
         return raw.split("?", 1)[0].split("#", 1)[0].strip().strip("/")
 
-    def _normalize_trello_card_id(self, value: str) -> str:
-        raw = self._normalize_trello_id(value)
+    def _normalize_erp_task_id(self, value: str) -> str:
+        raw = self._normalize_erp_id(value)
         if "/c/" in raw:
             raw = raw.split("/c/", 1)[1]
         if raw.startswith("c/"):
@@ -9568,7 +10061,7 @@ exit 1
             raw = raw.split("/", 1)[0]
         return raw.strip()
 
-    def _normalize_trello_attachment_ids(self, values: Any) -> List[str]:
+    def _normalize_erp_attachment_ids(self, values: Any) -> List[str]:
         if values is None:
             return []
         raw_items: List[Any]
@@ -9581,15 +10074,15 @@ exit 1
         normalized: List[str] = []
         seen: set[str] = set()
         for item in raw_items:
-            attachment_id = self._normalize_trello_id(str(item or ""))
+            attachment_id = self._normalize_erp_id(str(item or ""))
             if not attachment_id or attachment_id in seen:
                 continue
             seen.add(attachment_id)
             normalized.append(attachment_id)
         return normalized
 
-    def _normalize_trello_board_id(self, value: str) -> str:
-        raw = self._normalize_trello_id(value)
+    def _normalize_erp_project_id(self, value: str) -> str:
+        raw = self._normalize_erp_id(value)
         if "/b/" in raw:
             raw = raw.split("/b/", 1)[1]
         if raw.startswith("b/"):
@@ -9598,14 +10091,14 @@ exit 1
             raw = raw.split("/", 1)[0]
         return raw.strip()
 
-    def _trello_card_name(self, job_id: str, request: CreateJobRequest) -> str:
+    def _erp_task_name(self, job_id: str, request: CreateJobRequest) -> str:
         prompt = str(request.prompt or "").strip().replace("\n", " ")
         prompt = re.sub(r"\s+", " ", prompt)
         if len(prompt) > 72:
             prompt = f"{prompt[:69]}..."
         return prompt or f"Flow image {job_id[:8]}"
 
-    def _trello_card_description(self, job_id: str, request: CreateJobRequest) -> str:
+    def _erp_task_description(self, job_id: str, request: CreateJobRequest) -> str:
         prompt = str(request.prompt or "").strip()
         return "\n".join(
             part
@@ -9619,20 +10112,324 @@ exit 1
             if part
         )
 
-    def _trello_attachment_name(self, job_id: str, artifact: JobArtifact, index: int) -> str:
-        suffix = Path(str(artifact.media_name or "")).suffix or ".jpg"
+    def _erp_attachment_name(self, job_id: str, artifact: JobArtifact, index: int) -> str:
+        # Prefer the file that will actually be uploaded: the watermark pass
+        # rewrites a JPEG artifact into a PNG on disk.
+        local_path = str(artifact.local_path or "").strip()
+        suffix = (Path(local_path).suffix if local_path else "") or Path(str(artifact.media_name or "")).suffix or ".jpg"
         if suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
             suffix = ".jpg"
         return f"flow-{job_id[:8]}-{index + 1}{suffix}"
 
-    def _trello_endpoint(self, path: str, key: str, token: str, fields: Dict[str, Any] | None = None) -> str:
-        auth_fields = {"key": key, "token": token}
-        if fields:
-            auth_fields.update({k: v for k, v in fields.items() if str(v) != ""})
-        auth = urlencode(auth_fields)
-        return f"{self.TRELLO_API_BASE_URL}/{path.strip('/')}?{auth}"
+    def _erp_base_url(self) -> str:
+        configured = str(self.store.snapshot().erp_config.base_url or "").strip().rstrip("/")
+        return configured or self.ERP_BASE_URL
 
-    def _trello_get_json(
+    def _erp_graphql(
+        self,
+        query: str,
+        variables: Dict[str, Any],
+        operation_name: str,
+        *,
+        key: str,
+        token: str,
+    ) -> Dict[str, Any]:
+        """Execute the only ERP data-plane protocol used by this app.
+
+        The supplied credentials are a Frappe API key/secret pair.  They are
+        deliberately sent only in the Authorization header and never appear in
+        a URL, exception, state snapshot, or application response.
+        """
+        if not key or not token:
+            raise RuntimeError("Chưa thiết lập ERP API key/secret.")
+        endpoint = f"{self._erp_base_url()}{self.ERP_GRAPHQL_PATH}"
+        payload = json.dumps(
+            {"query": query, "variables": variables, "operationName": operation_name},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        request = Request(
+            endpoint,
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                # The ERP's Cloudflare layer rejects urllib's default Python
+                # signature. This identifies the internal client; it is not
+                # an authentication credential.
+                "User-Agent": "Flow-v2-HaviGroup-ERP/1.0",
+                # The supplied company credential is a Frappe API key/secret
+                # pair. It has been verified live against this GraphQL path.
+                # The guide's HVGToken header requires a distinct raw token;
+                # never derive or substitute one from this pair.
+                "Authorization": f"token {key}:{token}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.ERP_TIMEOUT_S) as response:
+                status = int(getattr(response, "status", response.getcode()))
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            detail = self._redact_erp_secret(detail or exc.reason, key, token)
+            if exc.code == 401:
+                raise RuntimeError("ERP từ chối xác thực (HTTP 401). Kiểm tra hoặc rotate API credential.") from exc
+            if exc.code == 429:
+                raise RuntimeError("ERP đang giới hạn request (HTTP 429). Hãy thử lại sau với backoff.") from exc
+            raise RuntimeError(f"ERP HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(self._redact_erp_secret(exc.reason or exc, key, token)) from exc
+
+        if status == 401:
+            raise RuntimeError("ERP từ chối xác thực (HTTP 401). Kiểm tra hoặc rotate API credential.")
+        if status == 429:
+            raise RuntimeError("ERP đang giới hạn request (HTTP 429). Hãy thử lại sau với backoff.")
+        try:
+            envelope = json.loads(raw) if raw else {}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("ERP trả dữ liệu không phải JSON.") from exc
+        errors = envelope.get("errors") if isinstance(envelope, dict) else None
+        if isinstance(errors, list) and errors:
+            messages = [str(item.get("message") or "GraphQL error") for item in errors if isinstance(item, dict)]
+            raise RuntimeError(self._redact_erp_secret("ERP GraphQL: " + "; ".join(messages), key, token))
+        data = envelope.get("data") if isinstance(envelope, dict) else None
+        if not isinstance(data, dict):
+            raise RuntimeError("ERP GraphQL không trả data hợp lệ.")
+        return data
+
+    def _erp_upload_file(
+        self,
+        key: str,
+        token: str,
+        task_id: str,
+        file_bytes: bytes,
+        mime_type: str,
+        name: str,
+    ) -> str:
+        """Host a file on the ERP itself and return its site-relative file URL.
+
+        These are exactly the fields the ERP web UI posts when a user drops an
+        image into the comment box.  The ``fieldname=comment`` sentinel is what
+        makes it work: the file is parked on the Task, and the next
+        ``addTaskComment`` re-parents every such pending file onto the comment
+        it creates, which is the only way the comment renders a real attachment
+        instead of a line of text.  The path stays relative because that is the
+        form ``addTaskComment`` matches on.
+        """
+        if not key or not token:
+            raise RuntimeError("Chưa thiết lập ERP API key/secret.")
+        mime = mime_type or mimetypes.guess_type(name)[0] or "image/jpeg"
+        body, content_type = self._multipart_form_data(
+            fields={
+                "is_private": "1",
+                "folder": "Home",
+                "doctype": "Task",
+                "docname": task_id,
+                "fieldname": "comment",
+            },
+            file_field="file",
+            file_name=name,
+            file_mime=mime,
+            file_bytes=file_bytes,
+        )
+        request = Request(
+            f"{self._erp_base_url()}/api/method/upload_file",
+            data=body,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": content_type,
+                "User-Agent": "Flow-v2-HaviGroup-ERP/1.0",
+                "Authorization": f"token {key}:{token}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.ERP_TIMEOUT_S) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = self._redact_erp_secret(exc.read().decode("utf-8", errors="replace") or exc.reason, key, token)
+            raise RuntimeError(f"ERP từ chối upload file (HTTP {exc.code}): {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(self._redact_erp_secret(exc.reason or exc, key, token)) from exc
+        try:
+            message = (json.loads(raw) if raw else {}).get("message") or {}
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("ERP trả dữ liệu upload không phải JSON.") from exc
+        file_url = str(message.get("file_url") or "").strip() if isinstance(message, dict) else ""
+        if not file_url:
+            raise RuntimeError("ERP không trả file_url sau khi upload.")
+        if not file_url.startswith("/"):
+            # An absolute URL can only be accepted if it is still this ERP,
+            # otherwise the comment would point somewhere we never wrote to.
+            parsed = urlparse(file_url)
+            if parsed.scheme != "https" or parsed.netloc != urlparse(self._erp_base_url()).netloc:
+                raise RuntimeError("ERP trả file_url không thuộc chính ERP này.")
+            file_url = parsed.path
+        return file_url
+
+    def _erp_allowed_project_id(self) -> str:
+        """Return the single ERP Project this app is allowed to touch.
+
+        The owner picks it in the ERP panel (or `ERP_PROJECT_ID`); every other
+        source — an imported automation graph, a batch item, a Task id typed by
+        hand — is still checked against this one value, so the blast radius
+        stays exactly one project instead of the whole production ERP.
+        """
+        return self._normalize_erp_project_id(
+            str(self.store.snapshot().erp_config.project_id or "").strip()
+            or os.getenv("ERP_PROJECT_ID", "").strip()
+            or self.ERP_PROJECT_ID
+        )
+
+    def _erp_required_project_id(self, project_id: str = "") -> str:
+        allowed = self._erp_allowed_project_id()
+        candidate = self._normalize_erp_project_id(project_id) or allowed
+        if candidate != allowed:
+            raise RuntimeError(
+                f"Flow v2 chỉ được phép thao tác ERP Project {allowed} (đang bị yêu cầu {candidate})."
+            )
+        return candidate
+
+    def _erp_task_board(self, key: str, token: str, project_id: str = "") -> Dict[str, Any]:
+        project = self._erp_required_project_id(project_id)
+        return self._erp_graphql(
+            "query TaskBoard($project: String!) { taskBoard(project: $project, includeArchived: false) }",
+            {"project": project},
+            "TaskBoard",
+            key=key,
+            token=token,
+        ).get("taskBoard") or {}
+
+    def _erp_normalized_task(self, raw_task: Dict[str, Any], status: str = "", detail: Dict[str, Any] | None = None) -> Dict[str, Any]:
+        source = detail if isinstance(detail, dict) else raw_task
+        nested_task = source.get("task") if isinstance(source.get("task"), dict) else {}
+        merged = {**raw_task, **nested_task, **source}
+        task_id = str(merged.get("name") or merged.get("id") or raw_task.get("name") or "").strip()
+        subject = str(merged.get("subject") or merged.get("title") or task_id).strip()
+        description = str(merged.get("description") or merged.get("content") or "").strip()
+        return {
+            "id": task_id,
+            "shortLink": task_id,
+            "name": subject,
+            "desc": description,
+            "url": f"{self._erp_base_url()}/hvg/task?task={quote(task_id, safe='')}",
+            "idList": str(merged.get("status") or status or "").strip(),
+            "closed": bool(merged.get("is_archived") or merged.get("archived")),
+            "_erp_raw": source,
+        }
+
+    def _erp_task_detail(self, key: str, token: str, task_id: str) -> Dict[str, Any]:
+        normalized_task_id = self._normalize_erp_task_id(task_id)
+        if not normalized_task_id:
+            raise RuntimeError("Thiếu ERP Task ID.")
+        return self._erp_graphql(
+            "query TaskDetail($name: String!) { taskDetail(name: $name) }",
+            {"name": normalized_task_id},
+            "TaskDetail",
+            key=key,
+            token=token,
+        ).get("taskDetail") or {}
+
+    def _erp_assert_task_in_project(self, key: str, token: str, task_id: str) -> None:
+        target = self._normalize_erp_task_id(task_id)
+        allowed = self._erp_allowed_project_id()
+        board = self._erp_task_board(key, token, allowed)
+        for column in board.get("columns", []):
+            if not isinstance(column, dict):
+                continue
+            for task in column.get("tasks", []):
+                if isinstance(task, dict) and self._normalize_erp_task_id(str(task.get("name") or task.get("id") or "")) == target:
+                    return
+        raise RuntimeError(f"ERP Task {target or '(trống)'} không thuộc Project {allowed}.")
+
+    def _erp_extract_task_attachments(self, detail: Any) -> List[Dict[str, Any]]:
+        """Normalize attachment URL shapes returned by the JSON taskDetail scalar.
+
+        The server schema intentionally leaves taskDetail as JSON, so this
+        accepts the documented comment attachment list and common File URL
+        shapes without treating arbitrary links in descriptions as sources.
+        """
+        attachments: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def add(url: Any, metadata: Dict[str, Any], flow_output: bool) -> None:
+            value = str(url or "").strip()
+            if value.startswith("/"):
+                value = f"{self._erp_base_url()}{value}"
+            parsed = urlparse(value)
+            if parsed.scheme != "https" or value in seen:
+                return
+            name = str(metadata.get("name") or metadata.get("file_name") or Path(parsed.path).name or "erp-image").strip()
+            mime = str(metadata.get("mime_type") or metadata.get("mimeType") or mimetypes.guess_type(name)[0] or "")
+            if not mime.startswith("image/") and Path(name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+                return
+            seen.add(value)
+            attachments.append(
+                {
+                    "id": value,
+                    "name": ("flow-" if flow_output and not name.lower().startswith("flow-") else "") + name,
+                    "url": value,
+                    "mimeType": mime or "image/jpeg",
+                    "date": str(metadata.get("creation") or metadata.get("date") or metadata.get("modified") or ""),
+                }
+            )
+
+        erp_host = urlparse(self._erp_base_url()).netloc
+
+        def add_hosted_urls_in_text(text: Any, metadata: Dict[str, Any], flow_output: bool) -> None:
+            """Recover image links written into a comment body.
+
+            The ERP credential cannot populate a comment's structured
+            attachment list, so Flow's own outputs only exist as URLs inside
+            the comment text.  Only files hosted by the ERP itself count —
+            arbitrary links in free text stay ignored, as before.
+            """
+            for match in re.findall(r"https://[^\s)\]<>\"']+", str(text or "")):
+                parsed = urlparse(match)
+                if parsed.netloc != erp_host:
+                    continue
+                if not parsed.path.startswith(("/files/", "/private/files/")):
+                    continue
+                # A comment's own "name" is its comment id, which would defeat
+                # the image-extension check, so name the file from the URL.
+                add(match, {**metadata, "name": Path(parsed.path).name}, flow_output)
+
+        def walk(value: Any, inherited_flow_output: bool = False, in_attachment_context: bool = False) -> None:
+            if isinstance(value, dict):
+                body = str(value.get("content") or value.get("comment") or value.get("text") or "")
+                marker = "FLOW_V2_ARTIFACT" in body
+                flow_output = inherited_flow_output or marker
+                if body:
+                    add_hosted_urls_in_text(body, value, flow_output)
+                for key_name in ("attachments", "attachment_urls", "files", "file_urls"):
+                    nested = value.get(key_name)
+                    if isinstance(nested, (list, tuple)):
+                        for item in nested:
+                            if isinstance(item, str):
+                                add(item, value, flow_output)
+                            else:
+                                walk(item, flow_output, True)
+                if in_attachment_context:
+                    add(value.get("url") or value.get("file_url") or value.get("file") or value.get("download_url"), value, flow_output)
+                for key_name, nested in value.items():
+                    if key_name in {"attachments", "attachment_urls", "files", "file_urls"}:
+                        continue
+                    if isinstance(nested, (dict, list, tuple)):
+                        walk(nested, flow_output, False)
+            elif isinstance(value, (list, tuple)):
+                for item in value:
+                    walk(item, inherited_flow_output, in_attachment_context)
+
+        if isinstance(detail, dict):
+            # The image a user drops on a Task through the ERP web UI becomes
+            # the card cover, which lives outside every attachment list, so an
+            # "Idea" card whose only image is its cover would otherwise look
+            # like a card with no source image at all.
+            add(detail.get("cover_image"), {"name": Path(urlparse(str(detail.get("cover_image") or "")).path).name}, False)
+        walk(detail)
+        return attachments
+
+    def _erp_get_json(
         self,
         path: str,
         key: str,
@@ -9640,33 +10437,56 @@ exit 1
         *,
         fields: Dict[str, Any] | None = None,
     ) -> Any:
-        request = Request(
-            self._trello_endpoint(path, key, token, fields),
-            headers={"Accept": "application/json"},
-            method="GET",
-        )
-        try:
-            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
-                raw_payload = response.read().decode("utf-8", errors="replace")
-                return json.loads(raw_payload) if raw_payload else {}
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            detail = self._redact_trello_secret(detail or exc.reason, key, token)
-            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail}") from exc
-        except URLError as exc:
-            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
+        clean_path = path.strip("/")
+        parts = [part for part in clean_path.split("/") if part]
+        if len(parts) >= 3 and parts[0] == "boards" and parts[2] == "lists":
+            board = self._erp_task_board(key, token, parts[1])
+            return [
+                {"id": str(column.get("status") or ""), "name": str(column.get("status") or "")}
+                for column in board.get("columns", [])
+                if isinstance(column, dict) and str(column.get("status") or "").strip()
+            ]
+        if len(parts) >= 3 and parts[0] == "boards" and parts[2] == "cards":
+            board = self._erp_task_board(key, token, parts[1])
+            cards: List[Dict[str, Any]] = []
+            for column in board.get("columns", []):
+                if not isinstance(column, dict):
+                    continue
+                status = str(column.get("status") or "")
+                for task in column.get("tasks", []):
+                    if isinstance(task, dict):
+                        cards.append(self._erp_normalized_task(task, status))
+            return cards
+        if len(parts) >= 2 and parts[0] == "cards":
+            task_id = self._normalize_erp_task_id(parts[1])
+            # A manually supplied Task ID must not expand the read scope.
+            # Verify membership against the locked project before requesting
+            # its JSON detail or downloading its public source URL.
+            self._erp_assert_task_in_project(key, token, task_id)
+            detail = self._erp_task_detail(key, token, task_id)
+            card = self._erp_normalized_task({}, detail=detail)
+            attachments = self._erp_extract_task_attachments(detail)
+            card["attachments"] = attachments
+            if len(parts) == 2:
+                return card
+            if len(parts) >= 3 and parts[2] == "attachments":
+                if len(parts) == 3:
+                    return attachments
+                attachment_id = parts[3]
+                return next((item for item in attachments if str(item.get("id") or "") == attachment_id), {})
+        raise RuntimeError("Flow v2 chỉ hỗ trợ đọc ERP Task qua GraphQL, không gọi REST resource endpoint.")
 
-    def _download_trello_card_image_attachments(
+    def _download_erp_task_image_attachments(
         self,
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         job_id: str,
         limit: int,
         attachment_ids: List[str] | None = None,
     ) -> List[str]:
-        payload = self._trello_get_json(
-            f"cards/{quote(card_id, safe='')}/attachments",
+        payload = self._erp_get_json(
+            f"cards/{quote(task_id, safe='')}/attachments",
             key,
             token,
             fields={"fields": "id,name,url,mimeType,bytes,date"},
@@ -9675,16 +10495,16 @@ exit 1
         image_attachments = [
             item
             for item in attachments
-            if self._trello_attachment_is_image(item)
+            if self._erp_attachment_is_image(item)
         ]
-        source_attachments, generated_attachments = self._trello_source_and_flow_output_attachments(image_attachments)
-        selected_ids = self._normalize_trello_attachment_ids(attachment_ids)
+        source_attachments, generated_attachments = self._erp_source_and_flow_output_attachments(image_attachments)
+        selected_ids = self._normalize_erp_attachment_ids(attachment_ids)
         if selected_ids:
-            by_id = {self._normalize_trello_id(str(item.get("id") or "")): item for item in source_attachments}
+            by_id = {self._normalize_erp_id(str(item.get("id") or "")): item for item in source_attachments}
             selected_attachments = [by_id[item_id] for item_id in selected_ids if item_id in by_id]
             if not selected_attachments:
                 raise RuntimeError(
-                    "Ảnh Trello đã chọn không phải ảnh nguồn hợp lệ trên card này, hoặc đó là ảnh output cũ của Flow. "
+                    "Ảnh ERP đã chọn không phải ảnh nguồn hợp lệ trên card này, hoặc đó là ảnh output cũ của Flow. "
                     "App đã dừng để tránh lấy ảnh cũ làm ảnh nguồn."
                 )
             image_attachments = selected_attachments
@@ -9693,13 +10513,13 @@ exit 1
                 image_attachments = source_attachments[:1]
             elif generated_attachments:
                 raise RuntimeError(
-                    "Card Trello này chỉ còn ảnh output cũ của Flow, không có ảnh nguồn mới để làm reference."
+                    "Card ERP này chỉ còn ảnh output cũ của Flow, không có ảnh nguồn mới để làm reference."
                 )
         image_attachments = image_attachments[: max(1, min(4, int(limit or 4)))]
-        self._trello_source_downloads[str(job_id or "")] = {
-            "card_id": self._normalize_trello_card_id(card_id),
+        self._erp_source_downloads[str(job_id or "")] = {
+            "task_id": self._normalize_erp_task_id(task_id),
             "attachment_ids": [
-                self._normalize_trello_id(str(item.get("id") or ""))
+                self._normalize_erp_id(str(item.get("id") or ""))
                 for item in image_attachments
                 if str(item.get("id") or "").strip()
             ],
@@ -9711,38 +10531,38 @@ exit 1
         }
         paths: List[str] = []
         for index, attachment in enumerate(image_attachments):
-            data, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
-            name = str(attachment.get("name") or f"trello-image-{index + 1}.jpg").strip()
+            data, mime = self._erp_download_attachment_bytes(key, token, task_id, attachment)
+            name = str(attachment.get("name") or f"erp-image-{index + 1}.jpg").strip()
             suffix = Path(name).suffix or mimetypes.guess_extension(mime or "") or ".jpg"
             if suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
                 suffix = ".jpg"
-            target = UPLOADS_DIR / f"trello-{job_id[:8]}-{index + 1}{suffix}"
+            target = UPLOADS_DIR / f"erp-{job_id[:8]}-{index + 1}{suffix}"
             target.write_bytes(data)
             paths.append(str(target))
         return paths
 
-    async def trello_attachment_preview(self, card_id: str, attachment_id: str) -> Dict[str, Any]:
-        key, token = self._trello_credentials()
+    async def erp_attachment_preview(self, task_id: str, attachment_id: str) -> Dict[str, Any]:
+        key, token = self._erp_credentials()
         if not key or not token:
-            raise HTTPException(status_code=400, detail="Chưa thiết lập Trello API key/token.")
-        normalized_card_id = self._normalize_trello_card_id(card_id)
-        normalized_attachment_id = self._normalize_trello_id(attachment_id)
+            raise HTTPException(status_code=400, detail="Chưa thiết lập ERP API key/API secret.")
+        normalized_card_id = self._normalize_erp_task_id(task_id)
+        normalized_attachment_id = self._normalize_erp_id(attachment_id)
         if not normalized_card_id or not normalized_attachment_id:
-            raise HTTPException(status_code=404, detail="Không tìm thấy attachment Trello.")
+            raise HTTPException(status_code=404, detail="Không tìm thấy attachment ERP.")
         try:
             attachment = await asyncio.to_thread(
-                self._trello_get_json,
+                self._erp_get_json,
                 f"cards/{quote(normalized_card_id, safe='')}/attachments/{quote(normalized_attachment_id, safe='')}",
                 key,
                 token,
                 fields={"fields": "id,name,url,mimeType"},
             )
             if not isinstance(attachment, dict) or not attachment:
-                raise HTTPException(status_code=404, detail="Không tìm thấy attachment Trello.")
-            if not self._trello_attachment_is_image(attachment):
-                raise HTTPException(status_code=415, detail="Attachment Trello không phải ảnh.")
+                raise HTTPException(status_code=404, detail="Không tìm thấy attachment ERP.")
+            if not self._erp_attachment_is_image(attachment):
+                raise HTTPException(status_code=415, detail="Attachment ERP không phải ảnh.")
             data, media_type = await asyncio.to_thread(
-                self._trello_download_attachment_bytes,
+                self._erp_download_attachment_bytes,
                 key,
                 token,
                 normalized_card_id,
@@ -9754,86 +10574,86 @@ exit 1
             raise HTTPException(status_code=502, detail=humanize_flow_error(str(exc))) from exc
         return {"content": data, "media_type": media_type or str(attachment.get("mimeType") or "image/jpeg")}
 
-    def _trello_first_image_card_id_on_board(
+    def _erp_first_image_card_id_on_board(
         self,
         key: str,
         token: str,
-        board_id: str,
-        list_id: str = "",
+        project_id: str,
+        status: str = "",
     ) -> str:
-        card = self._trello_first_image_card_on_board(key, token, board_id, list_id)
+        card = self._erp_first_image_card_on_board(key, token, project_id, status)
         return str(card.get("id") or card.get("shortLink") or "").strip() if card else ""
 
-    def _trello_matching_image_card_hint(
+    def _erp_matching_image_card_hint(
         self,
         request: CreateJobRequest,
         items: List[Dict[str, Any]],
     ) -> Dict[str, Any]:
-        key, token = self._trello_credentials()
+        key, token = self._erp_credentials()
         if not key or not token or not items:
             return {}
-        trello_config = self.store.snapshot().trello_config
-        board_id = self._normalize_trello_board_id(
-            request.trello_board_id
-            or trello_config.board_id
-            or os.getenv("TRELLO_BOARD_ID", "")
+        erp_config = self.store.snapshot().erp_config
+        project_id = self._normalize_erp_project_id(
+            request.erp_project_id
+            or erp_config.project_id
+            or os.getenv("ERP_PROJECT_ID", "")
         )
-        if not board_id:
+        if not project_id:
             return {}
         raw_list_id = (
-            trello_config.list_id
-            or os.getenv("TRELLO_LIST_ID", "")
-            or request.trello_list_id
+            erp_config.status
+            or os.getenv("ERP_STATUS_ID", "")
+            or request.erp_status_id
         )
-        list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
+        list_ids = self._erp_auto_source_list_ids(key, token, project_id, raw_list_id)
         if not list_ids:
             return {}
-        card = self._trello_matching_image_card_on_board(key, token, board_id, items, ",".join(list_ids))
+        card = self._erp_matching_image_card_on_board(key, token, project_id, items, ",".join(list_ids))
         if not card:
             return {}
-        card_list_id = self._normalize_trello_id(str(card.get("idList") or (list_ids[0] if list_ids else "") or ""))
+        card_list_id = self._normalize_erp_id(str(card.get("idList") or (list_ids[0] if list_ids else "") or ""))
         return {
-            "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
-            "card_name": str(card.get("name") or "").strip(),
+            "task_id": str(card.get("id") or card.get("shortLink") or "").strip(),
+            "task_name": str(card.get("name") or "").strip(),
             "card_short_link": str(card.get("shortLink") or "").strip(),
-            "card_url": str(card.get("url") or "").strip(),
-            "list_id": card_list_id,
-            "list_name": self._trello_list_name(key, token, card_list_id),
+            "task_url": str(card.get("url") or "").strip(),
+            "status": card_list_id,
+            "list_name": self._erp_status_name(key, token, card_list_id),
         }
 
-    def _trello_source_card_hint(self, request: CreateJobRequest) -> Dict[str, Any]:
-        key, token = self._trello_credentials()
+    def _erp_source_task_hint(self, request: CreateJobRequest) -> Dict[str, Any]:
+        key, token = self._erp_credentials()
         if not key or not token:
             return {}
-        trello_config = self.store.snapshot().trello_config
-        board_id = self._normalize_trello_board_id(
-            request.trello_board_id
-            or trello_config.board_id
-            or os.getenv("TRELLO_BOARD_ID", "")
+        erp_config = self.store.snapshot().erp_config
+        project_id = self._normalize_erp_project_id(
+            request.erp_project_id
+            or erp_config.project_id
+            or os.getenv("ERP_PROJECT_ID", "")
         )
-        card_id = self._normalize_trello_card_id(
-            request.trello_card_id
-            or trello_config.card_id
-            or os.getenv("TRELLO_CARD_ID", "")
+        task_id = self._normalize_erp_task_id(
+            request.erp_task_id
+            or erp_config.task_id
+            or os.getenv("ERP_TASK_ID", "")
         )
         raw_list_id = (
-            trello_config.list_id
-            or os.getenv("TRELLO_LIST_ID", "")
-            or request.trello_list_id
+            erp_config.status
+            or os.getenv("ERP_STATUS_ID", "")
+            or request.erp_status_id
         )
-        list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id) if board_id else []
-        list_id = list_ids[0] if list_ids else self._normalize_trello_id(raw_list_id)
-        if card_id:
-            hint = self._trello_card_hint_by_id(key, token, card_id)
+        list_ids = self._erp_auto_source_list_ids(key, token, project_id, raw_list_id) if project_id else []
+        status = list_ids[0] if list_ids else self._normalize_erp_id(raw_list_id)
+        if task_id:
+            hint = self._erp_task_hint_by_id(key, token, task_id)
             if not hint:
                 return {}
-            card_list_id = self._normalize_trello_id(str(hint.get("list_id") or ""))
-            allowed_list_ids = set(list_ids or ([list_id] if list_id else []))
+            card_list_id = self._normalize_erp_id(str(hint.get("status") or ""))
+            allowed_list_ids = set(list_ids or ([status] if status else []))
             if allowed_list_ids and card_list_id and card_list_id not in allowed_list_ids:
                 return {}
             return hint
-        elif board_id and (list_ids or list_id):
-            card = self._trello_first_image_card_on_board(key, token, board_id, ",".join(list_ids or [list_id]))
+        elif project_id and (list_ids or status):
+            card = self._erp_first_image_card_on_board(key, token, project_id, ",".join(list_ids or [status]))
         else:
             return {}
 
@@ -9842,23 +10662,23 @@ exit 1
         resolved_card_id = str(card.get("id") or card.get("shortLink") or "").strip()
         if not resolved_card_id:
             return {}
-        card_list_id = self._normalize_trello_id(str(card.get("idList") or list_id or ""))
+        card_list_id = self._normalize_erp_id(str(card.get("idList") or status or ""))
         return {
-            "card_id": resolved_card_id,
-            "card_name": str(card.get("name") or "").strip(),
+            "task_id": resolved_card_id,
+            "task_name": str(card.get("name") or "").strip(),
             "card_short_link": str(card.get("shortLink") or "").strip(),
-            "card_url": str(card.get("url") or "").strip(),
-            "list_id": card_list_id,
-            "list_name": self._trello_list_name(key, token, card_list_id),
+            "task_url": str(card.get("url") or "").strip(),
+            "status": card_list_id,
+            "list_name": self._erp_status_name(key, token, card_list_id),
         }
 
-    def _trello_list_name(self, key: str, token: str, list_id: str) -> str:
-        list_id = self._normalize_trello_id(list_id)
-        if not list_id:
+    def _erp_status_name(self, key: str, token: str, status: str) -> str:
+        status = self._normalize_erp_id(status)
+        if not status:
             return ""
         try:
-            payload = self._trello_get_json(
-                f"lists/{quote(list_id, safe='')}",
+            payload = self._erp_get_json(
+                f"lists/{quote(status, safe='')}",
                 key,
                 token,
                 fields={"fields": "name"},
@@ -9867,12 +10687,12 @@ exit 1
             return ""
         return str(payload.get("name") or "").strip() if isinstance(payload, dict) else ""
 
-    def _trello_card_hint_by_id(self, key: str, token: str, card_id: str) -> Dict[str, Any]:
-        card_id = self._normalize_trello_card_id(card_id)
-        if not card_id:
+    def _erp_task_hint_by_id(self, key: str, token: str, task_id: str) -> Dict[str, Any]:
+        task_id = self._normalize_erp_task_id(task_id)
+        if not task_id:
             return {}
-        card = self._trello_get_json(
-            f"cards/{quote(card_id, safe='')}",
+        card = self._erp_get_json(
+            f"cards/{quote(task_id, safe='')}",
             key,
             token,
             fields={"fields": "id,name,shortLink,url,idList,closed"},
@@ -9882,22 +10702,22 @@ exit 1
         resolved_card_id = str(card.get("id") or card.get("shortLink") or "").strip()
         if not resolved_card_id:
             return {}
-        card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+        card_list_id = self._normalize_erp_id(str(card.get("idList") or ""))
         return {
-            "card_id": resolved_card_id,
-            "card_name": str(card.get("name") or "").strip(),
+            "task_id": resolved_card_id,
+            "task_name": str(card.get("name") or "").strip(),
             "card_short_link": str(card.get("shortLink") or "").strip(),
-            "card_url": str(card.get("url") or "").strip(),
-            "list_id": card_list_id,
-            "list_name": self._trello_list_name(key, token, card_list_id),
+            "task_url": str(card.get("url") or "").strip(),
+            "status": card_list_id,
+            "list_name": self._erp_status_name(key, token, card_list_id),
         }
 
-    def _trello_image_card_by_id(self, key: str, token: str, card_id: str) -> Dict[str, Any]:
-        card_id = self._normalize_trello_card_id(card_id)
-        if not card_id:
+    def _erp_image_card_by_id(self, key: str, token: str, task_id: str) -> Dict[str, Any]:
+        task_id = self._normalize_erp_task_id(task_id)
+        if not task_id:
             return {}
-        card = self._trello_get_json(
-            f"cards/{quote(card_id, safe='')}",
+        card = self._erp_get_json(
+            f"cards/{quote(task_id, safe='')}",
             key,
             token,
             fields={
@@ -9910,76 +10730,59 @@ exit 1
             return {}
         attachments = card.get("attachments") if isinstance(card.get("attachments"), list) else []
         if not attachments:
-            attachments_payload = self._trello_get_json(
-                f"cards/{quote(card_id, safe='')}/attachments",
+            attachments_payload = self._erp_get_json(
+                f"cards/{quote(task_id, safe='')}/attachments",
                 key,
                 token,
                 fields={"fields": "id,name,url,mimeType,date"},
             )
             attachments = attachments_payload if isinstance(attachments_payload, list) else []
         all_image_attachments = [
-            item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            item for item in attachments if isinstance(item, dict) and self._erp_attachment_is_image(item)
         ]
-        image_attachments, generated_attachments = self._trello_source_and_flow_output_attachments(all_image_attachments)
+        image_attachments, generated_attachments = self._erp_source_and_flow_output_attachments(all_image_attachments)
         if not image_attachments:
             return {}
         card["_image_attachments"] = image_attachments
         card["_selected_attachment_ids"] = [
-            self._normalize_trello_id(str(item.get("id") or ""))
+            self._normalize_erp_id(str(item.get("id") or ""))
             for item in image_attachments[:1]
             if str(item.get("id") or "").strip()
         ]
         card["_flow_output_count"] = len(generated_attachments)
         return card
 
-    def _trello_card_flow_output_count(self, key: str, token: str, card_id: str) -> int:
-        card_id = self._normalize_trello_card_id(card_id)
-        if not card_id:
-            return 0
-        attachments_payload = self._trello_get_json(
-            f"cards/{quote(card_id, safe='')}/attachments",
-            key,
-            token,
-            fields={"fields": "id,name,url,mimeType,date"},
-        )
-        attachments = attachments_payload if isinstance(attachments_payload, list) else []
-        image_attachments = [
-            item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
-        ]
-        _sources, outputs = self._trello_source_and_flow_output_attachments(image_attachments)
-        return len(outputs)
-
-    def _select_trello_card_attachments(
+    def _select_erp_task_attachments(
         self,
         card: Dict[str, Any],
         attachment_ids: List[str],
     ) -> bool:
-        selected_ids = self._normalize_trello_attachment_ids(attachment_ids)
+        selected_ids = self._normalize_erp_attachment_ids(attachment_ids)
         if not selected_ids:
             card["_selected_attachment_ids"] = []
             return True
         image_attachments = [
             item
             for item in card.get("_image_attachments") or []
-            if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            if isinstance(item, dict) and self._erp_attachment_is_image(item)
         ]
-        by_id = {self._normalize_trello_id(str(item.get("id") or "")): item for item in image_attachments}
+        by_id = {self._normalize_erp_id(str(item.get("id") or "")): item for item in image_attachments}
         selected = [by_id[item_id] for item_id in selected_ids if item_id in by_id]
         if not selected:
             return False
         card["_image_attachments"] = selected
-        card["_selected_attachment_ids"] = [self._normalize_trello_id(str(item.get("id") or "")) for item in selected if str(item.get("id") or "").strip()]
+        card["_selected_attachment_ids"] = [self._normalize_erp_id(str(item.get("id") or "")) for item in selected if str(item.get("id") or "").strip()]
         return True
 
-    def _trello_locked_source_attachment_ids_for_card(
+    def _erp_locked_source_attachment_ids_for_card(
         self,
         card: Dict[str, Any],
         fallback_attachment_ids: Any = None,
     ) -> List[str]:
-        selected = self._normalize_trello_attachment_ids(card.get("_selected_attachment_ids") or [])
+        selected = self._normalize_erp_attachment_ids(card.get("_selected_attachment_ids") or [])
         if selected:
             return selected
-        image_ids = self._normalize_trello_attachment_ids(
+        image_ids = self._normalize_erp_attachment_ids(
             [
                 str(item.get("id") or "")
                 for item in (card.get("_image_attachments") or [])[:1]
@@ -9988,19 +10791,19 @@ exit 1
         )
         if image_ids:
             return image_ids
-        return self._normalize_trello_attachment_ids(fallback_attachment_ids or [])
+        return self._normalize_erp_attachment_ids(fallback_attachment_ids or [])
 
-    def _default_trello_source_list_name(self) -> str:
-        return os.getenv("TRELLO_SOURCE_LIST_NAME", self.DEFAULT_TRELLO_SOURCE_LIST_NAME).strip() or self.DEFAULT_TRELLO_SOURCE_LIST_NAME
+    def _default_erp_source_list_name(self) -> str:
+        return os.getenv("ERP_SOURCE_LIST_NAME", self.DEFAULT_ERP_SOURCE_LIST_NAME).strip() or self.DEFAULT_ERP_SOURCE_LIST_NAME
 
-    def _default_trello_review_list_name(self) -> str:
-        return os.getenv("TRELLO_REVIEW_LIST_NAME", self.DEFAULT_TRELLO_REVIEW_LIST_NAME).strip() or self.DEFAULT_TRELLO_REVIEW_LIST_NAME
+    def _default_erp_review_list_name(self) -> str:
+        return os.getenv("ERP_REVIEW_LIST_NAME", self.DEFAULT_ERP_REVIEW_LIST_NAME).strip() or self.DEFAULT_ERP_REVIEW_LIST_NAME
 
-    def _default_trello_extra_source_list_names(self) -> List[str]:
-        allow_extra = os.getenv("TRELLO_ALLOW_EXTRA_SOURCE_LISTS", "").strip().lower() in {"1", "true", "yes", "on"}
+    def _default_erp_extra_source_list_names(self) -> List[str]:
+        allow_extra = os.getenv("ERP_ALLOW_EXTRA_SOURCE_LISTS", "").strip().lower() in {"1", "true", "yes", "on"}
         if not allow_extra:
             return []
-        raw = os.getenv("TRELLO_EXTRA_SOURCE_LIST_NAMES", ",".join(self.DEFAULT_TRELLO_EXTRA_SOURCE_LIST_NAMES))
+        raw = os.getenv("ERP_EXTRA_SOURCE_LIST_NAMES", ",".join(self.DEFAULT_ERP_EXTRA_SOURCE_LIST_NAMES))
         names: List[str] = []
         seen: set[str] = set()
         for item in re.split(r"[,;|]+", str(raw or "")):
@@ -10012,36 +10815,36 @@ exit 1
             names.append(name)
         return names
 
-    def _trello_source_scope_label(self, list_names: List[str] | None = None) -> str:
+    def _erp_source_scope_label(self, list_names: List[str] | None = None) -> str:
         names = [str(name or "").strip() for name in (list_names or []) if str(name or "").strip()]
         if names:
             return " / ".join(names)
-        defaults = [self._default_trello_source_list_name(), *self._default_trello_extra_source_list_names()]
+        defaults = [self._default_erp_source_list_name(), *self._default_erp_extra_source_list_names()]
         return " / ".join(defaults)
 
-    def _trello_source_scope_label_for_ids(self, list_ids: List[str] | None = None) -> str:
-        return self._trello_source_scope_label() if len(list_ids or []) > 1 else self._default_trello_source_list_name()
+    def _erp_source_scope_label_for_ids(self, list_ids: List[str] | None = None) -> str:
+        return self._erp_source_scope_label() if len(list_ids or []) > 1 else self._default_erp_source_list_name()
 
-    def _split_trello_list_values(self, value: str) -> List[str]:
+    def _split_erp_status_values(self, value: str) -> List[str]:
         raw = str(value or "").strip()
         if not raw:
             return []
         return [item.strip() for item in re.split(r"[,;|]+", raw) if item.strip()]
 
-    def _trello_auto_source_list_ids(self, key: str, token: str, board_id: str, list_value: str = "") -> List[str]:
-        board_id = self._normalize_trello_board_id(board_id)
-        if not board_id:
+    def _erp_auto_source_list_ids(self, key: str, token: str, project_id: str, list_value: str = "") -> List[str]:
+        project_id = self._normalize_erp_project_id(project_id)
+        if not project_id:
             return []
 
-        raw_values = self._split_trello_list_values(list_value)
+        raw_values = self._split_erp_status_values(list_value)
         explicit_multi_scope = len(raw_values) > 1
-        primary_values = raw_values or [self._default_trello_source_list_name()]
+        primary_values = raw_values or [self._default_erp_source_list_name()]
         list_ids: List[str] = []
         seen: set[str] = set()
 
         def add_list(value: str, *, require_name_match: bool = False) -> str:
-            resolved = self._normalize_trello_id(self._trello_resolve_board_list_id(key, token, board_id, value))
-            if require_name_match and resolved == self._normalize_trello_id(value):
+            resolved = self._normalize_erp_id(self._erp_resolve_board_list_id(key, token, project_id, value))
+            if require_name_match and resolved == self._normalize_erp_id(value):
                 return ""
             if resolved and resolved not in seen:
                 seen.add(resolved)
@@ -10053,90 +10856,77 @@ exit 1
 
         primary_raw = primary_values[0] if primary_values else ""
         primary_key = self._compact_match_text(primary_raw)
-        default_key = self._compact_match_text(self._default_trello_source_list_name())
+        default_key = self._compact_match_text(self._default_erp_source_list_name())
         should_include_extra = (
             not explicit_multi_scope
             and (
                 not str(list_value or "").strip()
                 or primary_key == default_key
-                or self._normalize_trello_id(primary_raw) == self.DEFAULT_TRELLO_SOURCE_LIST_ID
+                or self._normalize_erp_id(primary_raw) == self.DEFAULT_ERP_SOURCE_LIST_ID
             )
         )
         if should_include_extra:
-            for name in self._default_trello_extra_source_list_names():
+            for name in self._default_erp_extra_source_list_names():
                 add_list(name, require_name_match=True)
 
         return list_ids
 
-    def _trello_board_lists(self, key: str, token: str, board_id: str) -> List[Dict[str, Any]]:
-        board_id = self._normalize_trello_board_id(board_id)
-        if not board_id:
+    def _erp_project_lists(self, key: str, token: str, project_id: str) -> List[Dict[str, Any]]:
+        project_id = self._normalize_erp_project_id(project_id)
+        if not project_id:
             return []
-        payload = self._trello_get_json(
-            f"boards/{quote(board_id, safe='')}/lists",
+        payload = self._erp_get_json(
+            f"boards/{quote(project_id, safe='')}/lists",
             key,
             token,
             fields={"fields": "id,name,closed", "filter": "open"},
         )
         return [item for item in payload if isinstance(item, dict) and not item.get("closed")] if isinstance(payload, list) else []
 
-    def _trello_content_review_list_id(self, key: str, token: str, board_id: str, list_name: str = "") -> str:
-        target_name = str(list_name or "").strip() or self._default_trello_review_list_name()
-        target_key = self._compact_match_text(target_name)
-        target_id = self._normalize_trello_id(target_name)
-        for item in self._trello_board_lists(key, token, board_id):
-            list_id = self._normalize_trello_id(str(item.get("id") or ""))
-            list_label = str(item.get("name") or "").strip()
-            if list_id and list_id == target_id:
-                return list_id
-            if list_label and self._compact_match_text(list_label) == target_key:
-                return list_id
-        return ""
-
-    def _trello_resolve_board_list_id(self, key: str, token: str, board_id: str, list_value: str = "") -> str:
-        board_id = self._normalize_trello_board_id(board_id)
-        normalized_value = self._normalize_trello_id(list_value)
-        if not board_id:
+    def _erp_resolve_board_list_id(self, key: str, token: str, project_id: str, list_value: str = "") -> str:
+        project_id = self._normalize_erp_project_id(project_id)
+        normalized_value = self._normalize_erp_id(list_value)
+        if not project_id:
             return normalized_value
 
-        target_name = normalized_value or self._default_trello_source_list_name()
+        target_name = normalized_value or self._default_erp_source_list_name()
         try:
-            lists = self._trello_board_lists(key, token, board_id)
+            lists = self._erp_project_lists(key, token, project_id)
         except Exception:
             return normalized_value
 
         if normalized_value:
             for item in lists:
-                list_id = self._normalize_trello_id(str(item.get("id") or ""))
-                if list_id and list_id == normalized_value:
-                    return list_id
+                status = self._normalize_erp_id(str(item.get("id") or ""))
+                if status and status == normalized_value:
+                    return status
 
         target_key = self._compact_match_text(target_name)
         for item in lists:
             list_name = str(item.get("name") or "").strip()
             if list_name and self._compact_match_text(list_name) == target_key:
-                return self._normalize_trello_id(str(item.get("id") or ""))
+                return self._normalize_erp_id(str(item.get("id") or ""))
 
         return normalized_value if normalized_value else ""
 
-    def _trello_matching_image_card_on_board(
+    def _erp_matching_image_card_on_board(
         self,
         key: str,
         token: str,
-        board_id: str,
+        project_id: str,
         items: List[Dict[str, Any]],
-        list_id: str = "",
+        status: str = "",
     ) -> Dict[str, Any]:
-        board_id = self._normalize_trello_board_id(board_id)
+        project_id = self._normalize_erp_project_id(project_id)
         list_ids = {
-            self._normalize_trello_id(item)
-            for item in self._split_trello_list_values(list_id)
-            if self._normalize_trello_id(item)
+            self._normalize_erp_id(item)
+            for item in self._split_erp_status_values(status)
+            if self._normalize_erp_id(item)
         }
-        if not board_id or not list_ids or not items:
+        if not project_id or not list_ids or not items:
             return {}
-        payload = self._trello_get_json(
-            f"boards/{quote(board_id, safe='')}/cards",
+        payload = self._erp_get_json(
+            f"boards/{quote(project_id, safe='')}/cards",
             key,
             token,
             fields={"fields": "id,name,shortLink,url,idList,closed", "filter": "open"},
@@ -10145,22 +10935,22 @@ exit 1
         attachment_cache: Dict[str, bool] = {}
         for item in items:
             for card in cards:
-                card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
+                card_list_id = self._normalize_erp_id(str(card.get("idList") or ""))
                 if list_ids and card_list_id not in list_ids:
                     continue
                 hint = {
-                    "card_id": str(card.get("id") or card.get("shortLink") or "").strip(),
-                    "card_name": str(card.get("name") or "").strip(),
-                    "list_id": card_list_id,
+                    "task_id": str(card.get("id") or card.get("shortLink") or "").strip(),
+                    "task_name": str(card.get("name") or "").strip(),
+                    "status": card_list_id,
                 }
-                if not self._prompt_batch_item_matches_trello_source(item, hint):
+                if not self._prompt_batch_item_matches_erp_source(item, hint):
                     continue
-                card_id = str(card.get("id") or card.get("shortLink") or "").strip()
-                if not card_id:
+                task_id = str(card.get("id") or card.get("shortLink") or "").strip()
+                if not task_id:
                     continue
-                if card_id not in attachment_cache:
-                    attachments_payload = self._trello_get_json(
-                        f"cards/{quote(card_id, safe='')}/attachments",
+                if task_id not in attachment_cache:
+                    attachments_payload = self._erp_get_json(
+                        f"cards/{quote(task_id, safe='')}/attachments",
                         key,
                         token,
                         fields={"fields": "id,name,url,mimeType,date"},
@@ -10169,85 +10959,85 @@ exit 1
                     image_attachments = [
                         attachment
                         for attachment in attachments
-                        if isinstance(attachment, dict) and self._trello_attachment_is_image(attachment)
+                        if isinstance(attachment, dict) and self._erp_attachment_is_image(attachment)
                     ]
-                    source_attachments, _generated_attachments = self._trello_source_and_flow_output_attachments(image_attachments)
-                    attachment_cache[card_id] = bool(source_attachments)
-                if attachment_cache[card_id]:
+                    source_attachments, _generated_attachments = self._erp_source_and_flow_output_attachments(image_attachments)
+                    attachment_cache[task_id] = bool(source_attachments)
+                if attachment_cache[task_id]:
                     return card
         return {}
 
-    def _trello_prompt_items_for_image_cards(
+    def _erp_prompt_items_for_image_cards(
         self,
         request: CreateJobRequest,
         items: List[Dict[str, Any]],
         limit: int,
         skip_card_ids: set[str] | None = None,
     ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        key, token = self._trello_credentials()
+        key, token = self._erp_credentials()
         if not key or not token:
-            raise RuntimeError("Auto Trello cần API key/token Trello để quét card có ảnh.")
+            raise RuntimeError("Auto ERP cần API key/API secret để quét ERP Task có ảnh.")
 
-        trello_config = self.store.snapshot().trello_config
-        board_id = self._normalize_trello_board_id(
-            request.trello_board_id
-            or trello_config.board_id
-            or os.getenv("TRELLO_BOARD_ID", "")
+        erp_config = self.store.snapshot().erp_config
+        project_id = self._normalize_erp_project_id(
+            request.erp_project_id
+            or erp_config.project_id
+            or os.getenv("ERP_PROJECT_ID", "")
         )
-        if not board_id:
-            raise RuntimeError("Auto Trello cần Board URL/Board ID để tìm card có ảnh.")
+        if not project_id:
+            raise RuntimeError("Auto ERP cần một ERP Project (ví dụ PROJ-0013) để tìm Task có ảnh.")
 
         raw_list_id = (
-            trello_config.list_id
-            or os.getenv("TRELLO_LIST_ID", "")
-            or request.trello_list_id
+            erp_config.status
+            or os.getenv("ERP_STATUS_ID", "")
+            or request.erp_status_id
         )
-        explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
-        list_ids = self._trello_auto_source_list_ids(key, token, board_id, raw_list_id)
-        list_id = list_ids[0] if list_ids else ""
+        explicit_card_id = self._normalize_erp_task_id(request.erp_task_id)
+        list_ids = self._erp_auto_source_list_ids(key, token, project_id, raw_list_id)
+        status = list_ids[0] if list_ids else ""
         if not list_ids:
             raise RuntimeError(
-                f"Auto Trello chỉ quét cột {self._trello_source_scope_label()}. "
-                "Hãy tạo/chọn đúng list này trong cục Trello Image Source để tránh lấy nhầm ảnh từ cột khác."
+                f"Auto ERP chỉ quét trạng thái {self._erp_source_scope_label()}. "
+                "Hãy chọn đúng trạng thái trong cục ERP Task Source để tránh lấy nhầm ảnh từ Task khác."
             )
         if explicit_card_id:
-            selected_card = self._trello_image_card_by_id(key, token, explicit_card_id)
+            selected_card = self._erp_image_card_by_id(key, token, explicit_card_id)
             if not selected_card:
                 raise RuntimeError(
-                    "Card Trello đã chọn chưa có attachment ảnh hoặc app không đọc được card đó. "
-                    "App đã dừng để tránh lấy nhầm ảnh từ card khác."
+                    "ERP Task đã chọn chưa có URL ảnh HTTPS hoặc app không đọc được Task đó. "
+                    "App đã dừng để tránh lấy nhầm ảnh từ Task khác."
                 )
-            card_list_id = self._normalize_trello_id(str(selected_card.get("idList") or ""))
+            card_list_id = self._normalize_erp_id(str(selected_card.get("idList") or ""))
             allowed_list_ids = set(list_ids)
             if allowed_list_ids and card_list_id not in allowed_list_ids:
                 raise RuntimeError(
-                    f"Card Trello đã chọn không nằm trong cột {self._trello_source_scope_label()}; "
-                    "Auto Trello đã dừng để chỉ lấy card trong Ready for AI."
+                    f"ERP Task đã chọn không nằm trong trạng thái {self._erp_source_scope_label()}; "
+                    "Auto ERP đã dừng để chỉ lấy Task ở trạng thái nguồn."
                 )
             cards = [selected_card]
             if card_list_id:
-                list_id = card_list_id
+                status = card_list_id
         else:
             cards = []
             seen_cards: set[str] = set()
             for source_list_id in list_ids:
-                for card in self._trello_image_cards_on_board(key, token, board_id, source_list_id):
-                    card_id = str(card.get("id") or card.get("shortLink") or "").strip()
-                    if not card_id or card_id in seen_cards:
+                for card in self._erp_image_cards_on_board(key, token, project_id, source_list_id):
+                    task_id = str(card.get("id") or card.get("shortLink") or "").strip()
+                    if not task_id or task_id in seen_cards:
                         continue
-                    seen_cards.add(card_id)
+                    seen_cards.add(task_id)
                     cards.append(card)
         normalized_skip_card_ids = {
-            self._normalize_trello_card_id(str(item or ""))
+            self._normalize_erp_task_id(str(item or ""))
             for item in (skip_card_ids or set())
-            if self._normalize_trello_card_id(str(item or ""))
+            if self._normalize_erp_task_id(str(item or ""))
         }
         skipped_seen_cards = 0
         if normalized_skip_card_ids and not explicit_card_id:
             fresh_cards: List[Dict[str, Any]] = []
             for card in cards:
-                card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
-                if card_id and card_id in normalized_skip_card_ids:
+                task_id = self._normalize_erp_task_id(str(card.get("id") or card.get("shortLink") or ""))
+                if task_id and task_id in normalized_skip_card_ids:
                     skipped_seen_cards += 1
                     continue
                 fresh_cards.append(card)
@@ -10258,29 +11048,29 @@ exit 1
         used_pairs: set[tuple[str, int, str]] = set()
 
         if not items:
-            expanded = self._trello_ai_prompt_items_for_image_cards(cards, request, max_items)
+            expanded = self._erp_ai_prompt_items_for_image_cards(cards, request, max_items)
             skipped_missing_rule_cards = [
                 card
                 for card in cards
-                if str(card.get("_auto_trello_skip_code") or "").strip() == "missing_product_rule"
+                if str(card.get("_auto_erp_skip_code") or "").strip() == "missing_product_rule"
             ]
             skipped_complete_cards = [
                 card
                 for card in cards
-                if str(card.get("_auto_trello_skip_code") or "").strip() == "complete_output_set"
+                if str(card.get("_auto_erp_skip_code") or "").strip() == "complete_output_set"
             ]
             if not expanded and not skipped_missing_rule_cards and not skipped_complete_cards:
                 raise RuntimeError(
-                    "Auto Trello chưa tìm thấy card ảnh phù hợp để gửi Tác nhân Flow. "
-                    "Hãy chọn card trong trợ lý, dán link card Trello, hoặc điền Lọc sản phẩm rõ hơn."
+                    "Auto ERP chưa tìm thấy Task có ảnh phù hợp để gửi Tác nhân Flow. "
+                    "Hãy chọn Task trong trợ lý hoặc điền Lọc sản phẩm rõ hơn."
                 )
             discovery = {
-                "mode": "auto_trello",
-                "board_id": board_id,
-                "list_id": list_id,
+                "mode": "auto_erp",
+                "project_id": project_id,
+                "status": status,
                 "list_ids": list_ids,
-                "list_name": self._trello_source_scope_label([self._trello_list_name(key, token, item) for item in list_ids]),
-                "matched_cards": len({item.get("trello_card_id") for item in expanded if item.get("trello_card_id")}),
+                "list_name": self._erp_source_scope_label([self._erp_status_name(key, token, item) for item in list_ids]),
+                "matched_cards": len({item.get("erp_task_id") for item in expanded if item.get("erp_task_id")}),
                 "matched_items": len(expanded),
                 "match_mode": "flow_agent",
                 "prompt_mode": "flow_agent",
@@ -10289,62 +11079,62 @@ exit 1
                 discovery["skipped_seen_cards"] = skipped_seen_cards
             if skipped_missing_rule_cards:
                 skipped_missing_rule_ids = [
-                    self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+                    self._normalize_erp_task_id(str(card.get("id") or card.get("shortLink") or ""))
                     for card in skipped_missing_rule_cards
                 ]
-                skipped_missing_rule_ids = [card_id for card_id in skipped_missing_rule_ids if card_id]
+                skipped_missing_rule_ids = [task_id for task_id in skipped_missing_rule_ids if task_id]
                 discovery["skipped_missing_product_rule_cards"] = len(skipped_missing_rule_cards)
                 discovery["skipped_missing_product_rule_card_ids"] = skipped_missing_rule_ids
                 discovery["skipped_missing_product_rule_details"] = [
-                    str(card.get("_auto_trello_skip_reason") or "").strip()
+                    str(card.get("_auto_erp_skip_reason") or "").strip()
                     for card in skipped_missing_rule_cards[:5]
-                    if str(card.get("_auto_trello_skip_reason") or "").strip()
+                    if str(card.get("_auto_erp_skip_reason") or "").strip()
                 ]
             if skipped_complete_cards:
                 skipped_complete_ids = [
-                    self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+                    self._normalize_erp_task_id(str(card.get("id") or card.get("shortLink") or ""))
                     for card in skipped_complete_cards
                 ]
-                skipped_complete_ids = [card_id for card_id in skipped_complete_ids if card_id]
+                skipped_complete_ids = [task_id for task_id in skipped_complete_ids if task_id]
                 discovery["skipped_complete_cards"] = len(skipped_complete_cards)
                 discovery["skipped_complete_card_ids"] = skipped_complete_ids
                 discovery["skipped_complete_details"] = [
-                    str(card.get("_auto_trello_skip_reason") or "").strip()
+                    str(card.get("_auto_erp_skip_reason") or "").strip()
                     for card in skipped_complete_cards[:5]
-                    if str(card.get("_auto_trello_skip_reason") or "").strip()
+                    if str(card.get("_auto_erp_skip_reason") or "").strip()
                 ]
             return expanded, discovery
 
         for card in cards:
-            card_id = str(card.get("id") or card.get("shortLink") or "").strip()
-            if not card_id:
+            task_id = str(card.get("id") or card.get("shortLink") or "").strip()
+            if not task_id:
                 continue
-            card_list_id = self._normalize_trello_id(str(card.get("idList") or list_id or ""))
+            card_list_id = self._normalize_erp_id(str(card.get("idList") or status or ""))
             hint = {
-                "card_id": card_id,
-                "card_name": str(card.get("name") or "").strip(),
+                "task_id": task_id,
+                "task_name": str(card.get("name") or "").strip(),
                 "card_short_link": str(card.get("shortLink") or "").strip(),
-                "card_url": str(card.get("url") or "").strip(),
-                "list_id": card_list_id,
+                "task_url": str(card.get("url") or "").strip(),
+                "status": card_list_id,
             }
             for item in items:
-                if not self._prompt_batch_item_matches_trello_source(item, hint):
+                if not self._prompt_batch_item_matches_erp_source(item, hint):
                     continue
-                item_key = (card_id, int(item.get("row") or 0), str(item.get("index") or ""))
+                item_key = (task_id, int(item.get("row") or 0), str(item.get("index") or ""))
                 if item_key in used_pairs:
                     continue
                 used_pairs.add(item_key)
-                selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card)
+                selected_attachment_ids = self._erp_locked_source_attachment_ids_for_card(card)
                 expanded.append(
                     {
                         **item,
-                        "trello_card_id": card_id,
-                        "trello_list_id": card_list_id,
-                        "trello_attachment_ids": selected_attachment_ids,
-                        "trello_source_card_id": card_id,
-                        "trello_source_attachment_ids": selected_attachment_ids,
-                        "trello_card_name": hint["card_name"],
-                        "trello_card_url": hint["card_url"],
+                        "erp_task_id": task_id,
+                        "erp_status_id": card_list_id,
+                        "erp_attachment_ids": selected_attachment_ids,
+                        "erp_source_task_id": task_id,
+                        "erp_source_attachment_ids": selected_attachment_ids,
+                        "erp_task_name": hint["task_name"],
+                        "erp_task_url": hint["task_url"],
                     }
                 )
                 if len(expanded) >= max_items:
@@ -10353,28 +11143,28 @@ exit 1
                 break
 
         if not expanded:
-            expanded = self._trello_prompt_items_for_keyword_image_cards(cards, items, request, max_items)
+            expanded = self._erp_prompt_items_for_keyword_image_cards(cards, items, request, max_items)
 
         if not expanded:
             raise RuntimeError(
-                "Auto Trello chưa tìm thấy card nào có attachment ảnh khớp Product_Key/Product_Name hoặc từ khóa tìm Trello."
+                "Auto ERP chưa tìm thấy card nào có attachment ảnh khớp Product_Key/Product_Name hoặc từ khóa tìm ERP."
             )
 
         discovery = {
-            "mode": "auto_trello",
-            "board_id": board_id,
-            "list_id": list_id,
+            "mode": "auto_erp",
+            "project_id": project_id,
+            "status": status,
             "list_ids": list_ids,
-            "list_name": self._trello_source_scope_label([self._trello_list_name(key, token, item) for item in list_ids]),
-            "matched_cards": len({item.get("trello_card_id") for item in expanded if item.get("trello_card_id")}),
+            "list_name": self._erp_source_scope_label([self._erp_status_name(key, token, item) for item in list_ids]),
+            "matched_cards": len({item.get("erp_task_id") for item in expanded if item.get("erp_task_id")}),
             "matched_items": len(expanded),
-            "match_mode": "keyword" if any(item.get("trello_match_mode") == "keyword" for item in expanded) else "product",
+            "match_mode": "keyword" if any(item.get("erp_match_mode") == "keyword" for item in expanded) else "product",
         }
         if skipped_seen_cards:
             discovery["skipped_seen_cards"] = skipped_seen_cards
         return expanded, discovery
 
-    def _flow_operator_trello_card_description_note(self, card: Dict[str, Any]) -> str:
+    def _flow_operator_erp_task_description_note(self, card: Dict[str, Any]) -> str:
         raw = str(card.get("desc") or "").strip()
         if not raw:
             return ""
@@ -10387,24 +11177,24 @@ exit 1
         return text
 
     def _flow_operator_card_product_signals(self, request: CreateJobRequest, card: Dict[str, Any]) -> Dict[str, Any]:
-        card_name = str(card.get("name") or "").strip()
-        query = self._trello_auto_search_query(request)
-        card_description = self._flow_operator_trello_card_description_note(card)
+        task_name = str(card.get("name") or "").strip()
+        query = self._erp_auto_search_query(request)
+        card_description = self._flow_operator_erp_task_description_note(card)
         attachment_names = ", ".join(
             str(item.get("name") or "").strip()
             for item in (card.get("_image_attachments") or [])[:4]
             if isinstance(item, dict) and str(item.get("name") or "").strip()
         )
-        primary_raw = " ".join([card_name, query, attachment_names, card_description]).strip()
-        user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
+        primary_raw = " ".join([task_name, query, attachment_names, card_description]).strip()
+        user_instruction = self._flow_operator_relevant_user_instruction_for_erp_task(request, card)
         raw = " ".join(part for part in (primary_raw, user_instruction) if part).strip()
         normalized = self._normalize_skill_token(raw)
         compact = self._compact_match_text(raw)
         tokens = set(self._tokenize_match_words(raw))
-        card_name_tokens = set(self._tokenize_match_words(card_name))
+        card_name_tokens = set(self._tokenize_match_words(task_name))
         ambiguous_album_notebook_name = "album" in card_name_tokens and "notebook" in card_name_tokens
         visual_product_rule_key = self._flow_operator_card_visual_product_rule_key(card)
-        card_name_product_rule_key = self._flow_operator_card_name_product_rule_key(card_name)
+        card_name_product_rule_key = self._flow_operator_card_name_product_rule_key(task_name)
         text_product_rule_key = self._flow_operator_product_rule_key_from_text(raw)
         if ambiguous_album_notebook_name:
             product_rule_key = ""
@@ -10424,8 +11214,8 @@ exit 1
             )
         )
         return {
-            "card_name": card_name,
-            "card_url": str(card.get("url") or "").strip(),
+            "task_name": task_name,
+            "task_url": str(card.get("url") or "").strip(),
             "query": query,
             "card_description": card_description,
             "attachment_names": attachment_names,
@@ -10498,18 +11288,18 @@ exit 1
             "is_baking": any(term in normalized for term in ("baking", "bakery", "kitchen", "nau_an", "lam_banh")),
         }
 
-    def _flow_operator_relevant_user_instruction_for_trello_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
+    def _flow_operator_relevant_user_instruction_for_erp_task(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
         instruction = re.sub(r"\s+", " ", str(request.prompt or "").strip())
         if not instruction:
             return ""
-        query = self._trello_auto_search_query(request)
+        query = self._erp_auto_search_query(request)
         if not query:
             return instruction
 
         instruction_normalized = self._normalize_skill_token(instruction)
         instruction_compact = self._compact_match_text(instruction)
-        card_name = str(card.get("name") or "").strip()
-        candidates = [query, card_name, *self._trello_query_aliases(query)]
+        task_name = str(card.get("name") or "").strip()
+        candidates = [query, task_name, *self._erp_query_aliases(query)]
         for candidate in candidates:
             candidate = str(candidate or "").strip()
             if not candidate:
@@ -10525,8 +11315,8 @@ exit 1
         # Nếu prompt cũ không nhắc tới sản phẩm đang lọc, bỏ qua để tránh đổi sai loại hàng.
         return ""
 
-    def _flow_operator_card_name_product_rule_key(self, card_name: str) -> str:
-        raw = str(card_name or "").strip()
+    def _flow_operator_card_name_product_rule_key(self, task_name: str) -> str:
+        raw = str(task_name or "").strip()
         if not raw:
             return ""
         name_tokens = set(self._tokenize_match_words(raw))
@@ -11213,13 +12003,13 @@ exit 1
 
     def _flow_operator_visual_rule_cache_key(
         self,
-        card_id: str,
+        task_id: str,
         attachment: Dict[str, Any],
     ) -> str:
-        attachment_id = self._normalize_trello_id(str(attachment.get("id") or ""))
+        attachment_id = self._normalize_erp_id(str(attachment.get("id") or ""))
         name = str(attachment.get("name") or "").strip()
         marker = str(attachment.get("date") or attachment.get("bytes") or "").strip()
-        return "|".join([self._normalize_trello_card_id(card_id), attachment_id or name, marker])
+        return "|".join([self._normalize_erp_task_id(task_id), attachment_id or name, marker])
 
     def _flow_operator_product_rule_from_visual_payload(self, payload: Any) -> Dict[str, Any]:
         if not isinstance(payload, dict):
@@ -11279,12 +12069,12 @@ exit 1
             "inferred_from_visual_text": inferred_from_visual_text,
         }
 
-    def _gemini_classify_trello_source_product_rule(
+    def _gemini_classify_erp_source_product_rule(
         self,
         *,
         image_bytes: bytes,
         mime_type: str,
-        card_name: str,
+        task_name: str,
         attachment_name: str,
         card_description: str,
     ) -> Dict[str, Any]:
@@ -11302,7 +12092,7 @@ exit 1
                 self._flow_operator_visual_product_rule_options(),
                 'Return JSON only with this exact shape: {"product_rule_key": string, "confidence": number, "visible_product": string, "reason": string}.',
                 "confidence must be 0.0 to 1.0.",
-                f"Card name: {card_name}",
+                f"Card name: {task_name}",
                 f"Attachment name: {attachment_name}",
                 f"Card description: {card_description[:1200]}",
             ]
@@ -11361,38 +12151,38 @@ exit 1
             return
         card["_visual_product_rule_checked"] = True
         existing_rule_key = self._flow_operator_card_visual_product_rule_key(card)
-        needs_ai_title = self._trello_should_write_ai_title_description(card)
+        needs_ai_title = self._erp_should_write_ai_title_description(card)
         if existing_rule_key and not needs_ai_title:
             return
         if not self._gemini_api_key():
             if needs_ai_title:
-                card["_ai_title_error"] = "Gemini chua cau hinh nen chua viet AI title vao mo ta Trello."
+                card["_ai_title_error"] = "Gemini chua cau hinh nen chua viet AI title vao mo ta ERP."
             return
-        key, token = self._trello_credentials()
+        key, token = self._erp_credentials()
         if not key or not token:
             if needs_ai_title:
-                card["_ai_title_error"] = "Trello credentials chua cau hinh nen chua viet AI title vao mo ta Trello."
+                card["_ai_title_error"] = "ERP credentials chua cau hinh nen chua viet AI title vao mo ta ERP."
             return
 
-        card_id = self._normalize_trello_card_id(
-            str(card.get("id") or card.get("shortLink") or request.trello_source_card_id or request.trello_card_id or "")
+        task_id = self._normalize_erp_task_id(
+            str(card.get("id") or card.get("shortLink") or request.erp_source_task_id or request.erp_task_id or "")
         )
         image_attachments = [
             item
             for item in (card.get("_image_attachments") or [])
-            if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            if isinstance(item, dict) and self._erp_attachment_is_image(item)
         ]
-        if not card_id or not image_attachments:
+        if not task_id or not image_attachments:
             if needs_ai_title:
-                card["_ai_title_error"] = "Khong co card id hoac attachment anh nguon nen chua viet AI title vao mo ta Trello."
+                card["_ai_title_error"] = "Khong co card id hoac attachment anh nguon nen chua viet AI title vao mo ta ERP."
             return
 
-        selected_ids = set(self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids))
+        selected_ids = set(self._erp_locked_source_attachment_ids_for_card(card, request.erp_attachment_ids))
         attachment = next(
             (
                 item
                 for item in image_attachments
-                if self._normalize_trello_id(str(item.get("id") or "")) in selected_ids
+                if self._normalize_erp_id(str(item.get("id") or "")) in selected_ids
             ),
             image_attachments[0],
         )
@@ -11401,12 +12191,12 @@ exit 1
                 [
                     str(card.get("name") or ""),
                     str(attachment.get("name") or ""),
-                    self._flow_operator_trello_card_description_note(card),
+                    self._flow_operator_erp_task_description_note(card),
                 ]
             )
         )
-        cache_key = self._flow_operator_visual_rule_cache_key(card_id, attachment)
-        cached = self._trello_visual_product_rule_cache.get(cache_key)
+        cache_key = self._flow_operator_visual_rule_cache_key(task_id, attachment)
+        cached = self._erp_visual_product_rule_cache.get(cache_key)
         if cached is not None:
             card.update(cached)
             if not needs_ai_title:
@@ -11415,7 +12205,7 @@ exit 1
         image_bytes: bytes | None = None
         mime = ""
         try:
-            image_bytes, mime = self._trello_download_attachment_bytes(key, token, card_id, attachment)
+            image_bytes, mime = self._erp_download_attachment_bytes(key, token, task_id, attachment)
         except Exception as exc:
             detail = humanize_flow_error(str(exc)) or str(exc)
             if existing_rule_key:
@@ -11429,7 +12219,7 @@ exit 1
                     "_visual_product_rule_inferred": False,
                     "_visual_product_rule_error": detail,
                 }
-            self._trello_visual_product_rule_cache[cache_key] = metadata
+            self._erp_visual_product_rule_cache[cache_key] = metadata
             card.update(metadata)
             return
 
@@ -11438,12 +12228,12 @@ exit 1
             metadata.update(cached)
         elif not existing_rule_key:
             try:
-                raw_payload = self._gemini_classify_trello_source_product_rule(
+                raw_payload = self._gemini_classify_erp_source_product_rule(
                     image_bytes=image_bytes,
                     mime_type=mime,
-                    card_name=str(card.get("name") or ""),
+                    task_name=str(card.get("name") or ""),
                     attachment_name=str(attachment.get("name") or ""),
-                    card_description=self._flow_operator_trello_card_description_note(card),
+                    card_description=self._flow_operator_erp_task_description_note(card),
                 )
                 parsed = self._flow_operator_product_rule_from_visual_payload(raw_payload)
                 metadata.update(
@@ -11472,24 +12262,24 @@ exit 1
                     metadata.get("_visual_product_rule_key") or existing_rule_key or text_rule_key or ""
                 ).strip()
                 try:
-                    title_payload = self._gemini_suggest_trello_product_title(
+                    title_payload = self._gemini_suggest_erp_product_title(
                         image_bytes=image_bytes,
                         mime_type=mime,
-                        card_name=str(card.get("name") or ""),
+                        task_name=str(card.get("name") or ""),
                         attachment_name=str(attachment.get("name") or ""),
-                        card_description=self._flow_operator_trello_card_description_note(card),
+                        card_description=self._flow_operator_erp_task_description_note(card),
                         product_rule_key=resolved_rule_key,
                         visible_product=str(metadata.get("_visual_product_rule_visible_product") or ""),
                     )
                 except Exception as title_exc:
                     metadata["_ai_title_fallback_reason"] = humanize_flow_error(str(title_exc)) or str(title_exc)
-                    title_payload = self._fallback_trello_product_title(
-                        card_name=str(card.get("name") or ""),
+                    title_payload = self._fallback_erp_product_title(
+                        task_name=str(card.get("name") or ""),
                         attachment_name=str(attachment.get("name") or ""),
                         product_rule_key=resolved_rule_key,
                         visible_product=str(metadata.get("_visual_product_rule_visible_product") or ""),
                     )
-                title_result = self._write_trello_ai_title_to_description(
+                title_result = self._write_erp_ai_title_to_description(
                     key=key,
                     token=token,
                     card=card,
@@ -11500,7 +12290,7 @@ exit 1
                 metadata["_ai_title_status"] = title_result.get("status") or ""
             except Exception as exc:
                 metadata["_ai_title_error"] = humanize_flow_error(str(exc)) or str(exc)
-        self._trello_visual_product_rule_cache[cache_key] = metadata
+        self._erp_visual_product_rule_cache[cache_key] = metadata
         card.update(metadata)
 
     def _flow_operator_banner_wall_hook_rule_for_shot(self, product_key: str, *parts: str) -> str:
@@ -11753,7 +12543,7 @@ exit 1
             deduped = [spec for spec in deduped if str(spec.get("key")) != "birthday"]
 
         base_rule = (
-            "Season and occasion decor adaptation rule: choose surrounding props by matching both the exact source product and the occasion/season detected from the Trello card, product rule, and user request. "
+            "Season and occasion decor adaptation rule: choose surrounding props by matching both the exact source product and the occasion/season detected from the ERP card, product rule, and user request. "
             "Decor must stay secondary, sparse, premium handmade Etsy style, and must never cover embroidery, print, seams, handles, cords, tie strings, edges, names, or the main product silhouette. "
             "Keep hero/detail shots cleaner than lifestyle shots; use only 1-3 subtle props when the shot does not explicitly ask for a decorated scene. "
             "Do not mix unrelated seasons in one image, do not force seasonal props when no occasion is present, and if the occasion conflicts with the visible product identity, the source product and Required shot plan win."
@@ -11768,7 +12558,7 @@ exit 1
         decor_lines = "; ".join(str(spec.get("decor") or "").strip() for spec in deduped if str(spec.get("decor") or "").strip())
         return f"{base_rule} Detected occasion/season: {labels}. For matching shots, {decor_lines}. Keep the exact product unchanged; only adapt the surrounding decor, background, and props."
 
-    def _flow_operator_occasion_decor_rule_for_trello_card(
+    def _flow_operator_occasion_decor_rule_for_erp_task(
         self,
         request: CreateJobRequest,
         card: Dict[str, Any],
@@ -11788,9 +12578,9 @@ exit 1
                 getattr(request, "prompt_notes", ""),
                 getattr(request, "prompt_product", ""),
                 getattr(request, "prompt_product_key", ""),
-                signals.get("card_name") or card.get("name"),
+                signals.get("task_name") or card.get("name"),
                 signals.get("attachment_names") or attachment_names,
-                signals.get("card_description") or self._flow_operator_trello_card_description_note(card),
+                signals.get("card_description") or self._flow_operator_erp_task_description_note(card),
                 signals.get("visual_product_rule_visible_product"),
             )
             if str(part or "").strip()
@@ -11868,10 +12658,10 @@ exit 1
             fill_index += 1
         return shots
 
-    def _flow_operator_design_analysis_for_trello_card(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
+    def _flow_operator_design_analysis_for_erp_task(self, request: CreateJobRequest, card: Dict[str, Any]) -> str:
         signals = self._flow_operator_card_product_signals(request, card)
-        card_name = str(signals.get("card_name") or "").strip()
-        card_url = str(signals.get("card_url") or "").strip()
+        task_name = str(signals.get("task_name") or "").strip()
+        task_url = str(signals.get("task_url") or "").strip()
         attachment_names = str(signals.get("attachment_names") or "").strip()
         product_rule_key = str(signals.get("product_rule_key") or "").strip()
         product_rule = PRODUCT_SHOT_RULES.get(product_rule_key) if product_rule_key else None
@@ -11911,10 +12701,10 @@ exit 1
                 "the visible source object's exact product type, physical silhouette, outline, construction, base color, material texture, print/embroidery details, scale, and hero features without inferring a category from a generic filename"
             )
 
-        visible_sources = ", ".join(part for part in [card_name, attachment_names] if part)
-        source_hint = f" Visible Trello clues: {visible_sources}." if visible_sources else ""
-        if card_url:
-            source_hint += f" Source card: {card_url}."
+        visible_sources = ", ".join(part for part in [task_name, attachment_names] if part)
+        source_hint = f" Visible ERP clues: {visible_sources}." if visible_sources else ""
+        if task_url:
+            source_hint += f" Source card: {task_url}."
         if visual_product_rule_key:
             try:
                 confidence_text = f"{float(visual_confidence):.2f}"
@@ -11928,28 +12718,28 @@ exit 1
                 detail += f", confidence {confidence_text}"
             source_hint += f" Visual source classification{detail}; this overrides random or generic card filenames."
         return (
-            "Before creating images, carefully analyze the selected Trello reference image for "
+            "Before creating images, carefully analyze the selected ERP reference image for "
             + "; ".join(product_bits)
             + ". Keep those design features consistent across the whole image set."
             + source_hint
         )
 
     def _flow_operator_missing_product_rule_detail(self, card: Dict[str, Any], signals: Dict[str, Any]) -> str:
-        card_name = str(signals.get("card_name") or card.get("name") or "").strip()
-        card_url = str(signals.get("card_url") or card.get("url") or "").strip()
+        task_name = str(signals.get("task_name") or card.get("name") or "").strip()
+        task_url = str(signals.get("task_url") or card.get("url") or "").strip()
         attachment_names = str(signals.get("attachment_names") or "").strip()
         visual_error = str(card.get("_visual_product_rule_error") or "").strip()
         if visual_error:
             reason = f"Visual classification failed: {visual_error}"
         elif not self._gemini_api_key():
             reason = "Gemini visual classification is not configured."
-        elif not self._trello_credentials()[0] or not self._trello_credentials()[1]:
-            reason = "Trello credentials are missing, so the source image could not be downloaded for visual classification."
+        elif not self._erp_credentials()[0] or not self._erp_credentials()[1]:
+            reason = "ERP credentials are missing, so the source image could not be downloaded for visual classification."
         else:
             reason = "Gemini did not classify the source image into a known HAVI product rule with enough confidence."
-        source = ", ".join(part for part in (card_name, attachment_names, card_url) if part) or "unknown Trello card"
+        source = ", ".join(part for part in (task_name, attachment_names, task_url) if part) or "unknown ERP card"
         return (
-            "Auto AI Trello chua xac dinh duoc HAVI product shot rule cho anh nguon, "
+            "Auto AI ERP chua xac dinh duoc HAVI product shot rule cho anh nguon, "
             "nen app bo qua card nay truoc khi gui Flow Agent de tranh tao bo anh sai rule. "
             f"Nguon: {source}. {reason}"
         )
@@ -12139,7 +12929,7 @@ exit 1
             },
         ]
 
-    def _flow_operator_shot_suite_for_trello_card(
+    def _flow_operator_shot_suite_for_erp_task(
         self,
         request: CreateJobRequest,
         card: Dict[str, Any],
@@ -12519,7 +13309,7 @@ exit 1
             {
                 "label": "Detail craft proof",
                 "brief": "Extreme close-up detail shot of the most important product craftsmanship, material texture, stitching, print/embroidery, edge finish, or surface detail.",
-                "must_include": "macro craftsmanship detail, selected Trello reference product, visible material texture",
+                "must_include": "macro craftsmanship detail, selected ERP reference product, visible material texture",
             },
             {
                 "label": "Full front hero",
@@ -12559,7 +13349,7 @@ exit 1
             *self._flow_operator_colorway_variant_shots("product"),
         ]
 
-    def _flow_operator_prompt_for_trello_card(
+    def _flow_operator_prompt_for_erp_task(
         self,
         request: CreateJobRequest,
         card: Dict[str, Any],
@@ -12569,32 +13359,32 @@ exit 1
         image_count: int | None = None,
         existing_flow_count: int = 0,
     ) -> str:
-        card_name = str(card.get("name") or "").strip()
-        card_url = str(card.get("url") or "").strip()
-        query = self._trello_auto_search_query(request)
-        card_description_note = self._flow_operator_trello_card_description_note(card)
-        user_instruction = self._flow_operator_relevant_user_instruction_for_trello_card(request, card)
+        task_name = str(card.get("name") or "").strip()
+        task_url = str(card.get("url") or "").strip()
+        query = self._erp_auto_search_query(request)
+        card_description_note = self._flow_operator_erp_task_description_note(card)
+        user_instruction = self._flow_operator_relevant_user_instruction_for_erp_task(request, card)
         signals = self._flow_operator_card_product_signals(request, card)
         product_rule_key = str(signals.get("product_rule_key") or "").strip()
         product_rule = PRODUCT_SHOT_RULES.get(product_rule_key) if product_rule_key else None
-        card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+        task_id = str(card.get("id") or card.get("shortLink") or "").strip()
         source_attachment_ids = [
             str(item or "").strip()
             for item in (
                 card.get("_selected_attachment_ids")
-                or getattr(request, "trello_source_attachment_ids", None)
-                or getattr(request, "trello_attachment_ids", None)
+                or getattr(request, "erp_source_attachment_ids", None)
+                or getattr(request, "erp_attachment_ids", None)
                 or []
             )
             if str(item or "").strip()
         ]
-        product_hint = query or card_name or f"card Trello {index + 1}"
-        design_analysis = design_analysis or self._flow_operator_design_analysis_for_trello_card(request, card)
-        occasion_decor_rule = self._flow_operator_occasion_decor_rule_for_trello_card(request, card, signals)
+        product_hint = query or task_name or f"card ERP {index + 1}"
+        design_analysis = design_analysis or self._flow_operator_design_analysis_for_erp_task(request, card)
+        occasion_decor_rule = self._flow_operator_occasion_decor_rule_for_erp_task(request, card, signals)
         target_output_count = self._flow_operator_product_rule_target_count(product_rule_key)
         target_count = max(1, min(target_output_count, int(image_count or target_output_count)))
         existing_flow_count = max(0, min(target_output_count, int(existing_flow_count or 0)))
-        all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
+        all_shots = self._flow_operator_shot_suite_for_erp_task(request, card)
         shot_start = 0
         shots = all_shots[shot_start : shot_start + target_count]
         if len(shots) < target_count and all_shots:
@@ -12607,7 +13397,7 @@ exit 1
         )
         if existing_flow_count:
             resume_note = (
-                f"This Trello card already has {existing_flow_count}/{target_output_count} Flow output image(s), but Auto now creates a fresh full {target_count}-image set by default. "
+                f"This ERP card already has {existing_flow_count}/{target_output_count} Flow output image(s), but Auto now creates a fresh full {target_count}-image set by default. "
                 "Do not create only the missing images, do not continue from the old output numbering, and do not reuse or reinterpret old outputs."
             )
         else:
@@ -12631,14 +13421,14 @@ exit 1
             "Use Google Flow Agent as the prompt writer and image-generation operator.",
             self._flow_agent_fresh_context_rule(),
             design_analysis,
-            f"Use the selected Trello attachment from card '{card_name or card_url or index + 1}' as the exact source product reference.",
+            f"Use the selected ERP attachment from card '{task_name or task_url or index + 1}' as the exact source product reference.",
             (
-                f"Current source lock: Trello card id {card_id}"
+                f"Current source lock: ERP card id {task_id}"
                 + (f", selected attachment id(s) {', '.join(source_attachment_ids)}" if source_attachment_ids else "")
                 + ". Do not use any other card, attachment, Flow project image, or previous Flow Agent task as the source."
-            ) if card_id or source_attachment_ids else "",
+            ) if task_id or source_attachment_ids else "",
             (
-                "Critical source lock: the selected Trello attachment is the only authoritative product image. "
+                "Critical source lock: the selected ERP attachment is the only authoritative product image. "
                 "The source image wins over filename/card text: do not infer product type from generic names like tao_hinh/image/photo or from motif words such as animal, flower, or character. "
                 "Ignore other Flow project/gallery images. Every generated output must keep the same product category, silhouette, physical shape, edge construction, motif/design placement, embroidery or print layout, fabric/material texture, base color family, and scale as the source. "
                 "Do not turn the source into a tooth fairy pillow, pillow, cushion, blanket, hoop, dress, apron, banner, baby photo album, drawstring bag, passport cover, hair bow, Christmas stocking, plush, shirt, mug, or any other product category unless the source itself is exactly that category. "
@@ -12662,17 +13452,17 @@ exit 1
             ) if signals.get("is_pennant") else "",
             resume_note,
             f"First analyze the product, then write your own internal prompts and generate exactly {target_count} commercial product image(s) for {product_hint}.",
-            f"Counting rule: the Trello card has one original source/reference image, and that source image is not a generated output. The default target for this run is always a fresh full set of {target_output_count} generated output images plus the 1 source image; do not subtract any existing output attachments from this run.",
+            f"Counting rule: the ERP card has one original source/reference image, and that source image is not a generated output. The default target for this run is always a fresh full set of {target_output_count} generated output images plus the 1 source image; do not subtract any existing output attachments from this run.",
             "Create a coherent image set, not one unrelated one-off image.",
             f"Required shot plan: {shot_summary}" if shot_summary else "Required shot plan: detail proof, full hero, lifestyle use, and flat lay or gift-ready scene.",
             occasion_decor_rule,
             "Lighting and color rule for every output: clean clear white neutral daylight, accurate whites, crisp bright product color, no yellow/orange/golden/tungsten/sepia/beige cast, and no warm color grading.",
             (
-                "Product-specific notes from the Trello card description: "
+                "Product-specific notes from the ERP card description: "
                 f"{card_description_note}"
             ) if card_description_note else "",
             (
-                "Treat the Trello description as user-supplied product guidance for customization, product identity, style, scene restrictions, and do/don't rules; "
+                "Treat the ERP description as user-supplied product guidance for customization, product identity, style, scene restrictions, and do/don't rules; "
                 "preserving the source product and avoiding tags, stickers, labels, barcodes, and price tags remain higher-priority constraints."
             ) if card_description_note else "",
             self._flow_agent_reference_prompt_style_guide(
@@ -12708,27 +13498,27 @@ exit 1
         ]
         if user_instruction:
             brief_parts.append(f"User automation instruction: {user_instruction}.")
-        if card_url:
-            brief_parts.append(f"Source card: {card_url}.")
+        if task_url:
+            brief_parts.append(f"Source card: {task_url}.")
         return " ".join(part for part in brief_parts if part)
 
     def _flow_agent_fresh_context_rule(self) -> str:
         return (
             "Fresh-task isolation: treat this message as a new isolated task. Ignore every previous Flow Agent chat message, "
             "approval brief, side-panel title, project memory, old card, prior output set, gallery thumbnail, and example from older runs. "
-            "Do not carry over any product category, product name, motif, colorway, scene, or shot idea unless it is visible in the currently attached Trello source image or written on the current Trello card."
+            "Do not carry over any product category, product name, motif, colorway, scene, or shot idea unless it is visible in the currently attached ERP source image or written on the current ERP card."
         )
 
-    def _trello_ai_prompt_items_for_image_cards(
+    def _erp_ai_prompt_items_for_image_cards(
         self,
         cards: List[Dict[str, Any]],
         request: CreateJobRequest,
         max_items: int,
     ) -> List[Dict[str, Any]]:
-        query = self._trello_auto_search_query(request)
+        query = self._erp_auto_search_query(request)
         matched_cards = cards
         if query:
-            matched_cards = [card for card in cards if self._trello_card_matches_query(card, query)]
+            matched_cards = [card for card in cards if self._erp_task_matches_query(card, query)]
             if not matched_cards:
                 if len(cards) == 1:
                     matched_cards = cards
@@ -12738,28 +13528,28 @@ exit 1
         for card in matched_cards:
             if len(expanded) >= max_items:
                 break
-            card_id = str(card.get("id") or card.get("shortLink") or "").strip()
-            if not card_id:
+            task_id = str(card.get("id") or card.get("shortLink") or "").strip()
+            if not task_id:
                 continue
-            card_list_id = self._normalize_trello_id(str(card.get("idList") or request.trello_list_id or ""))
-            card_name = str(card.get("name") or "").strip()
-            card_url = str(card.get("url") or "").strip()
-            selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids)
+            card_list_id = self._normalize_erp_id(str(card.get("idList") or request.erp_status_id or ""))
+            task_name = str(card.get("name") or "").strip()
+            task_url = str(card.get("url") or "").strip()
+            selected_attachment_ids = self._erp_locked_source_attachment_ids_for_card(card, request.erp_attachment_ids)
             self._flow_operator_enrich_card_with_visual_product_rule(request, card)
             signals = self._flow_operator_card_product_signals(request, card)
             if not self._flow_operator_has_product_rule_or_category_signal(signals):
-                card["_auto_trello_skip_code"] = "missing_product_rule"
-                card["_auto_trello_skip_reason"] = self._flow_operator_missing_product_rule_detail(card, signals)
+                card["_auto_erp_skip_code"] = "missing_product_rule"
+                card["_auto_erp_skip_reason"] = self._flow_operator_missing_product_rule_detail(card, signals)
                 continue
-            card.pop("_auto_trello_skip_code", None)
-            card.pop("_auto_trello_skip_reason", None)
-            design_analysis = self._flow_operator_design_analysis_for_trello_card(request, card)
-            all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
+            card.pop("_auto_erp_skip_code", None)
+            card.pop("_auto_erp_skip_reason", None)
+            design_analysis = self._flow_operator_design_analysis_for_erp_task(request, card)
+            all_shots = self._flow_operator_shot_suite_for_erp_task(request, card)
             target_output_count = self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
             raw_existing_flow_count = max(0, int(card.get("_flow_output_count") or 0))
             if raw_existing_flow_count >= target_output_count:
-                card["_auto_trello_skip_code"] = "complete_output_set"
-                card["_auto_trello_skip_reason"] = (
+                card["_auto_erp_skip_code"] = "complete_output_set"
+                card["_auto_erp_skip_reason"] = (
                     f"Card da co {raw_existing_flow_count}/{target_output_count} anh output theo rule; Auto bo qua."
                 )
                 continue
@@ -12771,7 +13561,7 @@ exit 1
                 shots = [*shots, *all_shots[: image_count - len(shots)]]
             shots = shots or all_shots[:image_count]
             shot_labels = [str(shot.get("label") or "").strip() for shot in shots if str(shot.get("label") or "").strip()]
-            prompt = self._flow_operator_prompt_for_trello_card(
+            prompt = self._flow_operator_prompt_for_erp_task(
                 request,
                 card,
                 len(expanded) + 1,
@@ -12785,27 +13575,27 @@ exit 1
                     "active": True,
                     "used": False,
                     "prompt": prompt,
-                    "product": query or card_name,
-                    "product_key": query or str(card.get("shortLink") or card_id).strip(),
-                    "product_name": card_name,
+                    "product": query or task_name,
+                    "product_key": query or str(card.get("shortLink") or task_id).strip(),
+                    "product_name": task_name,
                     "index": str(len(expanded) + 1),
                     "notes": (
                         f"{design_analysis} Flow Agent will write the final prompts and generate "
                         f"{image_count} fresh image(s). Google Sheet prompt not required."
                     ),
-                    "trello_card_id": card_id,
-                    "trello_list_id": card_list_id,
-                    "trello_attachment_ids": selected_attachment_ids,
-                    "trello_source_card_id": card_id,
-                    "trello_source_attachment_ids": selected_attachment_ids,
-                    "trello_card_name": card_name,
-                    "trello_card_url": card_url,
+                    "erp_task_id": task_id,
+                    "erp_status_id": card_list_id,
+                    "erp_attachment_ids": selected_attachment_ids,
+                    "erp_source_task_id": task_id,
+                    "erp_source_attachment_ids": selected_attachment_ids,
+                    "erp_task_name": task_name,
+                    "erp_task_url": task_url,
                     "ai_suggested_title": str(card.get("_ai_suggested_title") or "").strip(),
                     "ai_title_status": str(card.get("_ai_title_status") or "").strip(),
                     "ai_title_error": str(card.get("_ai_title_error") or "").strip(),
                     "ai_title_backup_path": str(card.get("_ai_title_backup_path") or "").strip(),
-                    "trello_match_mode": "flow_agent",
-                    "trello_search_query": query,
+                    "erp_match_mode": "flow_agent",
+                    "erp_search_query": query,
                     "shot_label": "Flow Agent image set",
                     "shot_labels": shot_labels,
                     "design_analysis": design_analysis,
@@ -12818,7 +13608,7 @@ exit 1
             )
         return expanded
 
-    def _trello_query_aliases(self, query: str) -> List[str]:
+    def _erp_query_aliases(self, query: str) -> List[str]:
         aliases = [str(query or "").strip()]
         normalized = self._normalize_skill_token(query)
         compact = self._compact_match_text(query)
@@ -12857,74 +13647,74 @@ exit 1
             unique.append(cleaned)
         return unique
 
-    def _trello_prompt_items_for_keyword_image_cards(
+    def _erp_prompt_items_for_keyword_image_cards(
         self,
         cards: List[Dict[str, Any]],
         items: List[Dict[str, Any]],
         request: CreateJobRequest,
         max_items: int,
     ) -> List[Dict[str, Any]]:
-        query = self._trello_auto_search_query(request)
+        query = self._erp_auto_search_query(request)
         if not query or not cards or not items:
             return []
 
-        matched_cards = [card for card in cards if self._trello_card_matches_query(card, query)]
+        matched_cards = [card for card in cards if self._erp_task_matches_query(card, query)]
         if not matched_cards:
             return []
-        explicit_card_id = self._normalize_trello_card_id(request.trello_card_id)
+        explicit_card_id = self._normalize_erp_task_id(request.erp_task_id)
         if len(matched_cards) > 1 and not explicit_card_id:
             names = ", ".join(str(card.get("name") or card.get("url") or card.get("id") or "").strip() for card in matched_cards[:5])
             raise RuntimeError(
-                "Auto Trello tìm thấy nhiều card cùng khớp từ khóa. "
-                f"Hãy dán đúng link card Trello hoặc đổi tên card rõ hơn trước khi chạy: {names}"
+                "Auto ERP tìm thấy nhiều card cùng khớp từ khóa. "
+                f"Hãy dán đúng link card ERP hoặc đổi tên card rõ hơn trước khi chạy: {names}"
             )
 
         expanded: List[Dict[str, Any]] = []
         used_pairs: set[tuple[str, int, str]] = set()
         for card in matched_cards:
-            card_id = str(card.get("id") or card.get("shortLink") or "").strip()
-            if not card_id:
+            task_id = str(card.get("id") or card.get("shortLink") or "").strip()
+            if not task_id:
                 continue
-            card_list_id = self._normalize_trello_id(str(card.get("idList") or ""))
-            selected_attachment_ids = self._trello_locked_source_attachment_ids_for_card(card, request.trello_attachment_ids)
-            item = self._best_prompt_item_for_trello_keyword_card(card, items, used_pairs, query)
+            card_list_id = self._normalize_erp_id(str(card.get("idList") or ""))
+            selected_attachment_ids = self._erp_locked_source_attachment_ids_for_card(card, request.erp_attachment_ids)
+            item = self._best_prompt_item_for_erp_keyword_card(card, items, used_pairs, query)
             if not item:
-                card_name = str(card.get("name") or card.get("url") or card_id).strip()
+                task_name = str(card.get("name") or card.get("url") or task_id).strip()
                 raise RuntimeError(
-                    "Auto Trello đã tìm thấy card ảnh nhưng chưa tìm thấy prompt Active khớp card/từ khóa. "
-                    f"Card: {card_name}. Hãy thêm Product_Key/Product_Name/Notes khớp trong sheet hoặc thêm Trello_Card/Card_URL."
+                    "Auto ERP đã tìm thấy card ảnh nhưng chưa tìm thấy prompt Active khớp card/từ khóa. "
+                    f"Card: {task_name}. Hãy thêm Product_Key/Product_Name/Notes khớp trong sheet hoặc thêm ERP_Task/Card_URL."
                 )
-            used_pairs.add((card_id, int(item.get("row") or 0), str(item.get("index") or "")))
+            used_pairs.add((task_id, int(item.get("row") or 0), str(item.get("index") or "")))
             expanded.append(
                 {
                     **item,
-                    "trello_card_id": card_id,
-                    "trello_list_id": card_list_id,
-                    "trello_attachment_ids": selected_attachment_ids,
-                    "trello_source_card_id": card_id,
-                    "trello_source_attachment_ids": selected_attachment_ids,
-                    "trello_card_name": str(card.get("name") or "").strip(),
-                    "trello_card_url": str(card.get("url") or "").strip(),
-                    "trello_match_mode": "keyword",
-                    "trello_search_query": query,
+                    "erp_task_id": task_id,
+                    "erp_status_id": card_list_id,
+                    "erp_attachment_ids": selected_attachment_ids,
+                    "erp_source_task_id": task_id,
+                    "erp_source_attachment_ids": selected_attachment_ids,
+                    "erp_task_name": str(card.get("name") or "").strip(),
+                    "erp_task_url": str(card.get("url") or "").strip(),
+                    "erp_match_mode": "keyword",
+                    "erp_search_query": query,
                 }
             )
             if len(expanded) >= max_items:
                 break
         return expanded
 
-    def _trello_auto_search_query(self, request: CreateJobRequest) -> str:
+    def _erp_auto_search_query(self, request: CreateJobRequest) -> str:
         generic_titles = {
-            "auto_image_from_trello_card",
+            "auto_image_from_erp_task",
             "automation_image_from_sheet_row",
-            "auto_trello_quet_card_co_anh",
-            "auto_trello_ai_chay_den_het_ready_for_ai",
-            "auto_trello_flow_agent_chay_den_het_ready_for_ai",
-            "auto_ai_trello_cho_san_pham_moi_lien_tuc",
+            "auto_erp_quet_card_co_anh",
+            "auto_erp_ai_chay_den_het_ready_for_ai",
+            "auto_erp_flow_agent_chay_den_het_ready_for_ai",
+            "auto_ai_erp_cho_san_pham_moi_lien_tuc",
             "ready_for_ai",
             "phan_ready_for_ai",
-            "trello_search_ready_for_ai",
-            "trello_search_phan_ready_for_ai",
+            "erp_search_ready_for_ai",
+            "erp_search_phan_ready_for_ai",
         }
         for value in (
             request.prompt_product_key,
@@ -12939,8 +13729,8 @@ exit 1
                 return cleaned[:80]
         return ""
 
-    def _trello_card_matches_query(self, card: Dict[str, Any], query: str) -> bool:
-        query_aliases = [self._compact_match_text(alias) for alias in self._trello_query_aliases(query)]
+    def _erp_task_matches_query(self, card: Dict[str, Any], query: str) -> bool:
+        query_aliases = [self._compact_match_text(alias) for alias in self._erp_query_aliases(query)]
         query_aliases = [alias for alias in query_aliases if alias]
         if not query_aliases:
             return False
@@ -12963,23 +13753,23 @@ exit 1
                 return True
         return False
 
-    def _best_prompt_item_for_trello_keyword_card(
+    def _best_prompt_item_for_erp_keyword_card(
         self,
         card: Dict[str, Any],
         items: List[Dict[str, Any]],
         used_pairs: set[tuple[str, int, str]],
         query: str,
     ) -> Dict[str, Any]:
-        card_id = str(card.get("id") or card.get("shortLink") or "").strip()
+        task_id = str(card.get("id") or card.get("shortLink") or "").strip()
         for item in items:
-            item_key = (card_id, int(item.get("row") or 0), str(item.get("index") or ""))
+            item_key = (task_id, int(item.get("row") or 0), str(item.get("index") or ""))
             if item_key in used_pairs:
                 continue
-            hint = {"card_id": card_id, "card_name": str(card.get("name") or "").strip()}
-            if self._prompt_batch_item_matches_trello_source(item, hint):
+            hint = {"task_id": task_id, "task_name": str(card.get("name") or "").strip()}
+            if self._prompt_batch_item_matches_erp_source(item, hint):
                 return item
         for item in items:
-            item_key = (card_id, int(item.get("row") or 0), str(item.get("index") or ""))
+            item_key = (task_id, int(item.get("row") or 0), str(item.get("index") or ""))
             if item_key not in used_pairs and self._prompt_batch_item_matches_query(item, query):
                 return item
         return {}
@@ -12988,13 +13778,13 @@ exit 1
         query_key = self._compact_match_text(query)
         if not query_key:
             return False
-        query_groups = self._user_assistant_trello_query_groups(query)
+        query_groups = self._user_assistant_erp_query_groups(query)
         for value in (
             item.get("product_key"),
             item.get("product_name"),
             item.get("product"),
             item.get("notes"),
-            item.get("trello_card_id"),
+            item.get("erp_task_id"),
         ):
             candidate = self._compact_match_text(value)
             if candidate and (query_key in candidate or candidate in query_key):
@@ -13004,23 +13794,23 @@ exit 1
                 return True
         return False
 
-    def _trello_image_cards_on_board(
+    def _erp_image_cards_on_board(
         self,
         key: str,
         token: str,
-        board_id: str,
-        list_id: str = "",
+        project_id: str,
+        status: str = "",
     ) -> List[Dict[str, Any]]:
-        board_id = self._normalize_trello_board_id(board_id)
+        project_id = self._normalize_erp_project_id(project_id)
         list_ids = {
-            self._normalize_trello_id(item)
-            for item in self._split_trello_list_values(list_id)
-            if self._normalize_trello_id(item)
+            self._normalize_erp_id(item)
+            for item in self._split_erp_status_values(status)
+            if self._normalize_erp_id(item)
         }
-        if not board_id or not list_ids:
+        if not project_id or not list_ids:
             return []
-        payload = self._trello_get_json(
-            f"boards/{quote(board_id, safe='')}/cards",
+        payload = self._erp_get_json(
+            f"boards/{quote(project_id, safe='')}/cards",
             key,
             token,
             fields={
@@ -13035,20 +13825,20 @@ exit 1
         for card in cards:
             if not isinstance(card, dict) or card.get("closed"):
                 continue
-            card_id = str(card.get("id") or card.get("shortLink") or "").strip()
-            if not card_id:
+            task_id = str(card.get("id") or card.get("shortLink") or "").strip()
+            if not task_id:
                 continue
-            if list_ids and self._normalize_trello_id(str(card.get("idList") or "")) not in list_ids:
+            if list_ids and self._normalize_erp_id(str(card.get("idList") or "")) not in list_ids:
                 continue
-            attachments = self._trello_card_attachments_or_fetch(card, key, token, card_id)
+            attachments = self._erp_task_attachments_or_fetch(card, key, token, task_id)
             image_attachments = [
-                item for item in attachments if isinstance(item, dict) and self._trello_attachment_is_image(item)
+                item for item in attachments if isinstance(item, dict) and self._erp_attachment_is_image(item)
             ]
-            source_attachments, flow_outputs = self._trello_source_and_flow_output_attachments(image_attachments)
+            source_attachments, flow_outputs = self._erp_source_and_flow_output_attachments(image_attachments)
             if source_attachments:
                 card["_image_attachments"] = source_attachments
                 card["_selected_attachment_ids"] = [
-                    self._normalize_trello_id(str(item.get("id") or ""))
+                    self._normalize_erp_id(str(item.get("id") or ""))
                     for item in source_attachments[:1]
                     if str(item.get("id") or "").strip()
                 ]
@@ -13056,42 +13846,42 @@ exit 1
                 image_cards.append(card)
         return image_cards
 
-    def _trello_first_image_card_on_board(
+    def _erp_first_image_card_on_board(
         self,
         key: str,
         token: str,
-        board_id: str,
-        list_id: str = "",
+        project_id: str,
+        status: str = "",
     ) -> Dict[str, Any]:
-        cards = self._trello_image_cards_on_board(key, token, board_id, list_id)
+        cards = self._erp_image_cards_on_board(key, token, project_id, status)
         return cards[0] if cards else {}
 
-    def _trello_attachment_is_image(self, attachment: Dict[str, Any]) -> bool:
+    def _erp_attachment_is_image(self, attachment: Dict[str, Any]) -> bool:
         name = str(attachment.get("name") or "").lower()
         mime = str(attachment.get("mimeType") or "").lower()
         return mime.startswith("image/") or Path(name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
-    def _trello_attachment_order_key(self, attachment: Dict[str, Any], index: int = 0) -> tuple[int, float, int]:
+    def _erp_attachment_order_key(self, attachment: Dict[str, Any], index: int = 0) -> tuple[int, float, int]:
         parsed = _parse_iso_datetime(str(attachment.get("date") or ""))
         if parsed is None:
             return (1, 0.0, index)
         return (0, parsed.timestamp(), index)
 
-    def _sort_trello_attachments_by_date(
+    def _sort_erp_attachments_by_date(
         self,
         attachments: List[Dict[str, Any]],
         *,
         newest_first: bool = False,
     ) -> List[Dict[str, Any]]:
         indexed = list(enumerate(attachments))
-        sorted_items = sorted(indexed, key=lambda pair: self._trello_attachment_order_key(pair[1], pair[0]))
+        sorted_items = sorted(indexed, key=lambda pair: self._erp_attachment_order_key(pair[1], pair[0]))
         if newest_first:
-            dated = [pair for pair in sorted_items if self._trello_attachment_order_key(pair[1], pair[0])[0] == 0]
-            undated = [pair for pair in sorted_items if self._trello_attachment_order_key(pair[1], pair[0])[0] != 0]
+            dated = [pair for pair in sorted_items if self._erp_attachment_order_key(pair[1], pair[0])[0] == 0]
+            undated = [pair for pair in sorted_items if self._erp_attachment_order_key(pair[1], pair[0])[0] != 0]
             sorted_items = list(reversed(dated)) + undated
         return [item for _index, item in sorted_items]
 
-    def _trello_attachment_is_flow_output(self, attachment: Dict[str, Any]) -> bool:
+    def _erp_attachment_is_flow_output(self, attachment: Dict[str, Any]) -> bool:
         name = str(attachment.get("name") or "").strip().lower()
         stem = Path(name).stem.lower()
         return (
@@ -13101,7 +13891,7 @@ exit 1
             or stem.startswith("flow_")
         )
 
-    def _trello_generated_series_prefix(self, attachment: Dict[str, Any]) -> str:
+    def _erp_generated_series_prefix(self, attachment: Dict[str, Any]) -> str:
         stem = Path(str(attachment.get("name") or "")).stem.strip().lower()
         if not stem:
             return ""
@@ -13136,32 +13926,32 @@ exit 1
             return ""
         return prefix
 
-    def _trello_source_and_flow_output_attachments(
+    def _erp_source_and_flow_output_attachments(
         self,
         image_attachments: List[Dict[str, Any]],
     ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         images = [
             item
             for item in image_attachments
-            if isinstance(item, dict) and self._trello_attachment_is_image(item)
+            if isinstance(item, dict) and self._erp_attachment_is_image(item)
         ]
         if not images:
             return [], []
         series_counts: Dict[str, int] = {}
         for item in images:
-            prefix = self._trello_generated_series_prefix(item)
+            prefix = self._erp_generated_series_prefix(item)
             if prefix:
                 series_counts[prefix] = series_counts.get(prefix, 0) + 1
         has_plain_source_candidate = any(
-            not self._trello_attachment_is_flow_output(item)
-            and not self._trello_generated_series_prefix(item)
+            not self._erp_attachment_is_flow_output(item)
+            and not self._erp_generated_series_prefix(item)
             for item in images
         )
 
         source_attachments: List[Dict[str, Any]] = []
         flow_outputs: List[Dict[str, Any]] = []
         for item in images:
-            series_prefix = self._trello_generated_series_prefix(item)
+            series_prefix = self._erp_generated_series_prefix(item)
             is_generated_series = bool(
                 series_prefix
                 and (
@@ -13169,42 +13959,46 @@ exit 1
                     or has_plain_source_candidate
                 )
             )
-            if self._trello_attachment_is_flow_output(item) or is_generated_series:
+            if self._erp_attachment_is_flow_output(item) or is_generated_series:
                 flow_outputs.append(item)
             else:
                 source_attachments.append(item)
 
-        source_attachments = self._sort_trello_attachments_by_date(source_attachments)
-        flow_outputs = self._sort_trello_attachments_by_date(flow_outputs)
+        source_attachments = self._sort_erp_attachments_by_date(source_attachments)
+        flow_outputs = self._sort_erp_attachments_by_date(flow_outputs)
         return source_attachments, flow_outputs
 
-    def _trello_download_attachment_bytes(
+    def _erp_download_attachment_bytes(
         self,
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         attachment: Dict[str, Any],
     ) -> tuple[bytes, str]:
-        attachment_id = str(attachment.get("id") or "").strip()
         name = str(attachment.get("name") or "image.jpg").strip() or "image.jpg"
         mime = str(attachment.get("mimeType") or mimetypes.guess_type(name)[0] or "image/jpeg")
-        if attachment_id:
-            path = (
-                f"cards/{quote(card_id, safe='')}/attachments/"
-                f"{quote(attachment_id, safe='')}/download/{quote(name)}"
-            )
-            request = Request(self._trello_endpoint(path, key, token), method="GET")
-            try:
-                with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
-                    return response.read(), response.headers.get_content_type() if response.headers else mime
-            except Exception:
-                pass
         url = str(attachment.get("url") or "").strip()
         if not url:
-            raise RuntimeError(f"Attachment Trello {name} không có URL để tải.")
-        return self._read_remote_file(url)
+            raise RuntimeError(f"Attachment ERP {name} không có URL để tải.")
+        if url.startswith("/"):
+            url = f"{self._erp_base_url()}{url}"
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            raise RuntimeError("Ảnh nguồn ERP phải có URL HTTPS.")
+        # Credentials never leave this ERP: they only ride along when the URL
+        # points at a private file on the ERP host itself, which is where every
+        # image a human drops on a Task through the ERP web UI lands.  Any
+        # other URL contained in Task data is fetched anonymously.
+        request = self._erp_private_file_request(url) or Request(url, method="GET")
+        try:
+            with urlopen(request, timeout=self.ERP_TIMEOUT_S) as response:
+                return response.read(), response.headers.get_content_type() if response.headers else mime
+        except HTTPError as exc:
+            raise RuntimeError(f"Không tải được ảnh nguồn ERP (HTTP {exc.code}).") from exc
+        except URLError as exc:
+            raise RuntimeError("Không kết nối được URL ảnh nguồn ERP.") from exc
 
-    def _trello_request_json(
+    def _erp_request_json(
         self,
         path: str,
         key: str,
@@ -13214,79 +14008,93 @@ exit 1
         data: bytes | None = None,
         headers: Dict[str, str] | None = None,
     ) -> Any:
-        payload = data
-        request_headers = {"Accept": "application/json", **(headers or {})}
-        if payload is None:
-            payload = urlencode({k: v for k, v in (fields or {}).items() if str(v) != ""}).encode("utf-8")
-            request_headers["Content-Type"] = "application/x-www-form-urlencoded"
+        if data is not None:
+            raise RuntimeError("Upload file lên ERP đi qua _erp_upload_file, không qua đường REST này.")
+        parts = [part for part in path.strip("/").split("/") if part]
+        if len(parts) == 3 and parts[0] == "cards" and parts[2] == "attachments":
+            task_id = self._normalize_erp_task_id(parts[1])
+            self._erp_assert_task_in_project(key, token, task_id)
+            artifact_url = str((fields or {}).get("url") or "").strip()
+            hosted_path = str((fields or {}).get("hostedPath") or "").strip()
+            name = str((fields or {}).get("name") or "Flow artifact").strip()
+            parent_comment = str((fields or {}).get("parentComment") or "").strip()
+            if hosted_path:
+                # The bytes already sit on this ERP, uploaded with the
+                # ``fieldname=comment`` sentinel, so addTaskComment adopts them
+                # as a real attachment and the body needs no URL of its own.
+                content = f"[FLOW_V2_ARTIFACT] {name}"
+                attachments = [hosted_path]
+                public_url = f"{self._erp_base_url()}{hosted_path}"
+            elif artifact_url and urlparse(artifact_url).scheme == "https":
+                # A link we do not host cannot become an ERP attachment, so it
+                # rides in the body to stay visible and re-readable on the Task.
+                content = f"[FLOW_V2_ARTIFACT] {name}\n\n{artifact_url}"
+                attachments = [artifact_url]
+                public_url = artifact_url
+            else:
+                raise RuntimeError("ERP chỉ nhận URL artefact HTTPS khi ghi comment vào Task.")
+            if parent_comment:
+                # The output belongs in the reply thread of the comment that
+                # carries the source image, which only the whitelisted method
+                # can do; the GraphQL mutation has no parent argument.
+                comment = self._erp_reply_comment(
+                    key,
+                    token,
+                    task_id,
+                    content,
+                    parent_comment=parent_comment,
+                    attachments=attachments,
+                )
+            else:
+                data_payload = self._erp_graphql(
+                    "mutation AddTaskComment($name: String!, $content: String!, $attachments: [String!]) { addTaskComment(name: $name, content: $content, attachments: $attachments) }",
+                    {"name": task_id, "content": content, "attachments": attachments},
+                    "AddTaskComment",
+                    key=key,
+                    token=token,
+                )
+                comment = data_payload.get("addTaskComment")
+            linked = int((comment or {}).get("linked") or 0) if isinstance(comment, dict) else 0
+            if hosted_path and linked < 1:
+                # The attachment did not stick, so leave the URL behind in a
+                # follow-up comment rather than a Task that shows nothing.
+                self._erp_comment(
+                    key,
+                    token,
+                    task_id,
+                    f"[FLOW_V2_ARTIFACT] {name}\n\n{public_url}",
+                    parent_comment=parent_comment,
+                )
+            return {
+                "id": public_url,
+                "name": name,
+                "url": public_url,
+                "mimeType": mimetypes.guess_type(name)[0] or "image/jpeg",
+                "comment": comment,
+                "linked": bool(hosted_path) and linked >= 1,
+            }
+        raise RuntimeError("Flow v2 không tạo Task hay gọi REST; ERP mutation duy nhất là addTaskComment cho artefact đã duyệt.")
 
-        request = Request(
-            self._trello_endpoint(path, key, token),
-            data=payload,
-            headers=request_headers,
-            method="POST",
-        )
-        try:
-            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
-                raw_payload = response.read().decode("utf-8", errors="replace")
-                return json.loads(raw_payload) if raw_payload else {}
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            detail = self._redact_trello_secret(detail or exc.reason, key, token)
-            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail}") from exc
-        except URLError as exc:
-            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
+    def _erp_put_json(self, path: str, key: str, token: str, fields: Dict[str, Any] | None = None) -> Any:
+        raise RuntimeError("Flow v2 không sửa Task ERP trong luồng này; chỉ comment artefact đã duyệt được phép.")
 
-    def _trello_put_json(self, path: str, key: str, token: str, fields: Dict[str, Any] | None = None) -> Any:
-        payload = urlencode({k: v for k, v in (fields or {}).items() if str(v) != ""}).encode("utf-8")
-        request = Request(
-            self._trello_endpoint(path, key, token),
-            data=payload,
-            headers={"Accept": "application/json", "Content-Type": "application/x-www-form-urlencoded"},
-            method="PUT",
-        )
-        try:
-            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
-                raw_payload = response.read().decode("utf-8", errors="replace")
-                return json.loads(raw_payload) if raw_payload else {}
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            detail = self._redact_trello_secret(detail or exc.reason, key, token)
-            raise RuntimeError(f"Trello API lá»—i {exc.code}: {detail}") from exc
-        except URLError as exc:
-            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
+    def _erp_delete_json(self, path: str, key: str, token: str) -> Any:
+        raise RuntimeError("Flow v2 không xóa dữ liệu ERP.")
 
-    def _trello_delete_json(self, path: str, key: str, token: str) -> Any:
-        request = Request(
-            self._trello_endpoint(path, key, token),
-            headers={"Accept": "application/json"},
-            method="DELETE",
-        )
-        try:
-            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
-                raw_payload = response.read().decode("utf-8", errors="replace")
-                return json.loads(raw_payload) if raw_payload else {}
-        except HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            detail = self._redact_trello_secret(detail or exc.reason, key, token)
-            raise RuntimeError(f"Trello API lỗi {exc.code}: {detail}") from exc
-        except URLError as exc:
-            raise RuntimeError(self._redact_trello_secret(exc.reason or exc, key, token)) from exc
-
-    def _trello_delete_attachment(self, key: str, token: str, card_id: str, attachment_id: str) -> Any:
-        return self._trello_delete_json(
-            f"cards/{quote(card_id, safe='')}/attachments/{quote(attachment_id, safe='')}",
+    def _erp_delete_attachment(self, key: str, token: str, task_id: str, attachment_id: str) -> Any:
+        return self._erp_delete_json(
+            f"cards/{quote(task_id, safe='')}/attachments/{quote(attachment_id, safe='')}",
             key,
             token,
         )
 
-    def _trello_create_card(self, key: str, token: str, list_id: str, name: str, description: str) -> Dict[str, Any]:
-        payload = self._trello_request_json(
+    def _erp_create_card(self, key: str, token: str, status: str, name: str, description: str) -> Dict[str, Any]:
+        payload = self._erp_request_json(
             "cards",
             key,
             token,
             fields={
-                "idList": list_id,
+                "idList": status,
                 "name": name,
                 "desc": description,
                 "pos": "top",
@@ -13294,92 +14102,85 @@ exit 1
         )
         return payload if isinstance(payload, dict) else {}
 
-    def _trello_move_card_to_list(self, key: str, token: str, card_id: str, list_id: str) -> Dict[str, Any]:
-        payload = self._trello_put_json(
-            f"cards/{quote(card_id, safe='')}",
-            key,
-            token,
-            fields={"idList": list_id, "pos": "top"},
-        )
-        return payload if isinstance(payload, dict) else {}
-
-    def _trello_attach_url(
+    def _erp_attach_url(
         self,
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         artifact_url: str,
         name: str,
         set_cover: bool,
+        parent_comment: str = "",
     ) -> Dict[str, Any]:
-        payload = self._trello_request_json(
-            f"cards/{quote(card_id, safe='')}/attachments",
+        payload = self._erp_request_json(
+            f"cards/{quote(task_id, safe='')}/attachments",
             key,
             token,
             fields={
                 "name": name,
                 "url": artifact_url,
                 "setCover": "true" if set_cover else "false",
+                "parentComment": parent_comment,
             },
         )
         if isinstance(payload, list):
             return payload[0] if payload else {}
         return payload if isinstance(payload, dict) else {}
 
-    def _trello_attach_file_from_url(
+    def _erp_attach_file_from_url(
         self,
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         artifact_url: str,
         name: str,
         mime_type: str,
         set_cover: bool,
+        parent_comment: str = "",
     ) -> Dict[str, Any]:
         file_bytes, detected_mime = self._read_remote_file(artifact_url)
         mime = detected_mime or mime_type or mimetypes.guess_type(name)[0] or "image/jpeg"
-        return self._trello_attach_file_bytes(
+        return self._erp_attach_file_bytes(
             key,
             token,
-            card_id,
+            task_id,
             file_bytes,
             mime,
             name,
             set_cover,
+            parent_comment,
         )
 
-    def _trello_attach_file_bytes(
+    def _erp_attach_file_bytes(
         self,
         key: str,
         token: str,
-        card_id: str,
+        task_id: str,
         file_bytes: bytes,
         mime_type: str,
         name: str,
         set_cover: bool,
+        parent_comment: str = "",
     ) -> Dict[str, Any]:
         mime = mime_type or mimetypes.guess_type(name)[0] or "image/jpeg"
-        body, content_type = self._multipart_form_data(
-            fields={
-                "name": name,
-                "mimeType": mime,
-                "setCover": "true" if set_cover else "false",
-            },
-            file_field="file",
-            file_name=name,
-            file_mime=mime,
-            file_bytes=file_bytes,
-        )
-        payload = self._trello_request_json(
-            f"cards/{quote(card_id, safe='')}/attachments",
+        # Two steps, because ERP has no single file-attach mutation: park the
+        # bytes on the Task, then let addTaskComment adopt them as attachments.
+        hosted_path = self._erp_upload_file(key, token, task_id, file_bytes, mime, name)
+        attachment = self._erp_request_json(
+            f"cards/{quote(task_id, safe='')}/attachments",
             key,
             token,
-            data=body,
-            headers={"Content-Type": content_type},
+            fields={
+                "name": name,
+                "hostedPath": hosted_path,
+                "setCover": "true" if set_cover else "false",
+                "parentComment": parent_comment,
+            },
         )
-        if isinstance(payload, list):
-            return payload[0] if payload else {}
-        return payload if isinstance(payload, dict) else {}
+        attachment = attachment if isinstance(attachment, dict) else {}
+        attachment.setdefault("mimeType", mime)
+        attachment["hosted"] = True
+        return attachment
 
     # ── Flow image upsampler (POST /v1/flow/upsampleImage) ──────────────────
     # Match Flow's current 2K image upsample request first. Local resize is
@@ -13391,8 +14192,8 @@ exit 1
             return True
         return value not in {"0", "false", "no", "off"}
 
-    def _trello_fake_2k_resize_enabled(self) -> bool:
-        value = os.getenv("TRELLO_FAKE_2K_RESIZE_ENABLED", "").strip().lower()
+    def _erp_fake_2k_resize_enabled(self) -> bool:
+        value = os.getenv("ERP_FAKE_2K_RESIZE_ENABLED", "").strip().lower()
         return value in {"1", "true", "yes", "on"}
 
     def _flow_upsample_payloads(
@@ -13755,7 +14556,7 @@ exit 1
                 )
                 continue
             decoded_size = self._image_size_from_bytes(decoded)
-            if decoded_size and max(decoded_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+            if decoded_size and max(decoded_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
                 return decoded
             log.warning(
                 "flow/upsampleImage attempt %s media=%s returned non-2K bytes (%sx%s)",
@@ -13767,7 +14568,7 @@ exit 1
         ui_downloaded = await self._upsample_image_via_flow_ui_download(client, media_id)
         if ui_downloaded and ui_downloaded != jpeg_bytes:
             ui_size = self._image_size_from_bytes(ui_downloaded)
-            if ui_size and max(ui_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+            if ui_size and max(ui_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
                 return ui_downloaded
             log.warning(
                 "Flow UI 2K download returned non-2K bytes (%sx%s)",
@@ -13835,10 +14636,10 @@ exit 1
                 image = ImageOps.exif_transpose(opened)
                 source_size = tuple(int(part) for part in image.size)
                 long_edge = max(source_size) if source_size else 0
-                if long_edge >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+                if long_edge >= self.ERP_UPSCALE_LONG_EDGE_PX:
                     return image_bytes, mime_type or Image.MIME.get(opened.format, "image/jpeg"), False, source_size, source_size
 
-                scale = self.TRELLO_UPSCALE_LONG_EDGE_PX / max(1, long_edge)
+                scale = self.ERP_UPSCALE_LONG_EDGE_PX / max(1, long_edge)
                 target_size = (
                     max(1, int(round(source_size[0] * scale))),
                     max(1, int(round(source_size[1] * scale))),
@@ -13866,7 +14667,7 @@ exit 1
         artifact: JobArtifact,
         artifact_url: str,
     ) -> ImageUpscaleResult:
-        """Fetch an artifact and prepare 2K bytes for Trello upload.
+        """Fetch an artifact and prepare 2K bytes for ERP upload.
 
         Flow's own 2K upsampler is tried first. Local resize is disabled by
         default because it creates a larger but still blurry file.
@@ -13892,7 +14693,7 @@ exit 1
         workflow_id = str(artifact.workflow_id or "").strip()
         media_generation_id = str(artifact.media_name or "").strip()
         source_size = await asyncio.to_thread(self._image_size_from_bytes, source_bytes)
-        if source_size and max(source_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+        if source_size and max(source_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
             return ImageUpscaleResult()
 
         async def _go(client: Any) -> bytes:
@@ -13914,7 +14715,7 @@ exit 1
         candidate_bytes = flow_upscaled if flow_changed else source_bytes
         candidate_mime = "image/jpeg" if flow_changed else source_mime
         candidate_size = await asyncio.to_thread(self._image_size_from_bytes, candidate_bytes)
-        if flow_changed and candidate_size and max(candidate_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+        if flow_changed and candidate_size and max(candidate_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
             return ImageUpscaleResult(
                 bytes=flow_upscaled,
                 mime_type="image/jpeg",
@@ -13924,14 +14725,14 @@ exit 1
                 used_flow=True,
             )
 
-        if self._trello_fake_2k_resize_enabled():
+        if self._erp_fake_2k_resize_enabled():
             ensured, ensured_mime, changed, resize_source_size, resize_target_size = await asyncio.to_thread(
                 self._ensure_image_long_edge_2k,
                 candidate_bytes,
                 candidate_mime,
             )
             if changed:
-                log.info("Locally resized Trello image from %sx%s to %sx%s", *resize_source_size, *resize_target_size)
+                log.info("Locally resized ERP image from %sx%s to %sx%s", *resize_source_size, *resize_target_size)
                 return ImageUpscaleResult(
                     bytes=ensured,
                     mime_type=ensured_mime,
@@ -13998,10 +14799,39 @@ exit 1
         except Exception as exc:
             log.warning("Could not persist Flow 2K artifact file: %s", exc)
 
+    def _erp_private_file_request(self, url: str) -> Request | None:
+        """Build an authenticated request for an ERP-hosted private file.
+
+        Images a human drops on a Task through the ERP web UI land under
+        ``/private/files/``. Those redirect to object storage and answer 400 to
+        an anonymous GET, so they have to be pulled through Frappe's own
+        download endpoint with the API credential attached.
+        """
+        parsed = urlparse(url)
+        base = urlparse(self._erp_base_url())
+        if not parsed.netloc or parsed.netloc != base.netloc:
+            return None
+        if not parsed.path.startswith("/private/files/"):
+            return None
+        key, token = self._erp_credentials()
+        if not key or not token:
+            return None
+        endpoint = (
+            f"{self._erp_base_url()}/api/method/frappe.core.doctype.file.file.download_file"
+            f"?file_url={quote(parsed.path, safe='')}"
+        )
+        return Request(
+            endpoint,
+            headers={
+                "User-Agent": "Flow-v2-HaviGroup-ERP/1.0",
+                "Authorization": f"token {key}:{token}",
+            },
+        )
+
     def _read_remote_file(self, url: str) -> tuple[bytes, str]:
-        request = Request(url, headers={"User-Agent": "FlowWebUI/0.1"})
+        request = self._erp_private_file_request(url) or Request(url, headers={"User-Agent": "FlowWebUI/0.1"})
         try:
-            with urlopen(request, timeout=self.TRELLO_TIMEOUT_S) as response:
+            with urlopen(request, timeout=self.ERP_TIMEOUT_S) as response:
                 content_type = response.headers.get_content_type() if response.headers else ""
                 return response.read(), content_type
         except HTTPError as exc:
@@ -14038,7 +14868,7 @@ exit 1
         body.extend(f"--{boundary}--\r\n".encode("utf-8"))
         return bytes(body), f"multipart/form-data; boundary={boundary}"
 
-    def _trello_attachment_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _erp_attachment_summary(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": str(payload.get("id") or "").strip(),
             "name": str(payload.get("name") or "").strip(),
@@ -14401,6 +15231,156 @@ exit 1
             "artifact_index": artifact_index,
         }
 
+    async def apply_dashboard_approval(
+        self,
+        job_id: str,
+        artifact_index: int,
+        status: str,
+        reviewer: str = "",
+    ) -> Dict[str, Any]:
+        """Record a local review decision and resume the ERP step when ready."""
+        decision = str(status or "").strip().lower()
+        if decision not in {"approved", "rejected"}:
+            raise HTTPException(status_code=400, detail="Trạng thái duyệt phải là approved hoặc rejected.")
+
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy lượt chạy để duyệt.")
+        if artifact_index < 0 or artifact_index >= len(job.artifacts):
+            raise HTTPException(status_code=404, detail="Không tìm thấy artefact cần duyệt.")
+
+        result = dict(job.result or {})
+        approvals = dict(result.get("dashboard_approvals") or {})
+        key = str(artifact_index)
+        previous = approvals.get(key) if isinstance(approvals.get(key), dict) else {}
+        previous_status = str(previous.get("status") or "").strip()
+        if previous_status in {"approved", "rejected"}:
+            if previous_status != decision:
+                raise HTTPException(status_code=409, detail="Artefact này đã có quyết định và không thể đổi trên dashboard.")
+            return previous
+
+        reviewer_name = str(reviewer or "").strip() or "Dashboard user"
+        approval = {
+            "artifact_index": artifact_index,
+            "status": decision,
+            "reviewer": {"name": reviewer_name},
+            "source": "dashboard",
+            "updated_at": utc_now(),
+        }
+        approvals[key] = approval
+        result["dashboard_approvals"] = approvals
+        summary = self._approval_summary(approvals, len(job.artifacts))
+        result["dashboard_approval_summary"] = summary
+        approval_module_id = self._sync_automation_approval_execution(
+            result,
+            summary,
+            len(job.artifacts),
+            summary_key="dashboard_approval_summary",
+        )
+        await self.store.patch_job(job_id, result=result)
+
+        label = "đã duyệt" if decision == "approved" else "đã từ chối"
+        await self.store.append_log(job_id, f"{reviewer_name} {label} ảnh {artifact_index + 1} trên dashboard.")
+        if approval_module_id and summary.get("pending") == 0:
+            await self._resume_automation_after_approval(job_id, approval_module_id)
+        return approval
+
+    async def add_dashboard_artifact(
+        self,
+        job_id: str,
+        artifact_url: str,
+        label: str = "",
+        reviewer: str = "",
+    ) -> Dict[str, Any]:
+        """Append a reviewer-supplied image to an open idea review.
+
+        A Flow run represents one ERP idea (its source Task).  Reviewers may
+        add a public image they already have to that same review batch, but it
+        must go through the same per-image approval gate before the ERP
+        comment step can receive its URL.
+        """
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy lượt chạy để thêm ảnh.")
+        if job.type != "image":
+            raise HTTPException(status_code=400, detail="Chỉ lượt tạo ảnh mới có thể thêm ảnh vào bộ idea.")
+
+        raw_url = str(artifact_url or "").strip()
+        parsed = urlparse(raw_url)
+        if (
+            len(raw_url) > 4096
+            or parsed.scheme != "https"
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+        ):
+            raise HTTPException(status_code=400, detail="Ảnh bổ sung phải là URL HTTPS công khai hợp lệ.")
+
+        inferred_mime = mimetypes.guess_type(parsed.path)[0] or ""
+        if inferred_mime and not inferred_mime.startswith("image/"):
+            raise HTTPException(status_code=400, detail="URL bổ sung phải trỏ tới một ảnh.")
+
+        result = dict(job.result or {})
+        execution = result.get("automation_execution")
+        nodes = execution.get("nodes") if isinstance(execution, dict) else []
+        approval_node = next(
+            (
+                node
+                for node in nodes
+                if isinstance(node, dict) and node.get("type") == "approval"
+            ),
+            None,
+        )
+        if not isinstance(approval_node, dict) or approval_node.get("status") != "running":
+            raise HTTPException(
+                status_code=409,
+                detail="Bộ idea này không còn ở bước duyệt nên không thể thêm ảnh.",
+            )
+
+        artifacts = list(job.artifacts or [])
+        existing_urls = {
+            str(item.public_url or item.url or "").strip()
+            for item in artifacts
+            if str(item.public_url or item.url or "").strip()
+        }
+        if raw_url in existing_urls:
+            raise HTTPException(status_code=409, detail="Ảnh này đã có trong bộ idea đang duyệt.")
+        if len(artifacts) >= 50:
+            raise HTTPException(status_code=400, detail="Bộ idea chỉ hỗ trợ tối đa 50 ảnh trong một lượt duyệt.")
+
+        source_name = Path(parsed.path or "").name.strip()
+        display_label = str(label or "").strip() or source_name or f"Ảnh bổ sung {len(artifacts) + 1}"
+        media_name = source_name or f"manual-idea-{len(artifacts) + 1}.jpg"
+        artifact = JobArtifact(
+            label=display_label,
+            media_name=media_name,
+            url=raw_url,
+            public_url=raw_url,
+            mime_type=inferred_mime or "image/*",
+            prompt=str((job.input or {}).get("prompt") or ""),
+        )
+        artifacts.append(artifact)
+        await self.store.replace_artifacts(job_id, artifacts)
+
+        approvals = dict(result.get("dashboard_approvals") or {})
+        summary = self._approval_summary(approvals, len(artifacts))
+        result["dashboard_approvals"] = approvals
+        result["dashboard_approval_summary"] = summary
+        self._sync_automation_approval_execution(
+            result,
+            summary,
+            len(artifacts),
+            summary_key="dashboard_approval_summary",
+        )
+        await self.store.patch_job(job_id, result=result)
+
+        reviewer_name = str(reviewer or "").strip() or "Dashboard user"
+        await self.store.append_log(
+            job_id,
+            f"{reviewer_name} đã thêm ảnh {len(artifacts)} vào bộ idea đang chờ duyệt.",
+        )
+        return _model_dump(artifact)
+
     async def _apply_telegram_approval(
         self,
         job_id: str,
@@ -14442,9 +15422,14 @@ exit 1
         }
         approvals[key] = approval
         result["telegram_approvals"] = approvals
-        summary = self._telegram_approval_summary(approvals, len(job.artifacts))
+        summary = self._approval_summary(approvals, len(job.artifacts))
         result["telegram_approval_summary"] = summary
-        approval_module_id = self._sync_automation_approval_execution(result, summary, len(job.artifacts))
+        approval_module_id = self._sync_automation_approval_execution(
+            result,
+            summary,
+            len(job.artifacts),
+            summary_key="telegram_approval_summary",
+        )
         await self.store.patch_job(job_id, result=result)
 
         if previous.get("status") != status:
@@ -14466,7 +15451,7 @@ exit 1
             "username": username,
         }
 
-    def _telegram_approval_summary(self, approvals: Dict[str, Any], artifact_count: int) -> Dict[str, Any]:
+    def _approval_summary(self, approvals: Dict[str, Any], artifact_count: int) -> Dict[str, Any]:
         approved = 0
         rejected = 0
         pending = max(0, artifact_count)
@@ -14493,6 +15478,8 @@ exit 1
         result: Dict[str, Any],
         summary: Dict[str, Any],
         artifact_count: int,
+        *,
+        summary_key: str = "approval_summary",
     ) -> str:
         execution = result.get("automation_execution")
         if not isinstance(execution, dict) or not isinstance(execution.get("nodes"), list):
@@ -14505,7 +15492,7 @@ exit 1
         approval_node["status"] = "completed" if summary.get("pending") == 0 and artifact_count else "running"
         approval_node["output"] = {
             "awaiting_user_approval": summary.get("pending", 0) > 0,
-            "telegram_approval_summary": summary,
+            summary_key: summary,
         }
         if not approval_node.get("started_at"):
             approval_node["started_at"] = now
@@ -15065,9 +16052,9 @@ exit 1
         return any(
             signal in detail
             for signal in (
-                "chua keo/upload duoc anh trello",
+                "chua keo/upload duoc anh erp",
                 "chua keo duoc anh nguon",
-                "chua upload duoc anh trello",
+                "chua upload duoc anh erp",
                 "chua xac minh duoc anh nguon",
                 "no new ready attachment visible",
             )
@@ -15299,7 +16286,9 @@ exit 1
         if await self._shared_browser_is_usable(selected_profile):
             return self._shared_browser
         await self._close_shared_browser()
-        self._ensure_playwright_browsers_available()
+        # A first-time install downloads ~150MB, so keep it off the event loop
+        # or every other request on the dashboard stalls behind it.
+        await asyncio.to_thread(self._ensure_playwright_browsers_available)
         BrowserManager, _, _, _, _ = self._flow_modules()
         try:
             selected_profile.path.mkdir(parents=True, exist_ok=True)
@@ -17779,9 +18768,9 @@ exit 1
         ]
         payload["media_id"] = str(payload.get("media_id", "")).strip()
         payload["workflow_id"] = str(payload.get("workflow_id", "")).strip() or config.active_workflow_id
-        payload["trello_source_card_id"] = self._normalize_trello_card_id(str(payload.get("trello_source_card_id") or ""))
-        payload["trello_source_attachment_ids"] = self._normalize_trello_attachment_ids(
-            payload.get("trello_source_attachment_ids") or []
+        payload["erp_source_task_id"] = self._normalize_erp_task_id(str(payload.get("erp_source_task_id") or ""))
+        payload["erp_source_attachment_ids"] = self._normalize_erp_attachment_ids(
+            payload.get("erp_source_attachment_ids") or []
         )
         payload["motion"] = str(payload.get("motion", "")).strip()
         payload["position"] = str(payload.get("position", "")).strip()
@@ -19491,7 +20480,7 @@ exit 1
         if (reference_media_names or local_reference_paths) and self._request_requires_flow_agent_ui(request):
             await self.store.append_log(
                 job_id,
-                "Auto AI Trello dùng Tác nhân Flow: app sẽ chạy qua giao diện Flow Agent, không gửi API prompt thường.",
+                "Auto AI ERP dùng Tác nhân Flow: app sẽ chạy qua giao diện Flow Agent, không gửi API prompt thường.",
             )
             return await self._generate_images_via_ui(client, request, reference_media_names, job_id=job_id)
 
@@ -19517,6 +20506,16 @@ exit 1
                     job_id,
                     "sending_request",
                     "Flow API chua nhan model anh da chon. Em dang tai lai project va gui lai bang giao dien Flow.",
+                )
+            elif self._is_flow_api_argument_error(exc):
+                await self.store.append_log(
+                    job_id,
+                    "Flow API tu choi cau truc yeu cau (INVALID_ARGUMENT). Em dang chuyen sang giao dien Flow de tao anh.",
+                )
+                await self._set_job_progress(
+                    job_id,
+                    "sending_request",
+                    "Flow API tu choi cau truc yeu cau. Em dang tai lai project va gui lai bang giao dien Flow.",
                 )
             else:
                 raise
@@ -19576,7 +20575,7 @@ exit 1
             if flow_agent_enabled and not source_workflow_id and reference_media_names:
                 raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
-            require_project_media_baseline = self._trello_source_validation_required(request)
+            require_project_media_baseline = self._erp_source_validation_required(request)
             if flow_agent_enabled and target_count > self._flow_agent_max_images_per_run():
                 max_per_run = self._flow_agent_max_images_per_run()
                 run_counts: List[int] = []
@@ -19733,16 +20732,72 @@ exit 1
                     return generated[:target_count]
                 raise RuntimeError(
                     f"Flow Agent chỉ tạo được {len(generated)}/{target_count} ảnh trong lượt x{target_count}. "
-                    "App đã dừng trước khi upload lên Trello để tránh bộ ảnh thiếu."
+                    "App đã dừng trước khi upload lên ERP để tránh bộ ảnh thiếu."
                 )
             return generated[:target_count]
-        return await client.generate_image(
-            request.prompt,
-            model=self._image_ui_model_label(request.model),
-            aspect=request.aspect,
-            count=max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(request.count or 1))),
-            timeout_s=max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300)),
-        )
+        prompt_only_count = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(request.count or 1)))
+        prompt_only_timeout_s = max(30, int(request.timeout_s or self.store.snapshot().config.generation_timeout_s or 300))
+        classic_detail = ""
+        try:
+            images = await client.generate_image(
+                request.prompt,
+                model=self._image_ui_model_label(request.model),
+                aspect=request.aspect,
+                count=prompt_only_count,
+                timeout_s=prompt_only_timeout_s,
+            )
+        except Exception as exc:
+            if not self._is_missing_flow_ui_result_error(exc):
+                raise
+            images = []
+            classic_detail = str(exc)
+        if images:
+            return images
+
+        # Newer Flow layouts drop the classic prompt bar entirely: the Agent
+        # panel is then the only surface that accepts a text-only prompt.
+        if job_id:
+            await self.store.append_log(
+                job_id,
+                "Ô tạo ảnh thường không trả ảnh nào. Em chuyển sang panel Tác nhân Flow để gửi lại prompt.",
+            )
+        # The Agent panel often opens on a cached conversation the first time;
+        # the guard closes that tab, so a retry on the fresh one is what
+        # actually produces the images.
+        tries = 3
+        last_exc: Exception | None = None
+        for attempt in range(tries):
+            try:
+                return await self._generate_single_reference_image_via_ui(
+                    client,
+                    request.prompt,
+                    model=request.model,
+                    reference_media_name="",
+                    aspect=request.aspect,
+                    count=prompt_only_count,
+                    timeout_s=prompt_only_timeout_s,
+                    flow_agent_enabled=True,
+                    flow_agent_auto_approve=self._flow_agent_auto_approve_enabled_for_request(request),
+                    job_id=job_id,
+                )
+            except Exception as exc:
+                last_exc = exc
+                normalized_detail = str(exc or "").lower()
+                if not self._is_retryable_flow_agent_ui_error(normalized_detail) or attempt >= tries - 1:
+                    raise
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        "Flow Agent còn hội thoại/ngữ cảnh cũ khi nhận prompt; app đã đóng tab Agent cũ và thử lại trên tab sạch."
+                        if self._is_stale_flow_agent_context_error(normalized_detail)
+                        else "Flow Agent báo bận/reCAPTCHA khi nhận prompt; app nghỉ rồi thử lại.",
+                    )
+                await asyncio.sleep(self._flow_agent_ui_retry_delay_s(normalized_detail))
+        raise last_exc if last_exc is not None else RuntimeError("Flow Agent không tạo được ảnh từ prompt.")
+
+    def _is_missing_flow_ui_result_error(self, exc: Exception) -> bool:
+        detail = str(exc or "").lower()
+        return "không trả ảnh mới" in detail or "chua bam duoc nut tao anh" in detail or "chưa bấm được nút tạo ảnh" in detail
 
     def _is_stale_flow_agent_context_error(self, detail: str) -> bool:
         normalized = str(detail or "").lower()
@@ -19978,12 +21033,12 @@ exit 1
             f"Use the x{total} image setting when available, and if the UI setting is lower, Flow Agent must still plan and create exactly {total} outputs from this message. "
             f"{run_scope} "
             f"{self._flow_agent_fresh_context_rule()} "
-            "These generated outputs are in addition to the attached Trello source/reference image; never count the source image as one of the generated outputs. "
+            "These generated outputs are in addition to the attached ERP source/reference image; never count the source image as one of the generated outputs. "
             f"{separate_output_rule}"
             f"{square_frame_rule}"
             f"{shot_plan_text}"
             f"{occasion_decor_rule} "
-            "HARD REFERENCE LOCK: use only the single attached Trello source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
+            "HARD REFERENCE LOCK: use only the single attached ERP source image as the product reference; ignore other Flow project thumbnails, previous outputs, examples, or gallery images. "
             "The source image beats the filename/card title: do not infer apparel from 'tao_hinh...', do not infer a plush from an animal motif, and do not infer a pillow/banner/hoop unless that is the visible product object in the source image. "
             "Before every output, compare against the source image and preserve the exact product category, silhouette, outline shape, construction, scale, fabric/material, base color, design placement, motif, embroidery/print layout, and edge details. "
             "Do not reinterpret, upgrade, or transform the source into another product type: a pillow stays the same pillow shape, a pennant/banner stays the same pennant/banner shape, a pillowcase stays a pillowcase, a hoop stays a hoop, a dress stays a dress, and an apron stays an apron. "
@@ -19996,12 +21051,12 @@ exit 1
             f"{self._flow_agent_embroidery_clarity_rule()} "
             "Product-specific exception: if the source is an embroidery hoop, khung theu, or embroidery frame, replace fabric colorway shots with personalized embroidered name variants only when the source image visibly contains an embroidered/personalized name; otherwise keep multiple hoop variants nameless while preserving the hoop/fabric/motif style. "
             f"Product-specific lock: if the source is a pennant/banner/flag wall hanging, every colorway or scene must keep the product as a flat hanging pennant/banner with top dowel/rod, cord hanger, side seams, pointed V bottom, and the same embroidery layout; for any wall-hanging banner output, {self.BANNER_VISIBLE_WALL_HOOK_RULE} Never copy the source motif/name onto a pillow, cushion, blanket, shirt, tote, hoop, or other product. For the explicitly planned process shot only, a round embroidery hoop may appear as a temporary tool holding the pennant fabric while stitching, not as a finished hoop product. "
-            "For non-hoop fabric colorways, preserve the same exact product form and embroidery layout; only if the Required shot plan, Trello description, or colorway/multi-color shot requires variants and the source image visibly contains an embroidered or personalized name may each product option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
+            "For non-hoop fabric colorways, preserve the same exact product form and embroidery layout; only if the Required shot plan, ERP description, or colorway/multi-color shot requires variants and the source image visibly contains an embroidered or personalized name may each product option use a different plausible name while preserving the same lettering and stitch style; if the source has no name, do not invent names. "
             f"{self._flow_agent_colorway_text_variant_rule()} "
             f"{no_grid_rule}"
             f"{self._flow_agent_no_tag_label_rule()} "
             f"{added_readable_text_rule}"
-            "Use the attached Trello source product image as the reference for every output. "
+            "Use the attached ERP source product image as the reference for every output. "
             "Keep every output 1:1 square, commercial product photography, and visually identical to the same source product identity."
         )
         return f"{correction}\n\n{base}" if base else correction
@@ -20019,7 +21074,7 @@ exit 1
         stop_markers = (
             "Lighting and color rule",
             "Product-specific notes",
-            "Treat the Trello description",
+            "Treat the ERP description",
             "Use the learned product-prompt style",
             "Preserve the original product shape",
             "Only change scene",
@@ -20065,8 +21120,15 @@ exit 1
         from flow._ui_interceptor import UIInterceptor
 
         safe_reference_image_path = str(reference_image_path or "").strip()
-        resolved_workflow_id = str(workflow_id or "").strip() or await self._find_workflow_id_for_media(client, reference_media_name)
-        if not resolved_workflow_id and not (flow_agent_enabled and safe_reference_image_path):
+        # A prompt-only job has no source image at all, so every source-image
+        # guard below has to stand down instead of refusing to submit.
+        text_only_agent = bool(
+            flow_agent_enabled and not str(reference_media_name or "").strip() and not safe_reference_image_path
+        )
+        resolved_workflow_id = str(workflow_id or "").strip()
+        if not resolved_workflow_id and not text_only_agent:
+            resolved_workflow_id = await self._find_workflow_id_for_media(client, reference_media_name)
+        if not resolved_workflow_id and not (flow_agent_enabled and (safe_reference_image_path or text_only_agent)):
             raise RuntimeError("Google Flow chua tim thay workflow cua anh goc de mo man hinh chinh anh.")
 
         ui_timeout_s = max(60.0, min(600.0, float(timeout_s or 300)))
@@ -20144,7 +21206,7 @@ exit 1
                     )
             if not agent_opened:
                 raise RuntimeError(
-                    "Auto AI Trello bắt buộc dùng Tác nhân Flow. App chưa thấy nút Tác nhân trên màn hình Flow, "
+                    "Auto AI ERP bắt buộc dùng Tác nhân Flow. App chưa thấy nút Tác nhân trên màn hình Flow, "
                     "nên đã dừng trước khi nhập lệnh để tránh tạo ảnh không dùng ảnh nguồn."
                 )
 
@@ -20162,7 +21224,7 @@ exit 1
                 )
             if not panel_opened:
                 raise RuntimeError(
-                    "Auto AI Trello cần mở panel Tác nhân Flow trước khi kéo ảnh vào AI. "
+                    "Auto AI ERP cần mở panel Tác nhân Flow trước khi kéo ảnh vào AI. "
                     "App đã dừng để tránh chỉ gửi prompt mà không có ảnh nguồn."
                 )
 
@@ -20187,7 +21249,7 @@ exit 1
                 await self.store.append_log(job_id, f"Fallback UI Flow: nhập prompt trong panel Tác nhân ({fill_detail[:120]}).")
             if not filled:
                 raise RuntimeError(
-                    "Auto AI Trello đã bật Tác nhân Flow nhưng chưa nhập được lệnh vào panel Tác nhân. "
+                    "Auto AI ERP đã bật Tác nhân Flow nhưng chưa nhập được lệnh vào panel Tác nhân. "
                     "App đã dừng trước khi dùng ô prompt thường."
                 )
         else:
@@ -20203,7 +21265,7 @@ exit 1
         attached_agent_source = False
         attached_local_source = False
         source_attachment_before: Dict[str, Any] = {}
-        source_attachment_verified = not flow_agent_enabled
+        source_attachment_verified = not flow_agent_enabled or text_only_agent
         source_verify_detail = ""
         if flow_agent_enabled and str(reference_media_name or "").strip():
             source_attachment_before = await self._flow_agent_panel_attachment_snapshot(page)
@@ -20241,7 +21303,9 @@ exit 1
         elif flow_agent_enabled and job_id:
             await self.store.append_log(
                 job_id,
-                "Fallback UI Flow: no project media id for the Trello source; using local file attach in Flow Agent.",
+                "Fallback UI Flow: prompt-only, khong dinh kem anh nguon vao Tac nhan Flow."
+                if text_only_agent
+                else "Fallback UI Flow: no project media id for the ERP source; using local file attach in Flow Agent.",
             )
 
         if flow_agent_enabled and (not attached_agent_source or not source_attachment_verified) and safe_reference_image_path:
@@ -20269,20 +21333,20 @@ exit 1
                 await self.store.append_log(
                     job_id,
                     (
-                        f"Fallback UI Flow: đã upload ảnh Trello vào khung Tác nhân ({attach_detail[:120]})."
+                        f"Fallback UI Flow: đã upload ảnh ERP vào khung Tác nhân ({attach_detail[:120]})."
                         if attached_local_source and source_attachment_verified
-                        else f"Fallback UI Flow: chưa upload được ảnh Trello vào khung Tác nhân ({attach_detail[:120]})."
+                        else f"Fallback UI Flow: chưa upload được ảnh ERP vào khung Tác nhân ({attach_detail[:120]})."
                     ),
                 )
             if not attached_agent_source or not source_attachment_verified:
                 raise RuntimeError(
-                    "Auto AI Trello chưa kéo/upload được ảnh Trello vào Tác nhân Flow. "
+                    "Auto AI ERP chưa kéo/upload được ảnh ERP vào Tác nhân Flow. "
                     f"App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: {attach_detail}; {source_verify_detail}"
                 )
 
         elif flow_agent_enabled and not source_attachment_verified:
             raise RuntimeError(
-                "Auto AI Trello chua xac minh duoc anh nguon trong panel Tac nhan Flow. "
+                "Auto AI ERP chua xac minh duoc anh nguon trong panel Tac nhan Flow. "
                 "App da dung truoc khi bam tao de tranh Flow Agent dung ngu canh/anh cu. "
                 f"Chi tiet: {source_verify_detail or 'khong thay attachment moi trong panel'}"
             )
@@ -20307,7 +21371,7 @@ exit 1
         except Exception as exc:
             if require_project_media_baseline:
                 raise RuntimeError(
-                    "Auto AI Trello không đọc được danh sách ảnh hiện có trong Flow trước khi bấm tạo. "
+                    "Auto AI ERP không đọc được danh sách ảnh hiện có trong Flow trước khi bấm tạo. "
                     "App đã dừng để tránh lấy nhầm ảnh cũ trong project rồi upload sai card."
                 ) from exc
             known_media_before_submit = set()
@@ -20460,7 +21524,7 @@ exit 1
         ):
             raise RuntimeError(
                 "Flow vua gui request tao anh nhung request khong co anh goc dang chon. "
-                "Em da dung lai de tranh luu anh moi khong dung card Trello."
+                "Em da dung lai de tranh luu anh moi khong dung card ERP."
             )
 
         images = self._parse_images_from_flow_payload(
@@ -20566,7 +21630,7 @@ exit 1
                 getattr(request, "prompt_product_key", ""),
             )
         ).lower()
-        if self._normalize_trello_card_id(getattr(request, "trello_card_id", "")):
+        if self._normalize_erp_task_id(getattr(request, "erp_task_id", "")):
             return True
         return any(
             token in marker
@@ -20575,7 +21639,7 @@ exit 1
                 "flow agent",
                 "tác nhân flow",
                 "tac nhan flow",
-                "auto ai trello",
+                "auto ai erp",
             )
         )
 
@@ -21818,7 +22882,7 @@ exit 1
                     .filter((el) => inPanelAttachmentArea(el) && !insideTextbox(el))
                     .map((el) => labelFor(el))
                     .filter((label) => label.length > 0 && label.length <= 180)
-                    .filter((label) => /\\.jpe?g|\\.png|\\.webp|\\.heic|trello-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label))
+                    .filter((label) => /\\.jpe?g|\\.png|\\.webp|\\.heic|erp-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label))
                     .slice(0, 12);
                   const attachmentCards = deepQuery('[data-testid], [aria-label], [title], [class]', panel.el)
                     .filter((el) => visible(el, 24, 18))
@@ -21849,7 +22913,7 @@ exit 1
                     .filter((el) => inCurrentComposer(el))
                     .map((el) => labelFor(el))
                     .filter((label) => label.length > 0 && label.length <= 220)
-                    .filter((label) => /\.jpe?g|\.png|\.webp|\.heic|trello-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label));
+                    .filter((label) => /\.jpe?g|\.png|\.webp|\.heic|erp-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label));
                   const composerCards = deepQuery('[data-testid], [aria-label], [title], [class]', panel.el)
                     .filter((el) => visible(el, 24, 18))
                     .filter((el) => inCurrentComposer(el))
@@ -22538,6 +23602,13 @@ exit 1
     def _is_recaptcha_error(self, exc: Exception) -> bool:
         detail = str(exc or "").lower()
         return "recaptcha" in detail and "failed" in detail
+
+    def _is_flow_api_argument_error(self, exc: Exception) -> bool:
+        # Google answers a drifted batchGenerateImages payload with a bare
+        # INVALID_ARGUMENT and no field detail.  The Flow UI keeps working when
+        # this happens, so treat it as "use the browser path", not a dead end.
+        detail = str(exc or "").lower()
+        return "invalid_argument" in detail or ("http 400" in detail and "invalid argument" in detail)
 
     def _is_image_model_error(self, exc: Exception) -> bool:
         detail = str(exc or "").lower()

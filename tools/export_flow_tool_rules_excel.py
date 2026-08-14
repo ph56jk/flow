@@ -288,8 +288,8 @@ def build_sheets() -> list[tuple[str, list[list[Any]], list[int]]]:
         ["Poll interval", config.get("poll_interval_s", ""), "giây"],
         ["Số output mục tiêu", FlowWebService.FLOW_AGENT_TARGET_OUTPUT_COUNT, "Không tính ảnh nguồn/reference"],
         ["Max images per run", FlowWebService.FLOW_AGENT_MAX_IMAGES_PER_RUN, "Giới hạn Flow Agent"],
-        ["Trello source list", FlowWebService.DEFAULT_TRELLO_SOURCE_LIST_NAME, "Tool quét card ở đây"],
-        ["Trello review list", FlowWebService.DEFAULT_TRELLO_REVIEW_LIST_NAME, "Card chuyển/duyệt khi đủ output"],
+        ["ERP source list", FlowWebService.DEFAULT_ERP_SOURCE_LIST_NAME, "Tool quét card ở đây"],
+        ["ERP review list", FlowWebService.DEFAULT_ERP_REVIEW_LIST_NAME, "Card chuyển/duyệt khi đủ output"],
         ["Active jobs", len(active_jobs), "queued/running/polling"],
         ["Tổng jobs trong state", len(jobs), ""],
         ["Gemini model", (state.get("integration_config") or {}).get("gemini_model") or "gemini-2.5-flash", ""],
@@ -298,8 +298,8 @@ def build_sheets() -> list[tuple[str, list[list[Any]], list[int]]]:
 
     workflow_rows = [
         ["#", "Giai đoạn", "Tool đang làm gì", "Rule/điều kiện dừng"],
-        [1, "Quét Trello", "Quét card có ảnh trong Ready for AI hoặc list nguồn cấu hình.", "Chỉ lấy đúng list/card nguồn; card đủ 12 output thì bỏ qua trừ khi reset."],
-        [2, "Khóa ảnh nguồn", "Chọn attachment ảnh trên chính card, lưu card_id và attachment_id vào prompt.", "Không dùng ảnh từ card khác, gallery Flow, thumbnail cũ, hoặc task trước."],
+        [1, "Quét ERP", "Quét card có ảnh trong Ready for AI hoặc list nguồn cấu hình.", "Chỉ lấy đúng list/card nguồn; card đủ 12 output thì bỏ qua trừ khi reset."],
+        [2, "Khóa ảnh nguồn", "Chọn attachment ảnh trên chính card, lưu task_id và attachment_id vào prompt.", "Không dùng ảnh từ card khác, gallery Flow, thumbnail cũ, hoặc task trước."],
         [3, "Nhận diện sản phẩm", "Dùng tên card/attachment/user instruction và Gemini visual classification nếu có.", "Nếu không xác định được HAVI product rule/category thì dừng trước khi gửi Flow Agent."],
         [4, "Tạo request", "Ghép prompt vận hành cho Flow Agent: source lock, product lock, shot plan, lighting, embroidery, no-tag rules.", "Prompt ảnh cuối do Flow Agent tự viết nội bộ; app không bắt buộc dùng Sheet."],
         [5, "Mở Flow", "Dùng Google Flow project/profile đã cấu hình.", "Nếu profile quota/project lỗi thì đánh dấu hoặc chuyển account; nếu hết account thì dừng."],
@@ -307,17 +307,17 @@ def build_sheets() -> list[tuple[str, list[list[Any]], list[int]]]:
         [7, "Tạo ảnh", "Yêu cầu đúng số ảnh còn thiếu, thường 12 output riêng biệt 1:1.", "Không tính ảnh gốc; không tạo grid/contact sheet; riêng pennant image 7 được collage detail."],
         [8, "Thu output", "Theo dõi/download ảnh Flow tạo ra và gom artifact.", "Nếu thiếu output thì split/rerun theo shot range, không reset về image 1."],
         [9, "QA/Gemini", "Nếu bật Gemini QA, kiểm ảnh generated có khớp nguồn/card nguồn không.", "Nếu Gemini báo sai source/category thì chặn upload; nếu Gemini quota thì báo lỗi rõ."],
-        [10, "Upload/Duyệt", "Upload output về đúng card Trello, có thể gửi Telegram duyệt và chuyển Content Review khi đủ.", "Không upload vào card khác; đủ 12 output mới chuyển, không tính ảnh gốc."],
+        [10, "Upload/Duyệt", "Upload output về đúng card ERP, có thể gửi Telegram duyệt và chuyển Content Review khi đủ.", "Không upload vào card khác; đủ 12 output mới chuyển, không tính ảnh gốc."],
     ]
 
     global_rule_rows = [
         ["Nhóm rule", "Rule hiện tại", "Tác dụng"],
         ["Fresh task", "Flow Agent phải coi mỗi prompt là task mới, bỏ qua chat/task/gallery/project memory cũ.", "Tránh lấy nhầm sản phẩm/shot idea từ lần chạy trước."],
-        ["Source lock", "Selected Trello attachment là ảnh nguồn duy nhất có thẩm quyền.", "Chống dùng nhầm thumbnail Flow hoặc ảnh card khác."],
+        ["Source lock", "Selected ERP attachment là ảnh nguồn duy nhất có thẩm quyền.", "Chống dùng nhầm thumbnail Flow hoặc ảnh card khác."],
         ["No generic filename inference", "Không suy luận product từ tên generic như tao_hinh/image/photo hoặc từ motif như animal/flower/character.", "Ảnh nguồn thắng filename."],
         ["Category lock", "Giữ nguyên category, silhouette, construction, material, base color family, design placement, scale.", "Không biến sản phẩm sang loại khác."],
         ["No derivative merchandise", "Không copy motif/name/design nguồn sang áo, gối, chăn, tote, hoop nếu nguồn không phải sản phẩm đó.", "Giữ đúng sản phẩm bán thật."],
-        ["HAVI product rule required", "Auto AI Trello phải có HAVI product shot rule hoặc tín hiệu category rõ; nếu không có thì dừng.", "Tránh fallback generic tạo sai rule."],
+        ["HAVI product rule required", "Auto AI ERP phải có HAVI product shot rule hoặc tín hiệu category rõ; nếu không có thì dừng.", "Tránh fallback generic tạo sai rule."],
         ["Output count", "Mục tiêu mặc định là 12 ảnh generated output + 1 ảnh nguồn; ảnh nguồn không được tính là output.", "Đảm bảo bộ ảnh đủ số lượng."],
         ["Missing outputs", "Nếu card đã có một phần output thì tạo phần còn thiếu tới đủ 12; split-run phải tiếp tục đúng shot range.", "Tránh tạo trùng image 1..8."],
         ["Square format", "Tất cả output là ảnh product photo 1:1 square.", "Chuẩn listing/Etsy."],

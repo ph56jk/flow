@@ -8,7 +8,7 @@ The Windows launchers run three isolated app instances:
 | Worker 2 | 3170 | `.env.worker-3170.local` | `data/workers/3170/` |
 | Worker 3 | 3171 | `.env.worker-3171.local` | `data/workers/3171/` |
 
-Each secondary worker must have a separate Trello input list and separate
+Each secondary worker must have a separate ERP input list and separate
 Google Flow browser profiles. Account emails, project IDs, cookies, tokens,
 generated images, and runtime state are local-only and ignored by Git.
 
@@ -16,15 +16,15 @@ generated images, and runtime state are local-only and ignored by Git.
 
 1. Copy the credentials from `.env.local` into a worker environment by running
    its setup script once.
-2. Add the worker's `TRELLO_BOARD_ID`, `TRELLO_LIST_ID`, profile map, and project
+2. Add the worker's `ERP_PROJECT_ID`, `ERP_STATUS_ID`, profile map, and project
    map to its local environment file.
 3. Open each browser profile and complete Google sign-in.
 
 Example `.env.worker-3170.local` values:
 
 ```env
-TRELLO_BOARD_ID=your-board-id
-TRELLO_LIST_ID=your-worker-list-id
+ERP_PROJECT_ID=your-board-id
+ERP_STATUS_ID=your-worker-list-id
 FLOW_CHROME_PROFILE_DIRS=AccountA=data\workers\3170\flow-profiles\account-a;AccountB=data\workers\3170\flow-profiles\account-b
 FLOW_CHROME_PROFILE_PROJECTS=AccountA=project-id-a;AccountB=project-id-b
 ```

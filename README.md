@@ -205,18 +205,20 @@ Tạo file `.env.local` với nội dung:
 
 ```env
 # Không cần env cho thao tác thường ngày:
-# nhập trực tiếp trong app ở sidebar App integrations / Trello storage.
+# nhập trực tiếp trong app ở sidebar App integrations / ERP storage.
 # Các biến dưới chỉ còn là fallback nâng cao nếu muốn cấu hình ngoài UI.
 # PLAYWRIGHT_BROWSERS_PATH=C:\pw-flow
 # GEMINI_API_KEY=AIza...
 # GEMINI_MODEL=gemini-2.5-flash
-# TELEGRAM_BOT_TOKEN=123456:bot-token
-# TELEGRAM_CHAT_ID=@kenh_duyet_anh
-# TRELLO_API_KEY=your_trello_key
-# TRELLO_TOKEN=your_trello_token
-# TRELLO_CARD_ID=trello_card_id_or_short_link
-# TRELLO_LIST_ID=trello_list_id
-# TRELLO_UPLOAD_MODE=file
+# ERP_API_KEY=your_erp_key
+# ERP_API_SECRET=your_erp_api_secret
+# ERP_BASE_URL=https://erp.havigroup.llc
+# ERP_PROJECT_ID=PROJ-0049
+# ERP_TASK_ID=TASK-xxxx
+# ERP_STATUS_ID=Open
+# Bộ xóa watermark Gemini (thư mục removelogo, chạy bằng `npm start`).
+# REMOVE_LOGO_URL=http://127.0.0.1:8788
+# REMOVE_LOGO_ENABLED=false
 
 # Multi-account Flow Agent fallback. Each path is one separate Chrome profile.
 # Use ; to separate profiles on Windows. The token "default" keeps the normal
@@ -229,10 +231,67 @@ Tạo file `.env.local` với nội dung:
 ```
 
 App sẽ tự nạp file này khi khởi động nếu có, nhưng không bắt buộc. Nếu không tạo Prompt AI sẽ dùng kho skill nội bộ.
-Telegram cũng không bắt buộc: nếu chưa cấu hình, app vẫn tạo ảnh bằng Flow và lưu lịch sử như bình thường.
-Gemini là tuỳ chọn, chỉ dùng cho phần **AI viết prompt**. Nếu workflow chỉ là Google Sheet/Excel -> Flow -> Telegram/Trello thì chỉ cần tài khoản Flow đã đăng nhập.
-Telegram và Playwright path có thể nhập trong sidebar **App integrations** rồi bấm **Lưu app**. Không cần sửa `.env.local`; API key/token được lưu trong state local của app và chỉ trả về frontend dưới dạng trạng thái đã lưu.
-Trello cũng là tuỳ chọn: mở dashboard, đi tới **Trello storage**, dán API key/token, nhập board/card/list, chọn cách lưu ảnh rồi bấm **Lưu Trello**. API key lấy ở `https://trello.com/app-key`, token tạo từ link token trên trang đó. Có thể dán board URL như `https://trello.com/b/board123/demo-board`; Trello Source sẽ tự tìm card đầu tiên có attachment ảnh nếu chưa nhập card cụ thể.
+Ảnh Flow chỉ được ghi về ERP sau khi toàn bộ review được duyệt trên dashboard.
+Gemini là tuỳ chọn, chỉ dùng cho phần **AI viết prompt**. Nếu workflow chỉ là Google Sheet/Excel -> Flow -> dashboard/ERP thì chỉ cần tài khoản Flow đã đăng nhập.
+Playwright path có thể nhập trong sidebar **App integrations** rồi bấm **Lưu app**. Không cần sửa `.env.local`; secret chỉ được lưu local và API chỉ trả về cờ trạng thái đã cấu hình.
+ERP sử dụng HaviGroup ERP qua HTTPS GraphQL: mở dashboard, đi tới **HaviGroup ERP**, nhập API key + API secret, điền mã **Project** (ví dụ `PROJ-0013`) rồi chọn Task nguồn. App chỉ đọc/ghi trong đúng project đang cấu hình — mọi Task ID gõ tay, graph import hay batch item đều bị kiểm tra lại theo giá trị này, nên phạm vi ảnh hưởng luôn gói trong một project. ERP Source đọc ảnh nguồn từ comment trên Task (kể cả file `/private/files/...` do người dùng đính qua web ERP — Flow v2 tải qua endpoint `download_file` có auth). Sau khi duyệt trên dashboard, Flow v2 đẩy ảnh đã xóa watermark lên chính ERP rồi gắn nó vào comment Task như **file đính kèm thật**, hiển thị inline đúng như khi người dùng kéo ảnh vào ô comment. Job thất bại cũng được ghi vào comment với tiền tố `[FLOW_V2_ERROR]`. App không tạo/sửa/xóa Task.
+
+Cơ chế gắn attachment gồm đúng hai bước, và **thứ tự cùng bộ field là bắt buộc** (đây chính là payload mà web ERP gửi):
+
+1. `POST /api/method/upload_file` với `is_private=1`, `folder=Home`, `doctype=Task`, `docname=<task>`, `fieldname=comment`. Giá trị `fieldname=comment` là cờ "file đang chờ gắn vào comment kế tiếp"; thiếu nó thì bước 2 luôn trả `linked: 0`.
+2. `addTaskComment(name, content, attachments: ["/private/files/..."])` với đường dẫn **tương đối** vừa nhận. ERP tự chuyển file sang `attached_to_field = comment:<comment_id>` và trả `linked: 1`.
+
+Nếu `linked` vẫn bằng 0, Flow v2 ghi thêm một comment chứa URL tuyệt đối để ảnh không biến mất; hàm đọc lại nhận cả hai dạng (attachment thật và URL trong nội dung), nên số output cũ luôn đếm đúng và ảnh không bị tạo lại.
+
+**Ảnh tạo ra nằm trong thread "Trả lời" của comment ảnh nguồn**, đúng luồng người dùng mong đợi: thả ảnh vào card → mọi ảnh Flow tạo ra (và cả comment lỗi `[FLOW_V2_ERROR]`) nằm gọn trong thread của chính comment đó thay vì thành một dãy comment rời. Mutation GraphQL `addTaskComment` **không có tham số cha** (trường `meta` chỉ được lưu nguyên văn, không tạo thread), nên Flow v2 gọi đúng whitelisted method mà nút "Trả lời" của web ERP dùng:
+
+```
+POST /api/method/hvg_workspace.api.add_task_comment
+{"name": "<TASK>", "content": "...", "mentions": "[]", "meta": "",
+ "parent": "<id comment ảnh nguồn>", "attachments": ["/private/files/..."]}
+→ {"message": {"ok": true, "linked": 1}}
+```
+
+Comment cha được tìm lại theo `file_url` của ảnh nguồn (`_erp_source_comment_id`) chứ không lưu trong state, nên vẫn đúng sau khi job chờ duyệt lâu hoặc app khởi động lại. Không tìm thấy comment cha thì ảnh rơi về comment thường và log job nói rõ điều đó.
+
+> ⚠️ **Giới hạn ERP còn lại:** không tạo được cột mới. "Cột" trên ERP là các option `status` của DocType Task (`Open`, `Working`, `Pending Review`, `Completed`, `Cancelled`); `DocField`/`DocPerm` đều trả `403` nên không thể thêm cột kiểu "Pic For AI" qua API. Dùng cột **Open** làm cột "cần làm" (mặc định sẵn của app).
+>
+> Lưu ý: ERP khử trùng lặp file theo nội dung — upload hai ảnh giống hệt nhau sẽ trả về cùng một `file_url`. Đọc trực tiếp DocType `Comment`/`DocPerm` qua REST bị `403`; muốn xóa comment thì gọi `hvg_workspace.api.delete_task_comment(name, comment)`.
+
+### 4.1b. Bước xóa watermark Gemini (`removelogo`)
+
+Mọi ảnh Google Flow trả về đều có watermark Gemini, nên module **Remove Logo** nằm ngay sau **Google Flow** và trước bước duyệt. Module này gọi server Node trong thư mục `removelogo`:
+
+1. Mở thư mục `removelogo`, chạy `npm install` (lần đầu) rồi `npm start`.
+2. Server lắng nghe ở `http://127.0.0.1:8788`. Đổi địa chỉ bằng `REMOVE_LOGO_URL` hoặc ô cấu hình trong app.
+3. Flow v2 gửi từng ảnh qua `POST {base_url}/process` và ghi file PNG sạch về thư mục downloads; ảnh trên dashboard và file gửi lên ERP đều là bản đã xử lý.
+
+Nếu server chưa chạy hoặc xử lý lỗi, job **không** fail: ảnh gốc được giữ nguyên, artifact ghi trạng thái `failed` và log job nói rõ lý do. Riêng trường hợp ảnh vốn không có watermark Gemini (removelogo trả `422`), artifact ghi `skipped` chứ không phải `failed` — không có gì để xóa thì không phải lỗi.
+
+removelogo gỡ metadata AI (C2PA/XMP/EXIF) **trước** khi tìm watermark hiển thị, và khi bước hiển thị không sửa được gì nó vẫn trả `200` kèm file chỉ-gỡ-metadata. Flow v2 vì thế so pixel file trả về với ảnh gốc: giống hệt nhau thì artifact ghi `metadata_only` (không phải `cleaned`) và log job cảnh báo "chỉ gỡ được metadata, watermark hiển thị vẫn còn". File đó vẫn là file được gửi lên ERP vì nó đã sạch metadata, chỉ là trạng thái không được phép nói quá. Đặt `REMOVE_LOGO_ENABLED=false` để bỏ hẳn bước này. Công cụ chỉ xóa watermark Gemini và metadata AI (C2PA/XMP/EXIF) do chính Google gắn vào ảnh bạn tạo ra — không dùng cho ảnh của người khác.
+
+Tài liệu ERP chính thức ưu tiên `Authorization: HVGToken <raw-token>`. Cặp API key/API secret được cấp cho luồng này đã được xác nhận chỉ-đọc qua cơ chế tương thích Frappe `Authorization: token <key>:<secret>`; chúng không thể tự chuyển thành raw HVG token. Khi công ty cấp raw HVG token, hãy chuyển integration sang header chính thức đó thay vì suy diễn token từ cặp key/secret.
+
+### 4.1c. Chạy ảnh cho từng idea (Phân rã công việc → mỗi thẻ con là 1 idea)
+
+Luồng người dùng ERP mô tả: một thẻ **Idea** cha giữ ảnh sản phẩm gốc (kể cả khi ảnh đó chỉ là **ảnh bìa** của thẻ), phần **PHÂN RÃ CÔNG VIỆC** tách mỗi idea thành một thẻ con riêng ở cột *Cần làm*. Ảnh content chạy cho idea "a" phải nằm trong chính thẻ "a", không dồn hết về thẻ cha.
+
+Trong sidebar **Chạy ảnh cho từng idea**: điền mã thẻ Idea cha (ví dụ `TASK-2026-00202`), số ảnh mỗi idea (mặc định 12) rồi bấm **Chạy ảnh cho các idea**. Tương đương API:
+
+```
+POST /api/erp/idea-batch
+{"task_id": "TASK-2026-00202", "count": 12, "include_done": false, "child_task_ids": []}
+→ {"parent_task_id": ..., "project_id": ..., "queued": [{"job_id", "task_id", "subject"}], "skipped": [...]}
+```
+
+Mỗi thẻ con thành một job riêng, chạy tuần tự (một trình duyệt, một phiên Flow):
+
+1. Ảnh nguồn lấy từ thẻ **cha** — comment, attachment, hoặc `cover_image`.
+2. Prompt ghép từ tiêu đề + mô tả của thẻ **con** cộng bối cảnh mô tả của thẻ cha.
+3. Ảnh chạy xong dừng ở **bước duyệt trên dashboard** — đúng yêu cầu "nhớ có nút duyệt/bỏ để check ảnh". Chưa duyệt thì không có gì được ghi lên ERP.
+4. Ảnh được duyệt mới được gửi vào comment của **chính thẻ con** đó; ảnh bị từ chối không bao giờ rời khỏi máy.
+
+Vì đích ghi khác thẻ nguồn, ảnh của idea nằm ở comment cấp một của thẻ con (không chui vào thread trả lời của comment ảnh nguồn trên thẻ cha). Thẻ con đã có ảnh Flow (`[FLOW_V2_ARTIFACT]`) bị bỏ qua, trừ khi bật **Chạy lại cả thẻ con đã có ảnh Flow** (`include_done: true`). Truyền `child_task_ids` để chỉ chạy vài idea cụ thể.
 
 ### 4.2. Custom giao diện và luồng automation
 
@@ -242,7 +301,7 @@ Trong sidebar **Tùy biến người dùng**, có thể đổi:
 - nguồn prompt bằng link Google Sheet/CSV, upload `.xlsx/.csv/.tsv`, hoặc paste bảng copy từ Google Sheets
 - màu chủ đạo
 - tên và ghi chú từng module trong diagram
-- Gemini, Telegram, Playwright path và Trello card/list dùng cho bước viết prompt, duyệt và lưu trữ
+- Gemini, Playwright path và ERP Task/status dùng cho bước viết prompt, duyệt trên dashboard và lưu URL artifact
 - bấm từng module để đổi loại, đổi ký hiệu, bật/tắt, thêm, xóa, nhân bản hoặc di chuyển module trong diagram
 
 Khi dùng file/bảng prompt, app tìm cột `Prompt_Content` hoặc `Prompt`, ưu tiên các dòng có `Active = TRUE`, rồi đưa prompt đầu tiên vào ô **Tạo ảnh bằng Flow**.
@@ -328,6 +387,13 @@ Hiện có 34 smoke tests cho `flow_web`.
 | "Google Flow chưa chuyển sang chế độ tạo ảnh" | UI tiếng Việt, selector không match "Image" | Đã fix trong `service.py` — nhận cả "Hình ảnh" |
 | Tạo ảnh bị treo mãi ở "Kết nối Flow" | Browser cũ còn lock profile hoặc reCAPTCHA chưa giải | `taskkill /F /IM chrome.exe /T`, restart app, giải captcha khi hiện |
 | Job hiển thị treo mãi ở UI | Đã fix — frontend chỉ hiện job đang chạy, ẩn failed/completed tự động |
+| Toàn bộ app treo trên macOS, mọi request đều timeout | App tìm Chromium ở `~/.cache/ms-playwright` (đường dẫn Linux) nên luôn tưởng thiếu, rồi chạy `playwright install` chặn event loop | Đã fix trong `service.py` — macOS dùng `~/Library/Caches/ms-playwright`; phần cài đặt cũng chạy ở thread riêng |
+| Dashboard báo "đã đăng nhập" nhưng job nào cũng 401 | `flow._storage.is_authenticated()` chỉ kiểm tra *có file* `Default/Cookies`, nên hồ sơ có phiên đã chết vẫn được tính là đăng nhập | Đã fix trong `service.py` — `get_auth_status` đọc thêm hạn của cookie `__Secure-next-auth.session-token` trong hồ sơ (chỉ đọc tên và hạn, không đọc giá trị); hồ sơ không đọc được thì giữ nguyên kết quả cũ |
+| Job báo `HTTP 401 ... API keys are not supported by this API` | Phiên đăng nhập Flow hết hạn nên không lấy được Bearer token; app rơi về API key trần | Bấm **Đăng nhập Flow** trên dashboard (hoặc `POST /api/flow/open-login`) và đăng nhập lại trong cửa sổ Chromium vừa mở |
+| `removelogo trả lỗi 503: ... can't open file '.../src/strip-ai-provenance.py': Operation not permitted` | macOS thu hồi quyền truy cập thư mục `Downloads` của tiến trình chạy removelogo (TCC) | Cấp lại quyền cho Terminal trong **System Settings → Privacy & Security → Files and Folders** (hoặc Full Disk Access) rồi `npm start` lại; trong lúc đó job vẫn chạy tiếp và giữ ảnh gốc. Chuyển hẳn thư mục `removelogo` ra ngoài `Downloads` thì hết lỗi này |
+| Job đọc ảnh trên card ERP báo `Không tải được ảnh nguồn ERP (HTTP 403)` | Ảnh người dùng thả vào comment ERP nằm ở `/private/files/`, mà bước tải ảnh nguồn lại GET ẩn danh | Đã fix trong `service.py` — `_erp_download_attachment_bytes` đi qua endpoint download có xác thực của Frappe khi URL trỏ đúng host ERP; URL host khác vẫn tải ẩn danh, không kèm credential |
+| Job chết ngay với `HTTP 400 INVALID_ARGUMENT on batchGenerateImages` | Google đổi cấu trúc request nên gọi API thẳng bị từ chối (không kèm chi tiết trường nào sai); trước đây chỉ lỗi reCAPTCHA mới có đường lui | Đã fix trong `service.py` — `_is_flow_api_argument_error` cho job chuyển sang tạo qua giao diện Flow như ca reCAPTCHA |
+| Ảnh cuối trong lô lên ERP kèm log `ERP không nhận file ảnh N` | Frappe giới hạn số tệp đính kèm mỗi Task (mặc định 20), card dùng lại nhiều lượt sẽ đầy; ảnh đó chỉ còn URL Flow gốc nên **vẫn còn watermark** | Xoá bớt ảnh cũ trên card hoặc nâng giới hạn đính kèm của Task; log tổng kết đã đếm riêng số ảnh rơi vào ca này |
 
 ---
 

@@ -1,6 +1,6 @@
 {
   "name": "flow-agent-automation-v2",
-  "description": "Make Flow v2 use Google Flow Agent as the default prompt author and generation operator. The app assistant only operates tools, Trello image selection, Flow execution, Telegram review, and Trello archive. The primary path no longer depends on Google Sheet prompts, generates 4 images by default, auto-approves Flow Agent generation prompts, and keeps Telegram as the final human review gate.",
+  "description": "Make Flow v2 use Google Flow Agent as the default prompt author and generation operator. The app assistant only operates tools, ERP image selection, Flow execution, dashboard review, and ERP archive. The primary path no longer depends on Google Sheet prompts, generates 4 images by default, auto-approves Flow Agent generation prompts, and keeps dashboard review as the final human review gate.",
   "branchName": "ralph/flow-agent-automation-v2",
   "userStories": [
     {
@@ -22,12 +22,12 @@
     {
       "id": "US-002",
       "title": "Sheetless primary automation path",
-      "description": "As an operator, I want the main automation path to work without Google Sheet prompts, so that Trello plus Flow Agent is enough to create product images.",
+      "description": "As an operator, I want the main automation path to work without Google Sheet prompts, so that ERP plus Flow Agent is enough to create product images.",
       "acceptanceCriteria": [
-        "The default Auto Trello run does not fail because no Google Sheet prompt matches.",
+        "The default Auto ERP run does not fail because no Google Sheet prompt matches.",
         "Google Sheet prompt library remains optional or secondary, not required for the primary path.",
         "UI copy makes clear that Flow Agent writes the prompt for the main path.",
-        "Existing Sheet status does not block Trello image selection and Flow Agent execution.",
+        "Existing Sheet status does not block ERP image selection and Flow Agent execution.",
         "Quality gates in metadata.qualityGates pass."
       ],
       "priority": 1,
@@ -41,7 +41,7 @@
       "description": "As an operator, I want the app AI to operate the workflow rather than write final prompts, so that prompt quality comes from Flow Agent and the local assistant stays predictable.",
       "acceptanceCriteria": [
         "The assistant panel no longer presents its own final image prompt as the production prompt.",
-        "Assistant actions can search Trello, choose a card/attachment, set module values, and start the automation.",
+        "Assistant actions can search ERP, choose a card/attachment, set module values, and start the automation.",
         "Assistant output explains what it will send to Flow Agent without pretending to generate the final prompt locally.",
         "Action buttons run immediately after selection when the user chooses a valid card/image.",
         "Quality gates in metadata.qualityGates pass."
@@ -57,10 +57,10 @@
     {
       "id": "US-004",
       "title": "Flow Agent interaction and auto approval",
-      "description": "As an operator, I want the app to talk to Google Flow Agent, attach the selected Trello reference, and approve Flow Agent's confirmation automatically, so that long generation runs do not stall.",
+      "description": "As an operator, I want the app to talk to Google Flow Agent, attach the selected ERP reference, and approve Flow Agent's confirmation automatically, so that long generation runs do not stall.",
       "acceptanceCriteria": [
         "The runner opens the configured Flow project and enables Agent mode when available.",
-        "The runner sends product analysis instructions, selected Trello image context, and requested image count to Flow Agent.",
+        "The runner sends product analysis instructions, selected ERP image context, and requested image count to Flow Agent.",
         "If Flow asks for generation approval, the app chooses approve-and-do-not-ask-again when available, then approves.",
         "The runner detects results from streamChat, batchGenerateImages, or project image scanning.",
         "Timeouts produce a clear recoverable error instead of looping forever.",
@@ -76,13 +76,13 @@
     },
     {
       "id": "US-005",
-      "title": "Telegram review and same-card Trello archive",
-      "description": "As an operator, I want generated images reviewed in Telegram before archiving, so that only approved outputs return to the original Trello card.",
+      "title": "Dashboard review and same-card ERP archive",
+      "description": "As an operator, I want generated images reviewed on the dashboard before archiving, so that only approved outputs return to the original ERP card.",
       "acceptanceCriteria": [
-        "Flow Agent approval is automatic, but final image approval in Telegram remains human-gated.",
-        "Approved Telegram images upload back to the same source Trello card.",
-        "Rejected or pending images are not archived to Trello.",
-        "The history view shows source card, selected attachment, Flow artifacts, Telegram status, and archive result.",
+        "Flow Agent approval is automatic, but final image approval on the dashboard remains human-gated.",
+        "Approved dashboard images are recorded back to the same source ERP card.",
+        "Rejected or pending images are not archived to ERP.",
+        "The history view shows source card, selected attachment, Flow artifacts, dashboard status, and archive result.",
         "Quality gates in metadata.qualityGates pass."
       ],
       "priority": 2,
@@ -124,13 +124,13 @@
       "./.venv/bin/python -m unittest tests.test_flow_web_smoke -q",
       "git diff --check",
       "background browser verification against http://127.0.0.1:8000/",
-      "real or safe smoke run proving selected Trello image context reaches Flow Agent and returns artifacts or a clear recoverable error"
+      "real or safe smoke run proving selected ERP image context reaches Flow Agent and returns artifacts or a clear recoverable error"
     ],
     "decisions": {
-      "primaryFlow": "Trello source image -> Google Flow Agent writes prompt -> generate images -> Telegram review -> archive approved images to the same Trello card",
+      "primaryFlow": "ERP source image -> Google Flow Agent writes prompt -> generate images -> dashboard review -> archive approved images to the same ERP card",
       "promptSource": "Google Flow Agent only for the production prompt",
       "flowAgentApproval": "auto approve inside Google Flow",
-      "telegramApproval": "human approval remains required",
+      "dashboardApproval": "human approval remains required",
       "defaultImageCount": 4,
       "backgroundTesting": true
     },

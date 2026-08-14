@@ -194,7 +194,7 @@ Cap nhat rule ve sau:
 3. Neu Auto dang chay, updater se cho tac vu hien tai xong roi moi backup, cap nhat va mo lai tool.
 4. Sau khi cap nhat, bat lai Auto lien tuc khi can.
 
-Updater khong thay doi tai khoan, profile trinh duyet, lich su, anh da tai hay cau hinh Trello.
+Updater khong thay doi tai khoan, profile trinh duyet, lich su, anh da tai hay cau hinh ERP.
 
 Ban nay da kem san:
 - Python portable

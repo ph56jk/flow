@@ -20,13 +20,29 @@ const REFERENCE_ROLE_OPTIONS = [
 const AUTOMATION_STORAGE_KEY = "flow-web-automation-dashboard-v1";
 const AUTOMATION_CONFIG_VERSION = 1;
 const DEFAULT_PROMPT_SHEET_URL = "https://docs.google.com/spreadsheets/d/1I8J4jkj2p_H2hsbDgh-kzc0WqUFWtmqR0gYqbE9Zp4U/edit?gid=2137274733#gid=2137274733";
-const DEFAULT_TRELLO_BOARD_URL = "https://trello.com/b/I2ti3PbI/2026";
-const DEFAULT_TRELLO_SOURCE_LIST_ID = "69e2ff2a90718d242df060b7";
-const DEFAULT_TRELLO_SOURCE_SCOPE_LABEL = "Ready for AI";
+const DEFAULT_ERP_PROJECT_URL = "PROJ-0049";
+
+// The app still touches exactly one ERP Project at a time; the owner just picks
+// which one instead of being locked to the project this app shipped with.
+function normalizeERPProjectId(value) {
+  const text = String(value || "").trim().toUpperCase();
+  const match = text.match(/PROJ-\d{4,}/);
+  return match ? match[0] : "";
+}
+
+function currentERPProjectId() {
+  return (
+    normalizeERPProjectId(state.erp?.project_id) ||
+    normalizeERPProjectId(state.automation?.erpProjectId) ||
+    DEFAULT_ERP_PROJECT_URL
+  );
+}
+const DEFAULT_ERP_SOURCE_LIST_ID = "Open";
+const DEFAULT_ERP_SOURCE_SCOPE_LABEL = "Task trạng thái Open";
 const FLOW_AI_SOURCE_TYPE = "flow_ai";
 const FLOW_AGENT_DEFAULT_IMAGE_COUNT = 12;
 const FLOW_AGENT_TARGET_OUTPUT_COUNT = 12;
-const AUTOMATION_STEP_ORDER = ["source", "trello_source", "normalize", "flow", "review_hold", "log", "telegram"];
+const AUTOMATION_STEP_ORDER = ["source", "erp_source", "normalize", "flow", "watermark", "review_hold", "log"];
 const AUTOMATION_CANVAS_ZOOM_MIN = 0.72;
 const AUTOMATION_CANVAS_ZOOM_MAX = 1.35;
 const AUTOMATION_CANVAS_ZOOM_STEP = 0.1;
@@ -39,14 +55,14 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
     title: "Flow Agent Request",
     detail: "Yêu cầu cho Tác nhân Flow",
     icon: "T",
-    iconClass: "node-icon-trello",
+    iconClass: "node-icon-erp",
   },
-  trello_source: {
-    label: "Trello source",
-    title: "Trello Image Source",
-    detail: "Lấy ảnh gốc từ đúng card Trello",
+  erp_source: {
+    label: "ERP source",
+    title: "ERP Task Source",
+    detail: "Lấy ảnh gốc từ đúng ERP Task",
     icon: "TS",
-    iconClass: "node-icon-trello",
+    iconClass: "node-icon-erp",
   },
   normalize: {
     label: "Prepare",
@@ -62,25 +78,25 @@ const AUTOMATION_MODULE_TYPE_CONFIG = {
     icon: "F",
     iconClass: "node-icon-flow",
   },
-  telegram: {
-    label: "Telegram",
-    title: "Telegram Optional",
-    detail: "Gửi thêm khi cần",
-    icon: "TG",
-    iconClass: "node-icon-telegram",
+  watermark: {
+    label: "Remove Logo",
+    title: "Remove Logo",
+    detail: "Xóa watermark Gemini bằng bộ xử lý cục bộ",
+    icon: "W",
+    iconClass: "node-icon-watermark",
   },
-  trello: {
-    label: "Trello",
-    title: "Trello Archive",
-    detail: "Lưu ảnh vào card/list Trello",
+  erp: {
+    label: "ERP",
+    title: "ERP Task Comment",
+    detail: "Ghi URL ảnh đã duyệt vào đúng Task",
     icon: "L",
     iconClass: "node-icon-log",
   },
   approval: {
     label: "Review",
-    title: "Trello Review",
-    detail: "Duyệt trực tiếp trên card Trello",
-    icon: "A",
+    title: "Dashboard Review",
+    detail: "Chờ quyết định duyệt ngay trong app",
+    icon: "D",
     iconClass: "node-icon-log",
   },
   custom: {
@@ -96,9 +112,9 @@ const AUTOMATION_STEP_DEFAULTS = {
     title: "Flow Agent Request",
     detail: "Yêu cầu cho Tác nhân Flow",
   },
-  trello_source: {
-    title: "Trello Image Source",
-    detail: "Lấy ảnh sản phẩm gốc từ card Trello",
+  erp_source: {
+    title: "ERP Task Source",
+    detail: "Lấy ảnh sản phẩm gốc từ ERP Task",
   },
   normalize: {
     title: "Prepare Request",
@@ -108,17 +124,17 @@ const AUTOMATION_STEP_DEFAULTS = {
     title: "Google Flow",
     detail: "Tác nhân Flow tạo ảnh",
   },
-  telegram: {
-    title: "Telegram Optional",
-    detail: "Gửi thêm nếu cần",
+  watermark: {
+    title: "Remove Logo",
+    detail: "Xóa watermark Gemini trước khi duyệt",
   },
   log: {
-    title: "Trello Archive",
-    detail: "Lưu ảnh vào card/list Trello",
+    title: "ERP Task Comment",
+    detail: "Ghi URL ảnh đã duyệt vào đúng Task",
   },
   review_hold: {
-    title: "Trello Review",
-    detail: "Ảnh lên đúng card để duyệt trực tiếp",
+    title: "Dashboard Review",
+    detail: "Chỉ ghi ERP sau khi duyệt trên dashboard",
   },
 };
 const ASPECT_DETAILS = {
@@ -337,13 +353,13 @@ const EDIT_ACTION_CONFIG = {
 
 function moduleTypeForLegacyKey(key) {
   if (key === "log") {
-    return "trello";
+    return "erp";
   }
   if (key === "review_hold") {
     return "approval";
   }
-  if (key === "trello_source") {
-    return "trello_source";
+  if (key === "erp_source") {
+    return "erp_source";
   }
   return AUTOMATION_MODULE_TYPE_CONFIG[key] ? key : "custom";
 }
@@ -423,7 +439,7 @@ function normalizeAutomationModule(value = {}, index = 0) {
   const title = type === "source" && ["Prompt Source", "AI Prompt Source", "Flow AI Prompt"].includes(sourceTitle)
     ? fallback.title
     : String(value.title || fallback.title);
-  const detail = type === "source" && ["Google Sheet / file / nhập tay", "Trello / Sheet / nhập tay", "AI tự viết / Sheet tùy chọn", "Flow AI tự viết prompt"].includes(sourceDetail)
+  const detail = type === "source" && ["Google Sheet / file / nhập tay", "ERP / Sheet / nhập tay", "AI tự viết / Sheet tùy chọn", "Flow AI tự viết prompt"].includes(sourceDetail)
     ? fallback.detail
     : String(value.detail || fallback.detail);
   return createAutomationModule(type, {
@@ -454,6 +470,7 @@ function normalizeAutomationModules(parsed = {}) {
       modules.push(normalizeAutomationModule(legacy, modules.length));
     }
   }
+  modules = modules.filter((module) => module.type !== "telegram");
   modules = modules.length ? modules : defaultAutomationModules();
   const existingTypes = new Set(modules.map((module) => module.type));
   for (const key of AUTOMATION_STEP_ORDER) {
@@ -468,6 +485,14 @@ function normalizeAutomationModules(parsed = {}) {
       detail: legacy.detail,
     }));
     existingTypes.add(requiredType);
+  }
+  // A saved config from before the Remove Logo node gets it appended last, but
+  // it only makes sense between Flow and the review gate.
+  const watermarkIndex = modules.findIndex((module) => module.type === "watermark");
+  const flowIndex = modules.findIndex((module) => module.type === "flow");
+  if (watermarkIndex > -1 && flowIndex > -1 && watermarkIndex !== flowIndex + 1) {
+    const [watermarkModule] = modules.splice(watermarkIndex, 1);
+    modules.splice(modules.findIndex((module) => module.type === "flow") + 1, 0, watermarkModule);
   }
   return modules;
 }
@@ -486,17 +511,15 @@ function defaultAutomationConfig() {
     sourceType: FLOW_AI_SOURCE_TYPE,
     sourceLocation: "",
     promptProductFilter: "",
-    telegramChat: "",
     sheetLog: "",
-    trelloBoardId: DEFAULT_TRELLO_BOARD_URL,
-    trelloCardId: "",
-    trelloListId: DEFAULT_TRELLO_SOURCE_LIST_ID,
-    trelloAttachmentIds: [],
-    trelloSetCover: true,
+    erpProjectId: DEFAULT_ERP_PROJECT_URL,
+    erpTaskId: "",
+    erpStatusId: DEFAULT_ERP_SOURCE_LIST_ID,
+    erpAttachmentIds: [],
     prompt: "",
     appEyebrow: "Flow v2",
     appTitle: "Flow v2",
-    appSubtitle: "Mọi thứ đã sẵn sàng. Auto Trello sẽ lấy ảnh, Tác nhân Flow tự viết prompt, tạo 12 ảnh trong một job rồi đẩy về đúng card Trello.",
+    appSubtitle: "Auto ERP lấy ảnh từ Task, Flow tạo ảnh, duyệt ngay trên dashboard, rồi ghi URL ảnh đã duyệt vào comment của chính Task.",
     accentColor: "#7c2ee6",
     canvasZoom: 1,
     modules,
@@ -532,8 +555,8 @@ function normalizeAutomationConfig(value = {}) {
       return { ...module, settings };
     });
   }
-  const trelloBoardId = String(parsed?.trelloBoardId || "").trim() || fallback.trelloBoardId;
-  const trelloListId = String(parsed?.trelloListId || "").trim() || fallback.trelloListId;
+  const erpProjectId = normalizeERPProjectId(parsed?.erpProjectId) || DEFAULT_ERP_PROJECT_URL;
+  const erpStatusId = String(parsed?.erpStatusId || "").trim() || fallback.erpStatusId;
   return {
     ...fallback,
     ...parsed,
@@ -543,18 +566,16 @@ function normalizeAutomationConfig(value = {}) {
     sourceType,
     sourceLocation,
     promptProductFilter: String(parsed?.promptProductFilter || ""),
-    telegramChat: String(parsed?.telegramChat || ""),
     sheetLog: String(parsed?.sheetLog || ""),
-    trelloBoardId,
-    trelloCardId: String(parsed?.trelloCardId || ""),
-    trelloListId,
-    trelloAttachmentIds: Array.isArray(parsed?.trelloAttachmentIds)
-      ? parsed.trelloAttachmentIds.map((item) => String(item || "").trim()).filter(Boolean)
-      : String(parsed?.trelloAttachmentIds || "")
+    erpProjectId,
+    erpTaskId: String(parsed?.erpTaskId || ""),
+    erpStatusId,
+    erpAttachmentIds: Array.isArray(parsed?.erpAttachmentIds)
+      ? parsed.erpAttachmentIds.map((item) => String(item || "").trim()).filter(Boolean)
+      : String(parsed?.erpAttachmentIds || "")
           .split(/[\s,;]+/)
           .map((item) => item.trim())
           .filter(Boolean),
-    trelloSetCover: parsed?.trelloSetCover !== false,
     prompt: String(parsed?.prompt || ""),
     appEyebrow: String(parsed?.appEyebrow || fallback.appEyebrow),
     appTitle: String(parsed?.appTitle || fallback.appTitle),
@@ -594,42 +615,37 @@ function clampAutomationCanvasZoom(value) {
   return Math.min(AUTOMATION_CANVAS_ZOOM_MAX, Math.max(AUTOMATION_CANVAS_ZOOM_MIN, zoom));
 }
 
-function defaultTrelloState() {
+function defaultERPState() {
   return {
     configured: false,
     credentials_saved: false,
     api_key_saved: false,
-    token_saved: false,
+    api_secret_saved: false,
     credentials_source: "",
-    board_id: "",
-    card_id: "",
-    list_id: "",
-    upload_mode: "file",
-    set_cover: true,
-    upscale_to_2k: true,
+    base_url: "https://erp.havigroup.llc",
+    project_id: DEFAULT_ERP_PROJECT_URL,
+    task_id: "",
+    status: "",
     updated_at: "",
   };
 }
 
-function normalizeTrelloState(value = {}) {
+function normalizeERPState(value = {}) {
   const payload = value && typeof value === "object" ? value : {};
-  const uploadMode = ["file", "url"].includes(payload.upload_mode) ? payload.upload_mode : "file";
   const credentialsSource = ["state", "env"].includes(payload.credentials_source)
     ? payload.credentials_source
     : "";
   return {
-    ...defaultTrelloState(),
+    ...defaultERPState(),
     configured: Boolean(payload.configured),
     credentials_saved: Boolean(payload.credentials_saved),
     api_key_saved: Boolean(payload.api_key_saved),
-    token_saved: Boolean(payload.token_saved),
+    api_secret_saved: Boolean(payload.api_secret_saved),
     credentials_source: credentialsSource,
-    board_id: String(payload.board_id || ""),
-    card_id: String(payload.card_id || ""),
-    list_id: String(payload.list_id || ""),
-    upload_mode: uploadMode,
-    set_cover: payload.set_cover !== false,
-    upscale_to_2k: payload.upscale_to_2k !== false,
+    base_url: String(payload.base_url || "https://erp.havigroup.llc"),
+    project_id: String(payload.project_id || DEFAULT_ERP_PROJECT_URL),
+    task_id: String(payload.task_id || ""),
+    status: String(payload.status || ""),
     updated_at: String(payload.updated_at || ""),
   };
 }
@@ -716,7 +732,7 @@ const state = {
   },
   promptSourcePreview: null,
   integrations: defaultIntegrationState(),
-  trello: defaultTrelloState(),
+  erp: defaultERPState(),
   promptAiResults: {
     video: null,
     image: null,
@@ -786,7 +802,6 @@ const elements = {
   automationIncompleteRefreshButton: document.querySelector("#automationIncompleteRefreshButton"),
   automationUseStudioButton: document.querySelector("#automationUseStudioButton"),
   automationOpenFlowButton: document.querySelector("#automationOpenFlowButton"),
-  automationResetReadyButton: document.querySelector("#automationResetReadyButton"),
   automationAutoRunButton: document.querySelector("#automationAutoRunButton"),
   automationRunButton: document.querySelector("#automationRunButton"),
   automationRunImageButton: document.querySelector("#automationRunImageButton"),
@@ -813,7 +828,6 @@ const elements = {
   automationModuleDeleteButton: document.querySelector("#automationModuleDeleteButton"),
   automationModuleSettings: document.querySelector("#automationModuleSettings"),
   automationPromptSourceSection: document.querySelector("#automationPromptSourceSection"),
-  automationTelegramInput: document.querySelector("#automationTelegramInput"),
   automationSheetInput: document.querySelector("#automationSheetInput"),
   automationSheetStatus: document.querySelector("#automationSheetStatus"),
   automationSheetPasteInput: document.querySelector("#automationSheetPasteInput"),
@@ -822,30 +836,34 @@ const elements = {
   automationSheetPreviewButton: document.querySelector("#automationSheetPreviewButton"),
   automationSheetPreviewList: document.querySelector("#automationSheetPreviewList"),
   automationProductFilterInput: document.querySelector("#automationProductFilterInput"),
-  automationTrelloBoardInput: document.querySelector("#automationTrelloBoardInput"),
-  automationTrelloBoardStorageInput: document.querySelector("#automationTrelloBoardStorageInput"),
-  automationTrelloCardInput: document.querySelector("#automationTrelloCardInput"),
-  automationTrelloListInput: document.querySelector("#automationTrelloListInput"),
-  automationTrelloKeyInput: document.querySelector("#automationTrelloKeyInput"),
-  automationTrelloTokenInput: document.querySelector("#automationTrelloTokenInput"),
-  automationTrelloUploadMode: document.querySelector("#automationTrelloUploadMode"),
-  automationTrelloUpscale2KInput: document.querySelector("#automationTrelloUpscale2KInput"),
-  automationTrelloStatus: document.querySelector("#automationTrelloStatus"),
-  automationTrelloSaveButton: document.querySelector("#automationTrelloSaveButton"),
-  automationTrelloClearButton: document.querySelector("#automationTrelloClearButton"),
-  automationTrelloSection: document.querySelector("#automationTrelloSection"),
-  trelloSetupWizard: document.querySelector("#trelloSetupWizard"),
-  trelloWizardKeyInput: document.querySelector("#trelloWizardKeyInput"),
-  trelloWizardTokenInput: document.querySelector("#trelloWizardTokenInput"),
-  trelloWizardBoardInput: document.querySelector("#trelloWizardBoardInput"),
-  trelloWizardSaveButton: document.querySelector("#trelloWizardSaveButton"),
-  trelloWizardLaterButton: document.querySelector("#trelloWizardLaterButton"),
-  trelloWizardStatus: document.querySelector("#trelloWizardStatus"),
-  trelloWizardCloseTriggers: Array.from(document.querySelectorAll("[data-trello-wizard-close]")),
+  automationERPProjectInput: document.querySelector("#automationERPProjectInput"),
+  automationERPProjectStorageInput: document.querySelector("#automationERPProjectStorageInput"),
+  automationERPTaskInput: document.querySelector("#automationERPTaskInput"),
+  automationERPStatusInput: document.querySelector("#automationERPStatusInput"),
+  automationERPKeyInput: document.querySelector("#automationERPKeyInput"),
+  automationERPSecretInput: document.querySelector("#automationERPSecretInput"),
+  automationERPUploadMode: document.querySelector("#automationERPUploadMode"),
+  automationERPUpscale2KInput: document.querySelector("#automationERPUpscale2KInput"),
+  automationERPStatus: document.querySelector("#automationERPStatus"),
+  automationERPSaveButton: document.querySelector("#automationERPSaveButton"),
+  automationERPClearButton: document.querySelector("#automationERPClearButton"),
+  automationERPSection: document.querySelector("#automationERPSection"),
+  automationERPIdeaTaskInput: document.querySelector("#automationERPIdeaTaskInput"),
+  automationERPIdeaCountInput: document.querySelector("#automationERPIdeaCountInput"),
+  automationERPIdeaIncludeDoneInput: document.querySelector("#automationERPIdeaIncludeDoneInput"),
+  automationERPIdeaRunButton: document.querySelector("#automationERPIdeaRunButton"),
+  automationERPIdeaStatus: document.querySelector("#automationERPIdeaStatus"),
+  erpSetupWizard: document.querySelector("#erpSetupWizard"),
+  erpWizardKeyInput: document.querySelector("#erpWizardKeyInput"),
+  erpWizardSecretInput: document.querySelector("#erpWizardSecretInput"),
+  erpWizardBoardInput: document.querySelector("#erpWizardBoardInput"),
+  erpWizardSaveButton: document.querySelector("#erpWizardSaveButton"),
+  erpWizardLaterButton: document.querySelector("#erpWizardLaterButton"),
+  erpWizardStatus: document.querySelector("#erpWizardStatus"),
+  erpWizardCloseTriggers: Array.from(document.querySelectorAll("[data-erp-wizard-close]")),
   automationEnvStatus: document.querySelector("#automationEnvStatus"),
   automationGeminiKeyInput: document.querySelector("#automationGeminiKeyInput"),
   automationGeminiModelInput: document.querySelector("#automationGeminiModelInput"),
-  automationTelegramTokenInput: document.querySelector("#automationTelegramTokenInput"),
   automationPlaywrightPathInput: document.querySelector("#automationPlaywrightPathInput"),
   automationEnvSaveButton: document.querySelector("#automationEnvSaveButton"),
   automationEnvClearButton: document.querySelector("#automationEnvClearButton"),
@@ -960,6 +978,7 @@ const elements = {
   composerForm: document.querySelector("#composerForm"),
   refreshButton: document.querySelector("#refreshButton"),
   latestStatusCard: document.querySelector("#latestStatusCard"),
+  dashboardReviewQueue: document.querySelector("#dashboardReviewQueue"),
   modeButtons: Array.from(document.querySelectorAll(".mode-button")),
   videoInputModeButtons: Array.from(document.querySelectorAll("[data-video-input-mode]")),
 };
@@ -1750,14 +1769,13 @@ function syncAutomationFromForm() {
   state.automation.sourceType = elements.automationSourceType.value || FLOW_AI_SOURCE_TYPE;
   state.automation.sourceLocation = elements.automationSourceLocationInput.value.trim();
   state.automation.promptProductFilter = elements.automationProductFilterInput?.value?.trim() || "";
-  state.automation.telegramChat = elements.automationTelegramInput.value.trim();
   state.automation.sheetLog = elements.automationSheetInput?.value?.trim() || state.automation.sheetLog || "";
-  state.automation.trelloBoardId =
-    elements.automationTrelloBoardInput?.value?.trim() ||
-    elements.automationTrelloBoardStorageInput?.value?.trim() ||
+  state.automation.erpProjectId =
+    elements.automationERPProjectInput?.value?.trim() ||
+    elements.automationERPProjectStorageInput?.value?.trim() ||
     "";
-  state.automation.trelloCardId = elements.automationTrelloCardInput.value.trim();
-  state.automation.trelloListId = elements.automationTrelloListInput.value.trim();
+  state.automation.erpTaskId = elements.automationERPTaskInput.value.trim();
+  state.automation.erpStatusId = elements.automationERPStatusInput.value.trim();
   state.automation.appEyebrow = elements.automationAppEyebrowInput.value.trim() || "Flow v2";
   state.automation.appTitle = elements.automationAppTitleInput.value.trim() || "Flow v2";
   state.automation.appSubtitle =
@@ -1783,7 +1801,7 @@ function automationJobs() {
   return (state.jobs || []).filter((job) => job.type === "image" || job.type === "batch_image");
 }
 
-function activeContinuousAutoTrelloJob() {
+function activeContinuousAutoERPJob() {
   return automationJobs().find((job) => {
     if (!ACTIVE_STATUSES.has(job.status) || job.type !== "batch_image") {
       return false;
@@ -1808,7 +1826,7 @@ function automationStepTone(module, stats) {
       return "watch";
     }
     if (status === "failed") {
-      if ((module.type || module.id) === "trello_source" && trelloSourceIsReady(module)) {
+      if ((module.type || module.id) === "erp_source" && erpSourceIsReady(module)) {
         return "ready";
       }
       return "blocked";
@@ -1819,13 +1837,13 @@ function automationStepTone(module, stats) {
   }
   const stepKey = module.type || module.id;
   if (stepKey === "source") {
-    return state.automation.prompt.trim() || shouldAutoDiscoverTrello() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
+    return state.automation.prompt.trim() || shouldAutoDiscoverERP() ? "done" : state.automation.sourceType === "manual" ? "watch" : "pending";
   }
-  if (stepKey === "trello_source") {
-    return trelloSourceIsReady(module) ? "ready" : "blocked";
+  if (stepKey === "erp_source") {
+    return erpSourceIsReady(module) ? "ready" : "blocked";
   }
   if (stepKey === "normalize") {
-    return state.automation.prompt.trim() || shouldAutoDiscoverTrello() ? "done" : "pending";
+    return state.automation.prompt.trim() || shouldAutoDiscoverERP() ? "done" : "pending";
   }
   if (stepKey === "flow") {
     if (!state.config?.project_id || !state.auth?.authenticated) {
@@ -1836,27 +1854,36 @@ function automationStepTone(module, stats) {
     }
     return stats.completed.length ? "done" : "ready";
   }
-  if (stepKey === "telegram" || stepKey === "approval") {
+  if (stepKey === "watermark") {
+    if (state.integrations?.removelogo?.enabled === false) {
+      return "disabled";
+    }
+    if (stats.active.length) {
+      return "active";
+    }
+    return stats.completed.length ? "done" : "ready";
+  }
+  if (stepKey === "approval") {
     if (stats.active.length) {
       return "pending";
     }
     return stats.completed.length ? "watch" : "pending";
   }
-  if (stepKey === "trello") {
+  if (stepKey === "erp") {
     return stats.completed.length ? "ready" : "pending";
   }
   return "pending";
 }
 
-function trelloSourceIsReady(module = {}) {
-  if (!state.trello?.credentials_saved) {
+function erpSourceIsReady(module = {}) {
+  if (!state.erp?.credentials_saved) {
     return false;
   }
   const settings = module.settings || {};
-  const card = settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "";
-  const list = settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "";
-  const board = settings.trelloBoard || state.automation.trelloBoardId || state.trello?.board_id || "";
-  return Boolean(card || (board && list));
+  const task = settings.erpTask || state.automation.erpTaskId || state.erp?.task_id || "";
+  const status = settings.erpStatus || state.automation.erpStatusId || state.erp?.status || "";
+  const project = currentERPProjectId();
+  return Boolean(task || (project && status));
 }
 
 function latestAutomationExecutionNode(module) {
@@ -1951,39 +1978,30 @@ function renderAutomationInspector(stats) {
   if (elements.automationPromptSourceSection) {
     elements.automationPromptSourceSection.hidden = selectedType !== "source";
   }
-  if (elements.automationTrelloSection) {
-    elements.automationTrelloSection.hidden = selectedType !== "trello";
+  if (elements.automationERPSection) {
+    elements.automationERPSection.hidden = selectedType !== "erp";
   }
   if (elements.automationAppIntegrationsSection) {
-    elements.automationAppIntegrationsSection.hidden = !["telegram", "flow"].includes(selectedType);
+    elements.automationAppIntegrationsSection.hidden = selectedType !== "flow";
   }
   renderModuleSettings(selectedConfig);
-  if (document.activeElement !== elements.automationTelegramInput) {
-    elements.automationTelegramInput.value = state.automation.telegramChat || state.integrations?.telegram?.chat_id || "";
-  }
   if (document.activeElement !== elements.automationSheetInput) {
     if (elements.automationSheetInput) {
       elements.automationSheetInput.value = state.automation.sheetLog || "";
     }
   }
-  const boardValue = state.automation.trelloBoardId || state.trello?.board_id || "";
-  if (document.activeElement !== elements.automationTrelloBoardInput && elements.automationTrelloBoardInput) {
-    elements.automationTrelloBoardInput.value = boardValue;
+  const boardValue = state.automation.erpProjectId || state.erp?.project_id || "";
+  if (document.activeElement !== elements.automationERPProjectInput && elements.automationERPProjectInput) {
+    elements.automationERPProjectInput.value = boardValue;
   }
-  if (document.activeElement !== elements.automationTrelloBoardStorageInput && elements.automationTrelloBoardStorageInput) {
-    elements.automationTrelloBoardStorageInput.value = boardValue;
+  if (document.activeElement !== elements.automationERPProjectStorageInput && elements.automationERPProjectStorageInput) {
+    elements.automationERPProjectStorageInput.value = boardValue;
   }
-  if (document.activeElement !== elements.automationTrelloCardInput) {
-    elements.automationTrelloCardInput.value = state.automation.trelloCardId || state.trello?.card_id || "";
+  if (document.activeElement !== elements.automationERPTaskInput) {
+    elements.automationERPTaskInput.value = state.automation.erpTaskId || state.erp?.task_id || "";
   }
-  if (document.activeElement !== elements.automationTrelloListInput) {
-    elements.automationTrelloListInput.value = state.automation.trelloListId || state.trello?.list_id || "";
-  }
-  if (document.activeElement !== elements.automationTrelloUploadMode) {
-    elements.automationTrelloUploadMode.value = state.trello?.upload_mode || "file";
-  }
-  if (elements.automationTrelloUpscale2KInput && document.activeElement !== elements.automationTrelloUpscale2KInput) {
-    elements.automationTrelloUpscale2KInput.checked = state.trello?.upscale_to_2k !== false;
+  if (document.activeElement !== elements.automationERPStatusInput) {
+    elements.automationERPStatusInput.value = state.automation.erpStatusId || state.erp?.status || "";
   }
   if (elements.automationGeminiModelInput && document.activeElement !== elements.automationGeminiModelInput) {
     elements.automationGeminiModelInput.value = state.integrations?.gemini?.model || "gemini-2.5-flash";
@@ -2025,38 +2043,37 @@ function renderAutomationInspector(stats) {
   elements.automationRunningStatus.textContent = stats.active.length ? `${stats.active.length} execution running` : "No execution";
   elements.automationRunningStatus.dataset.state = stats.active.length ? "ready" : "pending";
 
-  if (elements.automationTrelloStatus) {
-    const envBased = state.trello?.credentials_source === "env";
-    if (state.trello?.configured) {
-      elements.automationTrelloStatus.textContent = envBased
+  if (elements.automationERPStatus) {
+    const envBased = state.erp?.credentials_source === "env";
+    if (state.erp?.configured) {
+      elements.automationERPStatus.textContent = envBased
         ? "Đã sẵn sàng (.env.local)"
         : "Đã sẵn sàng";
-      elements.automationTrelloStatus.dataset.state = "ready";
-    } else if (state.trello?.credentials_saved) {
-      elements.automationTrelloStatus.textContent = envBased
-        ? "Thiếu board/card/list (key/token từ .env.local)"
-        : "Thiếu board/card/list";
-      elements.automationTrelloStatus.dataset.state = "pending";
-    } else if (state.trello?.board_id || state.trello?.card_id || state.trello?.list_id) {
-      elements.automationTrelloStatus.textContent = "Thiếu key/token";
-      elements.automationTrelloStatus.dataset.state = "pending";
+      elements.automationERPStatus.dataset.state = "ready";
+    } else if (state.erp?.credentials_saved) {
+      elements.automationERPStatus.textContent = envBased
+        ? "Thiếu Project/Task/trạng thái (API key/secret từ .env.local)"
+        : "Thiếu Project/Task/trạng thái";
+      elements.automationERPStatus.dataset.state = "pending";
+    } else if (state.erp?.project_id || state.erp?.task_id || state.erp?.status) {
+      elements.automationERPStatus.textContent = "Thiếu API key/secret";
+      elements.automationERPStatus.dataset.state = "pending";
     } else {
-      elements.automationTrelloStatus.textContent = "Chưa lưu";
-      elements.automationTrelloStatus.dataset.state = "pending";
+      elements.automationERPStatus.textContent = "Chưa lưu";
+      elements.automationERPStatus.dataset.state = "pending";
     }
   }
 
   if (elements.automationEnvStatus) {
     const configuredCount = [
       state.integrations?.gemini?.configured,
-      state.integrations?.telegram?.configured,
       state.integrations?.runtime?.playwright_browsers_path_set,
     ].filter(Boolean).length;
     if (configuredCount >= 2) {
-      elements.automationEnvStatus.textContent = `${configuredCount}/3 đã lưu`;
+      elements.automationEnvStatus.textContent = `${configuredCount}/2 đã lưu`;
       elements.automationEnvStatus.dataset.state = "ready";
     } else if (configuredCount === 1) {
-      elements.automationEnvStatus.textContent = "1/3 đã lưu";
+      elements.automationEnvStatus.textContent = "1/2 đã lưu";
       elements.automationEnvStatus.dataset.state = "pending";
     } else {
       elements.automationEnvStatus.textContent = "Chưa lưu";
@@ -2081,7 +2098,7 @@ function renderModuleSettings(module) {
         <select data-module-setting="sourceType">
           <option value="flow_ai"${sourceType === FLOW_AI_SOURCE_TYPE ? " selected" : ""}>Tác nhân Flow tự viết prompt</option>
           <option value="manual"${sourceType === "manual" ? " selected" : ""}>Nhập tay / clipboard</option>
-          <option value="trello"${sourceType === "trello" ? " selected" : ""}>Trello list</option>
+          <option value="erp"${sourceType === "erp" ? " selected" : ""}>ERP Task</option>
           <option value="sheets"${sourceType === "sheets" ? " selected" : ""}>Google Sheets / Excel</option>
           <option value="folder"${sourceType === "folder" ? " selected" : ""}>Folder / CSV nội bộ</option>
         </select>
@@ -2140,75 +2157,51 @@ function renderModuleSettings(module) {
     `;
     return;
   }
-  if (type === "trello_source") {
+  if (type === "erp_source") {
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
-        <span>Board chứa card ảnh</span>
-        <input type="text" data-module-setting="trelloBoard" value="${escapeHtml(settings.trelloBoard || state.automation.trelloBoardId || state.trello?.board_id || "")}" placeholder="Board ID hoặc link board Trello" />
+        <span>HaviGroup ERP Project (theo cấu hình)</span>
+        <input type="text" value="${escapeHtml(currentERPProjectId())}" readonly aria-readonly="true" />
       </label>
       <label class="field">
-        <span>Card lấy ảnh gốc</span>
-        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello chứa ảnh gốc" />
+        <span>Task lấy ảnh gốc</span>
+        <input type="text" data-module-setting="erpTask" value="${escapeHtml(settings.erpTask || state.automation.erpTaskId || state.erp?.task_id || "")}" placeholder="TASK-xxxx" />
       </label>
       <label class="field">
-        <span>List lọc card tùy chọn</span>
-        <input type="text" data-module-setting="trelloList" value="${escapeHtml(settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu chỉ muốn lấy card trong một list" />
+        <span>Trạng thái nguồn tùy chọn</span>
+        <input type="text" data-module-setting="erpStatus" value="${escapeHtml(settings.erpStatus || state.automation.erpStatusId || state.erp?.status || "")}" placeholder="Trạng thái nguồn, ví dụ Open" />
       </label>
       <label class="field">
-        <span>Ảnh Trello đã chọn</span>
-        <input type="text" data-module-setting="trelloAttachmentIds" value="${escapeHtml(
-          Array.isArray(settings.trelloAttachmentIds)
-            ? settings.trelloAttachmentIds.join(", ")
-            : Array.isArray(state.automation.trelloAttachmentIds)
-              ? state.automation.trelloAttachmentIds.join(", ")
+        <span>Ảnh ERP đã chọn (URL HTTPS công khai)</span>
+        <input type="text" data-module-setting="erpAttachmentIds" value="${escapeHtml(
+          Array.isArray(settings.erpAttachmentIds)
+            ? settings.erpAttachmentIds.join(", ")
+            : Array.isArray(state.automation.erpAttachmentIds)
+              ? state.automation.erpAttachmentIds.join(", ")
               : "",
         )}" placeholder="Attachment ID, bấm thumbnail trong trợ lý để tự điền" />
       </label>
       <label class="field">
         <span>Số ảnh lấy tối đa</span>
-        <input type="number" min="1" max="4" step="1" data-module-setting="trelloAttachmentLimit" value="${escapeHtml(settings.trelloAttachmentLimit || 1)}" />
+        <input type="number" min="1" max="4" step="1" data-module-setting="erpAttachmentLimit" value="${escapeHtml(settings.erpAttachmentLimit || 1)}" />
       </label>
-      <small>Bấm đúng thumbnail trong trợ lý để khóa chính xác attachment ảnh. Nếu không chọn ảnh cụ thể, app sẽ lấy ảnh đầu tiên trong card.</small>
+      <small>Bấm thumbnail trong trợ lý để khóa đúng ảnh. ERP chỉ đọc URL HTTPS công khai; nếu không chọn ảnh cụ thể, app dùng ảnh đầu tiên của Task.</small>
     `;
     return;
   }
-  if (type === "telegram") {
+  if (type === "erp") {
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
-        <span>Chat duyệt của cục này</span>
-        <input type="text" data-module-setting="telegramChat" value="${escapeHtml(settings.telegramChat || state.automation.telegramChat || state.integrations?.telegram?.chat_id || "")}" placeholder="@review_channel hoặc chat id" />
+        <span>Task nguồn để ghi comment</span>
+        <input type="text" data-module-setting="erpTask" value="${escapeHtml(settings.erpTask || state.automation.erpTaskId || state.erp?.task_id || "")}" placeholder="TASK-xxxx" />
       </label>
       <label class="field">
-        <span>Bot token tuỳ chọn</span>
-        <input type="password" data-module-secret="telegramToken" placeholder="${state.integrations?.telegram?.bot_token_saved ? "Đã lưu token, nhập mới nếu muốn đổi" : "Dán token bot Telegram"}" />
+        <span>Nguyên tắc lưu</span>
+        <small>Chỉ URL ảnh HTTPS được duyệt ngay trên dashboard mới được ghi bằng GraphQL comment. App không tạo Task, upload file hoặc đổi trạng thái.</small>
       </label>
       <div class="customize-actions source-actions">
-        <button type="button" class="ghost-button card-button" data-module-action="save-integrations">Lưu Telegram</button>
-        <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ duyệt</button>
-      </div>
-    `;
-    return;
-  }
-  if (type === "trello") {
-    elements.automationModuleSettings.innerHTML = `
-      <label class="field">
-        <span>Card lưu ảnh</span>
-        <input type="text" data-module-setting="trelloCard" value="${escapeHtml(settings.trelloCard || state.automation.trelloCardId || state.trello?.card_id || "")}" placeholder="Card ID hoặc link card Trello" />
-      </label>
-      <label class="field">
-        <span>List tạo card mới</span>
-        <input type="text" data-module-setting="trelloList" value="${escapeHtml(settings.trelloList || state.automation.trelloListId || state.trello?.list_id || "")}" placeholder="List ID nếu muốn mỗi job tạo card mới" />
-      </label>
-      <label class="field">
-        <span>Cách lưu ảnh</span>
-        <select data-module-setting="trelloUploadMode">
-          <option value="file"${(settings.trelloUploadMode || state.trello?.upload_mode || "file") === "file" ? " selected" : ""}>Upload file thật</option>
-          <option value="url"${(settings.trelloUploadMode || state.trello?.upload_mode) === "url" ? " selected" : ""}>Chỉ attach link</option>
-        </select>
-      </label>
-      <div class="customize-actions source-actions">
-        <button type="button" class="ghost-button card-button" data-module-action="save-trello">Lưu Trello</button>
-        <button type="button" class="ghost-button card-button" data-module-action="clear-trello">Xóa key/token</button>
+        <button type="button" class="ghost-button card-button" data-module-action="save-erp">Lưu ERP</button>
+        <button type="button" class="ghost-button card-button" data-module-action="clear-erp">Xóa API credential</button>
       </div>
     `;
     return;
@@ -2217,15 +2210,9 @@ function renderModuleSettings(module) {
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Trạng thái duyệt</span>
-        <select data-module-setting="approvalMode">
-          <option value="trello"${(settings.approvalMode || "trello") === "trello" ? " selected" : ""}>Duyệt trực tiếp trên Trello</option>
-          <option value="manual"${settings.approvalMode === "manual" ? " selected" : ""}>Duyệt tay</option>
-          <option value="telegram"${settings.approvalMode === "telegram" ? " selected" : ""}>Duyệt bằng nút Telegram</option>
-          <option value="auto"${settings.approvalMode === "auto" ? " selected" : ""}>Tự ghi log sau khi tạo</option>
-        </select>
+        <small>Duyệt ngay trên dashboard. Ảnh bị từ chối hoặc chưa có quyết định sẽ không được ghi vào ERP.</small>
       </label>
-      <small>Auto Trello sẽ upload ảnh tạo xong về đúng card đang chạy. Telegram chỉ dùng khi chủ nhân chọn riêng.</small>
-      <button type="button" class="ghost-button card-button" data-module-action="sync-telegram-approvals">Đồng bộ Telegram nếu dùng</button>
+      <small>Khi đủ quyết định cho tất cả ảnh, app tự ghi URL artefact đã duyệt vào comment của đúng ERP Task.</small>
     `;
     return;
   }
@@ -2287,7 +2274,7 @@ function renderPromptSourcePreview() {
     elements.automationSheetPreviewList.innerHTML =
       state.automation.sourceType === "sheets"
         ? `<p class="empty-automation-history">Dán link, upload file hoặc paste bảng rồi bấm lấy prompt.</p>`
-        : `<p class="empty-automation-history">Đang dùng Tác nhân Flow: app chỉ chọn ảnh Trello và gửi lệnh, prompt ảnh cuối do Google Flow tự viết.</p>`;
+        : `<p class="empty-automation-history">Đang dùng Tác nhân Flow: app chỉ chọn ảnh ERP và gửi lệnh, prompt ảnh cuối do Google Flow tự viết.</p>`;
     return;
   }
   const totalActive = Number(preview?.active_count || items.length || 0);
@@ -2415,8 +2402,8 @@ function activePromptSourceItems({ limit = 40, ignoreFilter = false } = {}) {
       product_name: String(item.product_name || "").trim(),
       index: String(item.index || "").trim(),
       notes: String(item.notes || "").trim(),
-      trello_card_id: String(item.trello_card_id || "").trim(),
-      trello_list_id: String(item.trello_list_id || "").trim(),
+      erp_task_id: String(item.erp_task_id || "").trim(),
+      erp_status_id: String(item.erp_status_id || "").trim(),
     }));
   return Number.isFinite(limit) ? normalizedItems.slice(0, Math.max(1, limit)) : normalizedItems;
 }
@@ -2489,88 +2476,84 @@ function productFilterMatches(values, filter) {
   return productFilterGroups(filter).some((group) => group.length && group.every((token) => tokenSet.has(token)));
 }
 
-function shouldAutoDiscoverTrello(batchItems = activePromptSourceItems({ limit: 500 })) {
-  if (!automationModuleEnabled("trello_source")) {
+function shouldAutoDiscoverERP(batchItems = activePromptSourceItems({ limit: 500 })) {
+  if (!automationModuleEnabled("erp_source")) {
     return false;
   }
-  const board = String(state.automation.trelloBoardId || state.trello?.board_id || "").trim();
+  const project = currentERPProjectId();
   const sourceType = String(state.automation.sourceType || FLOW_AI_SOURCE_TYPE);
   const hasPrompt = Boolean(String(state.automation.prompt || "").trim());
   return Boolean(
-    board &&
+    project &&
       (
         sourceType === FLOW_AI_SOURCE_TYPE ||
         sourceType === "sheets" ||
-        sourceType === "trello" ||
+        sourceType === "erp" ||
         batchItems.length ||
         !hasPrompt
       )
   );
 }
 
-function effectiveAutomationBatchLimit({ autoTrello = false } = {}) {
-  return automationModuleEnabled("trello_source") && !autoTrello ? 1 : (autoTrello ? 0 : 40);
+function effectiveAutomationBatchLimit({ autoERP = false } = {}) {
+  return automationModuleEnabled("erp_source") && !autoERP ? 1 : (autoERP ? 0 : 40);
 }
 
 function renderEasyPanel(stats) {
   const batchItems = activePromptSourceItems();
-  const autoTrelloReady = shouldAutoDiscoverTrello(batchItems);
-  const continuousAutoJob = activeContinuousAutoTrelloJob();
-  const batchLimit = effectiveAutomationBatchLimit({ autoTrello: autoTrelloReady });
+  const autoERPReady = shouldAutoDiscoverERP(batchItems);
+  const continuousAutoJob = activeContinuousAutoERPJob();
+  const batchLimit = effectiveAutomationBatchLimit({ autoERP: autoERPReady });
   const displayedBatchCount = batchItems.length > 1 ? Math.min(batchItems.length, batchLimit) : batchItems.length;
-  const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0 || autoTrelloReady;
+  const promptReady = Boolean(String(state.automation.prompt || "").trim()) || batchItems.length > 0 || autoERPReady;
   const projectReady = Boolean(state.config?.project_id);
   const flowModuleReady = automationModuleEnabled("flow");
   const flowReady = flowModuleReady && projectReady && Boolean(state.auth?.authenticated);
-  const trelloReady = automationModuleEnabled("trello") && Boolean(
-    state.trello?.configured ||
-    state.automation.trelloBoardId ||
-    state.automation.trelloCardId ||
-    state.automation.trelloListId
+  const erpReady = automationModuleEnabled("erp") && Boolean(
+    state.erp?.configured ||
+    state.automation.erpProjectId ||
+    state.automation.erpTaskId ||
+    state.automation.erpStatusId
   );
 
   if (elements.easyPromptStatus) {
-    elements.easyPromptStatus.textContent = autoTrelloReady && !batchItems.length
+    elements.easyPromptStatus.textContent = autoERPReady && !batchItems.length
       ? "Tác nhân Flow viết prompt"
-      : batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Nhập yêu cầu hoặc Auto Trello";
+      : batchItems.length > 1 ? `${batchItems.length} prompt active` : promptReady ? "Đã có prompt" : "Nhập yêu cầu hoặc Auto ERP";
   }
   if (elements.easyFlowStatus) {
     elements.easyFlowStatus.textContent = flowReady ? "Đã sẵn sàng" : !flowModuleReady ? "Thiếu cục Flow" : projectReady ? "Cần đăng nhập" : "Cần project";
   }
   if (elements.easyReviewStatus) {
-    elements.easyReviewStatus.textContent = trelloReady ? "Duyệt trên Trello" : "Cần Trello";
+    elements.easyReviewStatus.textContent = erpReady ? "Duyệt tại dashboard" : "Cần ERP";
   }
   const runHint = elements.easyRunButton?.querySelector("small");
   if (runHint) {
     runHint.textContent = stats.active.length
       ? "Đang tạo ảnh"
-      : autoTrelloReady && flowReady
-        ? `Chạy đến hết ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}`
+      : autoERPReady && flowReady
+        ? `Chạy đến hết ${DEFAULT_ERP_SOURCE_SCOPE_LABEL}`
       : batchItems.length > 1 && flowReady
         ? batchLimit === 1
-          ? "Chạy 1 prompt/card Trello"
+          ? "Chạy 1 prompt/ERP Task"
           : "Chạy vòng lặp sheet"
         : promptReady && flowReady ? "Sẵn sàng chạy" : "Bấm để chạy";
   }
   if (elements.automationRunImageButton) {
-    elements.automationRunImageButton.textContent = autoTrelloReady
-      ? (displayedBatchCount ? `Auto ${displayedBatchCount} prompt` : `Auto hết ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}`)
+    elements.automationRunImageButton.textContent = autoERPReady
+      ? (displayedBatchCount ? `Auto ${displayedBatchCount} prompt` : `Auto hết ${DEFAULT_ERP_SOURCE_SCOPE_LABEL}`)
       : batchItems.length > 1 ? `Tạo ${displayedBatchCount} prompt` : "Tạo ảnh bằng Flow";
   }
   if (elements.automationAutoRunButton) {
     elements.automationAutoRunButton.textContent = continuousAutoJob ? "Dừng auto" : "Bật auto liên tục";
-    elements.automationAutoRunButton.disabled = !continuousAutoJob && (stats.active.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello"));
-  }
-  if (elements.automationResetReadyButton) {
-    const blockingActiveJobs = stats.active.filter((job) => job.id !== continuousAutoJob?.id);
-    elements.automationResetReadyButton.disabled = blockingActiveJobs.length > 0 || !automationModuleEnabled("trello_source") || !automationModuleEnabled("trello");
+    elements.automationAutoRunButton.disabled = !continuousAutoJob && (stats.active.length > 0 || !automationModuleEnabled("erp_source") || !automationModuleEnabled("erp"));
   }
   if (elements.automationRunButton) {
-    elements.automationRunButton.textContent = autoTrelloReady ? "Chạy 1 lượt" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
+    elements.automationRunButton.textContent = autoERPReady ? "Chạy 1 lượt" : batchItems.length > 1 ? "Chạy batch" : "Chạy thử";
   }
   elements.easyPromptButton?.classList.toggle("ready", promptReady);
   elements.easyFlowButton?.classList.toggle("ready", flowReady);
-  elements.easyReviewButton?.classList.toggle("ready", trelloReady);
+  elements.easyReviewButton?.classList.toggle("ready", erpReady);
   elements.easyRunButton?.classList.toggle("ready", promptReady && flowReady && !stats.active.length);
   if (elements.easyRunButton) {
     elements.easyRunButton.disabled = stats.active.length > 0;
@@ -3002,8 +2985,7 @@ function renderPromptAssistant() {
 
 function userAssistantContextSummary() {
   const config = state.config || {};
-  const trello = state.trello || defaultTrelloState();
-  const integrations = state.integrations || defaultIntegrationState();
+  const erp = state.erp || defaultERPState();
   const promptItems = Array.isArray(state.promptSourcePreview?.items) ? state.promptSourcePreview.items : [];
   const promptRows = promptItems.length;
   const activeRows = activePromptSourceItems({ limit: 500 }).length;
@@ -3019,8 +3001,8 @@ function userAssistantContextSummary() {
   const activeJobs = (state.jobs || []).filter((job) => ACTIVE_STATUSES.has(job.status)).length;
   const failedJobs = (state.jobs || []).filter((job) => ["failed", "interrupted"].includes(job.status)).length;
   return [
-    `Quy trình chuẩn: Trello ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} attachment -> app chọn đúng ảnh/card -> Tác nhân Google Flow tự viết prompt và tạo 12 ảnh trong một job -> upload lại đúng card Trello để duyệt trực tiếp`,
-    `Nguồn sản phẩm: ảnh attachment trên từng Trello card trong list ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}`,
+    `Quy trình chuẩn: ERP Task nguồn -> app chọn ảnh HTTPS -> Tác nhân Google Flow tự viết prompt/tạo ảnh -> duyệt trên dashboard -> GraphQL thêm URL artifact vào comment của đúng Task`,
+    `Nguồn sản phẩm: URL ảnh HTTPS công khai trên ERP Task trong trạng thái ${DEFAULT_ERP_SOURCE_SCOPE_LABEL}`,
     `Màn hình đang ở chế độ ${state.mode}`,
     `Module bật: ${enabledModules || "chưa có"}`,
     `Nguồn prompt ${state.automation.sourceType || "flow_ai"} tại ${state.automation.sourceLocation || "Tác nhân Flow tự viết, Sheet tùy chọn"}`,
@@ -3028,8 +3010,8 @@ function userAssistantContextSummary() {
     `Sản phẩm/prompt mẫu ${sampleProducts || "chưa preview"}`,
     `Flow project ${config.project_id ? "đã lưu" : "chưa lưu"}`,
     `đăng nhập ${state.auth?.authenticated ? "đã có" : "chưa thấy"}`,
-    `Trello ${trello.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
-    `Telegram ${integrations.telegram?.configured ? "đã cấu hình tùy chọn" : "không bắt buộc"}`,
+    `ERP ${erp.configured ? "đã cấu hình" : "chưa đủ cấu hình"}`,
+    "Duyệt artefact: thực hiện trực tiếp trên dashboard trước khi app ghi ERP",
     `Gemini ${integrations.gemini?.configured ? "đã bật" : "chưa bật"}`,
     `prompt preview ${promptRows} dòng, ${activeRows} dòng active sau lọc`,
     `${activeJobs} job đang chạy`,
@@ -3054,7 +3036,7 @@ function renderUserAssistant() {
 
   if (!last?.answer) {
     elements.userAssistantAnswer.textContent =
-      "Hỏi lỗi Trello, Sheet hoặc Flow tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.";
+      "Hỏi lỗi ERP, Sheet hoặc Flow tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.";
     return;
   }
 
@@ -3066,20 +3048,20 @@ function renderUserAssistant() {
     .join("");
   const actions = Array.isArray(last.suggested_actions) ? last.suggested_actions.filter(Boolean) : [];
   const executableActions = actions.filter((action) => action.action);
-  const trelloCandidates = Array.isArray(last.trello_candidates) ? last.trello_candidates.filter(Boolean) : [];
+  const erpCandidates = Array.isArray(last.erp_candidates) ? last.erp_candidates.filter(Boolean) : [];
   const flowPlan = last.flow_operator_plan && typeof last.flow_operator_plan === "object" ? last.flow_operator_plan : null;
-  const selectedAttachmentCount = Array.isArray(state.automation?.trelloAttachmentIds)
-    ? state.automation.trelloAttachmentIds.filter(Boolean).length
+  const selectedAttachmentCount = Array.isArray(state.automation?.erpAttachmentIds)
+    ? state.automation.erpAttachmentIds.filter(Boolean).length
     : 0;
-  const hasRunAction = executableActions.some((action) => action.action === "run_auto_trello");
-  const canRunSelectedTrelloImage = Boolean(trelloCandidates.length && state.automation?.trelloCardId && selectedAttachmentCount);
+  const hasRunAction = executableActions.some((action) => action.action === "run_auto_erp");
+  const canRunSelectedERPImage = Boolean(erpCandidates.length && state.automation?.erpTaskId && selectedAttachmentCount);
   const planButtonLabel = state.userAssistant?.executing
     ? "Đang làm..."
-    : canRunSelectedTrelloImage
+    : canRunSelectedERPImage
       ? "Chạy ảnh đã chọn"
       : hasRunAction
         ? "Làm theo kế hoạch"
-        : trelloCandidates.length
+        : erpCandidates.length
           ? "Bấm thumbnail ảnh trước"
           : "Làm theo kế hoạch";
   const planButton = executableActions.length
@@ -3110,18 +3092,18 @@ function renderUserAssistant() {
         <div class="assistant-flow-prompt">Prompt ảnh cuối sẽ do Tác nhân Flow tự viết bên trong Google Flow.</div>
       </div>`
     : "";
-  const candidateHtml = trelloCandidates.length
+  const candidateHtml = erpCandidates.length
     ? `<div class="assistant-candidate-list">
-        <strong>Card Trello tìm được</strong>
-        ${trelloCandidates
+        <strong>ERP Task tìm được</strong>
+        ${erpCandidates
           .map((candidate) => {
             const inReady = Boolean(candidate.in_ready_list);
-            const status = inReady ? `Đúng ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}` : "Có thể chọn trực tiếp";
-            const value = candidate.short_link || candidate.card_id || candidate.url || "";
+            const status = inReady ? `Đúng ${DEFAULT_ERP_SOURCE_SCOPE_LABEL}` : "Có thể chọn trực tiếp";
+            const value = candidate.short_link || candidate.task_id || candidate.url || "";
             const previews = Array.isArray(candidate.image_previews) ? candidate.image_previews.filter(Boolean).slice(0, 4) : [];
             const firstAttachmentId = previews.map((preview) => String(preview?.id || "").trim()).find(Boolean) || "";
             const previewHtml = previews.length
-              ? `<div class="assistant-candidate-thumbs" aria-label="Ảnh trong card Trello">
+              ? `<div class="assistant-candidate-thumbs" aria-label="Ảnh trong ERP Task">
                   ${previews
                     .map((preview, index) => {
                       const src = String(preview.preview_url || preview.url || "").trim();
@@ -3129,12 +3111,12 @@ function renderUserAssistant() {
                       const label = preview.name || `Ảnh ${index + 1}`;
                       return `<button type="button" class="assistant-candidate-thumb" data-assistant-card-value="${escapeHtml(
                         value,
-                      )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" data-assistant-attachment-id="${escapeHtml(
+                      )}" data-assistant-list-id="${escapeHtml(candidate.status || "")}" data-assistant-attachment-id="${escapeHtml(
                         preview.id || "",
                       )}" ${preview.id ? "data-assistant-run-after-select=\"true\"" : ""} ${
                         state.userAssistant?.executing || !value ? "disabled" : ""
                       } title="${escapeHtml(
-                        `Chọn và chạy ảnh này trong ${candidate.name || "card Trello"}`,
+                        `Chọn và chạy ảnh này trong ${candidate.name || "ERP Task"}`,
                       )}">
                         <img src="${escapeHtml(src)}" alt="${escapeHtml(label)}" loading="lazy">
                       </button>`;
@@ -3146,7 +3128,7 @@ function renderUserAssistant() {
               value
                 ? `<button type="button" class="ghost-button card-button assistant-candidate-pin" data-assistant-card-value="${escapeHtml(
                     value,
-                  )}" data-assistant-list-id="${escapeHtml(candidate.list_id || "")}" data-assistant-attachment-id="${escapeHtml(
+                  )}" data-assistant-list-id="${escapeHtml(candidate.status || "")}" data-assistant-attachment-id="${escapeHtml(
                     firstAttachmentId,
                   )}" ${firstAttachmentId ? "data-assistant-run-after-select=\"true\"" : ""} ${
                     state.userAssistant?.executing ? "disabled" : ""
@@ -3155,7 +3137,7 @@ function renderUserAssistant() {
             return `
               <div class="assistant-candidate-item" data-ready="${inReady ? "true" : "false"}">
                 <div class="assistant-candidate-main">
-                  <strong>${escapeHtml(candidate.name || candidate.short_link || "Card Trello")}</strong>
+                  <strong>${escapeHtml(candidate.name || candidate.short_link || "ERP Task")}</strong>
                   <span>${escapeHtml(candidate.list_name || "Không rõ list")} · ${Number(candidate.image_count || 0)} ảnh · ${status}</span>
                   ${previewHtml ? `<span>Bấm đúng thumbnail để dùng chính ảnh đó làm ảnh gốc.</span>` : ""}
                   ${previewHtml}
@@ -3176,7 +3158,7 @@ function renderUserAssistant() {
     ? `<div class="assistant-action-list">${actions
         .map((action, index) => {
           const canExecute = Boolean(action.action);
-          const buttonLabel = action.action === "set_trello_card" && action.payload?.run_after_select ? "Chọn & chạy" : "Thực hiện";
+          const buttonLabel = action.action === "set_erp_task" && action.payload?.run_after_select ? "Chọn & chạy" : "Thực hiện";
           const button = canExecute
             ? `<button type="button" class="ghost-button card-button assistant-action-button" data-assistant-action-index="${index}" ${
                 state.userAssistant?.executing ? "disabled" : ""
@@ -3585,6 +3567,111 @@ function renderJobStepNotes(job) {
   `;
 }
 
+function dashboardApprovalStatus(job, artifactIndex) {
+  const approvals = job?.result?.dashboard_approvals;
+  const item = approvals && typeof approvals === "object" ? approvals[String(artifactIndex)] : null;
+  const status = String(item?.status || "").toLowerCase();
+  return ["approved", "rejected"].includes(status) ? status : "pending";
+}
+
+function jobAwaitsDashboardReview(job) {
+  if (job?.type !== "image" || !Array.isArray(job?.artifacts) || !job.artifacts.length) {
+    return false;
+  }
+  const nodes = Array.isArray(job?.result?.automation_execution?.nodes)
+    ? job.result.automation_execution.nodes
+    : [];
+  return nodes.some((node) => node?.type === "approval" && node?.status === "running");
+}
+
+function dashboardArtifactPreview(artifact) {
+  return String(artifact?.public_url || artifact?.url || "").trim();
+}
+
+function renderDashboardReviewQueue() {
+  if (!elements.dashboardReviewQueue) {
+    return;
+  }
+  const jobs = (state.jobs || [])
+    .filter(jobAwaitsDashboardReview)
+    .sort((left, right) => new Date(right.updated_at || right.created_at || 0).getTime() - new Date(left.updated_at || left.created_at || 0).getTime());
+  if (!jobs.length) {
+    elements.dashboardReviewQueue.hidden = true;
+    elements.dashboardReviewQueue.innerHTML = "";
+    return;
+  }
+
+  elements.dashboardReviewQueue.hidden = false;
+  elements.dashboardReviewQueue.innerHTML = `
+    <div class="dashboard-review-head">
+      <div>
+        <p class="eyebrow">Dashboard review</p>
+        <h3>Ảnh đang chờ duyệt</h3>
+        <p>Chỉ ảnh được duyệt ở đây mới được ghi URL vào comment của Task ERP nguồn.</p>
+      </div>
+      <span class="status-pill" data-state="pending">${jobs.length} lượt chờ</span>
+    </div>
+    <div class="dashboard-review-job-list">
+      ${jobs
+        .map((job) => {
+          const sourceTask = String(job.input?.erp_source_task_id || job.input?.erp_task_id || "").trim();
+          const sourceAttachments = Array.isArray(job.input?.erp_source_attachment_ids)
+            ? job.input.erp_source_attachment_ids.filter(Boolean)
+            : Array.isArray(job.input?.erp_attachment_ids)
+              ? job.input.erp_attachment_ids.filter(Boolean)
+              : [];
+          const ideaSource = sourceTask
+            ? `Bộ idea của Task ${sourceTask}${sourceAttachments.length ? ` · ${sourceAttachments.length} ảnh nguồn` : ""}`
+            : "Bộ idea của lượt chạy này";
+          const decisions = job.artifacts.map((artifact, artifactIndex) => {
+            const status = dashboardApprovalStatus(job, artifactIndex);
+            const preview = dashboardArtifactPreview(artifact);
+            const title = artifact.media_name || artifact.label || `Ảnh ${artifactIndex + 1}`;
+            const statusLabel = status === "approved" ? "Đã duyệt" : status === "rejected" ? "Đã từ chối" : "Chờ duyệt";
+            return `
+              <article class="dashboard-review-artifact" data-status="${escapeHtml(status)}">
+                ${preview ? `<img src="${escapeHtml(preview)}" alt="${escapeHtml(title)}" />` : `<div class="dashboard-review-placeholder">Chưa có preview</div>`}
+                <div class="dashboard-review-artifact-copy">
+                  <strong>${escapeHtml(title)}</strong>
+                  <span class="status-pill" data-state="${escapeHtml(status === "approved" ? "ready" : status === "rejected" ? "error" : "pending")}">${escapeHtml(statusLabel)}</span>
+                </div>
+                ${
+                  status === "pending"
+                    ? `<div class="card-actions">
+                        <button type="button" class="secondary-button dashboard-review-approve" data-dashboard-approval="approved" data-job-id="${escapeHtml(job.id)}" data-artifact-index="${artifactIndex}">Duyệt</button>
+                        <button type="button" class="ghost-button card-button" data-dashboard-approval="rejected" data-job-id="${escapeHtml(job.id)}" data-artifact-index="${artifactIndex}">Từ chối</button>
+                      </div>`
+                    : ""
+                }
+              </article>
+            `;
+          }).join("");
+          return `
+            <section class="dashboard-review-job">
+              <div class="dashboard-review-job-head">
+                <strong>${escapeHtml(job.title || "Flow image")}</strong>
+                <small>${escapeHtml(formatTime(job.created_at))}</small>
+              </div>
+              <p class="dashboard-review-idea-source">${escapeHtml(ideaSource)}</p>
+              <p>${escapeHtml(truncate(job.input?.prompt || "", 180) || "Không có prompt")}</p>
+              <div class="dashboard-review-artifact-grid">${decisions}</div>
+              <div class="dashboard-review-add" data-dashboard-review-job="${escapeHtml(job.id)}">
+                <div>
+                  <strong>Thêm ảnh vào bộ idea</strong>
+                  <small>Chỉ nhận URL ảnh HTTPS. Ảnh thêm vào cũng phải được duyệt trước khi ghi vào đúng Task nguồn.</small>
+                </div>
+                <input type="url" inputmode="url" autocomplete="url" placeholder="https://…/anh-da-chinh-sua.jpg" aria-label="URL ảnh bổ sung" data-dashboard-artifact-url />
+                <input type="text" maxlength="180" placeholder="Tên ảnh (tùy chọn)" aria-label="Tên ảnh bổ sung" data-dashboard-artifact-label />
+                <button type="button" class="secondary-button" data-dashboard-artifact-add data-job-id="${escapeHtml(job.id)}">Thêm ảnh</button>
+              </div>
+            </section>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 function renderLatestStatus() {
   const latestJob = jobsForCurrentMode()[0];
   if (!latestJob) {
@@ -3675,6 +3762,7 @@ function renderAll() {
   renderUserAssistant();
   renderComposer();
   renderLatestStatus();
+  renderDashboardReviewQueue();
 }
 
 async function loadState({ silent = false } = {}) {
@@ -3691,7 +3779,7 @@ async function loadState({ silent = false } = {}) {
       state.outputShelf = payload.output_shelf || { items: [] };
       state.promptAssistant = payload.prompt_assistant || null;
       state.integrations = normalizeIntegrationState(payload.integrations || {});
-      state.trello = normalizeTrelloState(payload.trello || {});
+      state.erp = normalizeERPState(payload.erp || {});
       state.skillLibraryCount = Array.isArray(payload.skills) ? payload.skills.length : 0;
 
       if (state.setupOpen == null) {
@@ -3700,7 +3788,7 @@ async function loadState({ silent = false } = {}) {
 
       renderAll();
       maybeAutoPreviewPromptSource();
-      maybeShowTrelloWizard();
+      maybeShowERPWizard();
       if (isReady() && !state.modelOptionsLoaded) {
         void loadModelOptions();
       }
@@ -4033,74 +4121,16 @@ function resetAutomationConfig() {
   showMessage("Đã reset phần custom về mặc định.", "success");
 }
 
-async function resetReadyForAiOutputs({ skipConfirm = false, quiet = false } = {}) {
-  if (automationSubmitInFlight) {
-    return null;
-  }
+async function prepareReadyForAutoERP() {
   syncAutomationFromForm();
-  const boardId = String(state.trello?.board_id || state.automation.trelloBoardId || DEFAULT_TRELLO_BOARD_URL).trim();
-  const listId = String(state.trello?.list_id || state.automation.trelloListId || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
-  if (!skipConfirm) {
-    const confirmed = window.confirm(
-      `Reset ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} sẽ xóa ảnh output do Flow tạo trên các card trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}, giữ nguyên ảnh nguồn. Sau đó Auto sẽ chạy lại các card đó. Tiếp tục?`
-    );
-    if (!confirmed) {
-      return null;
-    }
-  }
-  automationSubmitInFlight = true;
-  if (elements.automationResetReadyButton) {
-    elements.automationResetReadyButton.disabled = true;
-  }
-  if (elements.automationAutoRunButton) {
-    elements.automationAutoRunButton.disabled = true;
-  }
+  const boardId = String(state.erp?.project_id || state.automation.erpProjectId || DEFAULT_ERP_PROJECT_URL).trim();
+  const listId = String(state.erp?.status || state.automation.erpStatusId || DEFAULT_ERP_SOURCE_LIST_ID).trim();
   try {
-    const result = await api("/api/trello/ready/reset", {
+    const status = await api("/api/erp/ready/status", {
       method: "POST",
       body: JSON.stringify({
-        trello_board_id: boardId,
-        trello_list_id: listId,
-      }),
-    });
-    const deleted = Number(result.attachments_deleted || 0);
-    const cardsReset = Number(result.cards_reset || 0);
-    const cardsSeen = Number(result.cards_seen || 0);
-    if (!quiet) {
-      showMessage(
-        deleted
-          ? `Đã reset ${cardsReset} card trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL}, xóa ${deleted} ảnh output. Bấm Bật auto liên tục để chạy lại.`
-          : `${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} có ${cardsSeen} card nhưng chưa có ảnh output nào cần xóa.`,
-        "success",
-      );
-    }
-    await loadState({ silent: true });
-    return result;
-  } catch (error) {
-    showMessage(error.message, "error");
-    return null;
-  } finally {
-    automationSubmitInFlight = false;
-    if (elements.automationResetReadyButton) {
-      elements.automationResetReadyButton.disabled = false;
-    }
-    if (elements.automationAutoRunButton) {
-      elements.automationAutoRunButton.disabled = false;
-    }
-    renderAutomationDashboard();
-  }
-}
-
-async function prepareReadyForAutoTrello() {
-  syncAutomationFromForm();
-  const boardId = String(state.trello?.board_id || state.automation.trelloBoardId || DEFAULT_TRELLO_BOARD_URL).trim();
-  const listId = String(state.trello?.list_id || state.automation.trelloListId || DEFAULT_TRELLO_SOURCE_LIST_ID).trim();
-  try {
-    const status = await api("/api/trello/ready/status", {
-      method: "POST",
-      body: JSON.stringify({
-        trello_board_id: boardId,
-        trello_list_id: listId,
+        erp_project_id: boardId,
+        erp_status_id: listId,
       }),
     });
     const eligible = Number(status.eligible || 0);
@@ -4111,123 +4141,169 @@ async function prepareReadyForAutoTrello() {
       return true;
     }
     if (complete > 0) {
-      const confirmed = window.confirm(
-        `${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} hiện có ${complete} card đã có ảnh output nên Auto sẽ không làm lại. Reset ảnh output để tạo lại đủ ${targetOutputCount} ảnh cho các card này ngay bây giờ?`
-      );
-      if (!confirmed) {
-        showMessage(`Auto chưa chạy vì các card ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} đã có ảnh output. Bấm Reset Ready nếu muốn tạo lại đủ ${targetOutputCount} ảnh.`, "error");
-        return false;
-      }
-      const resetResult = await resetReadyForAiOutputs({ skipConfirm: true, quiet: true });
-      if (!resetResult) {
-        return false;
-      }
       showMessage(
-        `Đã reset ${resetResult.cards_reset || 0} card, xóa ${resetResult.attachments_deleted || 0} ảnh output. Auto sẽ lấy sản phẩm và chạy lại.`,
-        "success",
+        `${complete} Task đã có artefact Flow. App sẽ không xóa dữ liệu ERP; hãy chọn Task khác hoặc chạy lại có chủ đích.`,
+        "info",
       );
       return true;
     }
     if (Number(status.without_source || 0) > 0) {
-      showMessage(`${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} có card nhưng chưa có attachment ảnh nguồn hợp lệ.`, "error");
+      showMessage(`${DEFAULT_ERP_SOURCE_SCOPE_LABEL} có Task nhưng chưa có URL ảnh nguồn hợp lệ.`, "error");
       return false;
     }
   } catch (error) {
-    showMessage(`Chưa kiểm tra được ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} trước khi chạy: ${error.message}. App vẫn sẽ thử Auto.`, "error");
+    showMessage(`Chưa kiểm tra được ${DEFAULT_ERP_SOURCE_SCOPE_LABEL} trước khi chạy: ${error.message}. App vẫn sẽ thử Auto.`, "error");
   }
   return true;
 }
 
-async function saveTrelloConfig({ clearCredentials = false } = {}) {
+async function saveERPConfig({ clearCredentials = false } = {}) {
   syncAutomationFromForm();
   const payload = {
-    api_key: clearCredentials ? "" : elements.automationTrelloKeyInput?.value?.trim() || "",
-    token: clearCredentials ? "" : elements.automationTrelloTokenInput?.value?.trim() || "",
-    board_id: elements.automationTrelloBoardStorageInput?.value?.trim() || elements.automationTrelloBoardInput?.value?.trim() || "",
-    card_id: elements.automationTrelloCardInput?.value?.trim() || "",
-    list_id: elements.automationTrelloListInput?.value?.trim() || "",
-    upload_mode: elements.automationTrelloUploadMode?.value || state.trello?.upload_mode || "file",
-    set_cover: state.automation.trelloSetCover !== false,
-    upscale_to_2k:
-      elements.automationTrelloUpscale2KInput
-        ? Boolean(elements.automationTrelloUpscale2KInput.checked)
-        : state.trello?.upscale_to_2k !== false,
+    api_key: clearCredentials ? "" : elements.automationERPKeyInput?.value?.trim() || "",
+    api_secret: clearCredentials ? "" : elements.automationERPSecretInput?.value?.trim() || "",
+    base_url: "https://erp.havigroup.llc",
+    project_id:
+      normalizeERPProjectId(elements.automationERPProjectStorageInput?.value) ||
+      currentERPProjectId(),
+    task_id: elements.automationERPTaskInput?.value?.trim() || "",
+    status: elements.automationERPStatusInput?.value?.trim() || "",
     clear_credentials: clearCredentials,
   };
 
-  if (elements.automationTrelloSaveButton) {
-    elements.automationTrelloSaveButton.disabled = true;
+  if (elements.automationERPSaveButton) {
+    elements.automationERPSaveButton.disabled = true;
   }
-  if (elements.automationTrelloClearButton) {
-    elements.automationTrelloClearButton.disabled = true;
+  if (elements.automationERPClearButton) {
+    elements.automationERPClearButton.disabled = true;
   }
 
   try {
-    const response = await api("/api/integrations/trello", {
+    const response = await api("/api/integrations/erp", {
       method: "PUT",
       body: JSON.stringify(payload),
     });
-    state.trello = normalizeTrelloState(response.trello || {});
-    state.automation.trelloBoardId = state.trello.board_id || payload.board_id;
-    state.automation.trelloCardId = state.trello.card_id || payload.card_id;
-    state.automation.trelloListId = state.trello.list_id || payload.list_id;
+    state.erp = normalizeERPState(response.erp || {});
+    state.automation.erpProjectId = state.erp.project_id || payload.project_id;
+    state.automation.erpTaskId = state.erp.task_id || payload.task_id;
+    state.automation.erpStatusId = state.erp.status || payload.status;
     saveAutomationConfig(state.automation);
 
-    if (elements.automationTrelloKeyInput) {
-      elements.automationTrelloKeyInput.value = "";
+    if (elements.automationERPKeyInput) {
+      elements.automationERPKeyInput.value = "";
     }
-    if (elements.automationTrelloTokenInput) {
-      elements.automationTrelloTokenInput.value = "";
+    if (elements.automationERPSecretInput) {
+      elements.automationERPSecretInput.value = "";
     }
 
     renderAutomationDashboard();
     if (clearCredentials) {
-      showMessage("Đã xóa key/token Trello trong app. Board/card/list vẫn giữ để cấu hình lại nhanh.", "success");
-    } else if (state.trello.configured) {
-      showMessage("Đã lưu Trello. Ảnh Flow tạo xong sẽ tự đẩy lên nơi lưu này.", "success");
-    } else if (state.trello.credentials_saved) {
-      showMessage("Đã lưu key/token Trello. Hãy thêm board, card hoặc list để app biết lấy/lưu ảnh ở đâu.", "success");
+      showMessage("Đã xóa API key/secret ERP cục bộ.", "success");
+    } else if (state.erp.configured) {
+      showMessage("Đã lưu ERP. Chỉ URL ảnh được duyệt trên dashboard mới được ghi vào comment của Task nguồn.", "success");
+    } else if (state.erp.credentials_saved) {
+      showMessage("Đã lưu API key/secret ERP. Hãy chọn Task nguồn có ảnh URL và trạng thái nguồn.", "success");
     } else {
-      showMessage("Đã lưu board/card/list Trello. Hãy thêm API key và token để bật tự động.", "success");
+      showMessage("Cần API key và API secret ERP để bật tự động.", "success");
     }
   } catch (error) {
     showMessage(error.message, "error");
   } finally {
-    if (elements.automationTrelloSaveButton) {
-      elements.automationTrelloSaveButton.disabled = false;
+    if (elements.automationERPSaveButton) {
+      elements.automationERPSaveButton.disabled = false;
     }
-    if (elements.automationTrelloClearButton) {
-      elements.automationTrelloClearButton.disabled = false;
+    if (elements.automationERPClearButton) {
+      elements.automationERPClearButton.disabled = false;
     }
   }
 }
 
-// ── Trello first-run setup wizard ──────────────────────────────────
-// Pops a modal the first time chủ nhân opens the app without Trello creds,
+// ── Idea fan-out ────────────────────────────────────────────────
+// One child card of "Phân rã công việc" = one idea. The app reads the idea
+// image from the parent card, runs the images for each idea, and — only after
+// the dashboard approval — writes them back into that idea's own card.
+function setIdeaBatchStatus(text, state = "ready") {
+  if (!elements.automationERPIdeaStatus) {
+    return;
+  }
+  elements.automationERPIdeaStatus.textContent = text;
+  elements.automationERPIdeaStatus.dataset.state = state;
+}
+
+async function runERPIdeaBatch() {
+  syncAutomationFromForm();
+  const taskId =
+    elements.automationERPIdeaTaskInput?.value?.trim() ||
+    state.automation.erpTaskId ||
+    state.erp?.task_id ||
+    "";
+  if (!taskId) {
+    showMessage("Hãy điền mã thẻ Idea cha, ví dụ TASK-2026-00202.", "error");
+    return;
+  }
+  const count = Number.parseInt(elements.automationERPIdeaCountInput?.value || "", 10);
+  const payload = {
+    task_id: taskId,
+    count: Number.isFinite(count) && count > 0 ? count : 0,
+    include_done: Boolean(elements.automationERPIdeaIncludeDoneInput?.checked),
+    child_task_ids: [],
+  };
+  if (elements.automationERPIdeaRunButton) {
+    elements.automationERPIdeaRunButton.disabled = true;
+  }
+  setIdeaBatchStatus("Đang xếp hàng...", "pending");
+  try {
+    const response = await api("/api/erp/idea-batch", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    const queued = Array.isArray(response.queued) ? response.queued : [];
+    const skipped = Array.isArray(response.skipped) ? response.skipped : [];
+    setIdeaBatchStatus(`${queued.length} idea đang chạy`, queued.length ? "ready" : "pending");
+    const skippedNote = skipped.length ? `; bỏ qua ${skipped.length} thẻ đã có ảnh Flow` : "";
+    showMessage(
+      queued.length
+        ? `Đã xếp hàng ${queued.length} idea (${response.count} ảnh/idea)${skippedNote}. Ảnh sẽ chờ bạn duyệt trên dashboard trước khi gửi vào từng thẻ con.`
+        : `Không có idea nào cần chạy${skippedNote}.`,
+      queued.length ? "success" : "error",
+    );
+    await loadState({ silent: true });
+  } catch (error) {
+    setIdeaBatchStatus("Lỗi", "pending");
+    showMessage(error.message, "error");
+  } finally {
+    if (elements.automationERPIdeaRunButton) {
+      elements.automationERPIdeaRunButton.disabled = false;
+    }
+  }
+}
+
+// ── ERP first-run setup wizard ──────────────────────────────────
+// Pops a modal the first time chủ nhân opens the app without ERP creds,
 // then writes the 3 values straight into `.env.local` so the next launches
 // don't need any setup. Dismissed state lives in sessionStorage so a fresh
 // browser tab still gets the nudge.
-const TRELLO_WIZARD_DISMISS_KEY = "flow.v2.trelloWizard.dismissedThisSession";
+const ERP_WIZARD_DISMISS_KEY = "flow.v2.erpWizard.dismissedThisSession";
 
-function isTrelloWizardDismissedForSession() {
+function isERPWizardDismissedForSession() {
   try {
-    return window.sessionStorage?.getItem(TRELLO_WIZARD_DISMISS_KEY) === "1";
+    return window.sessionStorage?.getItem(ERP_WIZARD_DISMISS_KEY) === "1";
   } catch (error) {
     return false;
   }
 }
 
-function rememberTrelloWizardDismissal() {
+function rememberERPWizardDismissal() {
   try {
-    window.sessionStorage?.setItem(TRELLO_WIZARD_DISMISS_KEY, "1");
+    window.sessionStorage?.setItem(ERP_WIZARD_DISMISS_KEY, "1");
   } catch (error) {
     // sessionStorage may be blocked; the wizard will simply reappear next
     // load, which is the safer default for a setup nudge.
   }
 }
 
-function showTrelloWizardStatus(message, tone = "info") {
-  const node = elements.trelloWizardStatus;
+function showERPWizardStatus(message, tone = "info") {
+  const node = elements.erpWizardStatus;
   if (!node) {
     return;
   }
@@ -4242,27 +4318,27 @@ function showTrelloWizardStatus(message, tone = "info") {
   node.dataset.tone = tone;
 }
 
-function openTrelloWizard() {
-  const wizard = elements.trelloSetupWizard;
+function openERPWizard() {
+  const wizard = elements.erpSetupWizard;
   if (!wizard) {
     return;
   }
   wizard.hidden = false;
   wizard.setAttribute("aria-hidden", "false");
-  showTrelloWizardStatus("");
+  showERPWizardStatus("");
   // Focus first empty input so the user can paste immediately.
   const inputs = [
-    elements.trelloWizardKeyInput,
-    elements.trelloWizardTokenInput,
-    elements.trelloWizardBoardInput,
+    elements.erpWizardKeyInput,
+    elements.erpWizardSecretInput,
+    elements.erpWizardBoardInput,
   ];
   const firstEmpty = inputs.find((input) => input && !input.value.trim()) || inputs[0];
   setTimeout(() => firstEmpty?.focus(), 30);
   document.body.style.overflow = "hidden";
 }
 
-function closeTrelloWizard({ remember = true } = {}) {
-  const wizard = elements.trelloSetupWizard;
+function closeERPWizard({ remember = true } = {}) {
+  const wizard = elements.erpSetupWizard;
   if (!wizard) {
     return;
   }
@@ -4270,77 +4346,75 @@ function closeTrelloWizard({ remember = true } = {}) {
   wizard.setAttribute("aria-hidden", "true");
   document.body.style.overflow = "";
   if (remember) {
-    rememberTrelloWizardDismissal();
+    rememberERPWizardDismissal();
   }
 }
 
-function maybeShowTrelloWizard() {
-  if (!elements.trelloSetupWizard) {
+function maybeShowERPWizard() {
+  if (!elements.erpSetupWizard) {
     return;
   }
-  if (state.trello?.credentials_saved && state.trello?.configured) {
-    closeTrelloWizard({ remember: false });
+  if (state.erp?.credentials_saved && state.erp?.configured) {
+    closeERPWizard({ remember: false });
     return;
   }
-  if (state.trello?.credentials_saved && !state.trello?.configured) {
-    // Creds OK but board/card/list missing → user can fix inside the
+  if (state.erp?.credentials_saved && !state.erp?.configured) {
+    // Creds OK but Project/Task/trạng thái missing → user can fix inside the
     // inspector, no need to block the dashboard with a modal.
     return;
   }
-  if (isTrelloWizardDismissedForSession()) {
+  if (isERPWizardDismissedForSession()) {
     return;
   }
-  openTrelloWizard();
+  openERPWizard();
 }
 
-async function submitTrelloWizard() {
-  const key = elements.trelloWizardKeyInput?.value?.trim() || "";
-  const token = elements.trelloWizardTokenInput?.value?.trim() || "";
-  const board = elements.trelloWizardBoardInput?.value?.trim() || "";
+async function submitERPWizard() {
+  const key = elements.erpWizardKeyInput?.value?.trim() || "";
+  const apiSecret = elements.erpWizardSecretInput?.value?.trim() || "";
+  const project = normalizeERPProjectId(elements.erpWizardBoardInput?.value) || currentERPProjectId();
 
-  if (!key || !token || !board) {
-    showTrelloWizardStatus("Cần điền đủ API key, token và Trello board URL.", "error");
+  if (!key || !apiSecret) {
+    showERPWizardStatus("Cần điền đủ ERP API key và API secret.", "error");
     return;
   }
 
-  const saveButton = elements.trelloWizardSaveButton;
+  const saveButton = elements.erpWizardSaveButton;
   if (saveButton) {
     saveButton.disabled = true;
   }
-  showTrelloWizardStatus("Đang ghi creds vào .env.local…", "info");
+  showERPWizardStatus("Đang ghi creds vào .env.local…", "info");
 
   try {
-    const response = await api("/api/integrations/trello", {
+    const response = await api("/api/integrations/erp", {
       method: "PUT",
       body: JSON.stringify({
         api_key: key,
-        token,
-        board_id: board,
-        card_id: state.trello?.card_id || "",
-        list_id: state.trello?.list_id || "",
-        upload_mode: state.trello?.upload_mode || "file",
-        set_cover: state.automation?.trelloSetCover !== false,
-        upscale_to_2k: state.trello?.upscale_to_2k !== false,
+        api_secret: apiSecret,
+        base_url: "https://erp.havigroup.llc",
+        project_id: project,
+        task_id: state.erp?.task_id || "",
+        status: state.erp?.status || "",
         clear_credentials: false,
         persist_to_env: true,
       }),
     });
 
-    const nextTrello = normalizeTrelloState(response.trello || response || {});
-    state.trello = nextTrello;
-    state.automation.trelloBoardId = nextTrello.board_id || board;
+    const nextERP = normalizeERPState(response.erp || response || {});
+    state.erp = nextERP;
+    state.automation.erpProjectId = nextERP.project_id || project;
     saveAutomationConfig(state.automation);
 
     const persisted = response?.persisted_to_env === true;
     const persistError = String(response?.persist_error || "").trim();
 
     if (persisted) {
-      showTrelloWizardStatus(
+      showERPWizardStatus(
         "Đã lưu vào .env.local. Lần sau chỉ việc chạy — không cần nhập lại.",
         "success"
       );
       showMessage(
-        "Đã setup Trello vĩnh viễn vào .env.local. Auto Trello đã sẵn sàng.",
+        "Đã setup ERP vĩnh viễn vào .env.local. Auto ERP đã sẵn sàng.",
         "success"
       );
     } else {
@@ -4350,16 +4424,16 @@ async function submitTrelloWizard() {
       const fallback = persistError
         ? `Đã lưu vào app, nhưng không ghi được vào .env.local: ${persistError}. App vẫn dùng được trong phiên này.`
         : "Đã lưu vào app, nhưng không ghi được vào .env.local. Hãy thêm thủ công để giữ qua các lần khởi động.";
-      showTrelloWizardStatus(fallback, "error");
+      showERPWizardStatus(fallback, "error");
     }
 
     renderAutomationDashboard();
 
     if (persisted) {
-      setTimeout(() => closeTrelloWizard({ remember: false }), 1100);
+      setTimeout(() => closeERPWizard({ remember: false }), 1100);
     }
   } catch (error) {
-    showTrelloWizardStatus(error.message || "Lưu thất bại. Hãy kiểm tra creds.", "error");
+    showERPWizardStatus(error.message || "Lưu thất bại. Hãy kiểm tra creds.", "error");
   } finally {
     if (saveButton) {
       saveButton.disabled = false;
@@ -4372,11 +4446,11 @@ async function saveIntegrationConfig({ clearSecrets = false } = {}) {
   const payload = {
     gemini_api_key: clearSecrets ? "" : elements.automationGeminiKeyInput?.value?.trim() || "",
     gemini_model: elements.automationGeminiModelInput?.value?.trim() || state.integrations?.gemini?.model || "gemini-2.5-flash",
-    telegram_bot_token: clearSecrets ? "" : elements.automationTelegramTokenInput?.value?.trim() || "",
-    telegram_chat_id: elements.automationTelegramInput?.value?.trim() || "",
+    telegram_bot_token: "",
+    telegram_chat_id: state.integrations?.telegram?.chat_id || "",
     playwright_browsers_path: elements.automationPlaywrightPathInput?.value?.trim() || "",
     clear_gemini_api_key: clearSecrets,
-    clear_telegram_bot_token: clearSecrets,
+    clear_telegram_bot_token: false,
   };
 
   if (elements.automationEnvSaveButton) {
@@ -4392,21 +4466,16 @@ async function saveIntegrationConfig({ clearSecrets = false } = {}) {
       body: JSON.stringify(payload),
     });
     state.integrations = normalizeIntegrationState(response.integrations || {});
-    state.automation.telegramChat = state.integrations.telegram.chat_id || payload.telegram_chat_id;
     saveAutomationConfig(state.automation);
 
     if (elements.automationGeminiKeyInput) {
       elements.automationGeminiKeyInput.value = "";
     }
-    if (elements.automationTelegramTokenInput) {
-      elements.automationTelegramTokenInput.value = "";
-    }
-
     renderAutomationDashboard();
     if (clearSecrets) {
-      showMessage("Đã xóa Gemini key và Telegram bot token trong app. Các field không nhạy cảm vẫn giữ lại.", "success");
+      showMessage("Đã xóa Gemini key trong app. Các field không nhạy cảm vẫn giữ lại.", "success");
     } else {
-      showMessage("Đã lưu cấu hình app. Từ giờ không cần sửa file .env cho Gemini, Telegram hoặc Playwright path.", "success");
+      showMessage("Đã lưu cấu hình app. Từ giờ không cần sửa file .env cho Gemini hoặc Playwright path.", "success");
     }
   } catch (error) {
     showMessage(error.message, "error");
@@ -4448,7 +4517,7 @@ async function previewPromptSource(file = null, { silent = false } = {}) {
     renderAll();
     const count = Number(payload.active_count || payload.prompt_count || 0);
     if (!silent) {
-      showMessage(`Đã lấy ${count} prompt từ sheet/file. Bấm tạo ảnh để app chạy lần lượt các dòng active rồi gửi Telegram duyệt.`, "success");
+      showMessage(`Đã lấy ${count} prompt từ sheet/file. Bấm tạo ảnh để app chạy lần lượt các dòng active rồi chờ duyệt trên dashboard.`, "success");
     }
     return payload;
   } catch (error) {
@@ -4499,43 +4568,33 @@ function syncModuleSettingFromControl(control) {
     const count = Math.max(1, Math.min(maxCount, Number(value || 1)));
     state.drafts.image.count = count;
     module.settings[setting] = count;
-  } else if (setting === "telegramChat") {
-    state.automation.telegramChat = String(value || "").trim();
-    if (elements.automationTelegramInput) {
-      elements.automationTelegramInput.value = state.automation.telegramChat;
+  } else if (setting === "erpProject") {
+    state.automation.erpProjectId = String(value || "").trim();
+    if (elements.automationERPProjectInput) {
+      elements.automationERPProjectInput.value = state.automation.erpProjectId;
     }
-  } else if (setting === "trelloBoard") {
-    state.automation.trelloBoardId = String(value || "").trim();
-    if (elements.automationTrelloBoardInput) {
-      elements.automationTrelloBoardInput.value = state.automation.trelloBoardId;
+    if (elements.automationERPProjectStorageInput) {
+      elements.automationERPProjectStorageInput.value = state.automation.erpProjectId;
     }
-    if (elements.automationTrelloBoardStorageInput) {
-      elements.automationTrelloBoardStorageInput.value = state.automation.trelloBoardId;
+  } else if (setting === "erpTask") {
+    state.automation.erpTaskId = String(value || "").trim();
+    if (elements.automationERPTaskInput) {
+      elements.automationERPTaskInput.value = state.automation.erpTaskId;
     }
-  } else if (setting === "trelloCard") {
-    state.automation.trelloCardId = String(value || "").trim();
-    if (elements.automationTrelloCardInput) {
-      elements.automationTrelloCardInput.value = state.automation.trelloCardId;
+  } else if (setting === "erpStatus") {
+    state.automation.erpStatusId = String(value || "").trim();
+    if (elements.automationERPStatusInput) {
+      elements.automationERPStatusInput.value = state.automation.erpStatusId;
     }
-  } else if (setting === "trelloList") {
-    state.automation.trelloListId = String(value || "").trim();
-    if (elements.automationTrelloListInput) {
-      elements.automationTrelloListInput.value = state.automation.trelloListId;
-    }
-  } else if (setting === "trelloAttachmentIds") {
+  } else if (setting === "erpAttachmentIds") {
     const ids = String(value || "")
       .split(/[\s,;]+/)
       .map((item) => item.trim())
       .filter(Boolean);
-    state.automation.trelloAttachmentIds = ids;
+    state.automation.erpAttachmentIds = ids;
     module.settings[setting] = ids;
-  } else if (setting === "trelloAttachmentLimit") {
+  } else if (setting === "erpAttachmentLimit") {
     module.settings[setting] = Math.max(1, Math.min(4, Number(value || 1)));
-  } else if (setting === "trelloUploadMode") {
-    state.trello.upload_mode = value || "file";
-    if (elements.automationTrelloUploadMode) {
-      elements.automationTrelloUploadMode.value = state.trello.upload_mode;
-    }
   }
   persistAutomationModules();
 }
@@ -4571,40 +4630,54 @@ async function handleModuleSettingsAction(action) {
     await previewPromptSource();
   } else if (action === "upload-source") {
     elements.automationSheetFileInput?.click();
-  } else if (action === "save-integrations") {
-    const tokenInput = elements.automationModuleSettings?.querySelector("[data-module-secret='telegramToken']");
-    if (tokenInput && elements.automationTelegramTokenInput) {
-      elements.automationTelegramTokenInput.value = tokenInput.value;
-    }
-    await saveIntegrationConfig();
-  } else if (action === "save-trello") {
-    await saveTrelloConfig();
-  } else if (action === "clear-trello") {
-    await saveTrelloConfig({ clearCredentials: true });
-  } else if (action === "sync-telegram-approvals") {
-    await syncTelegramApprovals();
+  } else if (action === "save-erp") {
+    await saveERPConfig();
+  } else if (action === "clear-erp") {
+    await saveERPConfig({ clearCredentials: true });
   }
 }
 
-async function syncTelegramApprovals() {
+async function submitDashboardApproval(jobId, artifactIndex, status) {
+  const decision = String(status || "").trim().toLowerCase();
+  if (!["approved", "rejected"].includes(decision)) {
+    return;
+  }
   try {
-    const payload = await api("/api/telegram/approvals/sync", {
+    await api(`/api/jobs/${encodeURIComponent(jobId)}/artifacts/${encodeURIComponent(artifactIndex)}/approval`, {
       method: "POST",
-      body: JSON.stringify({}),
+      body: JSON.stringify({ status: decision }),
     });
     await loadState({ silent: true });
-    const result = payload.telegram_approvals || {};
-    const count = Number(result.processed || 0);
-    showMessage(
-      count
-        ? `Đã đồng bộ ${count} lượt duyệt từ Telegram.`
-        : result.configured === false
-          ? "Chưa lưu Telegram bot token nên chưa đồng bộ được lượt duyệt."
-          : "Chưa có lượt duyệt Telegram mới.",
-      count ? "success" : "error"
-    );
+    showMessage(decision === "approved" ? "Đã duyệt ảnh trên dashboard." : "Đã từ chối ảnh trên dashboard.", "success");
   } catch (error) {
     showMessage(error.message, "error");
+  }
+}
+
+async function submitDashboardArtifact(jobId, container, button) {
+  const urlInput = container?.querySelector("[data-dashboard-artifact-url]");
+  const labelInput = container?.querySelector("[data-dashboard-artifact-label]");
+  const url = String(urlInput?.value || "").trim();
+  if (!url) {
+    showMessage("Hãy dán URL HTTPS của ảnh muốn thêm vào bộ idea.", "error");
+    urlInput?.focus();
+    return;
+  }
+  button.disabled = true;
+  try {
+    await api(`/api/jobs/${encodeURIComponent(jobId)}/artifacts`, {
+      method: "POST",
+      body: JSON.stringify({
+        url,
+        label: String(labelInput?.value || "").trim(),
+      }),
+    });
+    await loadState({ silent: true });
+    showMessage("Đã thêm ảnh vào bộ idea. Ảnh này đang chờ duyệt.", "success");
+  } catch (error) {
+    showMessage(error.message, "error");
+  } finally {
+    button.disabled = false;
   }
 }
 
@@ -4614,8 +4687,7 @@ function automationImageJobPayload(prompt) {
   const flowModule = graph.modules.find((module) => module.enabled && module.type === "flow") || {};
   const flowSettings = flowModule.settings || {};
   const flowAgentEnabled = flowAgentEnabledFromSettings(flowSettings);
-  const telegramEnabled = automationModuleEnabled("telegram");
-  const trelloEnabled = automationModuleEnabled("trello");
+  const erpEnabled = automationModuleEnabled("erp");
   return {
     type: "image",
     title: "Automation image from prompt",
@@ -4624,37 +4696,36 @@ function automationImageJobPayload(prompt) {
     aspect: flowSettings.imageAspect || imageDraft.aspect || "square",
     count: flowModuleImageCount(flowSettings, imageDraft.count || MODE_CONFIG.image.defaultCount),
     timeout_s: Math.max(30, Number(elements.generationTimeout.value || state.config?.generation_timeout_s || 300)),
-    telegram_enabled: telegramEnabled,
-    telegram_chat_id: telegramEnabled ? state.automation.telegramChat || state.integrations?.telegram?.chat_id || "" : "",
-    trello_enabled: trelloEnabled,
+    telegram_enabled: false,
+    telegram_chat_id: "",
+    erp_enabled: erpEnabled,
     flow_agent_enabled: flowAgentEnabled,
     flow_agent_auto_approve: flowSettings.flowAgentAutoApprove !== false,
     automation_graph: graph,
-    trello_board_id: trelloEnabled ? state.automation.trelloBoardId || state.trello?.board_id || "" : "",
-    trello_card_id: trelloEnabled ? state.automation.trelloCardId || state.trello?.card_id || "" : "",
-    trello_list_id: trelloEnabled ? state.automation.trelloListId || state.trello?.list_id || "" : "",
-    trello_attachment_ids: trelloEnabled
-      ? Array.isArray(state.automation.trelloAttachmentIds)
-        ? state.automation.trelloAttachmentIds.filter(Boolean)
+    erp_project_id: erpEnabled ? currentERPProjectId() : "",
+    erp_task_id: erpEnabled ? state.automation.erpTaskId || state.erp?.task_id || "" : "",
+    erp_status_id: erpEnabled ? state.automation.erpStatusId || state.erp?.status || "" : "",
+    erp_attachment_ids: erpEnabled
+      ? Array.isArray(state.automation.erpAttachmentIds)
+        ? state.automation.erpAttachmentIds.filter(Boolean)
         : []
       : [],
-    trello_set_cover: state.automation.trelloSetCover !== false,
     prompt_product: state.automation.promptProductFilter || "",
     prompt_product_key: state.automation.promptProductFilter || "",
-    prompt_notes: state.automation.promptProductFilter ? `Trello search: ${state.automation.promptProductFilter}` : "",
+    prompt_notes: state.automation.promptProductFilter ? `ERP search: ${state.automation.promptProductFilter}` : "",
   };
 }
 
-function forcePayloadToReadyTrelloScope(payload) {
+function forcePayloadToReadyERPScope(payload) {
   if (!payload || typeof payload !== "object") {
     return payload;
   }
-  const boardId = String(state.trello?.board_id || payload.trello_board_id || "").trim();
-  const readyListId = String(state.trello?.list_id || payload.trello_list_id || "").trim();
-  payload.trello_board_id = boardId;
-  payload.trello_list_id = readyListId;
-  payload.trello_card_id = "";
-  payload.trello_attachment_ids = [];
+  const projectId = currentERPProjectId();
+  const readyListId = String(state.erp?.status || payload.erp_status_id || "").trim();
+  payload.erp_project_id = projectId;
+  payload.erp_status_id = readyListId;
+  payload.erp_task_id = "";
+  payload.erp_attachment_ids = [];
   payload.prompt = "";
   payload.prompt_product = "";
   payload.prompt_product_key = "";
@@ -4665,7 +4736,7 @@ function forcePayloadToReadyTrelloScope(payload) {
   payload.flow_agent_auto_approve = true;
   const modules = Array.isArray(payload.automation_graph?.modules) ? payload.automation_graph.modules : [];
   modules.forEach((module) => {
-    if (!module || !["trello_source", "trello", "flow"].includes(module.type)) {
+    if (!module || !["erp_source", "erp", "flow"].includes(module.type)) {
       return;
     }
     module.settings = module.settings && typeof module.settings === "object" ? module.settings : {};
@@ -4676,23 +4747,21 @@ function forcePayloadToReadyTrelloScope(payload) {
       module.settings.flowAgentAutoApprove = true;
       return;
     }
-    if (boardId) {
-      module.settings.trelloBoard = boardId;
-    }
+    module.settings.erpProject = projectId;
     if (readyListId) {
-      module.settings.trelloList = readyListId;
+      module.settings.erpStatus = readyListId;
     }
-    module.settings.trelloCard = "";
-    module.settings.trelloAttachmentIds = [];
-    delete module.settings.trelloAttachmentId;
+    module.settings.erpTask = "";
+    module.settings.erpAttachmentIds = [];
+    delete module.settings.erpAttachmentId;
   });
   return payload;
 }
 
-async function stopContinuousAutoTrello() {
-  const job = activeContinuousAutoTrelloJob();
+async function stopContinuousAutoERP() {
+  const job = activeContinuousAutoERPJob();
   if (!job) {
-    showMessage("Không có Auto AI Trello liên tục nào đang chạy.", "error");
+    showMessage("Không có Auto AI ERP liên tục nào đang chạy.", "error");
     return;
   }
   if (automationSubmitInFlight) {
@@ -4704,7 +4773,7 @@ async function stopContinuousAutoTrello() {
   }
   try {
     await api(`/api/jobs/${encodeURIComponent(job.id)}/stop`, { method: "POST" });
-    showMessage("Đã gửi lệnh dừng. App sẽ không nhận thêm card mới sau tác vụ hiện tại.", "success");
+    showMessage("Đã gửi lệnh dừng. App sẽ không nhận thêm Task mới sau tác vụ hiện tại.", "success");
     await loadState({ silent: true });
   } catch (error) {
     showMessage(error.message, "error");
@@ -4714,26 +4783,26 @@ async function stopContinuousAutoTrello() {
   }
 }
 
-async function submitAutomationImage({ autoTrello = false, batchLimit = null, continuousAutoTrello = false } = {}) {
+async function submitAutomationImage({ autoERP = false, batchLimit = null, continuousAutoERP = false } = {}) {
   if (automationSubmitInFlight) {
     return;
   }
   syncAutomationFromForm();
-  const selectedTrelloAttachmentIds = Array.isArray(state.automation.trelloAttachmentIds)
-    ? state.automation.trelloAttachmentIds.filter(Boolean)
+  const selectedERPAttachmentIds = Array.isArray(state.automation.erpAttachmentIds)
+    ? state.automation.erpAttachmentIds.filter(Boolean)
     : [];
-  const selectedTrelloCard = String(state.automation.trelloCardId || "").trim();
-  const selectedTrelloImageCandidate = Boolean(selectedTrelloCard && selectedTrelloAttachmentIds.length);
-  const selectedTrelloImageRun = Boolean(
-    !autoTrello &&
-      selectedTrelloImageCandidate &&
-      (shouldAutoDiscoverTrello([]) || String(state.automation.sourceType || FLOW_AI_SOURCE_TYPE) === FLOW_AI_SOURCE_TYPE)
+  const selectedERPTask = String(state.automation.erpTaskId || "").trim();
+  const selectedERPImageCandidate = Boolean(selectedERPTask && selectedERPAttachmentIds.length);
+  const selectedERPImageRun = Boolean(
+    !autoERP &&
+      selectedERPImageCandidate &&
+      (shouldAutoDiscoverERP([]) || String(state.automation.sourceType || FLOW_AI_SOURCE_TYPE) === FLOW_AI_SOURCE_TYPE)
   );
-  let batchItems = selectedTrelloImageRun ? [] : activePromptSourceItems({ limit: autoTrello ? Infinity : 500 });
-  const trelloSearchQuery = String(state.automation.promptProductFilter || "").trim();
-  const autoDiscoverTrello = Boolean(autoTrello || shouldAutoDiscoverTrello(batchItems));
+  let batchItems = selectedERPImageRun ? [] : activePromptSourceItems({ limit: autoERP ? Infinity : 500 });
+  const erpSearchQuery = String(state.automation.promptProductFilter || "").trim();
+  const autoDiscoverERP = Boolean(autoERP || shouldAutoDiscoverERP(batchItems));
   const prompt = String(batchItems[0]?.prompt || state.automation.prompt || "").trim();
-  const aiWillWritePrompt = Boolean(autoDiscoverTrello && !prompt);
+  const aiWillWritePrompt = Boolean(autoDiscoverERP && !prompt);
   if (!state.config?.project_id) {
     state.setupOpen = true;
     renderTopbar();
@@ -4748,9 +4817,9 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null, co
   }
   if (!prompt && !aiWillWritePrompt) {
     showMessage(
-      trelloSearchQuery
-        ? `Chưa có lệnh nhập tay. Có thể bấm Auto Trello để Tác nhân Flow tự viết prompt cho "${trelloSearchQuery}".`
-        : "Hãy nhập yêu cầu ngắn, hoặc bấm Auto Trello để Tác nhân Flow tự viết prompt từ card có ảnh.",
+      erpSearchQuery
+        ? `Chưa có lệnh nhập tay. Có thể bấm Auto ERP để Tác nhân Flow tự viết prompt cho "${erpSearchQuery}".`
+        : "Hãy nhập yêu cầu ngắn, hoặc bấm Auto ERP để Tác nhân Flow tự viết prompt từ Task có ảnh.",
       "error",
     );
     elements.automationPromptInput.focus();
@@ -4761,34 +4830,34 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null, co
     selectAutomationModuleByType("flow", { create: true });
     return;
   }
-  if (autoDiscoverTrello && !automationModuleEnabled("trello_source")) {
-    showMessage("Auto Trello cần bật cục Trello Image Source để tự tìm ảnh trong card.", "error");
-    selectAutomationModuleByType("trello_source", { create: true });
+  if (autoDiscoverERP && !automationModuleEnabled("erp_source")) {
+    showMessage("Auto ERP cần bật cục ERP Task Source để tự tìm ảnh trong Task.", "error");
+    selectAutomationModuleByType("erp_source", { create: true });
     return;
   }
-  if (autoDiscoverTrello && !automationModuleEnabled("trello")) {
-    showMessage("Auto Trello cần bật cục Trello Archive để ảnh tạo xong được lưu về đúng card.", "error");
-    selectAutomationModuleByType("trello", { create: true });
+  if (autoDiscoverERP && !automationModuleEnabled("erp")) {
+    showMessage("Auto ERP cần bật cục ERP Task Comment để ghi URL artifact sau khi duyệt trên dashboard.", "error");
+    selectAutomationModuleByType("erp", { create: true });
     return;
   }
 
   const payload = automationImageJobPayload(prompt);
-  const selectedImageDefaultLimit = selectedTrelloImageRun ? 1 : 0;
+  const selectedImageDefaultLimit = selectedERPImageRun ? 1 : 0;
   const explicitBatchLimit = Number(batchLimit || 0);
-  const runUntilReadyEmpty = Boolean(autoDiscoverTrello && !selectedTrelloImageRun && !(Number.isFinite(explicitBatchLimit) && explicitBatchLimit > 0));
-  if (autoDiscoverTrello && !selectedTrelloImageRun) {
+  const runUntilReadyEmpty = Boolean(autoDiscoverERP && !selectedERPImageRun && !(Number.isFinite(explicitBatchLimit) && explicitBatchLimit > 0));
+  if (autoDiscoverERP && !selectedERPImageRun) {
     batchItems = [];
     state.automation.promptProductFilter = "";
-    forcePayloadToReadyTrelloScope(payload);
+    forcePayloadToReadyERPScope(payload);
     saveAutomationConfig(state.automation);
   }
   const resolvedBatchLimit = runUntilReadyEmpty
     ? 0
     : Math.max(
         1,
-        Math.min(40, Number(explicitBatchLimit || selectedImageDefaultLimit || effectiveAutomationBatchLimit({ autoTrello: autoDiscoverTrello }) || 1)),
+        Math.min(40, Number(explicitBatchLimit || selectedImageDefaultLimit || effectiveAutomationBatchLimit({ autoERP: autoDiscoverERP }) || 1)),
       );
-  const queuedCount = autoDiscoverTrello
+  const queuedCount = autoDiscoverERP
     ? (runUntilReadyEmpty ? 0 : (batchItems.length ? Math.min(batchItems.length, resolvedBatchLimit) : resolvedBatchLimit))
     : batchItems.length > 1 ? Math.min(batchItems.length, resolvedBatchLimit) : 1;
 
@@ -4802,21 +4871,21 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null, co
     elements.easyRunButton.disabled = true;
   }
   try {
-    if (batchItems.length > 1 || autoDiscoverTrello) {
+    if (batchItems.length > 1 || autoDiscoverERP) {
       await api("/api/jobs/batch", {
         method: "POST",
         body: JSON.stringify({
-          title: continuousAutoTrello ? "Auto AI Trello: chờ sản phẩm mới liên tục" : autoDiscoverTrello ? "Auto Trello: quét card có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
-          limit: continuousAutoTrello ? 0 : resolvedBatchLimit,
-          auto_trello: autoDiscoverTrello,
-          run_until_empty: continuousAutoTrello || runUntilReadyEmpty,
-          continuous: Boolean(continuousAutoTrello),
+          title: continuousAutoERP ? "Auto AI ERP: chờ sản phẩm mới liên tục" : autoDiscoverERP ? "Auto ERP: quét Task có ảnh" : `Chạy ${batchItems.length} prompt từ sheet`,
+          limit: continuousAutoERP ? 0 : resolvedBatchLimit,
+          auto_erp: autoDiscoverERP,
+          run_until_empty: continuousAutoERP || runUntilReadyEmpty,
+          continuous: Boolean(continuousAutoERP),
           poll_interval_s: 30,
           job: {
             ...payload,
-            title: autoDiscoverTrello ? "Auto image from Trello card" : "Automation image from sheet row",
+            title: autoDiscoverERP ? "Auto image from ERP Task" : "Automation image from sheet row",
           },
-          items: autoDiscoverTrello && !selectedTrelloImageRun ? [] : batchItems,
+          items: autoDiscoverERP && !selectedERPImageRun ? [] : batchItems,
         }),
       });
     } else {
@@ -4830,15 +4899,15 @@ async function submitAutomationImage({ autoTrello = false, batchLimit = null, co
     state.automation.enabled = true;
     saveAutomationConfig(state.automation);
     showMessage(
-      autoDiscoverTrello
-        ? continuousAutoTrello
-          ? `Đã bật auto liên tục. App sẽ chờ card mới trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi bạn bấm Dừng auto.`
+      autoDiscoverERP
+        ? continuousAutoERP
+          ? `Đã bật auto liên tục. App sẽ chờ Task mới trong ${DEFAULT_ERP_SOURCE_SCOPE_LABEL} và chạy tới khi bạn bấm Dừng auto.`
           : runUntilReadyEmpty
-          ? `Đã xếp hàng chạy 1 lượt. App sẽ quét toàn bộ card có ảnh trong ${DEFAULT_TRELLO_SOURCE_SCOPE_LABEL} và chạy tới khi hết danh sách hiện tại.`
-          : `Đã xếp hàng chạy 1 lượt. App sẽ quét ${queuedCount} card có ảnh, nhờ Tác nhân Flow tạo 12 ảnh trong một job rồi đẩy về đúng card để duyệt trên Trello.`
+          ? `Đã xếp hàng chạy 1 lượt. App sẽ quét toàn bộ Task có ảnh trong ${DEFAULT_ERP_SOURCE_SCOPE_LABEL} và chạy tới khi hết danh sách hiện tại.`
+          : `Đã xếp hàng chạy 1 lượt. App sẽ quét ${queuedCount} Task có ảnh, nhờ Tác nhân Flow tạo ảnh, chờ duyệt trên dashboard rồi thêm URL artifact vào comment của đúng Task.`
         : batchItems.length > 1
-        ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh Trello, chỉnh bằng Flow rồi đẩy về đúng card Trello để duyệt.`
-        : "Đã gửi prompt sang Flow để tạo ảnh. Khi ảnh xong, app sẽ lưu về Trello nếu cục Trello đang bật.",
+        ? `Đã xếp hàng ${queuedCount} prompt active. App sẽ lấy ảnh ERP, chỉnh bằng Flow, chờ duyệt trên dashboard rồi thêm URL artifact vào Task.`
+        : "Đã gửi prompt sang Flow để tạo ảnh. Sau khi duyệt trên dashboard, app sẽ thêm URL artifact vào ERP Task nếu cục ERP đang bật.",
       "success"
     );
     await loadState({ silent: true });
@@ -5104,7 +5173,7 @@ async function requestFlowAiOperatorPlan(instructionOverride = "") {
       "Flow AI Operator đã lập kế hoạch. Chủ nhân có thể bấm từng hành động hoặc dùng Làm theo kế hoạch.",
     flow_operator_plan: payload,
     suggested_actions: mergeAssistantActions(payload.suggested_actions || [], previous.suggested_actions || []),
-    trello_candidates: payload.trello_candidates || previous.trello_candidates || [],
+    erp_candidates: payload.erp_candidates || previous.erp_candidates || [],
     engine: payload.engine || previous.engine,
     engine_label: payload.engine_label || previous.engine_label,
     model: payload.model || previous.model,
@@ -5183,50 +5252,50 @@ function setAssistantProductFilter(value) {
   return true;
 }
 
-function setAssistantTrelloCard(value, options = {}) {
+function setAssistantERPTask(value, options = {}) {
   const card = String(value || "").trim();
   if (!card) {
-    showMessage("AI chưa nhận ra card Trello cần ghim.", "error");
+    showMessage("AI chưa nhận ra ERP Task cần ghim.", "error");
     return false;
   }
   const listId = String(options.listId || "").trim();
   const attachmentId = String(options.attachmentId || "").trim();
   syncAutomationFromForm();
-  state.automation.trelloCardId = card;
+  state.automation.erpTaskId = card;
   if (listId) {
-    state.automation.trelloListId = listId;
+    state.automation.erpStatusId = listId;
   }
-  state.automation.trelloAttachmentIds = attachmentId ? [attachmentId] : [];
+  state.automation.erpAttachmentIds = attachmentId ? [attachmentId] : [];
   state.automation.modules = normalizeAutomationModules(state.automation).map((module) => {
-    if (!["trello_source", "trello"].includes(module.type)) {
+    if (!["erp_source", "erp"].includes(module.type)) {
       return module;
     }
     const settings = {
       ...(module.settings || {}),
-      trelloCard: card,
-      ...(listId ? { trelloList: listId } : {}),
+      erpTask: card,
+      ...(listId ? { erpStatus: listId } : {}),
     };
     if (attachmentId) {
-      settings.trelloAttachmentIds = [attachmentId];
+      settings.erpAttachmentIds = [attachmentId];
     } else {
-      delete settings.trelloAttachmentIds;
-      delete settings.trelloAttachmentId;
+      delete settings.erpAttachmentIds;
+      delete settings.erpAttachmentId;
     }
     return {
       ...module,
       settings,
     };
   });
-  if (elements.automationTrelloCardInput) {
-    elements.automationTrelloCardInput.value = card;
+  if (elements.automationERPTaskInput) {
+    elements.automationERPTaskInput.value = card;
   }
-  if (elements.automationTrelloListInput && listId) {
-    elements.automationTrelloListInput.value = listId;
+  if (elements.automationERPStatusInput && listId) {
+    elements.automationERPStatusInput.value = listId;
   }
   persistAutomationModules();
   renderAll();
   showMessage(
-    attachmentId ? `AI đã chọn đúng ảnh Trello "${attachmentId}" trong card "${card}".` : `AI đã ghim đúng card Trello "${card}".`,
+    attachmentId ? `AI đã chọn đúng ảnh ERP "${attachmentId}" trong Task "${card}".` : `AI đã ghim đúng ERP Task "${card}".`,
     "success",
   );
   return true;
@@ -5291,7 +5360,7 @@ function assistantRequestedNumericBatchLimit() {
 }
 
 function assistantPlanBatchLimit(actions = []) {
-  const runAction = actions.find((action) => action?.action === "run_auto_trello");
+  const runAction = actions.find((action) => action?.action === "run_auto_erp");
   const explicitLimit = Number(runAction?.payload?.limit || 0);
   if (Number.isFinite(explicitLimit) && explicitLimit > 0) {
     return explicitLimit;
@@ -5316,14 +5385,14 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
   try {
     if (actionName === "apply_product_filter") {
       setAssistantProductFilter(action.payload?.value || "");
-    } else if (actionName === "set_trello_card") {
-      const selected = setAssistantTrelloCard(action.payload?.value || "", {
-        listId: action.payload?.list_id || "",
+    } else if (actionName === "set_erp_task") {
+      const selected = setAssistantERPTask(action.payload?.value || "", {
+        listId: action.payload?.status || "",
         attachmentId: action.payload?.attachment_id || "",
       });
       if (selected && action.payload?.run_after_select) {
         await submitAutomationImage({
-          autoTrello: true,
+          autoERP: true,
           batchLimit: assistantPlanBatchLimit(state.userAssistant?.last?.suggested_actions || []),
         });
       }
@@ -5333,18 +5402,19 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
       applyFlowAiPrompt(action.payload?.prompt || state.userAssistant?.last?.flow_operator_plan?.flow_prompt || "");
     } else if (actionName === "preview_prompt_source") {
       await previewPromptSource();
-    } else if (actionName === "sync_telegram_approvals") {
-      await syncTelegramApprovals();
+    } else if (actionName === "open_dashboard_review") {
+      elements.dashboardReviewQueue?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      showMessage("Các artefact chờ duyệt đang hiển thị ngay trên dashboard.", "success");
     } else if (actionName === "open_flow_project") {
       await openFlowProjectSurface();
-    } else if (actionName === "select_trello_source") {
-      selectAutomationModuleByType("trello_source", { create: true });
-      showMessage("AI đã mở cục Trello Image Source để kiểm tra nguồn ảnh.", "success");
-    } else if (actionName === "run_auto_trello") {
+    } else if (actionName === "select_erp_source") {
+      selectAutomationModuleByType("erp_source", { create: true });
+      showMessage("AI đã mở cục ERP Task Source để kiểm tra nguồn ảnh.", "success");
+    } else if (actionName === "run_auto_erp") {
       if (state.automation.sourceType === "sheets" && String(state.automation.sourceLocation || "").trim() && !activePromptSourceItems({ limit: 500 }).length) {
         await previewPromptSource(null, { silent: true });
       }
-      await submitAutomationImage({ autoTrello: true, batchLimit: action.payload?.limit || null });
+      await submitAutomationImage({ autoERP: true, batchLimit: action.payload?.limit || null });
     } else {
       showMessage("Hành động AI này chưa được app hỗ trợ.", "error");
     }
@@ -5363,41 +5433,41 @@ async function executeUserAssistantPlan() {
   if (!actions.length || state.userAssistant.executing) {
     return;
   }
-  const hasRunAction = actions.some((action) => action.action === "run_auto_trello");
-  const trelloCandidates = Array.isArray(state.userAssistant?.last?.trello_candidates)
-    ? state.userAssistant.last.trello_candidates.filter(Boolean)
+  const hasRunAction = actions.some((action) => action.action === "run_auto_erp");
+  const erpCandidates = Array.isArray(state.userAssistant?.last?.erp_candidates)
+    ? state.userAssistant.last.erp_candidates.filter(Boolean)
     : [];
-  const selectedAttachmentIds = Array.isArray(state.automation?.trelloAttachmentIds)
-    ? state.automation.trelloAttachmentIds.filter(Boolean)
+  const selectedAttachmentIds = Array.isArray(state.automation?.erpAttachmentIds)
+    ? state.automation.erpAttachmentIds.filter(Boolean)
     : [];
-  if (!hasRunAction && trelloCandidates.length) {
-    if (state.automation?.trelloCardId && selectedAttachmentIds.length) {
-      showMessage("Đã có ảnh Trello được chọn, app bắt đầu chạy Auto Trello cho đúng ảnh đó.", "success");
-      await submitAutomationImage({ autoTrello: true, batchLimit: assistantPlanBatchLimit(actions) });
+  if (!hasRunAction && erpCandidates.length) {
+    if (state.automation?.erpTaskId && selectedAttachmentIds.length) {
+      showMessage("Đã có ảnh ERP được chọn, app bắt đầu chạy Auto ERP cho đúng ảnh đó.", "success");
+      await submitAutomationImage({ autoERP: true, batchLimit: assistantPlanBatchLimit(actions) });
       return;
     }
-    showMessage("Hãy bấm đúng thumbnail ảnh Trello trước, rồi bấm Chạy ảnh đã chọn.", "error");
+    showMessage("Hãy bấm đúng thumbnail ảnh ERP trước, rồi bấm Chạy ảnh đã chọn.", "error");
     return;
   }
   const needsConfirmation = actions.some((action) => action.requires_confirmation);
   if (needsConfirmation) {
-    const ok = window.confirm("AI sẽ thực hiện các bước có thể làm trong app. Nếu có bước chạy Auto Trello, app sẽ bắt đầu tạo/chỉnh ảnh bằng Flow. Tiếp tục?");
+    const ok = window.confirm("AI sẽ thực hiện các bước có thể làm trong app. Nếu có bước chạy Auto ERP, app sẽ bắt đầu tạo/chỉnh ảnh bằng Flow. Tiếp tục?");
     if (!ok) {
       return;
     }
   }
-  const setCardActions = actions.filter((action) => action.action === "set_trello_card");
+  const setCardActions = actions.filter((action) => action.action === "set_erp_task");
   const orderedActions = actions.slice().sort((left, right) => {
-    if (left.action === "run_auto_trello") {
+    if (left.action === "run_auto_erp") {
       return 1;
     }
-    if (right.action === "run_auto_trello") {
+    if (right.action === "run_auto_erp") {
       return -1;
     }
     return 0;
   });
   for (const action of orderedActions) {
-    if (setCardActions.length > 1 && action.action === "set_trello_card") {
+    if (setCardActions.length > 1 && action.action === "set_erp_task") {
       continue;
     }
     await executeUserAssistantAction(action, { skipConfirmation: true });
@@ -5794,19 +5864,18 @@ elements.automationOpenFlowButton.addEventListener("click", openFlowProjectSurfa
 elements.automationRefreshButton.addEventListener("click", () => loadState());
 elements.automationHistoryRefreshButton.addEventListener("click", () => loadState());
 elements.automationIncompleteRefreshButton.addEventListener("click", () => loadState());
-elements.automationResetReadyButton?.addEventListener("click", resetReadyForAiOutputs);
 elements.automationRunButton.addEventListener("click", submitAutomationImage);
 elements.automationRunImageButton.addEventListener("click", submitAutomationImage);
 elements.automationAutoRunButton?.addEventListener("click", async () => {
-  if (activeContinuousAutoTrelloJob()) {
-    void stopContinuousAutoTrello();
+  if (activeContinuousAutoERPJob()) {
+    void stopContinuousAutoERP();
     return;
   }
-  const ready = await prepareReadyForAutoTrello();
+  const ready = await prepareReadyForAutoERP();
   if (!ready) {
     return;
   }
-  void submitAutomationImage({ autoTrello: true, continuousAutoTrello: true });
+  void submitAutomationImage({ autoERP: true, continuousAutoERP: true });
 });
 elements.automationUseStudioButton.addEventListener("click", useAutomationPromptInStudio);
 elements.automationExportButton.addEventListener("click", exportAutomationConfig);
@@ -5848,10 +5917,9 @@ elements.easyFlowButton?.addEventListener("click", async () => {
 });
 elements.easyReviewButton?.addEventListener("click", () => {
   state.automation.view = "diagram";
-  selectAutomationModuleByType("telegram", { create: true });
+  selectAutomationModuleByType("approval", { create: true });
   window.setTimeout(() => {
-    const input = elements.automationModuleSettings?.querySelector("[data-module-setting='telegramChat']");
-    input?.focus();
+    elements.dashboardReviewQueue?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, 0);
 });
 elements.easyRunButton?.addEventListener("click", submitAutomationImage);
@@ -5890,29 +5958,24 @@ elements.automationSheetFileInput?.addEventListener("change", (event) => {
     previewPromptSource(file);
   }
 });
-elements.automationTrelloSaveButton?.addEventListener("click", () => saveTrelloConfig());
-elements.automationTrelloClearButton?.addEventListener("click", () => saveTrelloConfig({ clearCredentials: true }));
+elements.automationERPSaveButton?.addEventListener("click", () => saveERPConfig());
+elements.automationERPIdeaRunButton?.addEventListener("click", () => runERPIdeaBatch());
+elements.automationERPClearButton?.addEventListener("click", () => saveERPConfig({ clearCredentials: true }));
 
-elements.trelloWizardSaveButton?.addEventListener("click", () => {
-  void submitTrelloWizard();
+elements.erpWizardSaveButton?.addEventListener("click", () => {
+  void submitERPWizard();
 });
-elements.trelloWizardCloseTriggers.forEach((node) => {
-  node.addEventListener("click", () => closeTrelloWizard({ remember: true }));
+elements.erpWizardCloseTriggers.forEach((node) => {
+  node.addEventListener("click", () => closeERPWizard({ remember: true }));
 });
 document.addEventListener("keydown", (event) => {
   if (event.key !== "Escape") {
     return;
   }
-  const wizard = elements.trelloSetupWizard;
+  const wizard = elements.erpSetupWizard;
   if (wizard && !wizard.hidden) {
-    closeTrelloWizard({ remember: true });
+    closeERPWizard({ remember: true });
   }
-});
-elements.automationTrelloUpscale2KInput?.addEventListener("change", (event) => {
-  if (!state.trello) {
-    state.trello = defaultTrelloState();
-  }
-  state.trello.upscale_to_2k = Boolean(event.target?.checked);
 });
 elements.userAssistantAskButton?.addEventListener("click", () => askUserAssistant());
 elements.userAssistantQuestion?.addEventListener("keydown", (event) => {
@@ -5927,7 +5990,7 @@ elements.userAssistantQuickButtons.forEach((button) => {
 elements.userAssistantAnswer?.addEventListener("click", (event) => {
   const candidateButton = event.target.closest("[data-assistant-card-value]");
   if (candidateButton) {
-    const selected = setAssistantTrelloCard(candidateButton.dataset.assistantCardValue || "", {
+    const selected = setAssistantERPTask(candidateButton.dataset.assistantCardValue || "", {
       listId: candidateButton.dataset.assistantListId || "",
       attachmentId: candidateButton.dataset.assistantAttachmentId || "",
     });
@@ -5936,7 +5999,7 @@ elements.userAssistantAnswer?.addEventListener("click", (event) => {
         const actions = Array.isArray(state.userAssistant?.last?.suggested_actions)
           ? state.userAssistant.last.suggested_actions.filter((action) => action?.action)
           : [];
-        void submitAutomationImage({ autoTrello: true, batchLimit: assistantPlanBatchLimit(actions) });
+        void submitAutomationImage({ autoERP: true, batchLimit: assistantPlanBatchLimit(actions) });
       }, 0);
     }
     return;
@@ -6031,12 +6094,11 @@ elements.scenarioCanvas.addEventListener("click", (event) => {
   elements.automationStepIconInput,
   elements.automationModuleTypeInput,
   elements.automationModuleEnabledInput,
-  elements.automationTelegramInput,
   elements.automationSheetInput,
-  elements.automationTrelloBoardInput,
-  elements.automationTrelloBoardStorageInput,
-  elements.automationTrelloCardInput,
-  elements.automationTrelloListInput,
+  elements.automationERPProjectInput,
+  elements.automationERPProjectStorageInput,
+  elements.automationERPTaskInput,
+  elements.automationERPStatusInput,
   elements.automationAppEyebrowInput,
   elements.automationAppTitleInput,
   elements.automationAppSubtitleInput,
@@ -6177,6 +6239,23 @@ elements.latestStatusCard.addEventListener("click", (event) => {
   if (actionTarget.dataset.action === "reuse-job") {
     reuseJob(actionTarget.dataset.jobId);
   }
+});
+elements.dashboardReviewQueue?.addEventListener("click", (event) => {
+  const addTarget = event.target.closest("[data-dashboard-artifact-add]");
+  if (addTarget) {
+    const container = addTarget.closest("[data-dashboard-review-job]");
+    void submitDashboardArtifact(addTarget.dataset.jobId || "", container, addTarget);
+    return;
+  }
+  const actionTarget = event.target.closest("[data-dashboard-approval]");
+  if (!actionTarget) {
+    return;
+  }
+  void submitDashboardApproval(
+    actionTarget.dataset.jobId || "",
+    Number(actionTarget.dataset.artifactIndex || -1),
+    actionTarget.dataset.dashboardApproval || "",
+  );
 });
 elements.imageReferenceList.addEventListener("click", (event) => {
   const promoteTarget = event.target.closest("[data-action='promote-reference-image']");

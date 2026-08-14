@@ -16,15 +16,18 @@ from .schemas import (
     CleanupRequest,
     ConfigUpdateRequest,
     CreateJobRequest,
+    DashboardArtifactAddRequest,
+    DashboardApprovalRequest,
     DownloadRequest,
     FlowOperatorRequest,
     IntegrationConfigUpdateRequest,
     PromptBatchRequest,
     PromptCreateRequest,
-    ResetReadyTrelloRequest,
+    ResetReadyERPRequest,
     ReplayCleanupRequest,
     StoryboardPlanRequest,
-    TrelloConfigUpdateRequest,
+    ERPConfigUpdateRequest,
+    ERPIdeaBatchRequest,
     UserAssistantRequest,
 )
 from .service import FlowWebService
@@ -72,11 +75,10 @@ async def lifespan(app: FastAPI):
     store = StateStore()
     app.state.flow_service = FlowWebService(store)
     sync_task = asyncio.create_task(app.state.flow_service.ensure_media_skill_library())
-    telegram_approval_task = asyncio.create_task(app.state.flow_service.run_telegram_approval_sync_loop())
     try:
         yield
     finally:
-        for task in (sync_task, telegram_approval_task):
+        for task in (sync_task,):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
@@ -127,24 +129,24 @@ async def update_config(request: Request, payload: ConfigUpdateRequest) -> Dict[
     return {"config": config}
 
 
-@app.put("/api/integrations/trello")
-async def update_trello_config(request: Request, payload: TrelloConfigUpdateRequest) -> Dict[str, Any]:
-    return {"trello": await service(request).update_trello_config(payload)}
+@app.put("/api/integrations/erp")
+async def update_erp_config(request: Request, payload: ERPConfigUpdateRequest) -> Dict[str, Any]:
+    return {"erp": await service(request).update_erp_config(payload)}
 
 
-@app.post("/api/trello/ready/reset")
-async def reset_ready_trello_outputs(request: Request, payload: ResetReadyTrelloRequest) -> Dict[str, Any]:
-    return await service(request).reset_ready_trello_outputs(payload)
+@app.post("/api/erp/ready/status")
+async def ready_erp_status(request: Request, payload: ResetReadyERPRequest) -> Dict[str, Any]:
+    return await service(request).ready_erp_status(payload)
 
 
-@app.post("/api/trello/ready/status")
-async def ready_trello_status(request: Request, payload: ResetReadyTrelloRequest) -> Dict[str, Any]:
-    return await service(request).ready_trello_status(payload)
+@app.post("/api/erp/idea-batch")
+async def enqueue_erp_idea_jobs(request: Request, payload: ERPIdeaBatchRequest) -> Dict[str, Any]:
+    return await service(request).enqueue_erp_idea_jobs(payload)
 
 
-@app.get("/api/trello/cards/{card_id}/attachments/{attachment_id}/preview")
-async def trello_attachment_preview(request: Request, card_id: str, attachment_id: str) -> Response:
-    payload = await service(request).trello_attachment_preview(card_id, attachment_id)
+@app.get("/api/erp/tasks/{task_id}/attachments/{attachment_id}/preview")
+async def erp_attachment_preview(request: Request, task_id: str, attachment_id: str) -> Response:
+    payload = await service(request).erp_attachment_preview(task_id, attachment_id)
     return Response(
         content=payload["content"],
         media_type=payload["media_type"],
@@ -157,9 +159,35 @@ async def update_integration_config(request: Request, payload: IntegrationConfig
     return {"integrations": await service(request).update_integration_config(payload)}
 
 
-@app.post("/api/telegram/approvals/sync")
-async def sync_telegram_approvals(request: Request) -> Dict[str, Any]:
-    return {"telegram_approvals": await service(request).sync_telegram_approvals()}
+@app.post("/api/jobs/{job_id}/artifacts/{artifact_index}/approval")
+async def apply_dashboard_approval(
+    request: Request,
+    job_id: str,
+    artifact_index: int,
+    payload: DashboardApprovalRequest,
+) -> Dict[str, Any]:
+    approval = await service(request).apply_dashboard_approval(
+        job_id,
+        artifact_index,
+        payload.status,
+        payload.reviewer,
+    )
+    return {"approval": approval}
+
+
+@app.post("/api/jobs/{job_id}/artifacts")
+async def add_dashboard_artifact(
+    request: Request,
+    job_id: str,
+    payload: DashboardArtifactAddRequest,
+) -> Dict[str, Any]:
+    artifact = await service(request).add_dashboard_artifact(
+        job_id,
+        payload.url,
+        payload.label,
+        payload.reviewer,
+    )
+    return {"artifact": artifact}
 
 
 @app.post("/api/prompt-sources/preview")
@@ -233,7 +261,7 @@ async def create_prompt_batch(request: Request, payload: PromptBatchRequest) -> 
 
 @app.post("/api/jobs/{job_id}/stop")
 async def stop_job(request: Request, job_id: str) -> Dict[str, Any]:
-    job = await service(request).request_stop_prompt_batch(job_id)
+    job = await service(request).request_stop_job(job_id)
     return {"job": job}
 
 

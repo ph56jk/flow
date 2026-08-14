@@ -57,8 +57,7 @@
             <div class="scenario-toolbar">
 	              <button type="button" class="ghost-button" id="automationUseStudioButton">Sửa cục</button>
 	              <button type="button" class="ghost-button" id="automationOpenFlowButton">Mở Flow</button>
-	              <button type="button" class="ghost-button danger-button" id="automationResetReadyButton">Reset Ready</button>
-	              <button type="button" class="ghost-button" id="automationAutoRunButton">Auto Trello</button>
+	              <button type="button" class="ghost-button" id="automationAutoRunButton">Auto ERP</button>
 	              <button type="button" class="secondary-button" id="automationRunButton">Chạy thử</button>
 	            </div>
 	          </div>
@@ -74,10 +73,10 @@
 	              <strong>Flow</strong>
 	              <small id="easyFlowStatus">Chưa đăng nhập</small>
 	            </button>
-	            <button type="button" class="easy-step" id="easyReviewButton">
-	              <span>3</span>
-	              <strong>Duyệt / lưu</strong>
-	              <small id="easyReviewStatus">Tuỳ chọn</small>
+            <button type="button" class="easy-step" id="easyReviewButton">
+              <span>3</span>
+              <strong>Duyệt / lưu</strong>
+              <small id="easyReviewStatus">Duyệt tại dashboard</small>
 	            </button>
 	            <button type="button" class="easy-step easy-step-run" id="easyRunButton">
 	              <span>4</span>
@@ -95,15 +94,15 @@
             </div>
             <div class="scenario-node-row" aria-label="Automation modules">
               <button type="button" class="scenario-node" data-scenario-step="source">
-                <span class="node-icon node-icon-trello">T</span>
+                <span class="node-icon node-icon-erp">T</span>
                 <strong id="nodeTitleSource">Flow AI Prompt</strong>
                 <small id="nodeDetailSource">Flow AI tự viết prompt</small>
               </button>
               <span class="scenario-link" aria-hidden="true"></span>
-              <button type="button" class="scenario-node" data-scenario-step="trello_source">
-                <span class="node-icon node-icon-trello">TS</span>
-                <strong id="nodeTitleTrelloSource">Trello Image Source</strong>
-                <small id="nodeDetailTrelloSource">Lấy ảnh gốc từ card</small>
+              <button type="button" class="scenario-node" data-scenario-step="erp_source">
+                <span class="node-icon node-icon-erp">TS</span>
+                <strong id="nodeTitleERPSource">ERP Task Source</strong>
+                <small id="nodeDetailERPSource">Lấy ảnh gốc từ Task</small>
               </button>
               <span class="scenario-link" aria-hidden="true"></span>
               <button type="button" class="scenario-node" data-scenario-step="normalize">
@@ -118,22 +117,22 @@
                 <small id="nodeDetailFlow">Tạo ảnh thay Gemini</small>
               </button>
               <span class="scenario-link" aria-hidden="true"></span>
-              <button type="button" class="scenario-node" data-scenario-step="telegram">
-                <span class="node-icon node-icon-telegram">TG</span>
-                <strong id="nodeTitleTelegram">Telegram Review</strong>
-                <small id="nodeDetailTelegram">Gửi ảnh để duyệt</small>
+              <button type="button" class="scenario-node" data-scenario-step="review_hold">
+                <span class="node-icon node-icon-log">D</span>
+                <strong>Dashboard Review</strong>
+                <small>Duyệt ảnh ngay trong app</small>
               </button>
               <span class="scenario-link" aria-hidden="true"></span>
               <button type="button" class="scenario-node" data-scenario-step="log">
                 <span class="node-icon node-icon-log">L</span>
-                <strong id="nodeTitleLog">Trello Archive</strong>
-                <small id="nodeDetailLog">Lưu ảnh vào card/list Trello</small>
+                <strong id="nodeTitleLog">ERP Task Comment</strong>
+                <small id="nodeDetailLog">Ghi URL ảnh đã duyệt vào Task</small>
               </button>
             </div>
 
             <div class="break-route" aria-hidden="true">
               <span></span>
-              <button type="button" class="break-node" data-scenario-step="review_hold">Pause for approval</button>
+              <button type="button" class="break-node" data-scenario-step="review_hold">Chờ duyệt trên dashboard</button>
             </div>
           </div>
 
@@ -165,7 +164,7 @@
               <textarea
                 id="automationPromptInput"
                 rows="3"
-                placeholder="Tùy chọn. Nếu để trống, Flow AI sẽ tự viết prompt từ ảnh Trello."
+                placeholder="Tùy chọn. Nếu để trống, Flow AI sẽ tự viết prompt từ ảnh ERP."
               ></textarea>
             </label>
             <div class="automation-command-side">
@@ -174,7 +173,7 @@
                 <select id="automationSourceType">
                   <option value="flow_ai">Flow AI tự viết prompt</option>
                   <option value="manual">Nhập tay / clipboard</option>
-                  <option value="trello">Trello list</option>
+                  <option value="erp">ERP Task</option>
                   <option value="sheets">Google Sheets tùy chọn</option>
                   <option value="folder">Folder / CSV nội bộ</option>
                 </select>
@@ -221,10 +220,10 @@
               <span class="status-pill" id="userAssistantEngine">Nội bộ</span>
             </div>
             <div class="assistant-quick-row">
-              <button type="button" class="ghost-button card-button" data-assistant-question="Vì sao app lấy nhầm ảnh Trello?">Trello</button>
+              <button type="button" class="ghost-button card-button" data-assistant-question="Vì sao app lấy nhầm ảnh ERP?">ERP</button>
               <button type="button" class="ghost-button card-button" data-assistant-question="Sheet prompt còn cần không hay AI tự viết prompt?">Sheet</button>
-              <button type="button" class="ghost-button card-button" data-assistant-question="Duyệt Telegram xong app lưu lại Trello ra sao?">Telegram</button>
-              <button type="button" class="ghost-button card-button" data-assistant-question="Dùng Flow AI Operator để tự động lấy ảnh Trello, viết prompt Flow, gửi Telegram duyệt và lưu lại Trello.">Flow AI</button>
+              <button type="button" class="ghost-button card-button" data-assistant-question="Duyệt ảnh trên dashboard xong app lưu lại ERP ra sao?">Duyệt ảnh</button>
+              <button type="button" class="ghost-button card-button" data-assistant-question="Dùng Flow AI Operator để tự động lấy ảnh ERP, viết prompt Flow, duyệt trên dashboard và lưu lại ERP.">Flow AI</button>
             </div>
             <label class="field">
               <span>Hỏi trợ lý</span>
@@ -236,7 +235,7 @@
             </label>
             <button type="button" class="secondary-button" id="userAssistantAskButton">Hỏi AI</button>
             <div id="userAssistantAnswer" class="assistant-answer">
-              Hỏi lỗi Trello, Sheet, Flow hoặc Telegram tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.
+              Hỏi lỗi ERP, Sheet, Flow hoặc bước duyệt ảnh tại đây. Trợ lý sẽ nhìn trạng thái app hiện tại và chỉ dẫn bước cần bấm tiếp theo.
             </div>
           </section>
 
@@ -250,12 +249,12 @@
               <input type="text" id="automationSourceLocationInput" placeholder="Không bắt buộc. Dán link nếu muốn dùng prompt có sẵn." />
             </label>
             <label class="field">
-              <span>Từ khóa tìm Trello</span>
+              <span>Từ khóa tìm ERP</span>
               <input type="text" id="automationProductFilterInput" placeholder="Ví dụ: gấu bông, áo trẻ em, wedding_hoop" />
             </label>
             <label class="field">
               <span>Paste prompt từ Sheet nếu muốn</span>
-              <textarea id="automationSheetPasteInput" rows="3" placeholder="Tùy chọn. Nếu để trống, AI sẽ tự viết prompt từ card Trello."></textarea>
+              <textarea id="automationSheetPasteInput" rows="3" placeholder="Tùy chọn. Nếu để trống, AI sẽ tự viết prompt từ ERP Task."></textarea>
             </label>
             <div class="customize-actions source-actions">
               <button type="button" class="ghost-button card-button" id="automationSheetPreviewButton">Lấy prompt tùy chọn</button>
@@ -288,11 +287,10 @@
                 <span>Loại module</span>
                 <select id="automationModuleTypeInput">
                   <option value="source">Prompt source</option>
-                  <option value="trello_source">Trello source</option>
+                  <option value="erp_source">ERP source</option>
                   <option value="normalize">Normalize</option>
                   <option value="flow">Google Flow</option>
-                  <option value="telegram">Telegram</option>
-                  <option value="trello">Trello</option>
+                  <option value="erp">ERP</option>
                   <option value="approval">Approval</option>
                   <option value="custom">Custom</option>
                 </select>
@@ -316,55 +314,64 @@
             <div id="automationModuleSettings" class="module-settings"></div>
             <div class="detail-grid sidebar-detail-grid module-legacy-targets" hidden>
               <label class="field">
-                <span>Telegram chat</span>
-                <input type="text" id="automationTelegramInput" placeholder="@review_channel hoặc chat id" />
+                <span>HaviGroup ERP Project</span>
+                <input type="text" id="automationERPProjectInput" value="PROJ-0049" readonly />
               </label>
               <label class="field">
-                <span>Trello board lấy card</span>
-                <input type="text" id="automationTrelloBoardInput" placeholder="Board ID hoặc link board Trello" />
+                <span>ERP Task nguồn</span>
+                <input type="text" id="automationERPTaskInput" placeholder="TASK-xxxx (Task có ảnh nguồn)" />
               </label>
               <label class="field">
-                <span>Trello card lưu ảnh</span>
-                <input type="text" id="automationTrelloCardInput" placeholder="Card ID hoặc link card Trello" />
-              </label>
-              <label class="field">
-                <span>Trello list tạo card mới</span>
-                <input type="text" id="automationTrelloListInput" placeholder="List ID nếu muốn mỗi job tạo card mới" />
+                <span>Trạng thái nguồn</span>
+                <input type="text" id="automationERPStatusInput" placeholder="Open" />
               </label>
             </div>
           </section>
 
-          <section class="inspector-section" id="automationTrelloSection">
+          <section class="inspector-section" id="automationERPSection">
             <div class="inspector-head">
-              <p class="eyebrow">Trello storage</p>
-              <span class="status-pill" id="automationTrelloStatus">Chưa lưu</span>
+              <p class="eyebrow">HaviGroup ERP</p>
+              <span class="status-pill" id="automationERPStatus">Chưa lưu</span>
             </div>
             <label class="field">
-              <span>Trello API key</span>
-              <input type="password" id="automationTrelloKeyInput" autocomplete="off" placeholder="Dán API key Trello" />
+              <span>HaviGroup ERP API key</span>
+              <input type="password" id="automationERPKeyInput" autocomplete="off" placeholder="Dán API key ERP" />
             </label>
             <label class="field">
-              <span>Trello token</span>
-              <input type="password" id="automationTrelloTokenInput" autocomplete="off" placeholder="Dán token Trello" />
+              <span>HaviGroup ERP API secret</span>
+              <input type="password" id="automationERPSecretInput" autocomplete="off" placeholder="Dán API secret ERP" />
             </label>
             <label class="field">
-              <span>Trello board URL</span>
-              <input type="text" id="automationTrelloBoardStorageInput" placeholder="https://trello.com/b/... hoặc board ID" />
+              <span>HaviGroup ERP Project</span>
+              <input type="text" id="automationERPProjectStorageInput" placeholder="PROJ-0013" />
+              <small class="field-hint">Cặp API key/secret này dùng chế độ tương thích Frappe. App chỉ đọc/ghi trong đúng Project bạn nhập ở đây; URL artefact đã duyệt được ghi vào comment Task qua GraphQL.</small>
+            </label>
+            <div class="customize-actions erp-actions">
+              <button type="button" class="ghost-button card-button" id="automationERPSaveButton">Lưu ERP</button>
+              <button type="button" class="ghost-button card-button" id="automationERPClearButton">Xóa API key/secret</button>
+            </div>
+          </section>
+
+          <section class="inspector-section" id="automationERPIdeaSection">
+            <div class="inspector-head">
+              <p class="eyebrow">Chạy ảnh cho từng idea</p>
+              <span class="status-pill" id="automationERPIdeaStatus">Sẵn sàng</span>
+            </div>
+            <label class="field">
+              <span>Thẻ Idea cha (có Phân rã công việc)</span>
+              <input type="text" id="automationERPIdeaTaskInput" placeholder="TASK-2026-00202" />
+              <small class="field-hint">App lấy ảnh idea trên thẻ cha (kể cả ảnh bìa), chạy ảnh content cho từng thẻ con, rồi gửi ảnh vào đúng thẻ con đó sau khi bạn bấm duyệt trên dashboard.</small>
             </label>
             <label class="field">
-              <span>Cách lưu ảnh</span>
-              <select id="automationTrelloUploadMode">
-                <option value="file">Upload file thật lên Trello</option>
-                <option value="url">Chỉ attach link ảnh</option>
-              </select>
+              <span>Số ảnh mỗi idea</span>
+              <input type="number" id="automationERPIdeaCountInput" min="1" max="24" value="12" />
             </label>
-            <label class="field checkbox-field">
-              <input type="checkbox" id="automationTrelloUpscale2KInput" />
-              <span>Nâng cấp ảnh lên 2K trước khi upload (Flow UI 2K download)</span>
+            <label class="field module-toggle-field">
+              <span>Chạy lại cả thẻ con đã có ảnh Flow</span>
+              <input type="checkbox" id="automationERPIdeaIncludeDoneInput" />
             </label>
-            <div class="customize-actions trello-actions">
-              <button type="button" class="ghost-button card-button" id="automationTrelloSaveButton">Lưu Trello</button>
-              <button type="button" class="ghost-button card-button" id="automationTrelloClearButton">Xóa key/token</button>
+            <div class="customize-actions erp-actions">
+              <button type="button" class="primary-button card-button" id="automationERPIdeaRunButton">Chạy ảnh cho các idea</button>
             </div>
           </section>
 
@@ -382,14 +389,12 @@
               <input type="text" id="automationGeminiModelInput" placeholder="gemini-2.5-flash" />
             </label>
             <label class="field">
-              <span>Telegram bot token</span>
-              <input type="password" id="automationTelegramTokenInput" autocomplete="off" placeholder="Dán token bot Telegram" />
             </label>
             <label class="field">
               <span>Playwright browser path</span>
               <input type="text" id="automationPlaywrightPathInput" placeholder="Để trống để app tự chọn, hoặc dán thư mục Playwright" />
             </label>
-            <div class="customize-actions trello-actions">
+            <div class="customize-actions erp-actions">
               <button type="button" class="ghost-button card-button" id="automationEnvSaveButton">Lưu app</button>
               <button type="button" class="ghost-button card-button" id="automationEnvClearButton">Xóa secret</button>
             </div>
@@ -407,7 +412,7 @@
             </label>
             <label class="field">
               <span>Mô tả trên thanh đầu</span>
-              <textarea id="automationAppSubtitleInput" rows="2" placeholder="Auto Trello lấy ảnh, AI viết prompt, Flow tạo ảnh, Telegram duyệt."></textarea>
+              <textarea id="automationAppSubtitleInput" rows="2" placeholder="Auto ERP lấy ảnh, AI viết prompt, Flow tạo ảnh, duyệt ngay trên dashboard."></textarea>
             </label>
             <label class="field">
               <span>Nguồn prompt cụ thể</span>
@@ -857,53 +862,52 @@
           <div id="latestStatusCard" class="latest-status empty-state">
             Chưa có lượt chạy nào. Sau khi bấm chạy, tab Google Flow sẽ được giữ mở.
           </div>
+          <section id="dashboardReviewQueue" class="dashboard-review-queue" hidden aria-live="polite"></section>
         </section>
       </main>
     </div>
 
-    <div id="trelloSetupWizard" class="setup-wizard" hidden aria-hidden="true" role="dialog" aria-labelledby="trelloSetupWizardTitle">
-      <div class="setup-wizard__backdrop" data-trello-wizard-close></div>
+    <div id="erpSetupWizard" class="setup-wizard" hidden aria-hidden="true" role="dialog" aria-labelledby="erpSetupWizardTitle">
+      <div class="setup-wizard__backdrop" data-erp-wizard-close></div>
       <div class="setup-wizard__panel" role="document">
         <header class="setup-wizard__head">
           <p class="eyebrow">Setup lần đầu</p>
-          <h2 id="trelloSetupWizardTitle">Kết nối Trello để Flow v2 tự lấy ảnh sản phẩm</h2>
+          <h2 id="erpSetupWizardTitle">Kết nối HaviGroup ERP để Flow v2 tự lấy ảnh sản phẩm</h2>
           <p class="setup-wizard__lead">
-            Điền 3 ô dưới đây 1 lần. App sẽ lưu vào <code>.env.local</code> ở thư mục dự án để giữ creds qua mọi lần khởi động — không cần nhập lại.
+            Điền API key và API secret một lần. App lưu cục bộ vào <code>.env.local</code>; secret không được export hay trả về trình duyệt.
           </p>
         </header>
 
         <div class="setup-wizard__body">
           <label class="field">
-            <span>Trello API key</span>
-            <input type="password" id="trelloWizardKeyInput" autocomplete="off" placeholder="Dán API key Trello" />
+            <span>HaviGroup ERP API key</span>
+            <input type="password" id="erpWizardKeyInput" autocomplete="off" placeholder="Dán API key ERP" />
             <small class="field-hint">
-              Lấy tại
-              <a href="https://trello.com/power-ups/admin/" target="_blank" rel="noopener noreferrer">trello.com/power-ups/admin</a>
-              → "New" → tạo Power-Up → mở tab Generate, sao chép "API key".
+              Credential này chỉ được gửi trong header Authorization của GraphQL (chế độ tương thích Frappe key/secret).
             </small>
           </label>
           <label class="field">
-            <span>Trello token</span>
-            <input type="password" id="trelloWizardTokenInput" autocomplete="off" placeholder="Dán token Trello" />
+            <span>HaviGroup ERP API secret</span>
+            <input type="password" id="erpWizardSecretInput" autocomplete="off" placeholder="Dán API secret ERP" />
             <small class="field-hint">
-              Trong cùng trang Generate, bấm "Token" → cấp quyền cho key → sao chép token trả về.
+              Không dán secret vào URL, issue tracker hoặc tệp được commit.
             </small>
           </label>
           <label class="field">
-            <span>Trello board URL</span>
-            <input type="text" id="trelloWizardBoardInput" placeholder="https://trello.com/b/abc123/ten-board" />
+            <span>HaviGroup ERP Project</span>
+            <input type="text" id="erpWizardBoardInput" value="PROJ-0049" placeholder="PROJ-0013" />
             <small class="field-hint">
-              Dán URL board chứa card có ảnh sản phẩm để Auto Trello quét.
+              Flow v2 chỉ quét Task trong Project này.
             </small>
           </label>
-          <div class="setup-wizard__status" id="trelloWizardStatus" hidden></div>
+          <div class="setup-wizard__status" id="erpWizardStatus" hidden></div>
         </div>
 
         <footer class="setup-wizard__actions">
-          <button type="button" class="ghost-button" id="trelloWizardLaterButton" data-trello-wizard-close>
+          <button type="button" class="ghost-button" id="erpWizardLaterButton" data-erp-wizard-close>
             Để sau
           </button>
-          <button type="button" class="primary-button" id="trelloWizardSaveButton">
+          <button type="button" class="primary-button" id="erpWizardSaveButton">
             Lưu vĩnh viễn (.env.local)
           </button>
         </footer>

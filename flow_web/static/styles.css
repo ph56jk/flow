@@ -1390,6 +1390,139 @@ textarea:focus {
   flex-wrap: wrap;
 }
 
+.dashboard-review-queue {
+  display: grid;
+  gap: 14px;
+  margin-top: 18px;
+  padding: 18px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: rgba(124, 46, 230, 0.06);
+}
+
+.dashboard-review-head,
+.dashboard-review-job-head,
+.dashboard-review-artifact-copy {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.dashboard-review-head h3,
+.dashboard-review-head p,
+.dashboard-review-job > p {
+  margin: 0;
+}
+
+.dashboard-review-head > div {
+  display: grid;
+  gap: 5px;
+}
+
+.dashboard-review-head p,
+.dashboard-review-job > p,
+.dashboard-review-job-head small {
+  color: var(--muted);
+}
+
+.dashboard-review-idea-source {
+  font-size: 0.84rem;
+}
+
+.dashboard-review-job-list {
+  display: grid;
+  gap: 12px;
+}
+
+.dashboard-review-job {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--panel-soft);
+}
+
+.dashboard-review-artifact-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px;
+}
+
+.dashboard-review-artifact {
+  display: grid;
+  gap: 10px;
+  overflow: hidden;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.dashboard-review-artifact[data-status="approved"] {
+  border-color: rgba(74, 192, 132, 0.5);
+}
+
+.dashboard-review-artifact[data-status="rejected"] {
+  opacity: 0.72;
+  border-color: rgba(255, 112, 112, 0.4);
+}
+
+.dashboard-review-artifact img,
+.dashboard-review-placeholder {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  display: block;
+  object-fit: cover;
+  border-radius: calc(var(--radius-sm) - 3px);
+  background: #080808;
+}
+
+.dashboard-review-placeholder {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 0.86rem;
+}
+
+.dashboard-review-artifact-copy strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dashboard-review-add {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(220px, 1.4fr) minmax(150px, 0.8fr) auto;
+  align-items: end;
+  gap: 10px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.dashboard-review-add > div {
+  display: grid;
+  gap: 3px;
+}
+
+.dashboard-review-add small {
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.dashboard-review-add input {
+  min-width: 0;
+}
+
+@media (max-width: 860px) {
+  .dashboard-review-add {
+    grid-template-columns: 1fr;
+  }
+}
+
 .action-link {
   min-height: 38px;
   padding: 0 14px;
@@ -2136,7 +2269,7 @@ textarea:focus {
   transition: transform 170ms ease, outline-color 170ms ease, box-shadow 170ms ease, background 170ms ease;
 }
 
-.node-icon-trello {
+.node-icon-erp {
   background: #0c82c8;
 }
 
@@ -2151,6 +2284,10 @@ textarea:focus {
 
 .node-icon-telegram {
   background: var(--blue);
+}
+
+.node-icon-watermark {
+  background: #b45309;
 }
 
 .node-icon-custom {
@@ -2593,7 +2730,7 @@ textarea:focus {
   gap: 8px;
 }
 
-.trello-actions {
+.erp-actions {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
@@ -2901,7 +3038,7 @@ textarea:focus {
   }
 }
 
-/* ── Setup wizard (first-run Trello credentials) ─────────────────── */
+/* ── Setup wizard (first-run ERP credentials) ─────────────────── */
 .setup-wizard {
   position: fixed;
   inset: 0;

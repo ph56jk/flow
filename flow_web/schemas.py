@@ -24,15 +24,13 @@ class AppConfig(BaseModel):
     output_dir: str = ""
 
 
-class TrelloConfig(BaseModel):
+class ERPConfig(BaseModel):
     api_key: str = ""
-    token: str = ""
-    board_id: str = ""
-    card_id: str = ""
-    list_id: str = ""
-    upload_mode: str = "file"
-    set_cover: bool = True
-    upscale_to_2k: bool = True
+    api_secret: str = ""
+    base_url: str = "https://erp.havigroup.llc"
+    project_id: str = "PROJ-0049"
+    task_id: str = ""
+    status: str = ""
     updated_at: str = ""
 
 
@@ -42,6 +40,10 @@ class IntegrationConfig(BaseModel):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     playwright_browsers_path: str = ""
+    # Local Gemini watermark processor (removelogo). Empty url falls back to
+    # REMOVE_LOGO_URL then the documented http://127.0.0.1:8788 loopback.
+    removelogo_url: str = ""
+    removelogo_enabled: bool = True
     updated_at: str = ""
 
 
@@ -109,6 +111,11 @@ class JobArtifact(BaseModel):
     mime_type: str = ""
     prompt: str = ""
     dimensions: Dict[str, Any] = Field(default_factory=dict)
+    # Local Gemini watermark pass: "cleaned" (visible watermark repaired),
+    # "metadata_only" (AI provenance stripped but the sparkle is still visible),
+    # "skipped" (nothing to remove) or "failed" (original bytes kept).
+    watermark_status: str = ""
+    watermark_error: str = ""
 
 
 class JobRecoveryAction(BaseModel):
@@ -247,7 +254,7 @@ class PublicSkillSnapshot(BaseModel):
 
 class StateSnapshot(BaseModel):
     config: AppConfig = Field(default_factory=AppConfig)
-    trello_config: TrelloConfig = Field(default_factory=TrelloConfig)
+    erp_config: ERPConfig = Field(default_factory=ERPConfig)
     integration_config: IntegrationConfig = Field(default_factory=IntegrationConfig)
     flow_profile_quota_blocked_until: Dict[str, float] = Field(default_factory=dict)
     flow_profile_agent_retry_error_counts: Dict[str, int] = Field(default_factory=dict)
@@ -266,22 +273,36 @@ class ConfigUpdateRequest(BaseModel):
     output_dir: str = ""
 
 
-class TrelloConfigUpdateRequest(BaseModel):
+class ERPConfigUpdateRequest(BaseModel):
     api_key: str = ""
-    token: str = ""
-    board_id: str = ""
-    card_id: str = ""
-    list_id: str = ""
-    upload_mode: str = "file"
-    set_cover: bool = True
-    upscale_to_2k: bool = True
+    api_secret: str = ""
+    base_url: str = "https://erp.havigroup.llc"
+    project_id: str = "PROJ-0049"
+    task_id: str = ""
+    status: str = ""
     clear_credentials: bool = False
     persist_to_env: bool = False  # also write to .env.local so creds survive state resets
 
 
-class ResetReadyTrelloRequest(BaseModel):
-    trello_board_id: str = ""
-    trello_list_id: str = ""
+class ERPIdeaBatchRequest(BaseModel):
+    """Fan a parent "Idea" card out over the child cards its breakdown made.
+
+    One child card is one idea: the images generated for it are written back
+    onto that same card, so the board keeps one card per idea instead of one
+    pile of images on the parent.
+    """
+
+    task_id: str = ""
+    child_task_ids: List[str] = Field(default_factory=list)
+    count: int = 0  # images per idea; 0 keeps the app default
+    include_done: bool = False  # rerun ideas that already carry Flow images
+    model: str = ""
+    aspect: str = "square"
+
+
+class ResetReadyERPRequest(BaseModel):
+    erp_project_id: str = "PROJ-0049"
+    erp_status_id: str = ""
 
 
 class IntegrationConfigUpdateRequest(BaseModel):
@@ -290,8 +311,11 @@ class IntegrationConfigUpdateRequest(BaseModel):
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     playwright_browsers_path: str = ""
+    removelogo_url: str = ""
+    removelogo_enabled: Optional[bool] = None
     clear_gemini_api_key: bool = False
     clear_telegram_bot_token: bool = False
+    clear_removelogo_url: bool = False
 
 
 class AutomationModuleRequest(BaseModel):
@@ -333,17 +357,20 @@ class CreateJobRequest(BaseModel):
     workflow_id: str = ""
     telegram_chat_id: str = ""
     telegram_enabled: bool = True
-    trello_enabled: bool = True
+    erp_enabled: bool = True
     flow_agent_enabled: bool = True
     flow_agent_auto_approve: bool = True
     automation_graph: AutomationGraphRequest = Field(default_factory=AutomationGraphRequest)
-    trello_board_id: str = ""
-    trello_card_id: str = ""
-    trello_list_id: str = ""
-    trello_attachment_ids: List[str] = Field(default_factory=list)
-    trello_source_card_id: str = ""
-    trello_source_attachment_ids: List[str] = Field(default_factory=list)
-    trello_set_cover: bool = True
+    erp_project_id: str = ""
+    erp_task_id: str = ""
+    erp_status_id: str = ""
+    erp_attachment_ids: List[str] = Field(default_factory=list)
+    erp_source_task_id: str = ""
+    erp_source_attachment_ids: List[str] = Field(default_factory=list)
+    # Card that receives the finished images. Empty means "write back to the
+    # card the source image came from"; the idea fan-out sets it to the child
+    # card so each idea keeps its own images.
+    erp_output_task_id: str = ""
     prompt_source_row: int = 0
     prompt_product: str = ""
     prompt_product_key: str = ""
@@ -367,11 +394,11 @@ class PromptBatchItemRequest(BaseModel):
     product_name: str = ""
     index: str = ""
     notes: str = ""
-    trello_card_id: str = ""
-    trello_list_id: str = ""
-    trello_attachment_ids: List[str] = Field(default_factory=list)
-    trello_source_card_id: str = ""
-    trello_source_attachment_ids: List[str] = Field(default_factory=list)
+    erp_task_id: str = ""
+    erp_status_id: str = ""
+    erp_attachment_ids: List[str] = Field(default_factory=list)
+    erp_source_task_id: str = ""
+    erp_source_attachment_ids: List[str] = Field(default_factory=list)
 
 
 class PromptBatchRequest(BaseModel):
@@ -379,7 +406,7 @@ class PromptBatchRequest(BaseModel):
     items: List[PromptBatchItemRequest] = Field(default_factory=list)
     title: str = ""
     limit: int = 40
-    auto_trello: bool = False
+    auto_erp: bool = False
     run_until_empty: bool = False
     continuous: bool = False
     poll_interval_s: int = 30
@@ -392,6 +419,21 @@ class DownloadRequest(BaseModel):
 class ArtifactOpenRequest(BaseModel):
     artifact_index: int = 0
     target: str = "best"
+
+
+class DashboardApprovalRequest(BaseModel):
+    """A review decision made in the local Flow v2 dashboard."""
+
+    status: str = ""
+    reviewer: str = ""
+
+
+class DashboardArtifactAddRequest(BaseModel):
+    """A public image the reviewer adds to an open ERP idea review."""
+
+    url: str = ""
+    label: str = ""
+    reviewer: str = ""
 
 
 class ReplayCleanupRequest(BaseModel):
