@@ -1959,6 +1959,26 @@ textarea:focus {
   border-bottom-color: var(--accent);
 }
 
+/* Pending approvals are the only thing on this bar that blocks the pipeline,
+   so the count stays visible even while another tab is active. */
+.scenario-tab-count {
+  display: inline-block;
+  min-width: 20px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 18px;
+  text-align: center;
+}
+
+.scenario-tab-count[hidden] {
+  display: none;
+}
+
 .scenario-toolbar #automationRunButton,
 .automation-command #automationRunImageButton,
 .flow-dashboard #submitButton,

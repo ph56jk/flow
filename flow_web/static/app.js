@@ -796,6 +796,10 @@ const elements = {
   automationViewButtons: Array.from(document.querySelectorAll("[data-automation-view]")),
   scenarioHistoryPanel: document.querySelector("#scenarioHistoryPanel"),
   scenarioIncompletePanel: document.querySelector("#scenarioIncompletePanel"),
+  scenarioApprovalPanel: document.querySelector("#scenarioApprovalPanel"),
+  dashboardReviewEmpty: document.querySelector("#dashboardReviewEmpty"),
+  automationReviewTabCount: document.querySelector("#automationReviewTabCount"),
+  automationApprovalRefreshButton: document.querySelector("#automationApprovalRefreshButton"),
   automationHistoryPanelList: document.querySelector("#automationHistoryPanelList"),
   automationIncompletePanelList: document.querySelector("#automationIncompletePanelList"),
   automationHistoryRefreshButton: document.querySelector("#automationHistoryRefreshButton"),
@@ -2348,6 +2352,9 @@ function renderAutomationViewPanels(stats) {
   }
   elements.scenarioHistoryPanel.hidden = selectedView !== "history";
   elements.scenarioIncompletePanel.hidden = selectedView !== "incomplete";
+  if (elements.scenarioApprovalPanel) {
+    elements.scenarioApprovalPanel.hidden = selectedView !== "review";
+  }
 
   const command = document.querySelector(".automation-command");
   const usage = document.querySelector(".scenario-usage");
@@ -3605,6 +3612,18 @@ function dashboardWatermarkNotice(artifact) {
   return null;
 }
 
+// Every "go review the images" entry point has to land on the tab that owns the
+// Duyệt / Từ chối buttons, otherwise the operator is told to approve on a view
+// that no longer holds the queue.
+function openDashboardReviewTab() {
+  state.automation.view = "review";
+  saveAutomationConfig(state.automation);
+  renderAutomationDashboard();
+  window.setTimeout(() => {
+    elements.dashboardReviewQueue?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, 0);
+}
+
 function renderDashboardReviewQueue() {
   if (!elements.dashboardReviewQueue) {
     return;
@@ -3612,6 +3631,22 @@ function renderDashboardReviewQueue() {
   const jobs = (state.jobs || [])
     .filter(jobAwaitsDashboardReview)
     .sort((left, right) => new Date(right.updated_at || right.created_at || 0).getTime() - new Date(left.updated_at || left.created_at || 0).getTime());
+  // The tab badge is how an operator learns there is something to approve
+  // without opening the tab, so it counts undecided images, not jobs.
+  const pendingImages = jobs.reduce(
+    (total, job) =>
+      total +
+      (job.artifacts || []).filter((_artifact, index) => dashboardApprovalStatus(job, index) === "pending").length,
+    0,
+  );
+  if (elements.automationReviewTabCount) {
+    elements.automationReviewTabCount.hidden = pendingImages === 0;
+    elements.automationReviewTabCount.textContent = String(pendingImages);
+  }
+  if (elements.dashboardReviewEmpty) {
+    elements.dashboardReviewEmpty.hidden = jobs.length > 0;
+  }
+
   if (!jobs.length) {
     elements.dashboardReviewQueue.hidden = true;
     elements.dashboardReviewQueue.innerHTML = "";
@@ -3643,14 +3678,18 @@ function renderDashboardReviewQueue() {
           const decisions = job.artifacts.map((artifact, artifactIndex) => {
             const status = dashboardApprovalStatus(job, artifactIndex);
             const preview = dashboardArtifactPreview(artifact);
-            const title = artifact.media_name || artifact.label || `Ảnh ${artifactIndex + 1}`;
+            // Flow names its media with a bare UUID, which tells the reviewer
+            // nothing. Number the images the way the run log does and keep the
+            // original name only as a tooltip.
+            const title = `Ảnh ${artifactIndex + 1}`;
+            const mediaName = String(artifact.media_name || artifact.label || "").trim();
             const statusLabel = status === "approved" ? "Đã duyệt" : status === "rejected" ? "Đã từ chối" : "Chờ duyệt";
             const watermark = dashboardWatermarkNotice(artifact);
             return `
               <article class="dashboard-review-artifact" data-status="${escapeHtml(status)}">
                 ${preview ? `<img src="${escapeHtml(preview)}" alt="${escapeHtml(title)}" />` : `<div class="dashboard-review-placeholder">Chưa có preview</div>`}
                 <div class="dashboard-review-artifact-copy">
-                  <strong>${escapeHtml(title)}</strong>
+                  <strong title="${escapeHtml(mediaName)}">${escapeHtml(title)}</strong>
                   <span class="status-pill" data-state="${escapeHtml(status === "approved" ? "ready" : status === "rejected" ? "error" : "pending")}">${escapeHtml(statusLabel)}</span>
                   ${
                     watermark
@@ -5426,7 +5465,7 @@ async function executeUserAssistantAction(action, { skipConfirmation = false } =
     } else if (actionName === "preview_prompt_source") {
       await previewPromptSource();
     } else if (actionName === "open_dashboard_review") {
-      elements.dashboardReviewQueue?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      openDashboardReviewTab();
       showMessage("Các artefact chờ duyệt đang hiển thị ngay trên dashboard.", "success");
     } else if (actionName === "open_flow_project") {
       await openFlowProjectSurface();
@@ -5939,12 +5978,9 @@ elements.easyFlowButton?.addEventListener("click", async () => {
   await openFlowProjectSurface();
 });
 elements.easyReviewButton?.addEventListener("click", () => {
-  state.automation.view = "diagram";
-  selectAutomationModuleByType("approval", { create: true });
-  window.setTimeout(() => {
-    elements.dashboardReviewQueue?.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, 0);
+  openDashboardReviewTab();
 });
+elements.automationApprovalRefreshButton?.addEventListener("click", () => loadState());
 elements.easyRunButton?.addEventListener("click", submitAutomationImage);
 elements.automationModuleAddButton?.addEventListener("click", () => addAutomationModule());
 elements.automationModuleDuplicateButton?.addEventListener("click", () => addAutomationModule({ duplicate: true }));

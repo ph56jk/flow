@@ -53,6 +53,7 @@
 	              <button type="button" class="scenario-tab active" data-automation-view="diagram">Sơ đồ</button>
 	              <button type="button" class="scenario-tab" data-automation-view="history">Lịch sử</button>
 	              <button type="button" class="scenario-tab" data-automation-view="incomplete">Cần xem lại</button>
+	              <button type="button" class="scenario-tab" data-automation-view="review">Duyệt ảnh <span class="scenario-tab-count" id="automationReviewTabCount" hidden>0</span></button>
             </div>
             <div class="scenario-toolbar">
 	              <button type="button" class="ghost-button" id="automationUseStudioButton">Sửa cục</button>
@@ -156,6 +157,21 @@
               <button type="button" class="ghost-button card-button" id="automationIncompleteRefreshButton">Refresh</button>
             </div>
             <div id="automationIncompletePanelList" class="scenario-table-list"></div>
+          </section>
+
+          <!-- The approval gate is what the client asked for by name: nothing may
+               reach ERP until a person presses Duyệt here. It lives in the tab bar
+               the operator already uses, not in the hidden legacy studio. -->
+          <section class="scenario-view-panel" id="scenarioApprovalPanel" hidden>
+            <div class="scenario-panel-head">
+              <div>
+                <p class="eyebrow">Dashboard review</p>
+                <h2>Duyệt ảnh trước khi ghi vào ERP</h2>
+              </div>
+              <button type="button" class="ghost-button card-button" id="automationApprovalRefreshButton">Refresh</button>
+            </div>
+            <section id="dashboardReviewQueue" class="dashboard-review-queue" hidden aria-live="polite"></section>
+            <div id="dashboardReviewEmpty" class="scenario-panel-empty">Không có ảnh nào đang chờ duyệt.</div>
           </section>
 
           <div class="automation-command">
@@ -862,7 +878,6 @@
           <div id="latestStatusCard" class="latest-status empty-state">
             Chưa có lượt chạy nào. Sau khi bấm chạy, tab Google Flow sẽ được giữ mở.
           </div>
-          <section id="dashboardReviewQueue" class="dashboard-review-queue" hidden aria-live="polite"></section>
         </section>
       </main>
     </div>
