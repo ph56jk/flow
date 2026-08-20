@@ -1241,7 +1241,14 @@ class FlowWebService:
         return ""
 
     def _normalize_prompt_source_header(self, value: str) -> str:
-        normalized = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+        # ``đ`` gấp thành ``d`` trước: nó là chữ cái riêng (U+0111) nên NFKD
+        # không tách ra, và ``encode("ascii", "ignore")`` bên dưới xoá thẳng nó.
+        # Cột "Đã dùng" khi ấy ra ``adung`` trong khi bảng khoá viết ``dadung``,
+        # nên `_find_prompt_source_column` trả về rỗng — app coi như bảng tính
+        # không có cột đánh dấu đã dùng và chạy lại prompt cũ từ đầu. Hai khoá
+        # ``dungroi``/``xong`` không có đ nên vẫn sống, đó là lý do lỗi này im.
+        raw = str(value or "").replace("đ", "d").replace("Đ", "D")
+        normalized = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
         return re.sub(r"[^a-z0-9]+", "", normalized.lower())
 
     def _truthy_sheet_value(self, value: str) -> bool:
@@ -4020,7 +4027,7 @@ class FlowWebService:
         return await self.request_stop_job(job_id)
 
     def _auto_erp_waitable_empty_error(self, detail: str) -> bool:
-        normalized = self._strip_accents(str(detail or "")).lower()
+        normalized = self._flow_agent_error_match_text(detail)
         return any(
             signal in normalized
             for signal in (
@@ -4031,7 +4038,13 @@ class FlowWebService:
         )
 
     def _auto_erp_should_stop_on_child_error(self, detail: str) -> bool:
-        normalized = self._strip_accents(str(detail or "")).lower()
+        # Dùng `_flow_agent_error_match_text` chứ không `_strip_accents`: hàm kia
+        # đã biết gấp ``đ``, và danh sách tín hiệu dưới đây là bản sao của danh
+        # sách trong `_is_flow_agent_source_attachment_error` vốn đi qua nó. Bản
+        # sao ở đây trước dùng `_strip_accents` nên sáu trong chín tín hiệu chết:
+        # "được" ra ``uoc``, "đúng" ra ``ung``, "đã" ra ``a`` — thẻ hỏng vì
+        # không kéo được ảnh nguồn vẫn chạy tiếp cả loạt thay vì dừng.
+        normalized = self._flow_agent_error_match_text(detail)
         stop_signals = (
             "chua keo/upload duoc anh erp",
             "chua keo duoc anh nguon",
@@ -20666,6 +20679,15 @@ exit 1
         return "".join(char for char in normalized if unicodedata.category(char) != "Mn")
 
     def _normalize_skill_token(self, text: str) -> str:
+        # Gấp ``đ`` ở đây chứ không gấp trong `_strip_accents`: hàm kia còn nuôi
+        # `_compact_match_text`, thứ dùng để tra tên cột/tên thẻ ERP theo một từ
+        # vựng đóng, mà gấp trong từ vựng đóng thì hai tên khác nhau có thể đụng
+        # nhau ("dòng hàng" và "đóng hàng" cùng ra ``donghang``). Ở đây đầu vào
+        # là câu người dùng gõ tự do và các bảng so khớp đều viết ASCII, nên
+        # không gấp mới là hỏng: "bắt đầu" ra ``bat_au``, "điều khiển flow" ra
+        # ``ieu_khien_flow``, "hệ thống tự động" ra ``he_thong_tu_ong`` — cả ba
+        # khoá tương ứng không bao giờ khớp.
+        text = str(text or "").replace("đ", "d").replace("Đ", "D")
         stripped = self._strip_accents(text or "").lower()
         stripped = re.sub(r"[^a-z0-9]+", "_", stripped)
         return stripped.strip("_")
