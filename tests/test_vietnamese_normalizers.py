@@ -445,12 +445,15 @@ def anchors_outside_their_statement(
     Luật chữ một mình không đủ, và đây là chỗ nó mù theo **cấu trúc** chứ
     không phải vì trùng hợp: hễ trong cùng hàm có dòng khác cũng viết đúng
     hằng ấy thì đẩy mốc sang đó, luật chữ vẫn thấy chữ nên **im hoàn toàn**.
-    Đo trên cây thật: 18 kim đẩy được như thế, luật chữ bắt **0**.
+    Đo trên cây thật, lấy **mọi** dòng ứng viên: 48 lượt đẩy được như thế,
+    luật chữ bắt **0**. (Số cũ ghi ở đây là 18 lượt — sai, vì dụng cụ khi ấy
+    lấy ``elsewhere[0]``, tức dòng nhỏ nhất, nên chỉ đếm một chiều.)
 
-    Chia hai loại thì mới biết cần canh cái gì — 4 ca đẩy **trong cùng câu
-    lệnh** (kim thật sự viết ở cả hai dòng, mốc nào cũng nói thật, không
-    phải nói dối) và **14 ca đẩy sang câu lệnh khác** (nói dối thật). Luật
-    này bắt đúng 14 ca sau và im với 4 ca đầu.
+    Chia ba thì mới biết cần canh cái gì — **33 lượt lùi** và **6 lượt tiến**
+    sang câu lệnh khác (nói dối thật), **9 lượt vẫn trong câu lệnh** (kim
+    viết ở cả hai dòng, mốc nào cũng nói thật). Luật này bắt đúng 39 lượt
+    đầu và im với 9 lượt sau. Cả hai chiều đều phải có mẫu: nửa
+    ``anchor <= box[1]`` từng không phép thử nào giữ đúng vì thế.
 
     Ca quyết định do erplisting-21 tìm ra bên họ: cùng một kim ở hai phép so
     khác nhau trong một hàm (``shirt``/``tshirt``). Bên tôi cũng có, ở
@@ -473,6 +476,38 @@ def anchors_outside_their_statement(
                 reports.append(
                     f"{site}: mốc của kim {needle!r} ở dòng {anchor}, ngoài "
                     f"câu lệnh {box}"
+                )
+    return reports
+
+
+def anchors_standing_before_their_comparison(
+    literal_at: dict[str, dict[str, int]],
+) -> list[str]:
+    """Luật (f): mốc không được đứng **trên** dòng của chính phép so.
+
+    Hằng nằm *trong* phép so, nên dòng so luôn ``<=`` dòng hằng — đo trên
+    tập sạch: đúng **348/348**. Lùi mốc lên trên chỗ so là phá bất biến ấy
+    ngay cả khi vẫn còn trong một câu lệnh, nên (e) một mình không đủ.
+
+    Ranh giới nói thật/nói dối **không phải** "cùng câu lệnh hay không" —
+    đây là chỗ erplisting-21 đo được bên họ: hằng viết ở dòng trước có thể
+    là của một phép so **khác** trong cùng câu lệnh (``{... "theu" ...} &
+    tokens`` ở một dòng, chỗ so ở dòng sau), nên lùi mốc lên đó là nói dối
+    dù không ra khỏi câu lệnh. Bên tôi đo được **0 lượt** như thế trên cây
+    hôm nay: mọi lượt (f) bắt thì (e) cũng bắt. Giữ luật này vì nó chặn một
+    lớp hỏng có thật chứ không phải vì hôm nay nó bắt thêm được gì — ghim
+    bịa là chỗ duy nhất phân biệt được hai luật.
+    """
+    reports = []
+    for site in sorted(literal_at):
+        name, number = parse_site(site)
+        if number is None:
+            continue  # đã có luật khác báo
+        for needle, anchor in sorted(literal_at[site].items()):
+            if anchor < number:
+                reports.append(
+                    f"{site}: mốc của kim {needle!r} ở dòng {anchor}, trên cả "
+                    f"dòng {number} của phép so"
                 )
     return reports
 
@@ -2121,25 +2156,33 @@ class UnderscoreTwinTests(unittest.TestCase):
     def test_an_anchor_may_not_leave_its_own_statement(self) -> None:
         """Luật (e) trên cây thật: mốc phải nằm trong câu lệnh đã ghi nó.
 
-        Đo ba cột trên cây thật:
+        Đo trên cây thật, lấy **mọi** dòng ứng viên (bảng cũ ghi 14/14 và 0/4
+        là đo bằng dụng cụ chỉ nhìn một chiều, đã bỏ):
 
-        ==========================================  =========  =======
-        đột biến                                    luật chữ   (e)
-        ==========================================  =========  =======
-        cây sạch                                            0        0
-        đẩy mốc sang dòng khác cũng mang hằng ấy            0    14/14
-        …trong đó phần đẩy **trong cùng câu lệnh**          0      0/4
-        ==========================================  =========  =======
+        ==========================================  =========  =====  =====
+        đột biến                                    luật chữ     (e)    (f)
+        ==========================================  =========  =====  =====
+        cây sạch                                            0      0      0
+        đẩy mốc **lùi** sang câu lệnh khác                  0  33/33  33/33
+        đẩy mốc **tiến** sang câu lệnh khác                 0    6/6    0/6
+        …đẩy mà **vẫn trong câu lệnh**                      0    0/9    0/9
+        ==========================================  =========  =====  =====
 
         Luật chữ mù ở đây theo **cấu trúc**, không phải trùng hợp: dòng đích
-        vẫn viết đúng hằng ấy nên nó vẫn thấy chữ. 4 ca trong cùng câu lệnh
-        thì (e) im là **đúng** — kim viết thật ở cả hai dòng, mốc nào cũng
-        nói thật, đó không phải nói dối.
+        vẫn viết đúng hằng ấy nên nó vẫn thấy chữ. 9 lượt trong cùng câu lệnh
+        thì (e) im là **đúng** — kim viết thật ở cả hai dòng, và đo riêng ra
+        thì **0/9** lượt ấy lùi lên trên dòng chỗ so, nên (f) im cũng đúng.
+        Cột (f) hôm nay không bắt thêm được gì ngoài phần (e) đã bắt; nó canh
+        lớp hỏng mà erplisting-21 gặp bên họ — hằng của một phép so **khác**
+        nằm cùng câu lệnh — lớp ấy cây này chưa có ca nào.
         """
         for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
             swept = needles_compared_with(normalizer)
             with self.subTest(normalizer=normalizer):
                 self.assertEqual([], anchors_outside_their_statement(swept.literal_at))
+                self.assertEqual(
+                    [], anchors_standing_before_their_comparison(swept.literal_at)
+                )
 
     def test_the_statement_rule_is_pinned_on_made_up_data(self) -> None:
         """Ghim theo đúng thứ tự: **đòi luật chữ im trước**, rồi (e) mới kêu.
@@ -2165,10 +2208,6 @@ class UnderscoreTwinTests(unittest.TestCase):
         self.assertEqual(1, len(reports))
         self.assertIn("ngoài câu lệnh", reports[0])
 
-        # Chiều IM, và cố ý đặt mốc **khác dòng chỗ so** nhưng vẫn trong câu
-        # lệnh: nếu ai siết nhầm thành "mốc == dòng chỗ so" thì ca này đỏ.
-        # Bản ghim cũ đặt mốc trùng dòng chỗ so nên mù với đúng cái siết ấy —
-        # chỉ cây thật kêu (64 lời báo oan). Ghim mà không cắn thì chưa phải ghim.
         # Chiều XUÔI: mốc đứng **sau** câu lệnh, dòng ấy vẫn mang đúng hằng.
         # Thiếu ca này thì nửa dưới ``anchor <= box[1]`` không ai giữ — đo
         # được: bỏ nửa ấy mà cả suite vẫn xanh trơn. Câu lệnh khép ở dòng 2,
@@ -2184,8 +2223,39 @@ class UnderscoreTwinTests(unittest.TestCase):
         self.assertEqual(1, len(reports))
         self.assertIn("ngoài câu lệnh", reports[0])
 
+        # Ghim PHÂN BIỆT (e) với (f): mốc lùi lên dòng 3 — vẫn trong câu lệnh
+        # (3, 5) nên (e) **im**, nhưng đứng trên dòng 4 của chỗ so nên (f)
+        # phải kêu. Đây là ca duy nhất tách được hai luật: trên cây hôm nay
+        # mọi lượt (f) bắt thì (e) cũng bắt, nên thiếu ghim này thì xoá sạch
+        # (f) đi cả suite vẫn xanh.
+        above = {"f:4": {"shirt": 3}}
+        lines_above = [
+            'ALL = ("shirt", "tee")',
+            "def f(x):",
+            '    if ("shirt" in x) and (',
+            '        x in ("shirt",)',
+            "    ):",
+            "        pass",
+        ]
+        self.assertEqual(
+            [], inline_needles_not_written_on_their_own_line(above, lines_above),
+            "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
+        )
+        self.assertEqual(
+            [], anchors_outside_their_statement(above, {("f", 4): (3, 5)}),
+            "(e) phai IM — day moi la cho (f) ganh viec mot minh",
+        )
+        reports = anchors_standing_before_their_comparison(above)
+        self.assertEqual(1, len(reports))
+        self.assertIn("trên cả dòng", reports[0])
+
+        # Chiều IM, và cố ý đặt mốc **khác dòng chỗ so** nhưng vẫn trong câu
+        # lệnh: nếu ai siết nhầm thành "mốc == dòng chỗ so" thì ca này đỏ.
+        # Bản ghim cũ đặt mốc trùng dòng chỗ so nên mù với đúng cái siết ấy —
+        # chỉ cây thật kêu (64 lời báo oan). Ghim mà không cắn thì chưa phải ghim.
         honest = {"f:3": {"shirt": 4}}
         self.assertEqual([], anchors_outside_their_statement(honest, boxes))
+        self.assertEqual([], anchors_standing_before_their_comparison(honest))
         self.assertEqual(
             [], inline_needles_not_written_on_their_own_line(honest, lines)
         )
@@ -2247,9 +2317,20 @@ class UnderscoreTwinTests(unittest.TestCase):
                     1, len(anchors_outside_their_statement(bent)),
                     f"(e) phai bat moc bi day {way} toi dong {line}",
                 )
+                # (f) chỉ nói về thứ tự, nên nó phải bắt chiều lùi và IM với
+                # chiều tiến — đó là cặp phân biệt lấy từ cây thật.
+                self.assertEqual(
+                    1 if way == "lui" else 0,
+                    len(anchors_standing_before_their_comparison(bent)),
+                    f"(f) doc sai chieu {way} o dong {line}",
+                )
         self.assertEqual(
             [], anchors_outside_their_statement(honest),
             "moc doi trong cung cau lenh van noi that, khong duoc keu",
+        )
+        self.assertEqual(
+            [], anchors_standing_before_their_comparison(honest),
+            "moc doi trong cung cau lenh ma van sau cho so thi (f) phai im",
         )
 
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
