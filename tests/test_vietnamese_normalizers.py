@@ -360,6 +360,10 @@ def carriers_not_named_on_their_line(
     đọc từ bảng hằng thì chữ nằm ở chỗ KHAI BẢNG, cách chỗ so có khi vài
     trăm dòng — hỏi chữ là hỏi sai chỗ. Nhưng thứ luôn có mặt tại chỗ so là
     cái định danh đã mang bảng tới: ``generic_titles``, ``self.POLICY_...``.
+
+    Khớp **nguyên từ** chứ không phải chuỗi con: ``bang`` là chuỗi con của
+    ``max_bang``, hỏi lỏng thì xanh mà chẳng chứng minh gì (erplisting-21 đo
+    được bên họ). Siết lên không mất chỗ nào — 56/56 vẫn khớp nguyên từ.
     """
     reports = []
     for site in sorted(carriers_at):
@@ -368,7 +372,7 @@ def carriers_not_named_on_their_line(
             continue  # đã có luật khác báo
         text = lines[number - 1]
         for carrier in sorted(carriers_at[site]):
-            if carrier not in text:
+            if not re.search(rf"\b{re.escape(carrier)}\b", text):
                 reports.append(
                     f"{site}: kim tới đây qua tên {carrier!r}, "
                     f"mà dòng ấy không nhắc tên đó"
@@ -386,6 +390,11 @@ def inline_needles_not_written_in_their_span(
     Phải là KHOẢNG chứ không phải đúng dòng ghi lại: tập hằng gõ thẳng hay
     trải nhiều dòng, nên hỏi "có mặt trên chính dòng ấy" là báo oan hàng
     loạt. Khoảng đi từ dòng ghi tới hết nút.
+
+    Hỏi **có dấu nháy quanh** chứ không hỏi chuỗi con. Ở đây có 18 lượt kim
+    dài một hai ký tự (``x``, ``n``, ``_``, ``0``, ``1``, ``ao``, ``co``) —
+    hỏi lỏng thì chúng là chuỗi con của gần như mọi dòng, xanh mà vô nghĩa.
+    Siết lên không mất chỗ nào: 348/348 kim đều có mặt dưới dạng hằng chuỗi.
     """
     reports = []
     for site in sorted(inline_at):
@@ -394,11 +403,53 @@ def inline_needles_not_written_in_their_span(
             continue  # đã có luật khác báo
         window = "\n".join(lines[start - 1 : min(end, len(lines))])
         for needle in sorted(inline_at[site]):
-            if needle not in window:
+            if f'"{needle}"' not in window and f"'{needle}'" not in window:
                 reports.append(
-                    f"{site}: kim {needle!r} gõ thẳng mà không có mặt trong "
-                    f"khoảng dòng {start}-{end}"
+                    f"{site}: kim {needle!r} gõ thẳng mà không có mặt "
+                    f"dưới dạng hằng chuỗi trong khoảng dòng {start}-{end}"
                 )
+    return reports
+
+
+@lru_cache(maxsize=1)
+def node_spans_by_function() -> dict[str, frozenset[tuple[int, int]]]:
+    """Mỗi hàm → tập ``(dòng đầu, dòng cuối)`` của **mọi** nút trong thân nó.
+
+    Đọc lại từ cây, độc lập với lượt quét kim — giống cách
+    :func:`function_line_ranges` được dựng riêng.
+    """
+    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+    table: dict[str, set[tuple[int, int]]] = {}
+    for outer in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            table.setdefault(outer.name, set()).update(
+                (node.lineno, node.end_lineno)
+                for node in ast.walk(outer)
+                if hasattr(node, "lineno") and getattr(node, "end_lineno", None)
+            )
+    return {name: frozenset(spans) for name, spans in table.items()}
+
+
+def spans_that_are_not_a_real_node(spans_at: dict[str, tuple[int, int]]) -> list[str]:
+    """Luật (c): cửa sổ ghi lại phải đúng bằng cửa sổ của **một nút có thật**.
+
+    Không có luật này thì (b) mù hoàn toàn với **cửa sổ nới rộng**: nới ``end``
+    thêm 50 dòng, kim vẫn nằm trong, (b) bắt **0**. Đây là chỗ erplisting-21 đo
+    trước bên họ (``end`` lệch +1 → (b) = 0, chỉ (c) bắt). Cửa sổ càng rộng thì
+    (b) càng dễ xanh — một luật mà nới lỏng dữ liệu lại làm nó dễ xanh hơn thì
+    tự nó không đứng được.
+    """
+    table = node_spans_by_function()
+    reports = []
+    for site in sorted(spans_at):
+        name, _ = parse_site(site)
+        if name not in table:
+            continue  # đã có luật khác báo
+        if spans_at[site] not in table[name]:
+            reports.append(
+                f"{site}: cửa sổ {spans_at[site]} không phải cửa sổ của nút nào "
+                f"trong {name}"
+            )
     return reports
 
 
@@ -1915,6 +1966,14 @@ class UnderscoreTwinTests(unittest.TestCase):
         Ba câu vị trí đều mù với hoán vị TRONG CÙNG một hàm: dòng vẫn trong
         thân hàm, vẫn có phép so, các khoá vẫn khác nhau — đo được 0/0/18 y
         như cây sạch. Câu này là câu đầu tiên nhìn thấy nó.
+
+        **Số nhỏ chưa chắc là luật yếu — đếm xem đột biến có cắn không.** Đột
+        biến "đổi tên mang giữa các chỗ trong cùng hàm" chỉ làm (d) kêu **2**,
+        đọc như luật yếu. Đếm lại: trong 56 khoá mang bảng, tên gần như luôn
+        dùng chung trong một hàm (``token`` 25 chỗ, ``term`` 23), nên phép xoay
+        là **phép đồng nhất** với 54 khoá — chỉ **2 khoá** đổi được tên, và (d)
+        bắt **2/2**. Cùng hình dạng với con số 2/189 mà erplisting-21 đo bên họ,
+        hai bên ra độc lập.
         """
         source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
         lines = source.read_text(encoding="utf-8").split("\n")
@@ -1950,13 +2009,20 @@ class UnderscoreTwinTests(unittest.TestCase):
         **(b) và (d) canh hai thứ khác nhau, đừng gộp làm một.** Đo trên
         cùng cây sạch, 75 chỗ so gõ thẳng:
 
-        =====================================  =======  =======
-        đột biến                               (b) bắt  (d) bắt
-        =====================================  =======  =======
-        hoán vị khoá trong cùng một hàm              0       12
-        đổi span giữa các chỗ so cùng hàm          310        –
-        span lệch một dòng                         260        –
-        =====================================  =======  =======
+        =====================================  =======  =======  =======
+        đột biến                               (b) bắt  (c) bắt  (d) bắt
+        =====================================  =======  =======  =======
+        hoán vị khoá trong cùng một hàm              0        0       12
+        đổi span giữa các chỗ so cùng hàm          316        0        0
+        span lệch một dòng                         278       13        0
+        =====================================  =======  =======  =======
+
+        Cột (c) cho thấy chiều ngược lại: **đổi span giữa hai chỗ so trong
+        cùng hàm thì (c) mù hoàn toàn** — cửa sổ mượn ấy vẫn là cửa sổ của
+        một nút có thật, chỉ là nút khác. Đúng chỗ (b) bắt 316.
+
+        Cả bảng này đo lại **sau khi siết** hai luật văn bản (hỏi hằng chuỗi
+        / nguyên từ); số của bản lỏng thấp hơn, nên đừng chép lại số cũ.
 
         (b) **không đọc số dòng trong khoá** nên hoán vị khoá nó không thấy —
         lần đo đầu tôi hoán vị cả khoá lẫn span cùng lúc, tức là không đổi
@@ -1975,6 +2041,69 @@ class UnderscoreTwinTests(unittest.TestCase):
                 )
             )
         self.assertEqual([], wrong[:5], f"{len(wrong)} kim gõ thẳng ghi sai chỗ")
+
+    def test_the_two_text_rules_ask_tightly_not_loosely(self) -> None:
+        """Hỏi lỏng bằng chuỗi con thì xanh mà không chứng minh gì.
+
+        Cặp phân biệt, vì "chặt hơn" nói suông không phải bằng chứng — bản
+        lỏng **im**, bản chặt **kêu đúng một**:
+
+        * kim ``ao`` với dòng ``if x == "gao":`` — ``ao`` là chuỗi con của
+          ``gao``, nhưng không có hằng chuỗi ``"ao"`` nào ở đó.
+        * tên mang ``bang`` với dòng ``if t in max_bang:`` — chuỗi con của
+          ``max_bang``, nhưng không phải nguyên từ.
+
+        Cả hai ca do erplisting-21 đo bên họ rồi gửi sang; bên này dính nặng
+        hơn vì có 18 lượt kim dài một hai ký tự (``x``, ``n``, ``_``, ``0``).
+        """
+        kim_lines = ['if x == "gao":']
+        self.assertIn("ao", kim_lines[0], "ca thu phai qua duoc hoi long")
+        reports = inline_needles_not_written_in_their_span(
+            {"f:1": {"ao"}}, {"f:1": (1, 1)}, kim_lines
+        )
+        self.assertEqual(1, len(reports))
+        self.assertIn("ao", reports[0])
+
+        carrier_lines = ["if t in max_bang:"]
+        self.assertIn("bang", carrier_lines[0], "ca thu phai qua duoc hoi long")
+        reports = carriers_not_named_on_their_line({"f:1": {"bang"}}, carrier_lines)
+        self.assertEqual(1, len(reports))
+        self.assertIn("bang", reports[0])
+
+    def test_a_widened_window_is_caught_by_the_node_rule(self) -> None:
+        """Luật (c) bịt lỗ mà (b) không thấy: cửa sổ nới rộng.
+
+        Đo trên 75 chỗ so gõ thẳng của cây thật:
+
+        ==================  =======  =======
+        đột biến            (b) bắt  (c) bắt
+        ==================  =======  =======
+        cây sạch                  0        0
+        ``end`` +1                0    45/75
+        ``end`` +5                0    73/75
+        ``end`` +50               0    75/75
+        ``end`` −1              284    75/75
+        ``start`` +1            284    75/75
+        ==================  =======  =======
+
+        Cột (b) toàn 0 ở ba hàng nới rộng: kim vẫn nằm trong cửa sổ to hơn.
+        Hàng ``end`` +1 chỉ 45/75 vì 30 cửa sổ nới thêm một dòng thì **trùng
+        khít cửa sổ của một nút cha có thật** — đó là giới hạn thật của luật
+        (c), ghi ra chứ không làm tròn lên.
+        """
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            swept = needles_compared_with(normalizer)
+            with self.subTest(normalizer=normalizer):
+                self.assertEqual([], spans_that_are_not_a_real_node(swept.spans_at))
+
+    def test_the_node_rule_is_pinned_on_made_up_data(self) -> None:
+        real = next(iter(node_spans_by_function()["_normalize_skill_token"]))
+        self.assertEqual([], spans_that_are_not_a_real_node(
+            {"_normalize_skill_token:%d" % real[0]: real}))
+        reports = spans_that_are_not_a_real_node(
+            {"_normalize_skill_token:%d" % real[0]: (real[0], real[1] + 50)})
+        self.assertEqual(1, len(reports))
+        self.assertIn("không phải cửa sổ của nút nào", reports[0])
 
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
         """Phủ kín ở mức CHỖ SO, không chỉ ở mức nhãn hình dạng.
