@@ -1611,11 +1611,6 @@ class UnderscoreTwinTests(unittest.TestCase):
         self.assertIn("f:1", reports[0])
         self.assertIn("tapde", reports[0])
 
-    FLOOR_DISTINGUISHING_FUNCTIONS = {
-        "_compact_match_text": 3,
-        "_normalize_prompt_source_header": 1,
-    }
-
     def test_the_tree_really_has_room_for_that_to_happen(self) -> None:
         """Ca bịa ở trên ghim LUẬT; câu này ghim DỮ LIỆU ĐƯA VÀO luật.
 
@@ -1628,13 +1623,12 @@ class UnderscoreTwinTests(unittest.TestCase):
               3       2      0      0    _compact_match_text
               1       1      0      0    _normalize_prompt_source_header
 
-        Nên mốc phải là CON SỐ chứ không phải "có hay không": dồn theo //10
-        làm hụt một phần ba mà câu hỏi có-hay-không vẫn xanh. Mốc dưới đây
-        bắt được //10 ở cột compact.
-
-        Giới hạn ghi rõ: cột header chỉ có 1 hàm phân biệt được, nên mốc 1
-        ở đó chỉ bắt được lượt dồn sạch, không bắt được dồn nhẹ. Đó là số
-        đo của cây hiện tại, không phải chỗ để nâng bừa cho đẹp.
+        Câu này chỉ trả lời "cây thật CÓ hình dạng ấy không". Phần bắt dồn
+        dòng do ``test_every_recorded_line_points_at_a_real_comparison``
+        gánh, và gánh chặt hơn: đã thử đặt mốc SỐ ở đây (3 và 1) thì nó
+        bắt được //10 nhưng để lọt //2 với //4, mà nâng ngưỡng lên thì mục
+        ngay lần thêm bớt một phép so. Ngưỡng đuổi theo cây; tính chất thì
+        không.
         """
         for normalizer in self._alphabets_without_underscore():
             sites = needles_compared_with(normalizer).by_site
@@ -1643,13 +1637,51 @@ class UnderscoreTwinTests(unittest.TestCase):
                 by_function.setdefault(site.rsplit(":", 1)[0], set()).add(frozenset(needles))
             spread = [name for name, groups in by_function.items() if len(groups) > 1]
             with self.subTest(normalizer=normalizer):
-                self.assertGreaterEqual(
-                    len(spread),
-                    self.FLOOR_DISTINGUISHING_FUNCTIONS[normalizer],
-                    f"{normalizer}: số hàm có hai chỗ so khác tập kim tụt xuống "
-                    f"{sorted(spread)} — nhiều khả năng khoá chỗ so vừa bị dồn "
-                    f"ở chỗ gọi, chứ luật cặp thì vẫn xanh",
+                self.assertTrue(
+                    spread, f"{normalizer}: không hàm nào có hai chỗ so khác tập kim"
                 )
+
+
+    MARKS = (
+        " in ", "==", "!=", "<=", ">=", ".startswith(", ".endswith(",
+        ".get(", ".issubset(", ".issuperset(", "any(", "all(",
+    )
+
+    def test_every_recorded_line_points_at_a_real_comparison(self) -> None:
+        """Số dòng ghi lại phải trỏ vào một phép so THẬT trong service.py.
+
+        Đây là chỗ mốc số nên nhường lại. Mốc số hỏi "còn đủ nhiều không",
+        nên bao giờ cũng có mức dồn vừa đủ để lách; kiểm tính chất hỏi
+        "từng dòng có nói thật không", nên không có mức nào lách được.
+
+        Nó bắt cùng lúc ba loại hỏng khác nhau — dồn khoá ở chỗ gọi, cộng
+        bù sai, và bỏ hẳn phần bù — mà không loại nào cần một con số riêng.
+
+        Hai điều đã đo chứ không đoán:
+
+        * ``any(`` / ``all(`` phải nằm trong danh sách dấu hiệu. Hình dạng
+          "comprehension" ghi lại dòng của lời gọi bao ngoài, nên 7 chỗ so
+          ở repo này trỏ đúng vào dòng ``any(`` — thiếu dấu ấy là báo oan
+          bảy lần, chứ không phải bắt được bảy lỗi.
+        * Thêm hai dấu ấy gần như không làm cùn lưỡi: dòng bất kỳ trong
+          service.py trúng dấu hiệu 11.4% -> 11.5%. Tức một chỗ so bị dồn
+          hay bị lệch có gần chín phần mười khả năng rơi vào dòng không hề
+          có phép so, mà ở đây có 89 chỗ so cùng kiểm.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        lines = source.read_text(encoding="utf-8").split("\n")
+        wrong = []
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            for site in sorted(needles_compared_with(normalizer).by_site):
+                _, _, tail = site.rpartition(":")
+                if not tail.isdigit():
+                    wrong.append(f"{site}: khoá chỗ so không còn mang số dòng")
+                    continue
+                number = int(tail)
+                text = lines[number - 1] if 0 < number <= len(lines) else ""
+                if not any(mark in text for mark in self.MARKS):
+                    wrong.append(f"{site} trỏ vào {text.strip()[:60]!r}")
+        self.assertEqual([], wrong[:5], f"{len(wrong)} chỗ so trỏ sai dòng")
 
     def test_both_halves_of_each_pair_really_route(self) -> None:
         """Bằng chứng sống, không chỉ đối xứng chính tả.
