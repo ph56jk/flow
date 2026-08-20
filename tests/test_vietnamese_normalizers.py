@@ -272,6 +272,36 @@ def box_name(part: ast.AST) -> str:
     return part.id if isinstance(part, ast.Name) else ""
 
 
+MARKS_OF_A_COMPARISON = (
+    " in ", "==", "!=", "<=", ">=", ".startswith(", ".endswith(",
+    ".get(", ".issubset(", ".issuperset(", "any(", "all(",
+)
+
+
+def sites_pointing_nowhere(by_site: dict[str, set[str]], lines: list[str]) -> list[str]:
+    """Khoá chỗ so nào không trỏ vào một dòng có phép so thật.
+
+    Trả **lời báo**, không ném: khoá cong là chuyện phải BÁO, không phải
+    chuyện làm đổ lượt kiểm. Ba dạng cong đã gặp thật: mất hẳn số dòng,
+    số dòng không phải chữ số (``True`` in ra thành ``"True"``), và số
+    dòng nằm ngoài file.
+    """
+    reports = []
+    for site in sorted(by_site):
+        _, colon, tail = site.rpartition(":")
+        if not colon or not tail.isdigit():
+            reports.append(f"{site}: khoá chỗ so không còn mang số dòng")
+            continue
+        number = int(tail)
+        if not 0 < number <= len(lines):
+            reports.append(f"{site}: số dòng nằm ngoài file ({len(lines)} dòng)")
+            continue
+        text = lines[number - 1]
+        if not any(mark in text for mark in MARKS_OF_A_COMPARISON):
+            reports.append(f"{site} trỏ vào {text.strip()[:60]!r}")
+    return reports
+
+
 def missing_twins(by_site: dict[str, set[str]]) -> list[str]:
     """Kim có ``_`` mà thiếu bản viết liền **ngay tại chỗ so ấy**.
 
@@ -1623,14 +1653,23 @@ class UnderscoreTwinTests(unittest.TestCase):
               3       2      0      0    _compact_match_text
               1       1      0      0    _normalize_prompt_source_header
 
-        Câu này chỉ trả lời "cây thật CÓ hình dạng ấy không". Phần bắt dồn
-        dòng do ``test_every_recorded_line_points_at_a_real_comparison``
-        gánh, và gánh chặt hơn: đã thử đặt mốc SỐ ở đây (3 và 1) thì nó
+        Câu này KHÔNG phải câu ghi chép cho vui, dù lúc đầu tôi tưởng thế.
+        Đo mới thấy nó là chỗ duy nhất bắt được một kiểu dồn: dồn hết chỗ
+        so về **một dòng có phép so thật** (thử ``:14940`` cho mọi chỗ) thì
+        kiểm tính chất xanh trơn — vì từng khoá vẫn trỏ đúng vào một phép
+        so — mà phạm vi đã sập hoàn toàn. Chỉ câu này đỏ. Hai câu không
+        chồng nhau: một câu hỏi "từng dòng có nói thật không", câu này hỏi
+        "các dòng có còn khác nhau không".
+
+        Vì thế nó soi cả ba bảng chữ, không chỉ hai bảng mà luật cặp dùng.
+
+        Phần bắt dồn dòng còn lại do
+        ``test_every_recorded_line_points_at_a_real_comparison`` gánh: đã thử đặt mốc SỐ ở đây (3 và 1) thì nó
         bắt được //10 nhưng để lọt //2 với //4, mà nâng ngưỡng lên thì mục
         ngay lần thêm bớt một phép so. Ngưỡng đuổi theo cây; tính chất thì
         không.
         """
-        for normalizer in self._alphabets_without_underscore():
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
             sites = needles_compared_with(normalizer).by_site
             by_function: dict[str, set[frozenset]] = {}
             for site, needles in sites.items():
@@ -1641,11 +1680,6 @@ class UnderscoreTwinTests(unittest.TestCase):
                     spread, f"{normalizer}: không hàm nào có hai chỗ so khác tập kim"
                 )
 
-
-    MARKS = (
-        " in ", "==", "!=", "<=", ">=", ".startswith(", ".endswith(",
-        ".get(", ".issubset(", ".issuperset(", "any(", "all(",
-    )
 
     def test_every_recorded_line_points_at_a_real_comparison(self) -> None:
         """Số dòng ghi lại phải trỏ vào một phép so THẬT trong service.py.
@@ -1672,16 +1706,27 @@ class UnderscoreTwinTests(unittest.TestCase):
         lines = source.read_text(encoding="utf-8").split("\n")
         wrong = []
         for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
-            for site in sorted(needles_compared_with(normalizer).by_site):
-                _, _, tail = site.rpartition(":")
-                if not tail.isdigit():
-                    wrong.append(f"{site}: khoá chỗ so không còn mang số dòng")
-                    continue
-                number = int(tail)
-                text = lines[number - 1] if 0 < number <= len(lines) else ""
-                if not any(mark in text for mark in self.MARKS):
-                    wrong.append(f"{site} trỏ vào {text.strip()[:60]!r}")
+            wrong.extend(
+                sites_pointing_nowhere(needles_compared_with(normalizer).by_site, lines)
+            )
         self.assertEqual([], wrong[:5], f"{len(wrong)} chỗ so trỏ sai dòng")
+
+    def test_a_bent_key_is_reported_not_crashed_on(self) -> None:
+        """Khoá cong phải ra LỜI BÁO, không ra vết đổ.
+
+        Ba dạng cong này từng làm lượt kiểm đổ chứ không trượt, mà vết đổ
+        trỏ vào dòng ném lỗi nên giục người đọc đi sửa chỗ ném thay vì sửa
+        phạm vi. ``True`` đáng ngờ nhất: nó là ``int`` trong Python nên lọt
+        mọi phép ``isinstance(..., int)``, mà nó dồn toàn bộ chỗ so về một
+        khoá — đúng cái sập phạm vi mà luật này sinh ra để chặn.
+        """
+        lines = ["if a in b:", "x = 1"]
+        self.assertEqual([], sites_pointing_nowhere({"f:1": {"a"}}, lines))
+        for bent in ("f", f"f:{True}", "f:99"):
+            with self.subTest(bent=bent):
+                reports = sites_pointing_nowhere({bent: {"a"}}, lines)
+                self.assertEqual(1, len(reports))
+                self.assertIn(bent, reports[0])
 
     def test_both_halves_of_each_pair_really_route(self) -> None:
         """Bằng chứng sống, không chỉ đối xứng chính tả.
