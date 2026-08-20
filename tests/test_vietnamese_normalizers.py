@@ -17,6 +17,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -25,6 +26,186 @@ from flow_web.service import FlowWebService
 
 def service() -> FlowWebService:
     return FlowWebService.__new__(FlowWebService)
+
+
+class SweptNeedles(NamedTuple):
+    """Kết quả quét: cây kim ASCII, kèm nơi tìm thấy, kèm các hàm đã quét."""
+
+    by_text: dict[str, set[str]]
+    functions: list[str]
+
+
+def needles_compared_with(normalizer: str) -> SweptNeedles:
+    """Mọi hằng chuỗi được đem so với đầu ra của ``normalizer``.
+
+    Quét theo BIẾN chứ không theo hàm: chỉ nhận hằng nào thật sự so với
+    chính biến giữ kết quả chuẩn hoá. Quét theo hàm — lấy mọi hằng trong
+    hàm nào có gọi bộ chuẩn hoá — vừa nhiễu (kéo theo cả khoá payload và
+    từ vựng sản phẩm) vừa vẫn sót, vì cây kim có thể nằm ở nhánh khác.
+
+    Bắt đủ bốn hình dạng, kể cả hình dạng cây kim nằm bên TRÁI toán tử:
+    ``x == "k"``, ``x in {...}``, ``"k" in x``, ``any(k in x for k in (...))``,
+    cộng dict tra bằng ``.get(x)`` và ``x.startswith("k")``.
+
+    KHÔNG lọc theo hình dạng chuỗi. Bộ lọc ``^[a-z0-9_]+$`` của lượt quét
+    đầu chính là thứ đã giấu mất họ lỗi "cây kim viết sai bảng chữ cái":
+    nó vứt đúng những cây kim hỏng trước khi có ai kịp nhìn thấy chúng.
+    """
+    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+
+    def is_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == normalizer
+        )
+
+    def elements(node: ast.AST) -> list[ast.expr]:
+        if isinstance(node, ast.Constant):
+            return [node]
+        if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+            return list(node.elts)
+        return []
+
+    found: dict[str, set[str]] = {}
+    functions = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and any(is_call(child) for child in ast.walk(node))
+    ]
+
+    for function in functions:
+        holders: set[str] = set()
+        literal_dicts: dict[str, ast.Dict] = {}
+        for node in ast.walk(function):
+            if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                continue
+            target = node.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            if any(is_call(child) for child in ast.walk(node.value)):
+                holders.add(target.id)
+            if isinstance(node.value, ast.Dict):
+                literal_dicts[target.id] = node.value
+
+        def holds_result(node: ast.AST) -> bool:
+            return is_call(node) or (isinstance(node, ast.Name) and node.id in holders)
+
+        def keep(value: object, why: str) -> None:
+            if isinstance(value, str) and value:
+                found.setdefault(value, set()).add(f"{function.name}:{why}")
+
+        for node in ast.walk(function):
+            if isinstance(node, ast.Compare) and any(
+                isinstance(op, (ast.In, ast.NotIn, ast.Eq, ast.NotEq)) for op in node.ops
+            ):
+                parts = [node.left, *node.comparators]
+                if any(holds_result(part) for part in parts):
+                    for part in parts:
+                        if holds_result(part):
+                            continue
+                        for element in elements(part):
+                            if isinstance(element, ast.Constant):
+                                keep(element.value, "compare")
+            if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)) and isinstance(
+                node.elt, ast.Compare
+            ):
+                inner = node.elt
+                if any(holds_result(part) for part in [inner.left, *inner.comparators]):
+                    for generator in node.generators:
+                        for element in elements(generator.iter):
+                            if isinstance(element, ast.Constant):
+                                keep(element.value, "comprehension")
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get"
+                and node.args
+                and any(holds_result(child) for child in ast.walk(node.args[0]))
+            ):
+                receiver = node.func.value
+                table = receiver if isinstance(receiver, ast.Dict) else (
+                    literal_dicts.get(receiver.id) if isinstance(receiver, ast.Name) else None
+                )
+                if isinstance(table, ast.Dict):
+                    for key in table.keys:
+                        if isinstance(key, ast.Constant):
+                            keep(key.value, "mapping.get")
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"startswith", "endswith"}
+                and holds_result(node.func.value)
+            ):
+                for argument in node.args:
+                    for element in elements(argument):
+                        if isinstance(element, ast.Constant):
+                            keep(element.value, "startswith")
+
+    return SweptNeedles(by_text=found, functions=[fn.name for fn in functions])
+
+
+class NormalizedNeedleAlphabetTests(unittest.TestCase):
+    """Cây kim phải viết bằng đúng bảng chữ mà bộ chuẩn hoá nhả ra.
+
+    Họ lỗi này không dính gì tới ``đ``, nhưng chết cùng một kiểu im lặng.
+    `_normalize_skill_token` đổi mọi ký tự ngoài ``[a-z0-9]`` thành ``_``,
+    nên đầu ra không bao giờ có dấu cách; ai viết cây kim "thoi trang" như
+    văn xuôi thì cây ấy chết vĩnh viễn. Ba cây từng hỏng ở đây:
+    ``"thoi trang"``, ``"thuong hieu"`` (cả hai lỗi chảy thật) và
+    ``"vỏ_gối"`` (vô hại vì ``vo_goi`` ngay cạnh phủ hết, nhưng làm người
+    đọc sau tưởng bảng ấy nhận được kim có dấu).
+
+    Điều khiến nó không thể phát hiện bằng mắt: **cùng chuỗi "thoi trang"
+    lại viết ĐÚNG** ở ``POLICY_APPAREL_TERMS``, vì `_normalize_policy_text`
+    giữ dấu cách. Một chuỗi y hệt, hai bảng chữ cái, một chỗ sống một chỗ
+    chết. Nên câu hỏi không phải "cây kim này viết đúng không" mà là "nó
+    đang so với bộ chuẩn hoá NÀO".
+    """
+
+    # Bộ chuẩn hoá → bảng chữ nó nhả ra. Đọc thẳng từ bước ``re.sub`` cuối
+    # cùng của mỗi hàm.
+    ALPHABETS = {
+        "_normalize_skill_token": r"[a-z0-9_]*",
+        "_normalize_prompt_source_header": r"[a-z0-9]*",
+    }
+
+    def test_every_needle_uses_the_alphabet_its_normalizer_emits(self) -> None:
+        for normalizer, alphabet in self.ALPHABETS.items():
+            swept = needles_compared_with(normalizer)
+            with self.subTest(normalizer=normalizer):
+                self.assertTrue(swept.by_text, "quét rỗng thì test này vô nghĩa")
+                wrong = {
+                    text: sorted(where)
+                    for text, where in swept.by_text.items()
+                    if not re.fullmatch(alphabet, text)
+                }
+                self.assertEqual({}, wrong)
+
+    def test_the_same_string_is_correct_for_the_other_normalizer(self) -> None:
+        # Nhóm đối chứng, và là lý do không thể sửa bằng cách cấm dấu cách
+        # ở mọi nơi: `_normalize_policy_text` GIỮ dấu cách, nên "thoi trang"
+        # ở bảng policy là đúng và phải tiếp tục khớp.
+        svc = service()
+
+        self.assertIn("thoi trang", svc._normalize_policy_text("ảnh thời trang nữ"))
+        self.assertNotIn("thoi trang", svc._normalize_skill_token("ảnh thời trang nữ"))
+        self.assertIn("thoi_trang", svc._normalize_skill_token("ảnh thời trang nữ"))
+
+    def test_the_policy_tables_use_the_alphabet_that_normalizer_emits(self) -> None:
+        # Chiều ngược lại của cùng một họ lỗi. `_normalize_policy_text` kết
+        # bằng ``[^a-zA-Z0-9\s] -> " "`` rồi gộp khoảng trắng, nên nó nhả ra
+        # ``[a-z0-9 ]``: mục nào có gạch dưới hay còn dấu là chết vĩnh viễn.
+        # Ba bảng POLICY_* là hằng lớp nên đọc thẳng, không cần quét AST.
+        svc = service()
+        terms = set(svc.POLICY_MINOR_TERMS)
+        terms |= set(svc.POLICY_APPEARANCE_TERMS)
+        terms |= set(svc.POLICY_APPAREL_TERMS)
+
+        self.assertTrue(terms, "quét rỗng thì test này vô nghĩa")
+        self.assertEqual([], sorted(t for t in terms if not re.fullmatch(r"[a-z0-9 ]*", t)))
 
 
 class PromptSourceHeaderTests(unittest.TestCase):
@@ -170,11 +351,11 @@ class SkillTokenClosedSetTests(unittest.TestCase):
     """Đếm bao nhiêu kim so khớp chết vì ``đ`` — tám, không phải ba.
 
     Chú thích trong `_normalize_skill_token` từng nêu tên ba khoá. Quét
-    AST toàn bộ 33 hàm gọi hàm này thì ra 293 kim, 70 kim có chữ ``d``,
+    AST toàn bộ 33 hàm gọi hàm này thì ra 256 kim, 61 kim có chữ ``d``,
     và **tám** trong số đó sinh ra từ ``đ``. Ba khoá kia chỉ là ba khoá
     được nhớ tên, không phải cả tập.
 
-    Sáu mươi hai kim còn lại đã phân loại tay ngày 2026-08-20 và KHÔNG
+    Năm mươi ba kim còn lại đã phân loại tay ngày 2026-08-20 và KHÔNG
     ghim ở đây: chúng là từ vựng sản phẩm (`wedding_hoop`,
     `stuffed_animal`, ...) còn đang mọc thêm, ghim vào chỉ tổ đỏ vặt.
     Hệ quả phải nói thẳng: **thêm một kim tiếng Việt có ``đ`` sẽ KHÔNG
@@ -208,99 +389,9 @@ class SkillTokenClosedSetTests(unittest.TestCase):
     )
 
     def _needles(self) -> set[str]:
-        """Mọi hằng ASCII được đem so với kết quả `_normalize_skill_token`."""
-        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
-        tree = ast.parse(source.read_text(encoding="utf-8"))
-        shape = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
-
-        def is_norm_call(node: ast.AST) -> bool:
-            return (
-                isinstance(node, ast.Call)
-                and isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_normalize_skill_token"
-            )
-
-        found: set[str] = set()
-
-        def keep(value: object) -> None:
-            if isinstance(value, str) and len(value) >= 2 and shape.match(value):
-                found.add(value)
-
-        def elements(node: ast.AST) -> list[ast.expr]:
-            if isinstance(node, ast.Constant):
-                return [node]
-            if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
-                return list(node.elts)
-            return []
-
-        functions = [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and any(is_norm_call(child) for child in ast.walk(node))
-        ]
-        self.assertEqual(self.FUNCTIONS_CALLING_THE_NORMALIZER, len(functions))
-
-        for function in functions:
-            literal_dicts: dict[str, ast.Dict] = {}
-            normalized_names: set[str] = set()
-            for node in ast.walk(function):
-                if not isinstance(node, ast.Assign) or len(node.targets) != 1:
-                    continue
-                target = node.targets[0]
-                if not isinstance(target, ast.Name):
-                    continue
-                if any(is_norm_call(child) for child in ast.walk(node.value)):
-                    normalized_names.add(target.id)
-                if isinstance(node.value, ast.Dict):
-                    literal_dicts[target.id] = node.value
-
-            def looks_normalized(node: ast.AST) -> bool:
-                return any(
-                    is_norm_call(child)
-                    or (isinstance(child, ast.Name) and child.id in normalized_names)
-                    for child in ast.walk(node)
-                )
-
-            for node in ast.walk(function):
-                # 1) so sánh thẳng: ``x == "kim"``, ``"kim" in x``, ``x in {...}``
-                if isinstance(node, ast.Compare) and any(
-                    isinstance(op, (ast.In, ast.NotIn, ast.Eq, ast.NotEq)) for op in node.ops
-                ):
-                    for part in (node.left, *node.comparators):
-                        for element in elements(part):
-                            if isinstance(element, ast.Constant):
-                                keep(element.value)
-                # 2) ``any(term in normalized for term in (...))``
-                if (
-                    isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp))
-                    and isinstance(node.elt, ast.Compare)
-                    and any(
-                        isinstance(op, (ast.In, ast.NotIn, ast.Eq, ast.NotEq))
-                        for op in node.elt.ops
-                    )
-                ):
-                    for generator in node.generators:
-                        for element in elements(generator.iter):
-                            if isinstance(element, ast.Constant):
-                                keep(element.value)
-                # 3) ``mapping.get(normalized)`` — chỉ dict thật sự bị tra bằng token
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "get"
-                    and node.args
-                    and looks_normalized(node.args[0])
-                ):
-                    receiver = node.func.value
-                    table = receiver if isinstance(receiver, ast.Dict) else (
-                        literal_dicts.get(receiver.id) if isinstance(receiver, ast.Name) else None
-                    )
-                    if isinstance(table, ast.Dict):
-                        for key in table.keys:
-                            if isinstance(key, ast.Constant):
-                                keep(key.value)
-        return found
+        needles = needles_compared_with("_normalize_skill_token")
+        self.assertEqual(self.FUNCTIONS_CALLING_THE_NORMALIZER, len(needles.functions))
+        return set(needles.by_text)
 
     def test_the_sweep_finds_the_needles_at_all(self) -> None:
         # Chống rỗng: quét hỏng thì mọi test dưới đây xanh vô nghĩa.

@@ -12586,7 +12586,7 @@ exit 1
             ),
             "is_pillowcase": any(
                 term in normalized
-                for term in ("vo_goi", "vỏ_gối", "pillow", "pillowcase", "cushion", "baby_pillow")
+                for term in ("vo_goi", "pillow", "pillowcase", "cushion", "baby_pillow")
             ) or "vogoi" in compact or "goi" in tokens,
             "is_child_shirt": is_child_shirt,
             "is_shirt": any(term in normalized for term in ("shirt", "tshirt")) or bool({"ao", "tee"} & tokens),
@@ -20753,12 +20753,16 @@ exit 1
         # không gấp mới là hỏng.
         #
         # Đếm trên tập đóng, không ước lượng. Quét AST 33 hàm gọi hàm này, gom
-        # mọi hằng ASCII được đem so với kết quả của nó (so thẳng, ``any(term in
-        # normalized ...)``, và dict tra bằng ``.get(normalized)``): 293 kim,
-        # trong đó 70 kim có chữ ``d``:
+        # mọi hằng được đem so với chính BIẾN giữ kết quả (so thẳng, ``any(term
+        # in normalized ...)``, dict tra bằng ``.get(normalized)``): 256 kim,
+        # trong đó 61 kim có chữ ``d``:
         #
-        #   70 kim co 'd' ├─  8 la 'd' vốn là 'đ'  → CHET truoc ban va
-        #                 └─ 62 la 'd' that (dress, handmade, wedding_hoop, ...)
+        #   61 kim co 'd' ├─  8 la 'd' vốn là 'đ'  → CHET truoc ban va
+        #                 └─ 53 la 'd' that (dress, handmade, wedding_hoop, ...)
+        #
+        # Quét theo BIẾN chứ đừng quét theo HÀM. Lấy mọi hằng trong hàm nào có
+        # gọi bộ chuẩn hoá thì ra 293 chuỗi: vừa nhiễu (kéo cả khoá payload lẫn
+        # từ vựng sản phẩm vào) vừa vẫn sót, vì kim có thể nằm ở nhánh khác.
         #
         # Tám kim ấy, kèm câu người gõ ra chúng — đo trên cả hai bản hàm (trước
         # 9778758 và hiện tại), 8/8 chết trước, 8/8 sống sau:
@@ -20780,6 +20784,11 @@ exit 1
         # 2026-08-20 và không ghim, vì đó là từ vựng sản phẩm còn mọc thêm. Nên
         # thêm một kim tiếng Việt có ``đ`` sẽ không tự động bị bắt; chỉ tám kim
         # trên và các dạng hỏng của chúng là có test canh.
+        #
+        # Một họ lỗi KHÁC ở cùng chỗ này, không dính gì ``đ``: bước ``re.sub``
+        # cuối cùng nhả ra ``[a-z0-9_]``, nên cây kim viết dấu cách như văn xuôi
+        # là chết vĩnh viễn. Đã từng có ba cây như thế. Xem chú thích tại
+        # `_video_reference_prompt_suffix` và `NormalizedNeedleAlphabetTests`.
         text = str(text or "").replace("đ", "d").replace("Đ", "D")
         stripped = self._strip_accents(text or "").lower()
         stripped = re.sub(r"[^a-z0-9]+", "_", stripped)
@@ -22607,6 +22616,15 @@ exit 1
         return normalized
 
     def _video_reference_prompt_suffix(self, request: CreateJobRequest) -> str:
+        # Cây kim ở đây so với đầu ra của `_normalize_skill_token`, mà bộ ấy
+        # đổi mọi ký tự ngoài [a-z0-9] thành "_" — đầu ra KHÔNG BAO GIỜ có dấu
+        # cách. Viết "thoi trang"/"thuong hieu" như văn xuôi là cây kim chết
+        # vĩnh viễn, và chết im: "áo thời trang" vẫn ăn hậu tố nhờ cây "ao" đỡ
+        # hộ, "logo thương hiệu" vẫn ăn nhờ cây "logo", chỉ "thời trang mùa hè"
+        # và "làm nổi bật thương hiệu" là rơi. Cùng chuỗi "thoi trang" lại ĐÚNG
+        # ở `POLICY_APPAREL_TERMS`, vì `_normalize_policy_text` giữ dấu cách —
+        # nên nhìn riêng cây kim không biết nó sống hay chết, phải hỏi nó đang
+        # so với bộ chuẩn hoá NÀO. `NormalizedNeedleAlphabetTests` canh việc này.
         prompt_text = self._normalize_skill_token(request.prompt or "")
         suffix_parts = [
             "first storyboard keyframe for a later image-to-video shot",
@@ -22623,7 +22641,7 @@ exit 1
                 "tshirt",
                 "hoodie",
                 "fashion",
-                "thoi trang",
+                "thoi_trang",
                 "jacket",
                 "dress",
                 "quan",
@@ -22633,7 +22651,7 @@ exit 1
             )
         ):
             suffix_parts.append("show a photoreal fashion model wearing the referenced item naturally")
-        if any(token in prompt_text for token in ("logo", "brand", "thuong hieu", "nhan")):
+        if any(token in prompt_text for token in ("logo", "brand", "thuong_hieu", "nhan")):
             suffix_parts.append("preserve brand marks sharply and naturally on the product")
         return ", ".join(suffix_parts)
 
