@@ -380,6 +380,25 @@ def carriers_not_named_on_their_line(
     return reports
 
 
+def tables_that_lost_their_name(nameless_at: set[str]) -> list[str]:
+    """Chỗ so có bảng hằng thật mà không gọi được TÊN bảng ấy.
+
+    Luật (d) hỏi "dòng ấy có nhắc tên bảng không", nên nó chỉ với tới được
+    chỗ nào đã ghi được tên. ``box_name`` trả **chuỗi rỗng** cho hình nó
+    chưa nhận (``RULES["x"]``, ``self.a.b``), rồi ``if carrier:`` nuốt luôn
+    chuỗi rỗng ấy — chỗ so biến khỏi tầm luật (d) và tổng vẫn đọc là 0.
+
+    Trên cây hôm nay là **0/25**: mọi vế mang bảng đều gọi được tên. Nhưng
+    0 ấy đo cái "chưa với tới", không đo cái "không thể" — hình chưa nhận
+    thì có thật, chỉ là service.py chưa viết kiểu đó ở đúng chỗ so. Phân
+    biệt hai thứ ấy là của erplisting-21, đo được bên họ ở ``else ""``.
+    """
+    return [
+        f"{site}: có bảng hằng mà không đọc ra tên bảng — luật (d) mù ở đây"
+        for site in sorted(nameless_at)
+    ]
+
+
 def inline_needles_not_written_on_their_own_line(
     literal_at: dict[str, dict[str, int]], lines: list[str]
 ) -> list[str]:
@@ -598,6 +617,11 @@ class SweptNeedles(NamedTuple):
     inline_at: dict[str, set[str]] = {}
     literal_at: dict[str, dict[str, int]] = {}
     node_at: dict[str, dict[str, tuple[int, int]]] = {}
+    # Chỗ so có bảng hằng mà KHÔNG gọi được tên bảng ấy. ``box_name`` trả
+    # chuỗi rỗng cho hình nó chưa nhận (``RULES["x"]``, ``self.a.b``), rồi
+    # ``if carrier:`` nuốt luôn — chỗ so ấy biến khỏi tầm luật (d) mà tổng
+    # vẫn đọc là 0. Ghi lại để có cái mà kêu.
+    nameless_at: set[str] = set()
 
 
 def needles_compared_with(normalizer: str) -> SweptNeedles:
@@ -640,6 +664,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
     inline: dict[str, set[str]] = {}
     literals: dict[str, dict[str, int]] = {}
     nodes: dict[str, dict[str, tuple[int, int]]] = {}
+    nameless: set[str] = set()
     functions = [
         node
         for node in ast.walk(tree)
@@ -774,6 +799,9 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                     )
                 if carrier:
                     carriers.setdefault(site, set()).add(carrier)
+                elif why == "named-set":
+                    # Bảng có thật mà không gọi được tên: đừng bỏ qua im lặng.
+                    nameless.add(site)
 
         def named_set_strings(node: ast.AST) -> list[str]:  # noqa: D401
             """Hình dạng kim thứ SÁU: ``normalized in generic_exact``.
@@ -863,6 +891,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         inline_at=inline,
         literal_at=literals,
         node_at=nodes,
+        nameless_at=nameless,
     )
 
 
@@ -2526,6 +2555,58 @@ class UnderscoreTwinTests(unittest.TestCase):
             swept = needles_compared_with(normalizer)
             rieng += len(set(swept.carriers_at) - set(swept.by_site))
         self.assertEqual(0, rieng, "khoá carriers nằm ngoài by_site thì không ai gánh hộ")
+
+    def test_a_table_whose_name_cannot_be_read_is_reported_not_dropped(self) -> None:
+        """Họ lỗ thứ HAI: mặc-định-lặng, không phải bỏ-qua-lặng.
+
+        Lượt quét AST trước chỉ tìm ``if ...: continue`` — nên nó mù đúng
+        cái hình mà erplisting-21 tìm ra bên họ: ``x if c else ""``. Quét
+        lại theo họ ấy (IfExp, ``.get(k, mặc định)``, ``getattr(x, y, mặc
+        định)``, ``x or <hằng>``, ``try/except``) ra 40 chỗ, và chỗ nguy
+        hiểm nằm ở **dụng cụ**: ``box_name`` trả rỗng cho hình chưa nhận,
+        rồi ``if carrier:`` nuốt mất — chỗ so rơi khỏi tầm luật (d).
+
+        Đo trên cây thật: ``box_name`` được gọi **25** lượt trong lượt quét,
+        **0** lượt rỗng. Nhưng theo phân biệt của erplisting-21, 0 ấy là
+        "chưa với tới" chứ không phải "không thể" — khác hẳn vế ``"_" not in
+        needle`` của :func:`missing_twins`, cái đó không đầu vào nào chạm
+        được. Bằng chứng nó đổi được kết quả: bịt mắt ``box_name`` thì
+        carrier tụt **56 → 54** và giỏ mất-tên lên **0 → 2**: luật (d) mất
+        hai chỗ trong khi cây vẫn y nguyên. Giả định đầu của tôi là "mất
+        sạch 56" — số đo bác bỏ, vì 54 carrier còn lại đi lối ``loop-var``
+        và ``mapping.get-named`` chứ không qua ``box_name``.
+        """
+        for ma in ('RULES["x"]', "self.a.b", "diem.attr"):
+            part = ast.parse(ma, mode="eval").body
+            self.assertEqual("", box_name(part), f"{ma}: hình chưa nhận thì trả rỗng")
+
+        self.assertEqual(
+            1, len(tables_that_lost_their_name({"f:3"})),
+            "có chỗ mất tên bảng thì phải BÁO",
+        )
+
+        sach = sum(
+            len(needles_compared_with(n).nameless_at)
+            for n in NormalizedNeedleAlphabetTests.ALPHABETS
+        )
+        self.assertEqual(0, sach, "cây sạch: mọi vế mang bảng đều gọi được tên")
+
+        # Bịt mắt dụng cụ. Nếu bộ quét không ghi lại chỗ mất tên thì lượt
+        # này XANH mà luật (d) chẳng còn gì để kiểm — rỗng-vì-mù.
+        goc = globals()["box_name"]
+        globals()["box_name"] = lambda part: ""
+        try:
+            mu = [needles_compared_with(n) for n in NormalizedNeedleAlphabetTests.ALPHABETS]
+        finally:
+            globals()["box_name"] = goc
+        self.assertEqual(
+            54, sum(len(v) for s in mu for v in s.carriers_at.values()),
+            "bịt mắt thì luật (d) mất đúng phần carrier đi qua box_name",
+        )
+        self.assertEqual(
+            2, len([r for s in mu for r in tables_that_lost_their_name(s.nameless_at)]),
+            "và mất bao nhiêu thì phải kêu bấy nhiêu — không thì (d) tắt lặng lẽ",
+        )
 
     def test_a_widened_ruler_kills_g_but_leaves_e_speaking(self) -> None:
         """Vì sao giữ (e) dù (g) chặt hơn: hai luật hỏng theo hai kiểu.
