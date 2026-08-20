@@ -1,0 +1,43 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "hvg-automation-center",
+  "account_id": "f2cb3db89a7cc7e2578db1dfdb639a39",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-11",
+  "workers_dev": false,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hvg-automation-center",
+      "database_id": "4cd4ad2f-6b96-44ad-bdd1-5a092b9183fc",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "COMPANY_EMAIL_DOMAIN": "havigroup.llc",
+    // Ngày hết hạn của Cloudflare Access Service Token dùng cho runner.  Để ở
+    // đây chứ không hard-code trong worker.js, để lần rotate sau chỉ phải sửa
+    // một dòng cấu hình.  Đây là ngày tháng, không phải bí mật.
+    "ACCESS_TOKEN_EXPIRES_AT": "2027-08-13"
+  },
+  // Watchdog sức khoẻ.  5 phút một lần: runner heartbeat mỗi 2.5s nên ngưỡng
+  // RUNNER_STALE_MS 5 phút vẫn phát hiện trong vòng ~10 phút kể từ lúc chết.
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "routes": [
+    {
+      "pattern": "automation.havigroup.llc/*",
+      "zone_name": "havigroup.llc"
+    }
+  ]
+}
