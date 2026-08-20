@@ -344,6 +344,64 @@ def sites_outside_their_function(by_site: dict[str, set[str]]) -> list[str]:
     return reports
 
 
+# Hình dạng nào gõ kim THẲNG tại chỗ so, hình dạng nào đọc kim từ một bảng
+# có tên. Hai nhóm này phải phủ kín — xem
+# ``test_no_shape_falls_between_the_two_groups``.
+SHAPES_WRITTEN_INLINE = frozenset({"compare", "comprehension", "startswith"})
+SHAPES_FROM_A_TABLE = frozenset({"loop-var", "named-set", "mapping.get-named"})
+
+
+def carriers_not_named_on_their_line(
+    carriers_at: dict[str, set[str]], lines: list[str]
+) -> list[str]:
+    """Kim đến từ bảng thì **cái tên đã mang bảng tới** phải có trên dòng ấy.
+
+    Với kim gõ thẳng, chữ của kim nằm ngay đó nên hỏi thẳng chữ được. Kim
+    đọc từ bảng hằng thì chữ nằm ở chỗ KHAI BẢNG, cách chỗ so có khi vài
+    trăm dòng — hỏi chữ là hỏi sai chỗ. Nhưng thứ luôn có mặt tại chỗ so là
+    cái định danh đã mang bảng tới: ``generic_titles``, ``self.POLICY_...``.
+    """
+    reports = []
+    for site in sorted(carriers_at):
+        _, number = parse_site(site)
+        if number is None or not 0 < number <= len(lines):
+            continue  # đã có luật khác báo
+        text = lines[number - 1]
+        for carrier in sorted(carriers_at[site]):
+            if carrier not in text:
+                reports.append(
+                    f"{site}: kim tới đây qua tên {carrier!r}, "
+                    f"mà dòng ấy không nhắc tên đó"
+                )
+    return reports
+
+
+def inline_needles_not_written_in_their_span(
+    inline_at: dict[str, set[str]],
+    spans_at: dict[str, tuple[int, int]],
+    lines: list[str],
+) -> list[str]:
+    """Kim gõ thẳng thì chữ của nó phải nằm trong khoảng dòng của nút chứa nó.
+
+    Phải là KHOẢNG chứ không phải đúng dòng ghi lại: tập hằng gõ thẳng hay
+    trải nhiều dòng, nên hỏi "có mặt trên chính dòng ấy" là báo oan hàng
+    loạt. Khoảng đi từ dòng ghi tới hết nút.
+    """
+    reports = []
+    for site in sorted(inline_at):
+        start, end = spans_at.get(site, (0, 0))
+        if not 0 < start <= len(lines):
+            continue  # đã có luật khác báo
+        window = "\n".join(lines[start - 1 : min(end, len(lines))])
+        for needle in sorted(inline_at[site]):
+            if needle not in window:
+                reports.append(
+                    f"{site}: kim {needle!r} gõ thẳng mà không có mặt trong "
+                    f"khoảng dòng {start}-{end}"
+                )
+    return reports
+
+
 def missing_twins(by_site: dict[str, set[str]]) -> list[str]:
     """Kim có ``_`` mà thiếu bản viết liền **ngay tại chỗ so ấy**.
 
@@ -374,6 +432,10 @@ class SweptNeedles(NamedTuple):
     # theo dòng còn gộp đúng hai vế của ``x in normalized or x in compact``
     # thành một chỗ, vì đó mới thật là một phép so.
     by_site: dict[str, set[str]] = {}
+    shapes_at: dict[str, set[str]] = {}
+    carriers_at: dict[str, set[str]] = {}
+    inline_at: dict[str, set[str]] = {}
+    spans_at: dict[str, tuple[int, int]] = {}
 
 
 def needles_compared_with(normalizer: str) -> SweptNeedles:
@@ -411,6 +473,10 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
 
     found: dict[str, set[str]] = {}
     sites: dict[str, set[str]] = {}
+    shapes: dict[str, set[str]] = {}
+    carriers: dict[str, set[str]] = {}
+    inline: dict[str, set[str]] = {}
+    spans: dict[str, tuple[int, int]] = {}
     functions = [
         node
         for node in ast.walk(tree)
@@ -499,7 +565,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                             continue
                         for value in scope.get(part.id, ()):
                             if isinstance(value, str):
-                                keep(value, "loop-var", node)
+                                keep(value, "loop-var", node, carrier=part.id)
             for child in ast.iter_child_nodes(node):
                 scan(child, scope)
 
@@ -517,14 +583,25 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         def holds_result(node: ast.AST) -> bool:
             return is_call(node) or (isinstance(node, ast.Name) and node.id in holders)
 
-        def keep(value: object, why: str, node: ast.AST | None = None) -> None:
+        def keep(
+            value: object,
+            why: str,
+            node: ast.AST | None = None,
+            carrier: str | None = None,
+        ) -> None:
             if isinstance(value, str) and value:
+                site = f"{function.name}:{getattr(node, 'lineno', 0)}"
                 found.setdefault(value, set()).add(f"{function.name}:{why}")
-                sites.setdefault(
-                    f"{function.name}:{getattr(node, 'lineno', 0)}", set()
-                ).add(value)
+                sites.setdefault(site, set()).add(value)
+                shapes.setdefault(site, set()).add(why)
+                if why in SHAPES_WRITTEN_INLINE:
+                    inline.setdefault(site, set()).add(value)
+                    end = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0)
+                    spans[site] = (getattr(node, "lineno", 0), end)
+                if carrier:
+                    carriers.setdefault(site, set()).add(carrier)
 
-        def named_set_strings(node: ast.AST) -> list[str]:
+        def named_set_strings(node: ast.AST) -> list[str]:  # noqa: D401
             """Hình dạng kim thứ SÁU: ``normalized in generic_exact``.
 
             Bốn hình dạng đầu chỉ nhìn thấy tập hằng viết THẲNG tại chỗ.
@@ -556,7 +633,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                             if isinstance(element, ast.Constant):
                                 keep(element.value, "compare", node)
                         for value in named_set_strings(part):
-                            keep(value, "named-set", node)
+                            keep(value, "named-set", node, carrier=box_name(part))
             if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)) and isinstance(
                 node.elt, ast.Compare
             ):
@@ -578,9 +655,15 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                     literal_dicts.get(receiver.id) if isinstance(receiver, ast.Name) else None
                 )
                 if isinstance(table, ast.Dict):
+                    named = receiver.id if isinstance(receiver, ast.Name) else None
                     for key in table.keys:
                         if isinstance(key, ast.Constant):
-                            keep(key.value, "mapping.get", node)
+                            keep(
+                                key.value,
+                                "mapping.get-named" if named else "mapping.get",
+                                node,
+                                carrier=named,
+                            )
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -593,7 +676,13 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                             keep(element.value, "startswith", node)
 
     return SweptNeedles(
-        by_text=found, functions=[fn.name for fn in functions], by_site=sites
+        by_text=found,
+        functions=[fn.name for fn in functions],
+        by_site=sites,
+        shapes_at=shapes,
+        carriers_at=carriers,
+        inline_at=inline,
+        spans_at=spans,
     )
 
 
@@ -1372,7 +1461,7 @@ class SweepReachTests(unittest.TestCase):
         ("_normalize_skill_token", "comprehension"): 263,
         ("_normalize_skill_token", "loop-var"): 305,
         ("_normalize_skill_token", "compare"): 32,
-        ("_normalize_skill_token", "mapping.get"): 58,
+        ("_normalize_skill_token", "mapping.get-named"): 58,
         ("_normalize_skill_token", "named-set"): 25,
         ("_normalize_prompt_source_header", "compare"): 26,
         ("_compact_match_text", "compare"): 7,
@@ -1387,7 +1476,12 @@ class SweepReachTests(unittest.TestCase):
     # ``.startswith``/``.endswith`` trên giá trị đã gấp, trên cả sáu bộ
     # chuẩn hoá của ``flow_web/service.py``. "0 cây kim" ở đây nghĩa là "repo
     # này chưa có chỗ nào như thế", không phải "hình dạng này chạy tốt".
-    SHAPES_WITH_NO_SITE_HERE = {"startswith"}
+    # ``mapping.get`` = bảng gõ THẲNG tại chỗ gọi. Tách nhãn ra mới thấy:
+    # cả 58 cây kim mapping ở flow-v2 đều đi qua bảng CÓ TÊN
+    # (``mapping.get-named``), không cái nào gõ thẳng. Trước khi tách, tôi
+    # đã định xếp cả nhóm này vào "gõ thẳng" — xếp thế là sai, và cái sai ấy
+    # sẽ lặng lẽ đưa 58 kim ra ngoài luật (d).
+    SHAPES_WITH_NO_SITE_HERE = {"startswith", "mapping.get"}
 
     @staticmethod
     def _shape_counts(normalizer: str) -> dict[str, int]:
@@ -1792,6 +1886,119 @@ class UnderscoreTwinTests(unittest.TestCase):
                 self.assertIn(bent, reports[0])
         self.assertEqual([], sites_outside_their_function({"f": {"a"}}),
                          "khoá cong là việc của sites_pointing_nowhere, đừng báo hai lần")
+
+
+    def test_no_shape_falls_between_the_two_groups(self) -> None:
+        """Hai nhóm phải PHỦ KÍN, nếu không hình dạng mới lọt xuống khe.
+
+        Luật (d) chỉ hỏi được nhóm "đọc từ bảng"; luật chữ-của-kim chỉ hỏi
+        được nhóm "gõ thẳng". Hình dạng nào không thuộc nhóm nào thì chỉ
+        còn ba câu vị trí canh — mà ba câu ấy đều xanh khi hoán vị trong
+        cùng một hàm. Nó sẽ nằm im, không ai kêu.
+
+        Đây là câu phải lắp TRƯỚC khi lắp (d), không phải sau.
+        """
+        seen: set[str] = set()
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            for shapes in needles_compared_with(normalizer).shapes_at.values():
+                seen |= shapes
+        self.assertEqual(
+            set(),
+            seen - (SHAPES_WRITTEN_INLINE | SHAPES_FROM_A_TABLE),
+            "hình dạng này chưa được xếp vào nhóm nào — xếp nó vào một nhóm, "
+            "đừng để nó chỉ được canh bằng vị trí",
+        )
+
+    def test_a_table_needle_names_its_carrier_on_the_line(self) -> None:
+        """Luật (d) trên cây thật, và ca hoán vị trong hàm mà nó bắt được.
+
+        Ba câu vị trí đều mù với hoán vị TRONG CÙNG một hàm: dòng vẫn trong
+        thân hàm, vẫn có phép so, các khoá vẫn khác nhau — đo được 0/0/18 y
+        như cây sạch. Câu này là câu đầu tiên nhìn thấy nó.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        lines = source.read_text(encoding="utf-8").split("\n")
+        wrong = []
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            wrong.extend(
+                carriers_not_named_on_their_line(
+                    needles_compared_with(normalizer).carriers_at, lines
+                )
+            )
+        self.assertEqual([], wrong[:5], f"{len(wrong)} kim ghi sai chỗ mang")
+
+    def test_the_carrier_rule_is_pinned_on_made_up_data(self) -> None:
+        lines = ["if x in generic_titles:", "if x in other:"]
+        self.assertEqual([], carriers_not_named_on_their_line({"f:1": {"generic_titles"}}, lines))
+        reports = carriers_not_named_on_their_line({"f:2": {"generic_titles"}}, lines)
+        self.assertEqual(1, len(reports))
+        self.assertIn("generic_titles", reports[0])
+
+
+    def test_an_inline_needle_is_written_inside_its_own_span(self) -> None:
+        """Luật (b): kim gõ thẳng thì chữ của nó phải nằm trong khoảng của nút.
+
+        Phải là KHOẢNG chứ không phải đúng dòng ghi lại — tập hằng gõ thẳng
+        trải nhiều dòng thì hỏi "có trên chính dòng ấy" là báo oan hàng loạt.
+
+        Và nhóm phải xếp bằng SỐ ĐO chứ đừng xếp bằng cảm giác: tôi đã xếp
+        ``loop-var`` vào nhóm gõ thẳng, chạy ra **126 lời báo oan** — vì kim
+        của nó đến từ bảng gõ ở chỗ khác (``alias_groups`` khai ở 14930,
+        đem so ở 14940), cái nằm trên dòng so là **biến lặp**. Xếp lại sang
+        nhóm bảng, lấy tên biến lặp làm tên mang, thì cả hai luật về 0.
+
+        **(b) và (d) canh hai thứ khác nhau, đừng gộp làm một.** Đo trên
+        cùng cây sạch, 75 chỗ so gõ thẳng:
+
+        =====================================  =======  =======
+        đột biến                               (b) bắt  (d) bắt
+        =====================================  =======  =======
+        hoán vị khoá trong cùng một hàm              0       12
+        đổi span giữa các chỗ so cùng hàm          310        –
+        span lệch một dòng                         260        –
+        =====================================  =======  =======
+
+        (b) **không đọc số dòng trong khoá** nên hoán vị khoá nó không thấy —
+        lần đo đầu tôi hoán vị cả khoá lẫn span cùng lúc, tức là không đổi
+        thứ gì (b) nhìn được, rồi suýt ghi "(b) mù". (b) canh *span có nói
+        thật không*; (d) canh *số dòng trong khoá có nói thật không*. Ghép
+        lại mới phủ hết, chứ không cái nào thay được cái nào.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        lines = source.read_text(encoding="utf-8").split("\n")
+        wrong = []
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            swept = needles_compared_with(normalizer)
+            wrong.extend(
+                inline_needles_not_written_in_their_span(
+                    swept.inline_at, swept.spans_at, lines
+                )
+            )
+        self.assertEqual([], wrong[:5], f"{len(wrong)} kim gõ thẳng ghi sai chỗ")
+
+    def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
+        """Phủ kín ở mức CHỖ SO, không chỉ ở mức nhãn hình dạng.
+
+        Ba câu vị trí đều mù với hoán vị trong cùng một hàm, nên chỗ so nào
+        không có luật văn bản nào soi thì coi như không được canh. Đo: 87/87.
+        """
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            swept = needles_compared_with(normalizer)
+            with self.subTest(normalizer=normalizer):
+                self.assertEqual(
+                    set(),
+                    set(swept.by_site) - set(swept.inline_at) - set(swept.carriers_at),
+                    "chỗ so này không luật văn bản nào soi",
+                )
+
+    def test_the_inline_rule_is_pinned_on_made_up_data(self) -> None:
+        lines = ['if x in {"ao", "quan"}:', "    pass"]
+        self.assertEqual([], inline_needles_not_written_in_their_span(
+            {"f:1": {"ao"}}, {"f:1": (1, 1)}, lines))
+        reports = inline_needles_not_written_in_their_span(
+            {"f:1": {"vay"}}, {"f:1": (1, 1)}, lines)
+        self.assertEqual(1, len(reports))
+        self.assertIn("vay", reports[0])
 
     def test_a_bent_key_is_reported_not_crashed_on(self) -> None:
         """Khoá cong phải ra LỜI BÁO, không ra vết đổ.
