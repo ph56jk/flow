@@ -12,7 +12,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException, UploadFile
@@ -42,9 +42,15 @@ from flow_web.service import (
     FlowWebService,
     ImageUpscaleResult,
     RemoveLogoNoWatermarkError,
+    _full_chromium_headless_launcher,
 )
 from flow_web.shot_rules import PRODUCT_SHOT_RULES
-from flow_web.store import StateStore
+from flow_web.store import (
+    JOB_HISTORY_CEILING,
+    JOB_HISTORY_LIMIT,
+    StateStore,
+    trim_job_history,
+)
 
 
 def _approved(artifacts: JobArtifact | list[JobArtifact]) -> dict[str, Any]:
@@ -5613,6 +5619,76 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         build_client.assert_awaited_once()
         close_shared_browser.assert_not_called()
 
+    async def test_with_client_keeps_the_browser_to_itself_by_default(self) -> None:
+        # Most callers drive the page - the Agent panel, the prompt box, the
+        # download menu. Two of those at once read each other's output.
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold(_client: Any) -> str:
+            started.set()
+            await release.wait()
+            return "held"
+
+        with patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace())
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="shared-client")),
+        ):
+            holder = asyncio.create_task(self.service._with_client(hold))
+            await asyncio.wait_for(started.wait(), timeout=2)
+            with self.assertRaises(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    self.service._with_client(lambda client: asyncio.sleep(0, result="second")),
+                    timeout=0.2,
+                )
+            release.set()
+            self.assertEqual("held", await asyncio.wait_for(holder, timeout=2))
+
+    async def test_with_client_can_hand_the_browser_back_before_running_the_work(self) -> None:
+        # The 2K batch is five and a half minutes of waiting on an HTTPS call
+        # with the browser idle underneath. Holding the session lock through
+        # that is what made running two idea cards at once nearly worthless.
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        order: list[str] = []
+        upscales_started = asyncio.Event()
+        upscales_may_finish = asyncio.Event()
+
+        async def upscale(_client: Any) -> str:
+            order.append("upscale-start")
+            upscales_started.set()
+            await upscales_may_finish.wait()
+            order.append("upscale-end")
+            return "upscaled"
+
+        async def generate(_client: Any) -> str:
+            order.append("generate")
+            upscales_may_finish.set()
+            return "generated"
+
+        with patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace())
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(return_value=SimpleNamespace(name="shared-client")),
+        ):
+            batch = asyncio.create_task(
+                self.service._with_client(upscale, hold_session_lock=False)
+            )
+            await asyncio.wait_for(upscales_started.wait(), timeout=2)
+            second = await asyncio.wait_for(self.service._with_client(generate), timeout=2)
+            first = await asyncio.wait_for(batch, timeout=2)
+
+        self.assertEqual("upscaled", first)
+        self.assertEqual("generated", second)
+        # The next card got in and out while the upscales were still running.
+        self.assertEqual(["upscale-start", "generate", "upscale-end"], order)
+        self.assertFalse(self.service._browser_session_lock.locked())
+
     async def test_with_client_switches_to_next_profile_on_flow_agent_quota(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
         profiles = [
@@ -5798,6 +5874,28 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(429, second_ctx.exception.status_code)
         ensure_again.assert_not_awaited()
 
+    async def test_a_quota_block_ends_when_google_hands_the_quota_back(self) -> None:
+        # Khoá cứng 24 giờ dài hơn chu kỳ thật: quota về vào nửa đêm giờ Thái
+        # Bình Dương, nên profile hết quota lúc sáng bị app nhốt thêm gần năm
+        # tiếng sau khi Google đã trả — đo được đúng như vậy ngày 18-19/08.
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False):
+            with patch.object(self.service, "_seconds_until_flow_quota_reset", return_value=6.0 * 3600.0):
+                self.assertEqual(6.0 * 3600.0, self.service._flow_profile_block_seconds())
+            # Sát mốc reset thì vẫn chờ một khoảng, để khỏi thử lại liên tục
+            # nếu Google trả muộn hơn nửa đêm.
+            with patch.object(self.service, "_seconds_until_flow_quota_reset", return_value=30.0):
+                self.assertEqual(self.service.FLOW_QUOTA_MIN_BLOCK_S, self.service._flow_profile_block_seconds())
+
+    async def test_the_quota_block_length_can_still_be_pinned_by_env(self) -> None:
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "900"}, clear=False):
+            with patch.object(self.service, "_seconds_until_flow_quota_reset", return_value=6.0 * 3600.0):
+                self.assertEqual(900.0, self.service._flow_profile_block_seconds())
+
+    async def test_the_quota_reset_countdown_lands_on_pacific_midnight(self) -> None:
+        seconds = self.service._seconds_until_flow_quota_reset()
+        self.assertGreater(seconds, 0.0)
+        self.assertLessEqual(seconds, 24.0 * 3600.0)
+
     async def test_with_client_persists_quota_block_across_service_instances(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
         profiles = [
@@ -5910,6 +6008,132 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         open_login_page.assert_awaited_once_with(browser)
         self.assertTrue(payload["ok"])
         self.assertEqual("https://labs.google/fx/vi/tools/flow", payload["url"])
+
+    def _stub_shared_browser_launch(self) -> Dict[str, Any]:
+        """Bắt lấy lời gọi BrowserManager mà không mở Chromium thật."""
+        seen: Dict[str, Any] = {}
+
+        class FakeBrowserManager:
+            def __init__(self, headless: bool = True, profile_dir: Any = None) -> None:
+                seen["headless"] = headless
+                self._ctx = object()
+
+            async def start(self) -> None:
+                seen["started"] = True
+
+            async def stop(self) -> None:
+                seen["stopped"] = True
+
+        return {"seen": seen, "manager": FakeBrowserManager}
+
+    async def test_headless_no_longer_gives_up_the_shared_browser(self) -> None:
+        # Tắt cửa sổ không được phép kéo theo mất luôn trình duyệt dùng chung
+        # và cả danh sách profile - đó là cái giá của lối cũ.
+        self.assertTrue(self.service._should_keep_flow_browser_open(AppConfig(headless=True)))
+        self.assertTrue(self.service._should_keep_flow_browser_open(AppConfig(headless=False)))
+        self.assertFalse(
+            self.service._should_keep_flow_browser_open(AppConfig(cdp_url="http://127.0.0.1:9222"))
+        )
+
+    async def test_shared_browser_runs_hidden_when_configured(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=True))
+        stub = self._stub_shared_browser_launch()
+        with patch.object(
+            self.service, "_flow_modules", return_value=(stub["manager"], None, None, None, None)
+        ), patch.object(self.service, "_ensure_playwright_browsers_available"), patch.object(
+            self.service, "_close_placeholder_flow_tabs", AsyncMock()
+        ):
+            await self.service._ensure_shared_browser()
+        self.assertTrue(stub["seen"]["headless"])
+
+    async def test_hand_work_still_gets_a_window_even_when_hidden(self) -> None:
+        # Đăng nhập Google là việc người dùng phải tự làm; ẩn cửa sổ đi thì
+        # không còn đường nào đăng nhập nữa.
+        await self.store.replace_config(AppConfig(project_id="pid", headless=True))
+        stub = self._stub_shared_browser_launch()
+        with patch.object(
+            self.service, "_flow_modules", return_value=(stub["manager"], None, None, None, None)
+        ), patch.object(self.service, "_ensure_playwright_browsers_available"), patch.object(
+            self.service, "_close_placeholder_flow_tabs", AsyncMock()
+        ):
+            await self.service._ensure_shared_browser(visible=True)
+        self.assertFalse(stub["seen"]["headless"])
+
+    async def test_a_browser_opened_the_other_way_is_not_reused(self) -> None:
+        # Một profile Chromium không mở hai kiểu cùng lúc, nên đổi chế độ là
+        # phải dựng lại chứ không dùng lại cửa sổ đang có.
+        self.service._shared_browser = SimpleNamespace(_ctx=object())
+        self.service._shared_browser_profile_key = ""
+        self.service._shared_browser_headless = False
+        with patch.object(self.service, "_shared_browser", self.service._shared_browser):
+            self.assertFalse(await self.service._shared_browser_is_usable(None, True))
+
+    async def test_hidden_windows_open_the_full_chromium(self) -> None:
+        # ``chrome-headless-shell`` mở được hồ sơ nhưng labs.google không cấp
+        # phiên đăng nhập cho nó, nên chạy ẩn phải gọi bản Chromium đầy đủ.
+        seen: Dict[str, Any] = {}
+
+        async def fake_launch(_self: Any, user_data_dir: Any, **kwargs: Any) -> str:
+            seen.update(kwargs)
+            seen["profile"] = user_data_dir
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        self.assertEqual("ctx", await launcher(object(), "/hồ/sơ", headless=True))
+        self.assertEqual("chromium", seen.get("channel"))
+
+    async def test_a_visible_window_is_left_exactly_as_it_was(self) -> None:
+        seen: Dict[str, Any] = {}
+
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            seen.update(kwargs)
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        await launcher(object(), "/hồ/sơ", headless=False)
+        self.assertNotIn("channel", seen)
+
+    async def test_a_machine_without_the_full_chromium_still_runs(self) -> None:
+        # Máy chỉ có bản rút gọn thì thà chạy được còn hơn chết đứng.
+        attempts: list[Dict[str, Any]] = []
+
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            attempts.append(kwargs)
+            if kwargs.get("channel"):
+                raise RuntimeError("chromium chưa được cài")
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        self.assertEqual("ctx", await launcher(object(), "/hồ/sơ", headless=True))
+        self.assertEqual(["chromium", None], [attempt.get("channel") for attempt in attempts])
+
+    async def test_a_chosen_browser_is_never_overruled(self) -> None:
+        seen: Dict[str, Any] = {}
+
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            seen.update(kwargs)
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        await launcher(object(), "/hồ/sơ", headless=True, channel="chrome")
+        self.assertEqual("chrome", seen.get("channel"))
+
+    def test_the_launcher_is_only_wrapped_once(self) -> None:
+        async def fake_launch(_self: Any, _dir: Any, **kwargs: Any) -> str:
+            return "ctx"
+
+        launcher = _full_chromium_headless_launcher(fake_launch)
+        self.assertTrue(getattr(launcher, "__flow_v2_full_chromium__", False))
+
+    async def test_open_flow_login_surface_asks_for_a_visible_window(self) -> None:
+        page = SimpleNamespace(url="https://labs.google/fx/vi/tools/flow")
+        with patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace())
+        ) as ensure_browser, patch.object(
+            self.service, "_open_login_flow_page", AsyncMock(return_value=page)
+        ):
+            await self.service.open_flow_login_surface()
+        self.assertEqual({"visible": True}, ensure_browser.await_args.kwargs)
 
     async def test_open_flow_login_surface_fails_in_windows_session_zero(self) -> None:
         with patch("flow_web.service.os.name", "nt"), patch.object(
@@ -10274,18 +10498,21 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             mime_type=mime_type,
         )
 
-    def _cookie_store(self, profile: Path, rows: list[tuple[str, int, int]]) -> Path:
+    def _cookie_store(
+        self, profile: Path, rows: list[tuple[str, int, int]], host: str = "labs.google"
+    ) -> Path:
         import sqlite3
 
         path = profile / "Default" / "Cookies"
         path.parent.mkdir(parents=True, exist_ok=True)
         connection = sqlite3.connect(str(path))
         connection.execute(
-            "CREATE TABLE cookies (host_key TEXT, name TEXT, expires_utc INTEGER, has_expires INTEGER)"
+            "CREATE TABLE IF NOT EXISTS cookies "
+            "(host_key TEXT, name TEXT, expires_utc INTEGER, has_expires INTEGER)"
         )
         connection.executemany(
             "INSERT INTO cookies (host_key, name, expires_utc, has_expires) VALUES (?, ?, ?, ?)",
-            [("labs.google", name, expires, has_expires) for name, expires, has_expires in rows],
+            [(host, name, expires, has_expires) for name, expires, has_expires in rows],
         )
         connection.commit()
         connection.close()
@@ -10316,6 +10543,31 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         profile = self._cookie_store(
             self.downloads_dir / "analytics-profile",
             [("_ga", self._chrome_stamp(365 * 86400), 1)],
+        )
+
+        self.assertTrue(self.service._flow_session_cookie_expired(profile))
+
+    def test_a_live_google_account_still_counts_as_signed_in(self) -> None:
+        # Hồ sơ thật chạy Flow suốt nhiều giờ mà trên đĩa không hề có dòng
+        # next-auth nào: phiên ấy dựng lại từ cookie tài khoản Google mỗi lần
+        # mở trang. Lấy sự vắng mặt của next-auth làm bằng chứng hết hạn là
+        # chặn đứng một phiên còn sống.
+        profile = self.downloads_dir / "google-profile"
+        self._cookie_store(profile, [("_ga", self._chrome_stamp(365 * 86400), 1)])
+        self._cookie_store(
+            profile,
+            [("SID", self._chrome_stamp(400 * 86400), 1)],
+            host=".google.com",
+        )
+
+        self.assertFalse(self.service._flow_session_cookie_expired(profile))
+
+    def test_a_dead_google_account_reports_a_dead_session(self) -> None:
+        profile = self.downloads_dir / "dead-google-profile"
+        self._cookie_store(
+            profile,
+            [("SID", self._chrome_stamp(-86400), 1)],
+            host=".google.com",
         )
 
         self.assertTrue(self.service._flow_session_cookie_expired(profile))
@@ -10730,23 +10982,50 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         upload.assert_called_once_with("key", "secret", "TASK-1", b"png-bytes", "image/png", "sach.png")
         self.assertEqual([hosted_path], graphql_calls[0]["attachments"])
-        # A linked attachment renders on its own, so the body carries no URL.
-        self.assertEqual("[FLOW_V2_ARTIFACT] sach.png", graphql_calls[0]["content"])
+        # A linked attachment renders on its own, so the body carries no URL -
+        # and no words either: the artefact marker rides in ``meta`` so the
+        # card shows the picture alone.
+        self.assertEqual("\u200b", graphql_calls[0]["content"])
+        self.assertEqual("[FLOW_V2_ARTIFACT] sach.png", graphql_calls[0]["meta"])
         fallback.assert_not_called()
         self.assertTrue(result["hosted"])
         self.assertTrue(result["linked"])
         self.assertEqual("https://erp.havigroup.llc/private/files/sach.png", result["url"])
         self.assertEqual("image/png", result["mimeType"])
 
+    def test_a_silent_attachment_puts_neither_words_nor_marker_on_the_card(self) -> None:
+        # The idea picture is only carried across to the child card. It is not
+        # a Flow output, so it must not pick up the artefact marker - a child
+        # card wearing that marker reads as "already run" and never runs.
+        graphql_calls: List[Dict[str, Any]] = []
+
+        with patch.object(
+            self.service, "_erp_upload_file", return_value="/private/files/idea.png"
+        ), patch.object(self.service, "_erp_assert_task_in_project"), patch.object(
+            self.service,
+            "_erp_graphql",
+            side_effect=lambda q, v, o, *, key, token: (
+                graphql_calls.append(v) or {"addTaskComment": {"ok": True, "linked": 1}}
+            ),
+        ):
+            self.service._erp_attach_file_bytes(
+                "key", "secret", "TASK-1", b"png-bytes", "image/png", "idea.png", False,
+                silent_comment=True,
+            )
+
+        self.assertEqual("\u200b", graphql_calls[0]["content"])
+        self.assertEqual("", graphql_calls[0]["meta"])
+
     def test_erp_attach_file_bytes_posts_into_the_source_comment_thread(self) -> None:
         hosted_path = "/private/files/sach.png"
         replies: List[Dict[str, Any]] = []
 
-        def fake_reply(key, token, task_id, content, *, parent_comment, attachments=None):
+        def fake_reply(key, token, task_id, content, *, parent_comment, attachments=None, meta=""):
             replies.append(
                 {
                     "task_id": task_id,
                     "content": content,
+                    "meta": meta,
                     "parent": parent_comment,
                     "attachments": list(attachments or []),
                 }
@@ -10766,7 +11045,15 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         # only path that may run here.
         graphql.assert_not_called()
         self.assertEqual(
-            [{"task_id": "TASK-1", "content": "[FLOW_V2_ARTIFACT] sach.png", "parent": "cmt-nguon", "attachments": [hosted_path]}],
+            [
+                {
+                    "task_id": "TASK-1",
+                    "content": "\u200b",
+                    "meta": "[FLOW_V2_ARTIFACT] sach.png",
+                    "parent": "cmt-nguon",
+                    "attachments": [hosted_path],
+                }
+            ],
             replies,
         )
         self.assertTrue(result["linked"])
@@ -10863,6 +11150,84 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(["nguon.png"], [item["name"] for item in sources])
         self.assertEqual(1, len(outputs))
 
+    def test_extract_attachments_prefers_the_real_file_name_over_the_erp_id(self) -> None:
+        # On the real ERP a comment attachment names itself with a random File
+        # id and keeps "flow-<run>-<n>.png" in file_name, while the comment
+        # body is only a zero-width space.  Reading "name" first made every
+        # image Flow posted fail the image-extension check and disappear, so
+        # the card looked empty to both halves of the agent.
+        detail = {
+            "comments": [
+                {
+                    "name": "cmt-1",
+                    "content": "anh nguon cho AI",
+                    "attachments": [
+                        {
+                            "name": "1f0a2b3c4d",
+                            "file_name": "nguon.png",
+                            "file_url": "/private/files/nguon.png",
+                        }
+                    ],
+                },
+                {
+                    "name": "cmt-2",
+                    "content": "\u200b",
+                    "attachments": [
+                        {
+                            "name": "8c1f2a4d9e",
+                            "file_name": "flow-run7-1.png",
+                            "file_url": "/private/files/flow-run7-1.png",
+                        },
+                        {
+                            "name": "5b7e0d6a2f",
+                            "file_name": "flow-run7-2.jpg",
+                            "file_url": "/private/files/flow-run7-2.jpg",
+                        },
+                    ],
+                },
+            ]
+        }
+
+        found = self.service._erp_extract_task_attachments(detail)
+
+        self.assertEqual(
+            ["nguon.png", "flow-run7-1.png", "flow-run7-2.jpg"],
+            [item["name"] for item in found],
+        )
+        self.assertEqual(["image/png", "image/png", "image/jpeg"], [item["mimeType"] for item in found])
+        sources, outputs = self.service._erp_source_and_flow_output_attachments(found)
+        self.assertEqual(["nguon.png"], [item["name"] for item in sources])
+        self.assertEqual(2, len(outputs))
+
+    def test_task_metadata_typed_by_a_person_cannot_mark_images_as_flow_output(self) -> None:
+        # Only the comments Flow posts carry "meta"; a Task's own metadata is
+        # typed by a person.  Reading the marker there would brand the source
+        # image the reviewer uploaded as a Flow output, and the reset endpoint
+        # deletes Flow outputs.
+        detail = {
+            "meta": "action_1: listing FLOW_V2_ARTIFACT",
+            "comments": [
+                {
+                    "name": "cmt-1",
+                    "content": "anh nguon cho AI",
+                    "attachments": [
+                        {
+                            "name": "1f0a2b3c4d",
+                            "file_name": "nguon.png",
+                            "file_url": "/private/files/nguon.png",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        found = self.service._erp_extract_task_attachments(detail)
+
+        self.assertEqual(["nguon.png"], [item["name"] for item in found])
+        sources, outputs = self.service._erp_source_and_flow_output_attachments(found)
+        self.assertEqual(["nguon.png"], [item["name"] for item in sources])
+        self.assertEqual([], outputs)
+
     def test_extract_attachments_ignores_links_to_other_hosts(self) -> None:
         detail = {
             "comments": [
@@ -10956,24 +11321,10 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("https://example.com/private/files/nguon.png", captured["url"])
         self.assertIsNone(captured["auth"])
 
-    async def test_job_failure_is_mirrored_into_erp_task_comment(self) -> None:
-        job = JobRecord(type="image", status="failed", title="test")
-        await self.store.add_job(job)
-        request = CreateJobRequest(type="image", prompt="cat", erp_enabled=True, erp_task_id="TASK-1")
-
-        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
-            self.service, "_erp_assert_task_in_project"
-        ), patch.object(self.service, "_erp_source_comment_id", return_value=""), patch.object(
-            self.service, "_erp_graphql", return_value={"addTaskComment": {"name": "c1"}}
-        ) as graphql:
-            await self.service._report_erp_job_failure(job.id, request, "Flow  hết\n hạn mức tạo ảnh.")
-
-        graphql.assert_called_once()
-        variables = graphql.call_args.args[1]
-        self.assertEqual("TASK-1", variables["name"])
-        self.assertEqual("[FLOW_V2_ERROR] Flow hết hạn mức tạo ảnh.", variables["content"])
-
-    async def test_job_failure_lands_in_the_source_image_thread(self) -> None:
+    async def test_job_failure_is_written_to_the_job_log_not_to_the_card(self) -> None:
+        # The card is for images. A failure the reviewers cannot act on used to
+        # sit there as "[FLOW_V2_ERROR] ..." forever, because nobody deletes a
+        # robot's comment; the run's own log is where the reason belongs.
         job = JobRecord(type="image", status="failed", title="test")
         await self.store.add_job(job)
         request = CreateJobRequest(type="image", prompt="cat", erp_enabled=True, erp_task_id="TASK-1")
@@ -10982,17 +11333,21 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             self.service, "_erp_assert_task_in_project"
         ), patch.object(self.service, "_erp_source_comment_id", return_value="cmt-nguon"), patch.object(
             self.service, "_erp_graphql"
-        ) as graphql, patch.object(
-            self.service, "_erp_reply_comment", return_value={"ok": True}
-        ) as reply:
-            await self.service._report_erp_job_failure(job.id, request, "Flow hết hạn mức tạo ảnh.")
+        ) as graphql, patch.object(self.service, "_erp_reply_comment") as reply, patch.object(
+            self.service, "_erp_comment"
+        ) as comment:
+            await self.service._report_erp_job_failure(job.id, request, "Flow  hết\n hạn mức tạo ảnh.")
 
-        # The person who dropped the source image reads the thread, not the
-        # bottom of the card.
         graphql.assert_not_called()
-        reply.assert_called_once()
-        self.assertEqual("cmt-nguon", reply.call_args.kwargs["parent_comment"])
-        self.assertEqual("[FLOW_V2_ERROR] Flow hết hạn mức tạo ảnh.", reply.call_args.args[3])
+        reply.assert_not_called()
+        comment.assert_not_called()
+        saved = self.store.get_job(job.id)
+        self.assertTrue(
+            any(
+                "Không tạo được ảnh cho ERP Task TASK-1: Flow hết hạn mức tạo ảnh." in item.message
+                for item in saved.logs
+            )
+        )
 
     async def test_job_failure_comment_is_skipped_without_erp_task(self) -> None:
         job = JobRecord(type="image", status="failed", title="test")
@@ -11006,18 +11361,23 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         graphql.assert_not_called()
 
-    async def test_job_failure_comment_error_never_propagates(self) -> None:
+    async def test_job_failure_report_needs_no_erp_call_to_survive(self) -> None:
+        # Reporting a failure must never fail in turn. It no longer touches the
+        # ERP at all, so a card this app cannot even reach still gets its
+        # reason recorded.
         job = JobRecord(type="image", status="failed", title="test")
         await self.store.add_job(job)
         request = CreateJobRequest(type="image", prompt="cat", erp_enabled=True, erp_task_id="TASK-1")
 
-        with patch.object(self.service, "_erp_credentials", return_value=("key", "token")), patch.object(
+        with patch.object(self.service, "_erp_credentials", return_value=("", "")), patch.object(
             self.service, "_erp_assert_task_in_project", side_effect=RuntimeError("Task không thuộc Project")
         ):
             await self.service._report_erp_job_failure(job.id, request, "boom")
 
         saved = self.store.get_job(job.id)
-        self.assertTrue(any("Không ghi được lỗi lên ERP Task TASK-1" in item.message for item in saved.logs))
+        self.assertTrue(
+            any("Không tạo được ảnh cho ERP Task TASK-1: boom" in item.message for item in saved.logs)
+        )
 
     async def test_erp_archive_still_attaches_url_when_no_local_file_exists(self) -> None:
         artifact = JobArtifact(
@@ -11050,6 +11410,62 @@ class RemoveLogoWatermarkTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual("https://example.com/flow-image.jpg", attach_url.call_args.args[3])
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["uploaded_files"])
+
+
+class JobHistoryTrimTests(unittest.TestCase):
+    """Lịch sử lượt chạy có hạn, nhưng không được nuốt ảnh chưa lên thẻ."""
+
+    def _job(self, *, task_id: str = "", images: int = 0, result: dict | None = None) -> JobRecord:
+        return JobRecord(
+            type="image",
+            status="completed",
+            input={"erp_output_task_id": task_id} if task_id else {},
+            artifacts=[JobArtifact(media_name=f"a{index}.jpg") for index in range(images)],
+            result=result or {},
+        )
+
+    def test_history_keeps_the_newest_runs(self) -> None:
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT + 10)]
+
+        kept = trim_job_history(jobs)
+
+        self.assertEqual(jobs[:JOB_HISTORY_LIMIT], kept)
+
+    def test_a_run_whose_images_never_reached_its_card_survives_the_trim(self) -> None:
+        # Cutting it loose strands twelve finished images: only this record
+        # knows where they are, so the card could never be filled again.
+        owing = self._job(task_id="TASK-2026-01009", images=12)
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT)] + [owing]
+
+        kept = trim_job_history(jobs)
+
+        self.assertIn(owing, kept)
+        self.assertEqual(JOB_HISTORY_LIMIT + 1, len(kept))
+
+    def test_a_run_whose_images_are_all_on_the_card_is_dropped_as_usual(self) -> None:
+        settled = self._job(
+            task_id="TASK-2026-01009",
+            images=2,
+            result={"erp_review": {"items": {"0": {"comment": "c0"}, "1": {"comment": "c1"}}}},
+        )
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT)] + [settled]
+
+        self.assertNotIn(settled, trim_job_history(jobs))
+
+    def test_a_run_whose_images_were_all_judged_is_dropped_as_usual(self) -> None:
+        judged = self._job(
+            task_id="TASK-2026-01009",
+            images=2,
+            result={"dashboard_approvals": {"0": {"status": "approved"}, "1": {"status": "rejected"}}},
+        )
+        jobs = [self._job() for _ in range(JOB_HISTORY_LIMIT)] + [judged]
+
+        self.assertNotIn(judged, trim_job_history(jobs))
+
+    def test_the_history_still_has_a_ceiling(self) -> None:
+        jobs = [self._job(task_id="TASK-2026-01009", images=1) for _ in range(JOB_HISTORY_CEILING + 20)]
+
+        self.assertEqual(JOB_HISTORY_CEILING, len(trim_job_history(jobs)))
 
 
 if __name__ == "__main__":

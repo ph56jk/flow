@@ -27,6 +27,48 @@ from .schemas import (
 )
 
 
+#: Số lượt chạy giữ lại trong lịch sử, và mức trần tuyệt đối kể cả khi còn nợ.
+JOB_HISTORY_LIMIT = 50
+JOB_HISTORY_CEILING = 500
+
+
+def job_owes_erp_images(job: JobRecord) -> bool:
+    """Lượt chạy còn ảnh chưa giao được cho thẻ ERP của nó.
+
+    Ảnh đã tạo mà chưa lên thẻ thì chỉ hồ sơ lượt chạy này biết chúng nằm ở
+    đâu. Cắt nó khỏi lịch sử là cắt luôn đường đăng bù: thẻ vĩnh viễn trắng
+    trong khi mười hai tấm ảnh vẫn nằm trên đĩa. Nên nó ở lại quá hạn mức,
+    cho tới khi từng tấm đã lên thẻ hoặc đã có người quyết.
+    """
+    payload = job.input if isinstance(job.input, dict) else {}
+    if not str(payload.get("erp_output_task_id") or "").strip():
+        return False
+    if not job.artifacts:
+        return False
+    result = job.result if isinstance(job.result, dict) else {}
+    review = result.get("erp_review")
+    items = review.get("items") if isinstance(review, dict) and isinstance(review.get("items"), dict) else {}
+    approvals = result.get("dashboard_approvals")
+    decided = approvals if isinstance(approvals, dict) else {}
+    for index in range(len(job.artifacts)):
+        key = str(index)
+        if str((decided.get(key) or {}).get("status") or "") in {"approved", "rejected"}:
+            continue
+        if str((items.get(key) or {}).get("comment") or ""):
+            continue
+        return True
+    return False
+
+
+def trim_job_history(jobs: List[JobRecord]) -> List[JobRecord]:
+    """Lịch sử sau khi cắt, giữ lại phần còn nợ ảnh cho thẻ ERP."""
+    if len(jobs) <= JOB_HISTORY_LIMIT:
+        return list(jobs)
+    kept = list(jobs[:JOB_HISTORY_LIMIT])
+    kept.extend(job for job in jobs[JOB_HISTORY_LIMIT:] if job_owes_erp_images(job))
+    return kept[:JOB_HISTORY_CEILING]
+
+
 def _model_dump(model: Any) -> Dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump(mode="json")
@@ -114,7 +156,7 @@ class StateStore:
     async def add_job(self, job: JobRecord) -> JobRecord:
         async with self._lock:
             self._state.jobs.insert(0, job)
-            self._state.jobs = self._state.jobs[:50]
+            self._state.jobs = trim_job_history(self._state.jobs)
             self._sync_job_error_snapshot(job)
             self._sync_job_retry_snapshot(job)
             self._sync_job_replay_snapshot(job)

@@ -25,6 +25,7 @@ data/state.restored-*.json
 data/trello-title-description-backups.json
 data/workers/
 data/_state_dump.json
+data/agent_bot_state.json
 .flow-web.log
 .flow-web.pid
 logs/

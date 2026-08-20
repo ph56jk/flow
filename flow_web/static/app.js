@@ -773,6 +773,7 @@ const elements = {
   projectId: document.querySelector("#projectId"),
   projectName: document.querySelector("#projectName"),
   generationTimeout: document.querySelector("#generationTimeout"),
+  headlessToggle: document.querySelector("#headlessToggle"),
   loginButton: document.querySelector("#loginButton"),
   openLoginButton: document.querySelector("#openLoginButton"),
   openProjectButton: document.querySelector("#openProjectButton"),
@@ -1595,6 +1596,9 @@ function renderTopbar() {
   if (document.activeElement !== elements.projectName) {
     elements.projectName.value = state.config?.project_name || "";
   }
+  if (elements.headlessToggle && document.activeElement !== elements.headlessToggle) {
+    elements.headlessToggle.checked = Boolean(state.config?.headless);
+  }
   if (document.activeElement !== elements.generationTimeout) {
     elements.generationTimeout.value = String(state.config?.generation_timeout_s || 300);
   }
@@ -2214,7 +2218,7 @@ function renderModuleSettings(module) {
     elements.automationModuleSettings.innerHTML = `
       <label class="field">
         <span>Trạng thái duyệt</span>
-        <small>Duyệt ngay trên dashboard. Ảnh bị từ chối hoặc chưa có quyết định sẽ không được ghi vào ERP.</small>
+        <small>Duyệt ngay trên dashboard: 👍 để lấy ảnh, 👎 để bỏ và gỡ ảnh khỏi thẻ ERP. Ảnh chưa có quyết định không được ghi vào ERP.</small>
       </label>
       <small>Khi đủ quyết định cho tất cả ảnh, app tự ghi URL artefact đã duyệt vào comment của đúng ERP Task.</small>
     `;
@@ -3676,7 +3680,7 @@ function dashboardErpReviewRow(job) {
   const published = review && typeof review.items === "object" ? Object.keys(review.items).length : 0;
   const taskId = String(review?.task_id || job.input?.erp_output_task_id || job.input?.erp_task_id || "").trim();
   const note = published
-    ? `Đã đăng ${published} ảnh lên Task ${taskId} để duyệt. Người duyệt trả lời "DUYỆT" hoặc "BỎ" ngay dưới ảnh.`
+    ? `Đã đăng ${published} ảnh lên Task ${taskId} để duyệt. Người duyệt trả lời 👍 (DUYỆT) hoặc 👎 (BỎ) ngay dưới ảnh; ảnh bị 👎 sẽ được gỡ khỏi thẻ.`
     : `Đăng ảnh chờ duyệt lên Task ${taskId || "ERP"} để duyệt ngay trên thẻ.`;
   return `
     <div class="dashboard-review-erp" data-dashboard-review-job="${escapeHtml(job.id)}">
@@ -3768,8 +3772,8 @@ function renderDashboardReviewQueue() {
                 ${
                   status === "pending"
                     ? `<div class="card-actions">
-                        <button type="button" class="secondary-button dashboard-review-approve" data-dashboard-approval="approved" data-job-id="${escapeHtml(job.id)}" data-artifact-index="${artifactIndex}">Duyệt</button>
-                        <button type="button" class="ghost-button card-button" data-dashboard-approval="rejected" data-job-id="${escapeHtml(job.id)}" data-artifact-index="${artifactIndex}">Từ chối</button>
+                        <button type="button" class="secondary-button dashboard-review-approve" data-dashboard-approval="approved" data-job-id="${escapeHtml(job.id)}" data-artifact-index="${artifactIndex}" title="Duyệt ảnh và ghi vào thẻ ERP">👍 Thích</button>
+                        <button type="button" class="ghost-button card-button" data-dashboard-approval="rejected" data-job-id="${escapeHtml(job.id)}" data-artifact-index="${artifactIndex}" title="Bỏ ảnh và gỡ luôn khỏi thẻ ERP">👎 Không thích</button>
                       </div>`
                     : ""
                 }
@@ -3970,7 +3974,7 @@ async function saveConfig(event) {
         project_id: projectId,
         project_name: elements.projectName.value.trim(),
         active_workflow_id: state.config?.active_workflow_id || "",
-        headless: Boolean(state.config?.headless),
+        headless: elements.headlessToggle ? elements.headlessToggle.checked : Boolean(state.config?.headless),
         cdp_url: state.config?.cdp_url || "",
         generation_timeout_s: Math.max(30, Number(elements.generationTimeout.value || 300)),
         poll_interval_s: state.config?.poll_interval_s || 5,

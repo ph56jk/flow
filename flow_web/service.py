@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import csv
 import ctypes
 import io
@@ -28,11 +29,14 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 from pathlib import Path, PureWindowsPath
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from xml.etree import ElementTree as ET
 
 from fastapi import HTTPException, UploadFile
 
+from .agent_bot import AgentBot, AgentBotConfig, AgentBotError, build_agent_bot
+from .erp_meta import task_meta
+from .listing_bridge import ListingBridge, ListingBridgeConfig, build_listing_hook
 from .messages import humanize_flow_error
 from .paths import DATA_DIR, DOWNLOADS_DIR, PROJECT_ROOT, UPLOADS_DIR, ensure_app_dirs
 from .shot_rules import PRODUCT_SHOT_RULE_PRIORITY, PRODUCT_SHOT_RULES
@@ -133,6 +137,37 @@ def _model_dump(model: Any) -> Dict[str, Any]:
     return model.dict()
 
 
+def _full_chromium_headless_launcher(original: Any) -> Any:
+    """Chạy ẩn thì phải mở bản Chromium đầy đủ, không phải ``headless shell``.
+
+    Đặt ``headless=True``, Playwright lặng lẽ đổi sang ``chrome-headless-shell``
+    - một bản rút gọn. Nó vẫn mở đúng hồ sơ và vẫn giải mã được cookie Google,
+    nhưng labs.google không cấp phiên next-auth cho nó: ``/fx/api/auth/session``
+    trả về ``{}``, thế là không có Bearer token và mọi lệnh gọi Flow rơi xuống
+    401 "API keys are not supported by this API" - đọc lên cứ như phiên đăng
+    nhập đã hết hạn, trong khi bật cửa sổ lên là chạy ngon lành. Bản Chromium
+    đầy đủ chạy chế độ ``--headless=new`` thì phiên đăng nhập còn nguyên.
+
+    Máy nào chưa tải bản đầy đủ thì quay về lối cũ, thà chạy được còn hơn chết.
+    """
+
+    async def launch_persistent_context(self: Any, user_data_dir: Any, **kwargs: Any) -> Any:
+        if not kwargs.get("headless") or kwargs.get("channel") or kwargs.get("executable_path"):
+            return await original(self, user_data_dir, **kwargs)
+        try:
+            return await original(self, user_data_dir, channel="chromium", **kwargs)
+        except Exception as exc:
+            log.warning(
+                "Không mở được bản Chromium đầy đủ để chạy ẩn (%s); "
+                "quay về headless shell - Google Flow có thể báo hết phiên đăng nhập.",
+                exc,
+            )
+        return await original(self, user_data_dir, **kwargs)
+
+    launch_persistent_context.__flow_v2_full_chromium__ = True  # type: ignore[attr-defined]
+    return launch_persistent_context
+
+
 def _parse_iso_datetime(value: str) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
@@ -199,6 +234,8 @@ class FlowWebService:
     ERP_GRAPHQL_PATH = "/api/method/hvg_workspace.graphql.endpoint.graphql"
     ERP_PROJECT_ID = "PROJ-0013"
     ERP_TIMEOUT_S = 30
+    # Câu lỗi trống rỗng ERP trả về khi khoá API không thuộc Project của thẻ.
+    ERP_OPAQUE_ERROR = "An unknown error occurred"
     ERP_UPSCALE_LONG_EDGE_PX = 2048
     ERP_AI_TITLE_BACKUP_FILE_NAME = "erp-title-description-backups.json"
     ERP_AI_TITLE_BEGIN_MARKER = "<!-- FLOW_AI_TITLE_START -->"
@@ -325,6 +362,7 @@ class FlowWebService:
         "remove",
     }
     _FLOW_RUNTIME_PATCHED = False
+    _PLAYWRIGHT_HEADLESS_PATCHED = False
 
     def __init__(self, store: StateStore) -> None:
         ensure_app_dirs()
@@ -332,11 +370,24 @@ class FlowWebService:
         self._apply_runtime_integration_env()
         self._tasks: Dict[str, asyncio.Task] = {}
         self._browser_session_lock = asyncio.Lock()
+        # The 2K calls run several at a time; the fallback that downloads
+        # through the Flow page cannot, so it takes turns on this lock.
+        self._flow_upsample_ui_lock = asyncio.Lock()
+        # Google queues upsampleImage per account, so one card's 2K batch waits
+        # for another card's. Measured, not assumed: see _upsample_artifacts_bytes.
+        self._flow_upsample_batch_lock = asyncio.Lock()
+        # How many images in a row had every reCAPTCHA token refused. Once
+        # Google is refusing them it refuses the next one too, so re-minting
+        # per image is time bought and thrown away.
+        self._flow_upsample_recaptcha_streak = 0
         self._prompt_batch_lock = asyncio.Lock()
         self._telegram_approval_sync_lock = asyncio.Lock()
         self._last_telegram_approval_sync_error = ""
         self._shared_browser: Any | None = None
         self._shared_browser_profile_key = ""
+        # Cửa sổ đang mở là loại nào. Đổi giữa ẩn và hiện thì phải dựng lại
+        # trình duyệt: một profile Chromium không mở hai kiểu cùng lúc được.
+        self._shared_browser_headless = False
         self._active_flow_profile_index = 0
         self._erp_source_downloads: Dict[str, Dict[str, Any]] = {}
         self._erp_visual_product_rule_cache: Dict[str, Dict[str, Any]] = {}
@@ -1297,6 +1348,11 @@ class FlowWebService:
 
     # next-auth names the Flow session cookie differently over https and http.
     FLOW_SESSION_COOKIE_NAMES = ("__Secure-next-auth.session-token", "next-auth.session-token")
+    # Phiên Google của cả máy. Hồ sơ thật giữ đăng nhập bằng chỗ này, còn phiên
+    # next-auth của labs.google thì dựng lại mỗi lần mở trang nên trên đĩa
+    # thường chẳng có dòng nào - lấy sự vắng mặt ấy làm bằng chứng "hết hạn" là
+    # đuổi người dùng ra khỏi một phiên vẫn còn sống nguyên.
+    GOOGLE_ACCOUNT_COOKIE_NAMES = ("SID", "__Secure-1PSID", "__Secure-3PSID")
     # Chromium stores cookie expiry in microseconds since 1601-01-01.
     _CHROME_EPOCH_OFFSET_S = 11644473600
 
@@ -1307,6 +1363,10 @@ class FlowWebService:
         Anything that leaves real doubt — a locked store, an unexpected schema,
         no store at all — answers ``False`` so an unreadable profile can never
         flip a perfectly good session to "signed out".
+
+        Còn sống nếu hồ sơ giữ một phiên next-auth chưa hết hạn, **hoặc** giữ
+        cookie tài khoản Google chưa hết hạn: mở trang Flow là phiên next-auth
+        tự dựng lại từ đó.
         """
         try:
             from flow._storage import PROFILE_DIR
@@ -1331,15 +1391,16 @@ class FlowWebService:
                     try:
                         rows = connection.execute(
                             "SELECT name, expires_utc, has_expires FROM cookies "
-                            "WHERE host_key LIKE '%labs.google%'"
+                            "WHERE host_key LIKE '%labs.google%' OR host_key LIKE '%.google.com'"
                         ).fetchall()
                     finally:
                         connection.close()
                 except (OSError, sqlite3.Error):
                     continue
             read_any = True
+            live_names = self.FLOW_SESSION_COOKIE_NAMES + self.GOOGLE_ACCOUNT_COOKIE_NAMES
             for name, expires_utc, has_expires in rows:
-                if str(name) not in self.FLOW_SESSION_COOKIE_NAMES:
+                if str(name) not in live_names:
                     continue
                 if not has_expires:
                     return False
@@ -1409,7 +1470,7 @@ class FlowWebService:
     async def open_flow_login_surface(self) -> Dict[str, Any]:
         self._assert_windows_interactive_browser_session("đăng nhập Google Flow")
         async with self._browser_session_lock:
-            browser = await self._ensure_shared_browser()
+            browser = await self._ensure_shared_browser(visible=True)
             page = await self._open_login_flow_page(browser)
         return {
             "ok": True,
@@ -1423,7 +1484,7 @@ class FlowWebService:
         project_id = self._flow_profile_project_id(profile, config.project_id)
         target_url = self._project_url(project_id) if project_id else "https://labs.google/fx/vi/tools/flow"
         async with self._browser_session_lock:
-            browser = await self._ensure_shared_browser(profile)
+            browser = await self._ensure_shared_browser(profile, visible=True)
             if project_id:
                 await self._repair_placeholder_flow_tabs(browser, target_url)
                 page = await self._acquire_fresh_flow_page(browser, target_url)
@@ -2277,13 +2338,47 @@ class FlowWebService:
         )
         return "\n".join(part for part in (subject, description) if part).strip()
 
-    def _erp_idea_prompt(self, parent_detail: Dict[str, Any], child_detail: Dict[str, Any]) -> str:
+    ERP_IDEA_MIN_TEXT_CHARS = 8
+
+    def _erp_idea_source_attachment_id(self, child_detail: Dict[str, Any]) -> str:
+        """The idea image the card carries itself, if it has one.
+
+        On this board the idea *is* a picture: the child card's cover shows the
+        embroidery to make content for, while the title is only a letter. Using
+        the parent's image for every child would ask the same question six
+        times and get six copies of the same answer back.
+        """
+        source, _ = self._erp_source_and_flow_output_attachments(
+            self._erp_extract_task_attachments(child_detail)
+        )
+        return self._normalize_erp_id(str((source[0] if source else {}).get("id") or ""))
+
+    def _erp_idea_is_blank(self, child_detail: Dict[str, Any]) -> bool:
+        """True when the card carries neither an idea image nor idea text.
+
+        Such a card would inherit the parent's image and a prompt identical to
+        every other empty card, so the whole board comes back looking like one
+        image made over and over. Better to say so than to burn a run on it.
+        """
+        if self._erp_idea_source_attachment_id(child_detail):
+            return False
+        return len(self._erp_idea_text(child_detail)) < self.ERP_IDEA_MIN_TEXT_CHARS
+
+    def _erp_idea_prompt(
+        self,
+        parent_detail: Dict[str, Any],
+        child_detail: Dict[str, Any],
+        *,
+        own_image: bool = False,
+    ) -> str:
         context = self._html_to_text(
             parent_detail.get("description_md") or parent_detail.get("description") or ""
         )
         idea = self._erp_idea_text(child_detail)
         lines = [
-            "Ảnh đính kèm là ảnh sản phẩm gốc của thẻ idea; giữ đúng sản phẩm đó.",
+            "Ảnh đính kèm là ảnh idea của chính thẻ này; giữ đúng mẫu thêu và sản phẩm trong ảnh."
+            if own_image
+            else "Ảnh đính kèm là ảnh sản phẩm gốc của thẻ idea; giữ đúng sản phẩm đó.",
             f"Ý tưởng cần thể hiện: {idea}" if idea else "",
             f"Bối cảnh dự án: {context}" if context else "",
             "Hãy tạo ảnh content cho đúng ý tưởng này.",
@@ -2294,13 +2389,361 @@ class FlowWebService:
         for comment in detail.get("comments") or []:
             if not isinstance(comment, dict):
                 continue
-            bodies = [comment.get("content")]
+            bodies = [self._erp_comment_markers(comment)]
             bodies.extend(
-                reply.get("content") for reply in (comment.get("replies") or []) if isinstance(reply, dict)
+                self._erp_comment_markers(reply)
+                for reply in (comment.get("replies") or [])
+                if isinstance(reply, dict)
             )
-            if any("FLOW_V2_ARTIFACT" in str(body or "") for body in bodies):
+            if any("FLOW_V2_ARTIFACT" in body for body in bodies):
                 return True
         return False
+
+    def _erp_task_has_pending_review(self, detail: Dict[str, Any]) -> bool:
+        """True when images for this card are already on it awaiting a decision.
+
+        An idea whose images sit in review has been run - it is just waiting for
+        a person. Counting only the approved output would let a re-run (and the
+        auto-runner in particular) put a second full set of images on a card
+        nobody has answered yet.
+        """
+        for comment in detail.get("comments") or []:
+            if not isinstance(comment, dict):
+                continue
+            if self.ERP_REVIEW_PREFIX in self._erp_comment_markers(comment):
+                return True
+        return False
+
+    #: Trạng thái của một lượt chạy đã chết hẳn: không chặn thẻ idea nữa.
+    ERP_IDEA_DEAD_JOB_STATUSES = frozenset({"failed", "cancelled", "error", "interrupted"})
+
+    def _erp_child_jobs(self, child_task_id: str) -> List[Any]:
+        """Jobs this app already created for one idea card.
+
+        Job state outlives a restart, so this is what keeps the auto-runner from
+        queueing the same idea twice when the card itself is still empty because
+        the first run has not finished writing to it yet.
+
+        A run that died does not count. ``interrupted`` is what the store stamps
+        on a job that was still running when the app went down: nothing will ever
+        resume it, so leaving it in here would fence the idea card off forever.
+        """
+        child = self._normalize_erp_task_id(child_task_id)
+        if not child:
+            return []
+        found: List[Any] = []
+        for job in list(self.store.snapshot().jobs or []):
+            payload = job.input if isinstance(job.input, dict) else {}
+            if self._normalize_erp_task_id(str(payload.get("erp_output_task_id") or "")) != child:
+                continue
+            if str(job.status or "") in self.ERP_IDEA_DEAD_JOB_STATUSES:
+                continue
+            found.append(job)
+        return found
+
+    def _erp_child_job_ids(self, child_task_id: str) -> List[str]:
+        """Ids of the runs above, for the callers that only need to count them."""
+        return [job.id for job in self._erp_child_jobs(child_task_id)]
+
+    def _erp_idea_image_shortfall(self, child_task_id: str) -> int:
+        """Ảnh lượt chạy đã hứa mà chưa bao giờ được tạo ra, cho một thẻ idea.
+
+        Đo ở chỗ ảnh sinh ra chứ không phải ở mặt thẻ: một tấm bị người duyệt
+        bỏ vẫn là một tấm đã tạo, nên nó không phải chỗ thiếu. Còn một lượt
+        chạy hứa mười hai mà chỉ trả về một thì mười một tấm kia đúng là chưa
+        từng tồn tại, và không lượt nào khác sẽ tự đi tạo chúng.
+        """
+        jobs = self._erp_child_jobs(child_task_id)
+        if not jobs:
+            return 0
+        if any(str(job.status or "") not in {"completed"} for job in jobs):
+            # Còn một lượt đang chạy dở thì chưa biết nó trả về bao nhiêu.
+            return 0
+        wanted = max(int((job.input or {}).get("count") or 0) for job in jobs)
+        produced = sum(len(job.artifacts or []) for job in jobs)
+        return max(0, wanted - produced)
+
+    def _erp_idea_skip_reason(self, child_detail: Dict[str, Any], child_task_id: str) -> str:
+        """Why this idea card should not be run now, or "" when it should."""
+        if self._erp_task_has_flow_output(child_detail):
+            return "đã có ảnh Flow"
+        if self._erp_task_has_pending_review(child_detail):
+            return "đang có ảnh chờ duyệt trên thẻ"
+        if self._erp_child_job_ids(child_task_id):
+            return "đã có lượt chạy trong app"
+        if self._erp_idea_is_blank(child_detail):
+            return "thẻ con chưa có nội dung idea (tiêu đề/mô tả trống)"
+        return ""
+
+    # ── Nhận ảnh: mỗi ảnh thả lên thẻ Idea là một thẻ con mới ───────────────
+
+    ERP_IDEA_INTAKE_MARKER = re.compile(r"\[FLOW_V2_IDEA\s+src=([^\]]+)\]")
+
+    def _erp_idea_intake_enabled(self) -> bool:
+        return os.getenv("ERP_IDEA_INTAKE", "").strip().lower() not in {"0", "false", "no", "off"}
+
+    def _erp_idea_intake_key(self, attachment: Dict[str, Any]) -> str:
+        """What identifies one dropped image for as long as it stays on the ERP.
+
+        The site-relative path of the file: unique per upload, unchanged by a
+        rename of either card, and short enough to sit in a comment.
+        """
+        url = str(attachment.get("url") or attachment.get("id") or "").strip()
+        return urlparse(url).path if url else ""
+
+    def _erp_idea_intake_subject(self, attachment: Dict[str, Any], ordinal: int) -> str:
+        """The title of the card this image is about to become.
+
+        The title goes into the prompt as "ý tưởng cần thể hiện", so a file name
+        like ``media.jpg_2K_202608031516 (2)ds`` is worse than useless there. A
+        plain number says the honest thing - the idea is the picture - and the
+        person can rename the card to whatever they meant by it.
+        """
+        return f"Idea {ordinal}"
+
+    def _erp_attachment_row(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        """One ERP File row read as an attachment, or {} when it is not an image.
+
+        The File rows the ERP returns name themselves twice: ``name`` is the
+        docname (``fa8cde4573``) and ``file_name`` is what the person called
+        the picture. Reading the first as a file name is how an image ends up
+        looking like a file with no extension, so it is read second here.
+        """
+        name = str(row.get("file_name") or row.get("name") or "").strip()
+        url = str(row.get("file_url") or row.get("url") or "").strip()
+        if url.startswith("/"):
+            url = f"{self._erp_base_url()}{url}"
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
+            return {}
+        if not Path(name).suffix:
+            name = Path(parsed.path).name
+        mime = str(row.get("mime_type") or row.get("mimeType") or mimetypes.guess_type(name)[0] or "")
+        if not mime.startswith("image/") and Path(name).suffix.lower() not in {
+            ".jpg", ".jpeg", ".png", ".webp", ".gif",
+        }:
+            return {}
+        return {
+            "id": url,
+            "name": name,
+            "url": url,
+            "mimeType": mime or "image/jpeg",
+            "date": str(row.get("creation") or row.get("modified") or ""),
+        }
+
+    def _erp_idea_dropped_images(
+        self,
+        key: str,
+        token: str,
+        task_id: str,
+        detail: Dict[str, Any],
+    ) -> List[Dict[str, Any]]:
+        """Every picture a person has put on an Idea card, oldest first.
+
+        Three places, because the ERP has three and the person choosing where
+        to drop the file is not choosing between them: the card cover, the
+        card's own attachment list - which ``taskDetail`` does not return at
+        all - and an image pasted into a comment. Anything this app wrote is
+        left out: its comments are marked, and picking its own output back up
+        as an idea would run generated images against themselves.
+        """
+        images, _ = self._erp_source_and_flow_output_attachments(
+            self._erp_extract_task_attachments(detail)
+        )
+        seen = {str(item.get("url") or "") for item in images}
+
+        def take(row: Dict[str, Any]) -> None:
+            item = self._erp_attachment_row(row)
+            url = str(item.get("url") or "")
+            if not url or url in seen or self._erp_attachment_is_flow_output(item):
+                return
+            seen.add(url)
+            images.append(item)
+
+        for row in self._erp_task_attachment_files(key, token, task_id):
+            take(row)
+        for comment in detail.get("comments") or []:
+            if not isinstance(comment, dict):
+                continue
+            if "FLOW_V2" in self._erp_plain_text(comment.get("content")):
+                continue
+            for row in comment.get("attachments") or []:
+                if isinstance(row, dict):
+                    take(row)
+        return self._sort_erp_attachments_by_date(images)
+
+    def _erp_idea_product_image(
+        self,
+        detail: Dict[str, Any],
+        images: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Which picture on the Idea card is the product rather than an idea.
+
+        The cover, when the card has one: that is the picture the card is *of*,
+        it is what a child with no picture of its own falls back to, and it is
+        the one a person set deliberately. Only a card with no cover falls back
+        to "the oldest image", and there the ERP's own ordering is all there is
+        to go on - attachments carry a date, a cover does not, so the two
+        cannot simply be sorted together.
+        """
+        cover = urlparse(str(detail.get("cover_image") or "").strip()).path
+        if cover:
+            for item in images:
+                if urlparse(str(item.get("url") or "")).path == cover:
+                    return item
+        return images[0] if images else {}
+
+    def _erp_idea_claim_variants(self, value: str) -> set[str]:
+        """Cùng một tấm ảnh, viết theo mấy kiểu ERP có thể trả về.
+
+        Chỗ thì đường dẫn đầy đủ trong site, chỗ chỉ tên tệp. Giữ cả hai rồi so
+        giao nhau, để một tấm ảnh không bị coi là hai tấm chỉ vì hai đầu đọc nó
+        theo hai kiểu.
+        """
+        path = urlparse(str(value or "").strip()).path
+        if not path:
+            return set()
+        return {path, Path(path).name}
+
+    def _erp_idea_intake_claims(self, child_details: Iterable[Dict[str, Any]]) -> set[str]:
+        """Which dropped images already have a card of their own.
+
+        Read off the child cards themselves rather than kept in app state: the
+        cards are what a person edits, and a ledger that lives somewhere else
+        would go on insisting an image was handled after they deleted the card
+        that handled it.
+
+        Nhận ra bằng chính tấm ảnh, không bằng dòng chữ nào: ảnh bìa của thẻ con
+        và tệp đính kèm của nó vẫn trỏ đúng về đường dẫn của ảnh gốc trên thẻ
+        cha. Bot từng ghi một dòng ``[FLOW_V2_IDEA src=...]`` lên thẻ để tự nhớ,
+        nhưng thẻ là chỗ người ta đọc, không phải sổ tay của máy. Dòng chữ cũ
+        vẫn được đọc tiếp - những thẻ sinh ra trước thay đổi này còn mang nó, và
+        đọc sót một dòng nghĩa là tạo lại một thẻ đã có.
+        """
+        claimed: set[str] = set()
+        for detail in child_details:
+            claimed |= self._erp_idea_claim_variants((detail or {}).get("cover_image") or "")
+            for comment in (detail or {}).get("comments") or []:
+                if not isinstance(comment, dict):
+                    continue
+                text = self._erp_plain_text(comment.get("content"))
+                for match in self.ERP_IDEA_INTAKE_MARKER.finditer(text):
+                    claimed |= self._erp_idea_claim_variants(match.group(1).strip())
+                if "FLOW_V2" in text:
+                    # Ảnh Flow tự sinh, không phải ảnh idea người dùng thả.
+                    continue
+                for attachment in comment.get("attachments") or []:
+                    if not isinstance(attachment, dict):
+                        continue
+                    url = str(attachment.get("file_url") or attachment.get("url") or "").strip()
+                    if Path(urlparse(url).path).name.lower().startswith("flow-"):
+                        continue
+                    claimed |= self._erp_idea_claim_variants(url)
+        return claimed
+
+    async def _erp_intake_idea_images(
+        self,
+        key: str,
+        token: str,
+        parent_id: str,
+        project_id: str,
+        parent_detail: Dict[str, Any],
+    ) -> tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
+        """Turn each image dropped on an Idea card into a child card of its own.
+
+        The board already worked this way by hand: the parent holds the product
+        photo, and every child holds one idea picture. Dropping the idea
+        pictures onto the parent and having the cards appear is the same model
+        with the typing taken out.
+
+        The product photo is left alone - it is what the whole card is about,
+        and it is what a child without its own picture falls back to. The
+        originals stay on the parent too: moving them would be a deletion of
+        something a person uploaded, to save a duplicate nobody is short of.
+
+        Returns the cards it created and the child details it read on the way,
+        so the fan-out that follows does not pay for those reads twice.
+        """
+        if not self._erp_idea_intake_enabled():
+            return [], {}
+        images = await asyncio.to_thread(
+            self._erp_idea_dropped_images, key, token, parent_id, parent_detail
+        )
+        product = self._erp_idea_product_image(parent_detail, images)
+        dropped = [item for item in images if item is not product]
+        if not dropped:
+            # Only the product photo, or nothing at all: no idea was dropped.
+            return [], {}
+
+        children = [
+            self._normalize_erp_task_id(str(child.get("name") or ""))
+            for child in (parent_detail.get("children") or [])
+            if isinstance(child, dict) and str(child.get("name") or "").strip()
+        ]
+        details: Dict[str, Dict[str, Any]] = {}
+        for child_id in children:
+            try:
+                details[child_id] = await asyncio.to_thread(
+                    self._erp_task_detail, key, token, child_id
+                )
+            except Exception as exc:
+                # A child that cannot be read cannot be shown to have claimed
+                # anything, and creating a duplicate card is worse than doing
+                # nothing this round, so the whole intake stands down.
+                log.warning("Bỏ lượt nhận ảnh của %s: không đọc được thẻ con %s (%s).", parent_id, child_id, exc)
+                return [], details
+
+        claimed = self._erp_idea_intake_claims(details.values())
+        # Thẻ con phải mang đúng người phụ trách của thẻ cha ngay từ lúc sinh
+        # ra: người dùng gắn agent vào thẻ cha là đã nói cả cụm việc này là của
+        # bot, và thẻ con hiện ra với ô người phụ trách trống trông như bị bỏ
+        # quên. Bot cũng tự khâu lại ở lượt sau, nhưng "lượt sau" là hai phút.
+        parent_agents = self._erp_task_agent_users(parent_detail)
+        created: List[Dict[str, Any]] = []
+        for image in dropped:
+            claim = self._erp_idea_intake_key(image)
+            variants = self._erp_idea_claim_variants(claim)
+            if not claim or (variants & claimed):
+                continue
+            claimed |= variants
+            name = str(image.get("name") or "idea.jpg").strip() or "idea.jpg"
+            subject = self._erp_idea_intake_subject(image, len(children) + len(created) + 1)
+            try:
+                file_bytes, mime = await asyncio.to_thread(
+                    self._erp_download_attachment_bytes, key, token, parent_id, image
+                )
+                child_id = await asyncio.to_thread(
+                    self._erp_create_child_task, key, token, parent_id, project_id, subject
+                )
+                await asyncio.to_thread(
+                    self._erp_attach_file_bytes,
+                    key,
+                    token,
+                    child_id,
+                    file_bytes,
+                    mime,
+                    name,
+                    False,
+                    "",
+                    "",
+                    # Không một chữ nào lên thẻ: thẻ con chỉ có đúng tấm ảnh.
+                    True,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log.warning("Không tạo được thẻ con cho ảnh %s của %s: %s", name, parent_id, exc)
+                continue
+            await asyncio.to_thread(
+                self._erp_set_task_cover, key, token, child_id, file_bytes, mime, name
+            )
+            for bot_user in parent_agents:
+                await asyncio.to_thread(
+                    self._erp_add_task_agent, key, token, child_id, bot_user
+                )
+            created.append({"task_id": child_id, "subject": subject, "image": name, "source": claim})
+            log.info("Ảnh %s thả trên %s đã thành thẻ con %s (%s).", name, parent_id, child_id, subject)
+        return created, details
 
     async def enqueue_erp_idea_jobs(self, request: ERPIdeaBatchRequest) -> Dict[str, Any]:
         """Queue one image job per child card of an "Idea" card.
@@ -2317,19 +2760,34 @@ class FlowWebService:
         parent_id = self._normalize_erp_task_id(request.task_id or erp_config.task_id)
         if not parent_id:
             raise HTTPException(status_code=400, detail="Thiếu ERP Task ID của thẻ Idea cha.")
-        project_id = self._erp_allowed_project_id()
-        await asyncio.to_thread(self._erp_assert_task_in_project, key, token, parent_id)
+        # The project comes from the card, not from the settings panel: the
+        # agent bot can be attached to an Idea card in any allowed project, and
+        # stamping the default project onto those jobs would send their images
+        # back to the wrong board.
+        project_id = await asyncio.to_thread(self._erp_task_project_id, key, token, parent_id)
         parent_detail = await asyncio.to_thread(self._erp_task_detail, key, token, parent_id)
+
+        # Any image dropped on the parent since the last pass becomes a child
+        # card before the fan-out reads the list, so the run that follows picks
+        # it up in the same pass rather than the next one. This has to happen
+        # before the parent is checked for a source image: a file dragged onto
+        # the card lands in the Task's own attachment list, which taskDetail
+        # does not report, so a card whose every picture arrived that way looks
+        # empty here and would be refused before its cards were ever made.
+        created, child_details = await self._erp_intake_idea_images(
+            key, token, parent_id, project_id, parent_detail
+        )
+        if created:
+            parent_detail = await asyncio.to_thread(self._erp_task_detail, key, token, parent_id)
 
         source_attachments, _ = self._erp_source_and_flow_output_attachments(
             self._erp_extract_task_attachments(parent_detail)
         )
-        if not source_attachments:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Thẻ {parent_id} chưa có ảnh idea nào để làm ảnh nguồn (kể cả ảnh bìa).",
-            )
-        source_attachment_id = self._normalize_erp_id(str(source_attachments[0].get("id") or ""))
+        # Only the children with no picture of their own need this, so an empty
+        # answer is not fatal on its own - it is refused per child, below.
+        source_attachment_id = (
+            self._normalize_erp_id(str(source_attachments[0].get("id") or "")) if source_attachments else ""
+        )
 
         wanted = {self._normalize_erp_task_id(item) for item in (request.child_task_ids or []) if str(item).strip()}
         children = [
@@ -2342,7 +2800,10 @@ class FlowWebService:
         if not children:
             raise HTTPException(
                 status_code=400,
-                detail=f"Thẻ {parent_id} chưa có thẻ con nào trong phần Phân rã công việc để chạy.",
+                detail=(
+                    f"Thẻ {parent_id} chưa có thẻ con nào trong phần Phân rã công việc để chạy. "
+                    "Thả thêm ảnh idea lên thẻ này thì mỗi ảnh sẽ tự thành một thẻ con."
+                ),
             )
 
         parent_status = self._normalize_erp_id(str(parent_detail.get("status") or ""))
@@ -2352,23 +2813,47 @@ class FlowWebService:
         entries: List[tuple[str, CreateJobRequest]] = []
         for child in children:
             child_id = self._normalize_erp_task_id(str(child.get("name")))
-            child_detail = await asyncio.to_thread(self._erp_task_detail, key, token, child_id)
-            if not request.include_done and self._erp_task_has_flow_output(child_detail):
-                skipped.append({"task_id": child_id, "subject": str(child.get("subject") or ""), "reason": "đã có ảnh Flow"})
+            child_detail = child_details.get(child_id)
+            if child_detail is None:
+                child_detail = await asyncio.to_thread(self._erp_task_detail, key, token, child_id)
+            skip_reason = "" if request.include_done else self._erp_idea_skip_reason(child_detail, child_id)
+            if skip_reason:
+                skipped.append({"task_id": child_id, "subject": str(child.get("subject") or ""), "reason": skip_reason})
                 continue
+            # The idea is the picture on the child card, so that picture is the
+            # source. Only a card without one falls back to the parent's image.
+            child_attachment_id = self._erp_idea_source_attachment_id(child_detail)
+            child_source_id = child_attachment_id or source_attachment_id
+            if not child_source_id:
+                skipped.append(
+                    {
+                        "task_id": child_id,
+                        "subject": str(child.get("subject") or ""),
+                        "reason": "chưa có ảnh nguồn (thẻ con không có ảnh riêng, thẻ cha cũng không có ảnh)",
+                    }
+                )
+                continue
+            source_task_id = child_id if child_attachment_id else parent_id
+            # ERP Source refuses to read a card outside the column it was told
+            # to look in, so it has to be told the column of the card the image
+            # actually comes from: a child card normally still sits in Open
+            # while the parent Idea card has already moved on to Working.
+            source_status = parent_status
+            if child_attachment_id:
+                source_status = self._normalize_erp_id(str(child_detail.get("status") or "")) or parent_status
             child_request = CreateJobRequest(
                 type="image",
-                prompt=self._erp_idea_prompt(parent_detail, child_detail),
+                prompt=self._erp_idea_prompt(parent_detail, child_detail, own_image=bool(child_attachment_id)),
                 count=count,
                 model=request.model or "",
                 aspect=request.aspect or "square",
                 title=f"Idea {str(child.get('subject') or child_id)[:40]} ({child_id})",
                 erp_enabled=True,
                 erp_project_id=project_id,
-                erp_status_id=parent_status,
-                erp_task_id=parent_id,
-                erp_source_task_id=parent_id,
-                erp_source_attachment_ids=[source_attachment_id] if source_attachment_id else [],
+                erp_status_id=source_status,
+                erp_task_id=source_task_id,
+                erp_source_task_id=source_task_id,
+                erp_source_attachment_ids=[child_source_id] if child_source_id else [],
                 # The images belong to the idea, not to the parent Idea card.
                 erp_output_task_id=child_id,
                 automation_graph={
@@ -2380,8 +2865,8 @@ class FlowWebService:
                             "type": "erp_source",
                             "enabled": True,
                             "settings": {
-                                "erpTask": parent_id,
-                                "erpStatus": parent_status,
+                                "erpTask": source_task_id,
+                                "erpStatus": source_status,
                                 "erpAttachmentLimit": 1,
                             },
                         },
@@ -2399,41 +2884,126 @@ class FlowWebService:
             await self.store.add_job(job)
             await self.store.append_log(
                 job.id,
-                f"Idea từ thẻ con {child_id} ({child.get('subject') or ''}); ảnh nguồn lấy từ thẻ cha {parent_id}, "
-                f"ảnh tạo ra sẽ nằm trong comment của chính thẻ {child_id} sau khi được duyệt.",
+                f"Idea từ thẻ con {child_id} ({child.get('subject') or ''}); ảnh nguồn lấy từ "
+                + (
+                    f"ảnh idea của chính thẻ {child_id}"
+                    if child_attachment_id
+                    else f"thẻ cha {parent_id} (thẻ con chưa có ảnh riêng)"
+                )
+                + f", ảnh tạo ra sẽ nằm trong comment của chính thẻ {child_id} sau khi được duyệt.",
             )
             entries.append((job.id, child_request))
-            queued.append({"job_id": job.id, "task_id": child_id, "subject": str(child.get("subject") or "")})
+            queued.append(
+                {
+                    "job_id": job.id,
+                    "task_id": child_id,
+                    "subject": str(child.get("subject") or ""),
+                    "source_task_id": source_task_id,
+                    "source_attachment_id": child_source_id,
+                }
+            )
 
         if entries:
-            # One browser, one Flow session: the ideas run one after another.
             asyncio.create_task(self._run_erp_idea_jobs(entries))
         return {
             "parent_task_id": parent_id,
             "project_id": project_id,
             "count": count,
             "source_attachment_id": source_attachment_id,
+            "created": created,
             "queued": queued,
             "skipped": skipped,
         }
 
+    ERP_IDEA_CONCURRENCY_MAX = 4
+    ERP_IDEA_CONCURRENCY_AUTO_MAX = 3
+    ERP_IDEA_CORES_PER_CARD = 2
+    ERP_IDEA_CORES_RESERVED = 2
+
+    def _erp_idea_auto_concurrency(self) -> int:
+        """How many cards this machine can carry at once, read off its CPUs.
+
+        Worth being clear about what this number does *not* buy, because the
+        name suggests more than it delivers: it does not add generations
+        running side by side. There is one browser and one Flow session, and
+        `_with_client` holds `_browser_session_lock` through every call that
+        drives the page, so the cards still queue one at a time in front of
+        the Agent panel - deliberately, because that is what stops two cards
+        reading each other's images out of it. Generating in parallel needs
+        more Flow profiles (`FLOW_CHROME_PROFILE_DIRS`), not more cores.
+
+        What it does size is the rest of a card's life, which is most of its
+        wall clock and is local: watermark removal, the re-encode, the ERP
+        upload. Two cores a card, and two held back for Chrome and the app
+        itself - so below six cores this comes out at one card, which is the
+        honest answer on a small machine.
+
+        The ceiling here is three, one below what the env allows by hand. The
+        ERP has been answering with Cloudflare 502s under load, and four
+        cards uploading together is a poor way to discover its limit; a
+        person who wants the fourth can ask for it.
+        """
+        cores = os.cpu_count() or 2
+        usable = cores - self.ERP_IDEA_CORES_RESERVED
+        return max(1, min(self.ERP_IDEA_CONCURRENCY_AUTO_MAX, usable // self.ERP_IDEA_CORES_PER_CARD))
+
+    def _erp_idea_concurrency(self) -> int:
+        """How many idea cards may be in flight at the same time.
+
+        An empty value - or ``auto`` - means "work it out from this machine",
+        so the same checkout behaves on a laptop and on the box it is
+        deployed to without anyone remembering to retune it.
+        """
+        raw = os.getenv("ERP_IDEA_CONCURRENCY", "").strip()
+        if not raw or raw.lower() == "auto":
+            return self._erp_idea_auto_concurrency()
+        try:
+            return max(1, min(self.ERP_IDEA_CONCURRENCY_MAX, int(raw)))
+        except ValueError:
+            return self._erp_idea_auto_concurrency()
+
     async def _run_erp_idea_jobs(self, entries: List[tuple[str, CreateJobRequest]]) -> None:
-        for job_id, child_request in entries:
-            current = asyncio.current_task()
-            if current is not None:
-                # Registering the running job keeps the dashboard stop button
-                # working while the rest of the ideas are still queued.
-                self._tasks[job_id] = current
-            try:
-                await self._run_flow_job(job_id, child_request)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                # _run_flow_job already recorded the failure on the job itself.
-                await self.store.append_log(job_id, f"Idea job dừng bất thường: {humanize_flow_error(str(exc))}")
-            finally:
-                if self._tasks.get(job_id) is current:
-                    self._tasks.pop(job_id, None)
+        # There is one browser, and `_with_client` holds the session lock for a
+        # whole call, so the ideas still take turns in front of Flow and cannot
+        # read each other's images out of the Agent panel. What overlaps is
+        # everything else — watermark removal and the ERP uploads — which is
+        # where most of a card's wall clock goes, so a second card generates
+        # while the first one is still posting.
+        concurrency = self._erp_idea_concurrency()
+        log.info(
+            "ERP idea batch: %s thẻ, chạy %s thẻ cùng lúc (máy có %s nhân CPU)",
+            len(entries),
+            concurrency,
+            os.cpu_count() or "?",
+        )
+        gate = asyncio.Semaphore(concurrency)
+
+        async def _run_one(job_id: str, child_request: CreateJobRequest) -> None:
+            async with gate:
+                current = asyncio.current_task()
+                if current is not None:
+                    # Registering the running job keeps the dashboard stop
+                    # button working while the rest of the ideas wait.
+                    self._tasks[job_id] = current
+                try:
+                    await self._run_flow_job(job_id, child_request)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    # _run_flow_job already recorded the failure on the job itself.
+                    await self.store.append_log(
+                        job_id, f"Idea job dừng bất thường: {humanize_flow_error(str(exc))}"
+                    )
+                finally:
+                    if self._tasks.get(job_id) is current:
+                        self._tasks.pop(job_id, None)
+
+        # Stopping one card must not take the others down with it, so each idea
+        # gets its own task and gather keeps the failures to itself.
+        await asyncio.gather(
+            *(_run_one(job_id, child_request) for job_id, child_request in entries),
+            return_exceptions=True,
+        )
 
     async def enqueue_prompt_batch(self, request: PromptBatchRequest) -> JobRecord:
         config = self._normalized_config(self.store.snapshot().config)
@@ -7018,7 +7588,7 @@ class FlowWebService:
         await self._set_job_progress(job_id, "launching_browser", "Em đang mở Chromium để đi tới Google Flow.")
         await self.store.append_log(job_id, "Đang mở Chromium để đăng nhập Google Flow")
         async with self._browser_session_lock:
-            browser = await self._ensure_shared_browser()
+            browser = await self._ensure_shared_browser(visible=True)
             page = await self._open_login_flow_page(browser)
         await self._set_job_progress(
             job_id,
@@ -7561,6 +8131,30 @@ exit 1
                     payload["erp_source_attachment_ids"] = attachment_ids
         return CreateJobRequest(**payload)
 
+    def _result_with_module_side_writes(self, job_id: str, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Fold back the result keys the modules wrote behind this snapshot.
+
+        ``_run_automation_post_modules`` works from a copy taken before the
+        modules ran, but some of them patch the job directly instead of
+        returning their output: the runner keeps ``automation_execution``
+        current, and the approval module publishes to the ERP card, which
+        records one comment id per image under ``erp_review``. Writing the
+        stale copy back drops whatever they wrote.
+
+        Losing ``erp_review`` is the expensive one. ``erp_review_jobs_to_sync``
+        skips any job whose ``items`` are missing, so the poller stops
+        watching the card and the 👍/👎 replies are never read - the images
+        sit there looking answered by nobody.
+        """
+        latest = self.store.get_job(job_id)
+        latest_result = (latest.result if latest is not None else None) or {}
+        merged = dict(result)
+        for key in ("automation_execution", "erp_review"):
+            value = latest_result.get(key)
+            if value:
+                merged[key] = value
+        return merged
+
     async def _run_automation_post_modules(
         self,
         job_id: str,
@@ -7632,6 +8226,13 @@ exit 1
                         },
                     )
                     erp_result = await self._archive_erp_artifacts(job_id, module_request, artifacts)
+                    if erp_result.get("waiting_approval"):
+                        # Nothing may be archived until a person decides, and
+                        # that person decides on the card - so the images have
+                        # to be posted there instead of waiting in this app.
+                        posted = await self._auto_publish_erp_review(job_id, module_request)
+                        if posted:
+                            erp_result = {**erp_result, "published_to_card": posted}
                     if erp_result:
                         next_result["erp"] = erp_result
                     status = "completed" if erp_result.get("configured", True) else "skipped"
@@ -7640,6 +8241,10 @@ exit 1
                     # Approval is local and cannot be bypassed by a
                     # client-provided module graph or configuration flag.
                     waiting_for_dashboard = bool(artifacts)
+                    # Reviewers work on the ERP card, not in this app, so the
+                    # images have to travel to the card themselves - otherwise
+                    # an automated run ends with the card still empty.
+                    published = await self._auto_publish_erp_review(job_id, module_request) if waiting_for_dashboard else 0
                     await self._set_automation_module_status(
                         job_id,
                         request,
@@ -7649,7 +8254,8 @@ exit 1
                         output={
                             "awaiting_user_approval": waiting_for_dashboard,
                             "pending": len(artifacts) if waiting_for_dashboard else 0,
-                            "review_surface": "dashboard",
+                            "review_surface": "erp" if published else "dashboard",
+                            "published_to_card": published,
                         },
                     )
                     await self.store.append_log(
@@ -8198,11 +8804,7 @@ exit 1
         # Keep the review evidence produced by the dashboard decision even
         # when a downstream runner returns only its own output payload.
         resumed_result = {**result, **dict(resumed_result or {})}
-        latest_job = self.store.get_job(job_id)
-        latest_execution = (latest_job.result or {}).get("automation_execution") if latest_job is not None else None
-        if latest_execution:
-            resumed_result = dict(resumed_result)
-            resumed_result["automation_execution"] = latest_execution
+        resumed_result = self._result_with_module_side_writes(job_id, resumed_result)
         await self.store.patch_job(job_id, result=resumed_result)
 
     async def _run_flow_job(self, job_id: str, request: CreateJobRequest) -> None:
@@ -8629,11 +9231,7 @@ exit 1
                 },
             )
             result = await self._run_automation_post_modules(job_id, request, artifacts, result)
-            latest_job = self.store.get_job(job_id)
-            latest_execution = (latest_job.result or {}).get("automation_execution") if latest_job is not None else None
-            if latest_execution:
-                result = dict(result)
-                result["automation_execution"] = latest_execution
+            result = self._result_with_module_side_writes(job_id, result)
             await self.store.patch_job(job_id, status="completed", result=result)
             await self.store.append_log(job_id, "Tác vụ đã hoàn tất")
         except asyncio.CancelledError:
@@ -9620,6 +10218,7 @@ exit 1
         task_id: str,
         content: str,
         parent_comment: str = "",
+        meta: str = "",
     ) -> Dict[str, Any]:
         """Post a plain comment (no attachment) on an ERP Task."""
         task_id = self._normalize_erp_task_id(task_id)
@@ -9632,11 +10231,13 @@ exit 1
                     task_id,
                     content,
                     parent_comment=parent_comment,
+                    meta=meta,
                 )
             }
         payload = self._erp_graphql(
-            "mutation AddTaskComment($name: String!, $content: String!) { addTaskComment(name: $name, content: $content) }",
-            {"name": task_id, "content": content},
+            "mutation AddTaskComment($name: String!, $content: String!, $meta: String) "
+            "{ addTaskComment(name: $name, content: $content, meta: $meta) }",
+            {"name": task_id, "content": content, "meta": meta},
             "AddTaskComment",
             key=key,
             token=token,
@@ -9652,6 +10253,7 @@ exit 1
         *,
         parent_comment: str,
         attachments: List[str] | None = None,
+        meta: str = "",
     ) -> Dict[str, Any]:
         """Post a comment inside another comment's reply thread.
 
@@ -9671,7 +10273,7 @@ exit 1
                 "name": self._normalize_erp_task_id(task_id),
                 "content": content,
                 "mentions": "[]",
-                "meta": "",
+                "meta": meta,
                 "parent": parent,
                 "attachments": [str(item).strip() for item in (attachments or []) if str(item).strip()],
             },
@@ -9731,7 +10333,7 @@ exit 1
             name = str(comment.get("name") or "").strip()
             if not name:
                 continue
-            body = str(comment.get("content") or "")
+            body = self._erp_comment_markers(comment)
             if "FLOW_V2_ARTIFACT" in body or "FLOW_V2_ERROR" in body:
                 continue
             urls: List[str] = []
@@ -9769,51 +10371,23 @@ exit 1
         )
 
     async def _report_erp_job_failure(self, job_id: str, request: CreateJobRequest, detail: str) -> None:
-        """Mirror a job failure into the ERP source Task as a comment.
+        """Ghi lý do thất bại vào nhật ký lượt chạy, không ghi lên thẻ ERP.
 
-        Best effort only: whoever watches the Task should see why no image
-        arrived, but a broken ERP call must never mask the original failure
-        that is already recorded on the job itself.
+        Trước đây app bình luận ``[FLOW_V2_ERROR] ...`` ngay trên thẻ. Người
+        làm việc trên thẻ chỉ cần thấy ảnh; chữ của máy - kể cả chữ báo lỗi -
+        làm rối thẻ và không ai xoá. Lý do vẫn còn nguyên trong nhật ký lượt
+        chạy và trên dashboard, là nơi người ta đi tìm khi ảnh không về.
         """
         if not request.erp_enabled:
             return
         task_id = self._erp_output_task_id(request)
         if not task_id:
             return
-        key, token = self._erp_credentials()
-        if not key or not token:
-            return
         message = " ".join(str(detail or "").split())[:900] or "Không rõ nguyên nhân."
-        # The failure belongs where the images would have gone: inside the
-        # thread of the comment the source image was dropped into, or plainly
-        # on the idea card when the job writes to a card of its own.
-        parent_comment = ""
-        if task_id == self._normalize_erp_task_id(request.erp_source_task_id or request.erp_task_id):
-            parent_comment = await asyncio.to_thread(
-                self._erp_source_comment_id,
-                key,
-                token,
-                task_id,
-                list(request.erp_source_attachment_ids or request.erp_attachment_ids or []),
-            )
-        try:
-            await asyncio.to_thread(
-                self._erp_comment,
-                key,
-                token,
-                task_id,
-                f"[FLOW_V2_ERROR] {message}",
-                parent_comment,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await self.store.append_log(
-                job_id,
-                f"Không ghi được lỗi lên ERP Task {task_id}: {humanize_flow_error(str(exc))}",
-            )
-            return
-        await self.store.append_log(job_id, f"Đã ghi lỗi của tác vụ vào comment ERP Task {task_id}.")
+        await self.store.append_log(
+            job_id,
+            f"Không tạo được ảnh cho ERP Task {task_id}: {message}",
+        )
 
     async def _archive_erp_artifacts(
         self,
@@ -9986,6 +10560,11 @@ exit 1
                 f" Cảnh báo: {url_fallbacks} ảnh chỉ gắn được URL Flow gốc nên trên ERP vẫn còn watermark Gemini."
             )
         await self.store.append_log(job_id, summary)
+        if attachments:
+            # Every image of this idea has a decision and at least one of them
+            # is now on the card, so the idea itself is finished. A card where
+            # the reviewer bỏ hết ảnh stays open - there is nothing to show.
+            await self._erp_advance_task_status(job_id, task_id, self.ERP_STATUS_COMPLETED)
         return {
             "configured": True,
             "sent": len(attachments),
@@ -10033,6 +10612,8 @@ exit 1
         artifact: JobArtifact,
         index: int,
         artifact_url: str,
+        *,
+        upscaled: ImageUpscaleResult | None = None,
     ) -> tuple[bytes, str]:
         """The exact bytes that go to ERP: cleaned file, upscaled to 2K.
 
@@ -10045,12 +10626,13 @@ exit 1
         # right before the bytes leave for ERP. A failed upscale must never
         # cost the image: keep the original and carry on, exactly like a failed
         # watermark strip does.
-        try:
-            upscaled = await self._upsample_artifact_bytes(artifact, artifact_url)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            upscaled = ImageUpscaleResult(failure_reason=humanize_flow_error(str(exc)))
+        if upscaled is None:
+            try:
+                upscaled = await self._upsample_artifact_bytes(artifact, artifact_url)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                upscaled = ImageUpscaleResult(failure_reason=humanize_flow_error(str(exc)))
         if upscaled.bytes:
             width, height = upscaled.target_size
             size_text = f" lên {width}x{height}" if width and height else ""
@@ -10085,9 +10667,26 @@ exit 1
         sparkle onto the result - an image cleaned on disk can arrive at the
         card marked again. So the file is measured here, at the door, and
         repaired if the mark is back.
+
+        Every outgoing file goes through removelogo, unasked. The local
+        measurement is not allowed to decide that any more: on wood grain and
+        linen it reads about 0.1-0.24 - under the threshold, so the file
+        shipped - while the sparkle sits plainly visible in the corner. The
+        strong cleaner removes those; it just never got to look at them.
+        removelogo answers 422 on a picture with no mark, so an already clean
+        file simply comes back untouched.
         """
+        cleaned, cleaned_mime = await self._removelogo_bytes(job_id, index, data, mime_type)
+        removed = cleaned is not data
+        data, mime_type = cleaned, cleaned_mime
         strength = await asyncio.to_thread(watermark_repair.measure_image_bytes, data)
         if strength < watermark_repair.MIN_STRENGTH:
+            if removed:
+                await self.store.append_log(
+                    job_id,
+                    f"Ảnh {index + 1} bị đóng lại watermark Gemini sau khi nâng 2K, "
+                    "đã xóa bằng removelogo trước khi upload ERP.",
+                )
             return data, mime_type
         repair = await asyncio.to_thread(watermark_repair.repair_image_bytes, data)
         if repair.repaired and repair.image:
@@ -10102,6 +10701,51 @@ exit 1
             f"Ảnh {index + 1} vẫn còn watermark Gemini khi upload ERP (cường độ {repair.strength:.2f}): {repair.reason}",
         )
         return (repair.image or data), ("image/png" if repair.image else mime_type)
+
+    async def _removelogo_bytes(
+        self,
+        job_id: str,
+        index: int,
+        data: bytes,
+        mime_type: str,
+    ) -> tuple[bytes, str]:
+        """Send raw bytes through removelogo; return the original on any miss.
+
+        The artifact pass works on a file it owns and can swap on disk. The
+        upload path only ever holds bytes, so it gets its own way in - the
+        caller measures the result and still has the local patcher to fall
+        back on, which is why nothing here raises.
+        """
+        if not self._removelogo_enabled():
+            return data, mime_type
+        request_mime = self._removelogo_input_mime(mime_type, f"erp-{job_id}-{index + 1}.png")
+        if not request_mime:
+            return data, mime_type
+        try:
+            cleaned = await asyncio.to_thread(
+                self._removelogo_process_bytes,
+                self._removelogo_base_url(),
+                data,
+                request_mime,
+                f"erp-{job_id}-{index + 1}",
+            )
+        except asyncio.CancelledError:
+            raise
+        except RemoveLogoNoWatermarkError:
+            # No mark to remove. The caller measures the bytes anyway and still
+            # has the local patcher, in case removelogo's detector missed it.
+            return data, mime_type
+        except Exception as exc:
+            await self.store.append_log(
+                job_id,
+                f"Ảnh {index + 1} không gọi được removelogo cho bản 2K: {humanize_flow_error(str(exc))}",
+            )
+            return data, mime_type
+        if not cleaned:
+            return data, mime_type
+        if await asyncio.to_thread(self._removelogo_left_pixels_untouched, data, cleaned):
+            return data, mime_type
+        return cleaned, "image/png"
 
     async def _erp_artifact_file_bytes(
         self,
@@ -10379,7 +11023,20 @@ exit 1
         errors = envelope.get("errors") if isinstance(envelope, dict) else None
         if isinstance(errors, list) and errors:
             messages = [str(item.get("message") or "GraphQL error") for item in errors if isinstance(item, dict)]
-            raise RuntimeError(self._redact_erp_secret("ERP GraphQL: " + "; ".join(messages), key, token))
+            text = "; ".join(messages)
+            # The ERP answers a Task in a Project this credential is not a
+            # member of with a bare "An unknown error occurred" — no code, no
+            # field. Measured: the same query succeeds on the Projects the key
+            # belongs to and fails on every other one. Unattended, that opaque
+            # line repeats every autorun cooldown and reads like a server
+            # outage, so name the one cause it is actually known to have.
+            if self.ERP_OPAQUE_ERROR in text:
+                text += (
+                    " — thường là API key/secret của Flow v2 chưa được thêm vào Project"
+                    " của thẻ này. Agent bot dùng token riêng nên vẫn thấy thẻ,"
+                    " nhưng phần chạy việc thì không vào được."
+                )
+            raise RuntimeError(self._redact_erp_secret("ERP GraphQL: " + text, key, token))
         data = envelope.get("data") if isinstance(envelope, dict) else None
         if not isinstance(data, dict):
             raise RuntimeError("ERP GraphQL không trả data hợp lệ.")
@@ -10456,12 +11113,11 @@ exit 1
         return file_url
 
     def _erp_allowed_project_id(self) -> str:
-        """Return the single ERP Project this app is allowed to touch.
+        """Return the default ERP Project this app writes to.
 
-        The owner picks it in the ERP panel (or `ERP_PROJECT_ID`); every other
-        source — an imported automation graph, a batch item, a Task id typed by
-        hand — is still checked against this one value, so the blast radius
-        stays exactly one project instead of the whole production ERP.
+        The owner picks it in the ERP panel (or `ERP_PROJECT_ID`). It is the
+        project every call falls back to when none was named; the full set of
+        projects a call may name is `_erp_allowed_project_ids`.
         """
         return self._normalize_erp_project_id(
             str(self.store.snapshot().erp_config.project_id or "").strip()
@@ -10469,12 +11125,71 @@ exit 1
             or self.ERP_PROJECT_ID
         )
 
+    def _erp_allowed_project_ids(self) -> List[str]:
+        """Every ERP Project this app is allowed to touch, default first.
+
+        One project used to be the whole answer, and for the dashboard it still
+        is: every other source — an imported automation graph, a batch item, a
+        Task id typed by hand — is checked against this list, so the blast
+        radius stays a named set instead of the whole production ERP.
+
+        The list grew a second source because of the agent bot. Its whole point
+        is that dropping the bot into a project is the only setup step, and a
+        hard-coded single project would have made that untrue the moment
+        somebody attached the agent to a card outside it. `ERP_AGENT_PROJECTS`
+        therefore extends the set — it never replaces the default, so leaving
+        it empty keeps the old one-project behaviour exactly.
+
+        And the third source is the ERP itself: every board the agent token can
+        see, as the bot's last scan recorded it. Adding the bot to a board on
+        the ERP is then genuinely the only step — the Idea cards on that board
+        run without anybody also editing `.env.local`. It is read off the bot's
+        saved state rather than fetched here, because this runs on the event
+        loop and a board list is not worth a request, let alone a stall.
+        """
+        allowed = [self._erp_allowed_project_id()]
+        raw = os.getenv("ERP_AGENT_PROJECTS", "").replace(";", ",")
+        for item in raw.split(","):
+            # Uppercased to match AgentBotConfig: the same line of .env.local
+            # must not mean two different fences depending on how it was typed.
+            project = self._normalize_erp_project_id(item).upper()
+            if project and project not in allowed:
+                allowed.append(project)
+        for project in self._erp_agent_scope_projects():
+            if project not in allowed:
+                allowed.append(project)
+        return allowed
+
+    def _erp_agent_scope_projects(self) -> List[str]:
+        """Các board bot đang đứng, theo sổ ghi của chính nó.
+
+        Rỗng là chuyện bình thường chứ không phải lỗi: chưa cấu hình bot, hoặc
+        app vừa khởi động và bot chưa quét lượt nào trên một máy mới tinh. Khi
+        đó phạm vi rơi về đúng như cũ.
+        """
+        try:
+            bot = self.agent_bot()
+        except Exception as exc:
+            log.debug("Không dựng được agent bot để đọc phạm vi: %s", exc)
+            return []
+        if bot is None:
+            return []
+        return [
+            project
+            for project in (
+                self._normalize_erp_project_id(str(item)).upper()
+                for item in (bot.state.projects or [])
+            )
+            if project
+        ]
+
     def _erp_required_project_id(self, project_id: str = "") -> str:
-        allowed = self._erp_allowed_project_id()
-        candidate = self._normalize_erp_project_id(project_id) or allowed
-        if candidate != allowed:
+        allowed = self._erp_allowed_project_ids()
+        candidate = self._normalize_erp_project_id(project_id) or allowed[0]
+        if candidate not in allowed:
             raise RuntimeError(
-                f"Flow v2 chỉ được phép thao tác ERP Project {allowed} (đang bị yêu cầu {candidate})."
+                f"Flow v2 chỉ được phép thao tác ERP Project {', '.join(allowed)} "
+                f"(đang bị yêu cầu {candidate})."
             )
         return candidate
 
@@ -10518,17 +11233,320 @@ exit 1
             token=token,
         ).get("taskDetail") or {}
 
-    def _erp_assert_task_in_project(self, key: str, token: str, task_id: str) -> None:
+    def _erp_task_project_id(self, key: str, token: str, task_id: str) -> str:
+        """Which allowed project a Task lives in, or refuse the Task.
+
+        The default project is tried first and, in the common one-project
+        setup, is the only board ever fetched — the extra projects only cost a
+        request when the Task really is somewhere else.
+        """
         target = self._normalize_erp_task_id(task_id)
-        allowed = self._erp_allowed_project_id()
-        board = self._erp_task_board(key, token, allowed)
-        for column in board.get("columns", []):
-            if not isinstance(column, dict):
+        allowed = self._erp_allowed_project_ids()
+        for project in allowed:
+            board = self._erp_task_board(key, token, project)
+            for column in board.get("columns", []):
+                if not isinstance(column, dict):
+                    continue
+                for task in column.get("tasks", []):
+                    if not isinstance(task, dict):
+                        continue
+                    if self._normalize_erp_task_id(str(task.get("name") or task.get("id") or "")) == target:
+                        return project
+        raise RuntimeError(
+            f"ERP Task {target or '(trống)'} không thuộc Project {', '.join(allowed)}."
+        )
+
+    def _erp_assert_task_in_project(self, key: str, token: str, task_id: str) -> None:
+        self._erp_task_project_id(key, token, task_id)
+
+    # ── Ghi trạng thái và gỡ ảnh bị bỏ trên thẻ ERP ───────────────────────
+    # These two are the only ERP writes besides commenting, and both stay
+    # inside the one allowed project. The status move is what lets the board
+    # show an idea as "Đang review" then "Hoàn thành" without anyone dragging
+    # the card; the comment delete is what the reviewer's 👎 asks for.
+
+    ERP_STATUS_PENDING_REVIEW = "Pending Review"
+    ERP_STATUS_COMPLETED = "Completed"
+    # A card a person already closed or cancelled is never moved back by us.
+    ERP_STATUS_ADVANCEABLE_FROM = ("Open", "Working", "Pending Review")
+
+    def _erp_update_task_status(self, key: str, token: str, task_id: str, status: str) -> Dict[str, Any]:
+        """Move one Task of the allowed project to another status column."""
+        target = self._normalize_erp_task_id(task_id)
+        if not target:
+            raise RuntimeError("Thiếu ERP Task ID để đổi trạng thái.")
+        wanted = str(status or "").strip()
+        if not wanted:
+            raise RuntimeError("Thiếu trạng thái ERP cần chuyển.")
+        self._erp_assert_task_in_project(key, token, target)
+        payload = self._erp_graphql(
+            "mutation UpdateTaskStatus($name: String!, $status: String!) "
+            "{ updateTaskStatus(name: $name, status: $status) }",
+            {"name": target, "status": wanted},
+            "UpdateTaskStatus",
+            key=key,
+            token=token,
+        )
+        return payload.get("updateTaskStatus") if isinstance(payload.get("updateTaskStatus"), dict) else {}
+
+    def _erp_create_child_task(
+        self,
+        key: str,
+        token: str,
+        parent_task_id: str,
+        project_id: str,
+        subject: str,
+        *,
+        status: str = "Open",
+        description: str = "",
+    ) -> str:
+        """Open one child card under an Idea card and return its Task ID.
+
+        This is the one place the app creates a Task. Everything else it writes
+        to the ERP hangs off a card a person made, and that stays true here in
+        the sense that matters: the child is only ever hung under a parent the
+        project fence already allows, and it exists because a person dropped an
+        image on that parent.
+        """
+        parent = self._normalize_erp_task_id(parent_task_id)
+        if not parent:
+            raise RuntimeError("Thiếu ERP Task ID của thẻ Idea cha để tạo thẻ con.")
+        title = str(subject or "").strip()
+        if not title:
+            raise RuntimeError("Thiếu tiêu đề cho thẻ con ERP.")
+        # The fence is the parent, not the child: a child inherits the project
+        # it is created in, so checking the parent is what keeps this inside the
+        # allowed board.
+        project = str(project_id or "").strip() or self._erp_task_project_id(key, token, parent)
+        if project not in self._erp_allowed_project_ids():
+            raise RuntimeError(f"Project {project} nằm ngoài phạm vi được phép của Flow v2.")
+        self._erp_assert_task_in_project(key, token, parent)
+        payload = self._erp_graphql(
+            "mutation CreateTask($subject: String!, $project: String, $parentTask: String, "
+            "$status: String, $description: String) "
+            "{ createTask(subject: $subject, project: $project, parentTask: $parentTask, "
+            "status: $status, description: $description) }",
+            {
+                "subject": title,
+                "project": project,
+                "parentTask": parent,
+                "status": str(status or "Open").strip() or "Open",
+                "description": str(description or ""),
+            },
+            "CreateTask",
+            key=key,
+            token=token,
+        )
+        created = payload.get("createTask")
+        if isinstance(created, dict):
+            created = created.get("name") or created.get("task") or created.get("id")
+        child_id = self._normalize_erp_task_id(str(created or ""))
+        if not child_id:
+            raise RuntimeError(f"ERP không trả về mã thẻ con vừa tạo dưới {parent}.")
+        return child_id
+
+    @staticmethod
+    def _erp_task_agent_users(detail: Dict[str, Any]) -> List[str]:
+        """Những bot đang gắn trên thẻ, theo đúng thứ tự ERP trả về."""
+        users: List[str] = []
+        for agent in (detail or {}).get("agents") or []:
+            if not isinstance(agent, dict):
                 continue
-            for task in column.get("tasks", []):
-                if isinstance(task, dict) and self._normalize_erp_task_id(str(task.get("name") or task.get("id") or "")) == target:
-                    return
-        raise RuntimeError(f"ERP Task {target or '(trống)'} không thuộc Project {allowed}.")
+            name = str(agent.get("bot_user") or "").strip()
+            if name and name not in users:
+                users.append(name)
+        return users
+
+    def _erp_add_task_agent(self, key: str, token: str, task_id: str, bot_user: str) -> None:
+        """Gắn một bot vào thẻ, y như chọn agent ở ô Người phụ trách.
+
+        Hỏng thì thôi: thẻ con vẫn có ảnh và vẫn chạy được, chỉ là ô người phụ
+        trách trống — không đáng để cả lượt nhận ảnh đổ theo.
+        """
+        target = self._normalize_erp_task_id(task_id)
+        if not target or not bot_user:
+            return
+        try:
+            self._erp_graphql(
+                "mutation AddTaskAgent($task: String!, $botUser: String!) "
+                "{ addTaskAgent(task: $task, botUser: $botUser) }",
+                {"task": target, "botUser": bot_user},
+                "AddTaskAgent",
+                key=key,
+                token=token,
+            )
+        except Exception as exc:
+            log.debug("Không gắn được agent %s vào %s: %s", bot_user, target, exc)
+
+    def _erp_set_task_cover(
+        self,
+        key: str,
+        token: str,
+        task_id: str,
+        file_bytes: bytes,
+        mime_type: str,
+        name: str,
+    ) -> None:
+        """Show an image on the card face, the way a hand-made child card does.
+
+        Two steps, because ``setTaskCover`` refuses any file that is not held
+        by this Task as a cover — "Tệp ảnh bìa không hợp lệ hoặc không thuộc về
+        task này" — and a file hung on one of the Task's comments does not
+        count. So the bytes are uploaded again with ``purpose: "cover"``, which
+        is what the ERP web UI's own cover picker does, and only then named as
+        the cover.
+
+        Best effort on purpose: a child that carries the image but not as its
+        cover is still a working idea card, so a refusal here is logged rather
+        than thrown at the caller.
+        """
+        target = self._normalize_erp_task_id(task_id)
+        if not target or not file_bytes:
+            return
+        file_name = str(name or "").strip() or "cover.jpg"
+        try:
+            payload = self._erp_graphql(
+                "mutation UploadTaskFile($task: String!, $fileName: String!, "
+                "$contentBase64: String!, $purpose: String) "
+                "{ uploadTaskFile(task: $task, fileName: $fileName, "
+                "contentBase64: $contentBase64, purpose: $purpose) }",
+                {
+                    "task": target,
+                    "fileName": file_name,
+                    "contentBase64": base64.b64encode(file_bytes).decode("ascii"),
+                    "purpose": "cover",
+                },
+                "UploadTaskFile",
+                key=key,
+                token=token,
+            )
+            uploaded = payload.get("uploadTaskFile")
+            # The ERP de-duplicates by content, so the URL it hands back is not
+            # always built from the name that was sent - use its answer.
+            url = str((uploaded or {}).get("file_url") or "").strip() if isinstance(uploaded, dict) else ""
+            if not url:
+                return
+            self._erp_graphql(
+                "mutation SetTaskCover($task: String!, $fileUrl: String!) "
+                "{ setTaskCover(task: $task, fileUrl: $fileUrl) }",
+                {"task": target, "fileUrl": url},
+                "SetTaskCover",
+                key=key,
+                token=token,
+            )
+        except Exception as exc:
+            log.debug("Không đặt được ảnh bìa cho %s: %s", target, exc)
+
+    def _erp_task_attachment_files(self, key: str, token: str, task_id: str) -> List[Dict[str, Any]]:
+        """Files hung on the Task itself, as opposed to on one of its comments.
+
+        This is where a file dropped into the card's attachment area lands, and
+        ``taskDetail`` does not carry it: a card can show three pictures in the
+        ERP web UI and still read back with ``cover_image: null`` and no
+        comments at all. A failure here means "found nothing extra" rather than
+        a failed scan, because the caller has already read the card once.
+        """
+        target = self._normalize_erp_task_id(task_id)
+        if not target:
+            return []
+        try:
+            payload = self._erp_graphql(
+                "query TaskAttachments($task: String!) { taskAttachments(task: $task) }",
+                {"task": target},
+                "TaskAttachments",
+                key=key,
+                token=token,
+            )
+        except Exception as exc:
+            log.debug("Không đọc được danh sách tệp của %s: %s", target, exc)
+            return []
+        files = (payload.get("taskAttachments") or {}).get("files")
+        return [item for item in files if isinstance(item, dict)] if isinstance(files, list) else []
+
+    async def _erp_advance_task_status(self, job_id: str, task_id: str, status: str) -> bool:
+        """Best-effort status move that never fails the run that asked for it.
+
+        A card that is already in the wanted column, or that a person moved to
+        Completed/Cancelled themselves, is left exactly as it is: the board is
+        theirs, this only saves them the drag.
+        """
+        key, token = self._erp_credentials()
+        target = self._normalize_erp_task_id(task_id)
+        if not key or not token or not target:
+            return False
+        try:
+            detail = await asyncio.to_thread(self._erp_task_detail, key, token, target)
+            current = str((detail or {}).get("status") or "").strip()
+            if current == status or current not in self.ERP_STATUS_ADVANCEABLE_FROM:
+                return False
+            if status == self.ERP_STATUS_COMPLETED and task_meta(detail).is_listing:
+                # Thẻ listing làm xong ảnh mới chỉ xong nửa đầu: nửa Etsy còn
+                # phải đăng chính bộ ảnh ấy lên shop. Đóng thẻ ở đây là giấu nó
+                # khỏi chính con bot đang cần đọc lại nó — ``is_idea_card`` coi
+                # "Completed" là đã đóng, mà bảng dự án không trả về khối
+                # ``meta`` nên lượt lọc ứng viên không thể biết thẻ nào là thẻ
+                # listing để chừa ra. Ai đóng thẻ cũng được, trừ chính chúng ta.
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        f"Giữ nguyên trạng thái Task {target}: thẻ listing chỉ đóng sau khi "
+                        "nửa Etsy đăng xong, không đóng khi vừa xong ảnh.",
+                    )
+                return False
+            await asyncio.to_thread(self._erp_update_task_status, key, token, target, status)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if job_id:
+                await self.store.append_log(
+                    job_id,
+                    f"Không đổi được trạng thái Task {target} sang “{status}”: {humanize_flow_error(str(exc))}",
+                )
+            return False
+        if job_id:
+            await self.store.append_log(job_id, f"Đã chuyển Task {target} sang trạng thái “{status}” trên ERP.")
+        return True
+
+    def _erp_delete_task_comment(self, key: str, token: str, task_id: str, comment: str) -> Dict[str, Any]:
+        """Remove one comment — and the image it carries — from a Task.
+
+        GraphQL exposes no delete, so this goes through the same whitelisted
+        method the ERP web UI calls when a user deletes their own comment.
+        Reading the Comment DocType over REST answers 403, so the id can only
+        come from ``taskDetail``, which is where every caller here gets it.
+        """
+        if not key or not token:
+            raise RuntimeError("Chưa thiết lập ERP API key/secret.")
+        target = self._normalize_erp_task_id(task_id)
+        comment_id = str(comment or "").strip()
+        if not target or not comment_id:
+            raise RuntimeError("Thiếu Task hoặc comment cần xoá trên ERP.")
+        self._erp_assert_task_in_project(key, token, target)
+        payload = json.dumps({"name": target, "comment": comment_id}, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"{self._erp_base_url()}/api/method/hvg_workspace.api.delete_task_comment",
+            data=payload,
+            method="POST",
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "Flow-v2-HaviGroup-ERP/1.0",
+                "Authorization": f"token {key}:{token}",
+            },
+        )
+        try:
+            with urlopen(request, timeout=self.ERP_TIMEOUT_S) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            detail = self._redact_erp_secret(exc.read().decode("utf-8", errors="replace") or exc.reason, key, token)
+            raise RuntimeError(f"ERP HTTP {exc.code}: {detail}") from exc
+        except URLError as exc:
+            raise RuntimeError(self._redact_erp_secret(exc.reason or exc, key, token)) from exc
+        try:
+            message = (json.loads(raw) if raw else {}).get("message")
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("ERP trả dữ liệu xoá comment không phải JSON.") from exc
+        return message if isinstance(message, dict) else {}
 
     def _erp_extract_task_attachments(self, detail: Any) -> List[Dict[str, Any]]:
         """Normalize attachment URL shapes returned by the JSON taskDetail scalar.
@@ -10539,6 +11557,7 @@ exit 1
         """
         attachments: List[Dict[str, Any]] = []
         seen: set[str] = set()
+        image_suffixes = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 
         def add(url: Any, metadata: Dict[str, Any], flow_output: bool) -> None:
             value = str(url or "").strip()
@@ -10547,9 +11566,22 @@ exit 1
             parsed = urlparse(value)
             if parsed.scheme != "https" or value in seen:
                 return
-            name = str(metadata.get("name") or metadata.get("file_name") or Path(parsed.path).name or "erp-image").strip()
+            # A comment attachment names itself with a random ERP id that has
+            # no extension, while the real "flow-<run>-<n>.png" sits in
+            # "file_name"; taking the first non-empty field would fail the
+            # image check below and hide every output Flow posted to the card.
+            name = ""
+            for candidate in (metadata.get("name"), metadata.get("file_name"), Path(parsed.path).name):
+                text = str(candidate or "").strip()
+                if not text:
+                    continue
+                name = name or text
+                if Path(text).suffix.lower() in image_suffixes:
+                    name = text
+                    break
+            name = name or "erp-image"
             mime = str(metadata.get("mime_type") or metadata.get("mimeType") or mimetypes.guess_type(name)[0] or "")
-            if not mime.startswith("image/") and Path(name).suffix.lower() not in {".jpg", ".jpeg", ".png", ".webp", ".gif"}:
+            if not mime.startswith("image/") and Path(name).suffix.lower() not in image_suffixes:
                 return
             seen.add(value)
             attachments.append(
@@ -10585,7 +11617,14 @@ exit 1
         def walk(value: Any, inherited_flow_output: bool = False, in_attachment_context: bool = False) -> None:
             if isinstance(value, dict):
                 body = str(value.get("content") or value.get("comment") or value.get("text") or "")
-                marker = "FLOW_V2_ARTIFACT" in body
+                # Flow writes ``meta`` only on the comments it posts itself, so
+                # the marker is read from a comment node and nowhere else.  A
+                # Task's own metadata is typed by a person; letting it flip the
+                # marker would brand every image on the card — the reviewer's
+                # own source image included — as a Flow output, and the reset
+                # endpoint deletes those.
+                meta = str(value.get("meta") or "") if body else ""
+                marker = "FLOW_V2_ARTIFACT" in f"{body} {meta}"
                 flow_output = inherited_flow_output or marker
                 if body:
                     add_hosted_urls_in_text(body, value, flow_output)
@@ -14209,17 +15248,34 @@ exit 1
             hosted_path = str((fields or {}).get("hostedPath") or "").strip()
             name = str((fields or {}).get("name") or "Flow artifact").strip()
             parent_comment = str((fields or {}).get("parentComment") or "").strip()
+            # An image this app *generated* is a Flow artefact; an image it only
+            # carried across from one card to another is not, and calling it one
+            # would make the receiving card look like it had already been run.
+            # The caller says which it is by supplying its own comment body.
+            comment_text = str((fields or {}).get("comment") or "").strip()
+            # Và có thứ không phải cả hai: tấm ảnh idea người dùng vừa thả, chép
+            # sang thẻ con của nó. Thẻ ấy chỉ nên có đúng tấm ảnh, nên ở đây
+            # không chữ nghĩa nào hết - kể cả dòng mặc định.
+            silent = str((fields or {}).get("silentComment") or "").strip().lower() in {
+                "1", "true", "yes", "on",
+            }
+            # Dấu artefact là chuyện của máy, không phải của người xem thẻ:
+            # nó đi vào ``meta``, còn thân bình luận để trống hẳn.
+            marker = "" if silent else f"[FLOW_V2_ARTIFACT] {name}"
+            fallback_text = self.ERP_SILENT_COMMENT_BODY
             if hosted_path:
                 # The bytes already sit on this ERP, uploaded with the
                 # ``fieldname=comment`` sentinel, so addTaskComment adopts them
                 # as a real attachment and the body needs no URL of its own.
-                content = f"[FLOW_V2_ARTIFACT] {name}"
+                content = comment_text or fallback_text
                 attachments = [hosted_path]
                 public_url = f"{self._erp_base_url()}{hosted_path}"
             elif artifact_url and urlparse(artifact_url).scheme == "https":
                 # A link we do not host cannot become an ERP attachment, so it
                 # rides in the body to stay visible and re-readable on the Task.
-                content = f"[FLOW_V2_ARTIFACT] {name}\n\n{artifact_url}"
+                content = "\n\n".join(
+                    part for part in (comment_text or fallback_text, artifact_url) if part
+                )
                 attachments = [artifact_url]
                 public_url = artifact_url
             else:
@@ -14235,11 +15291,13 @@ exit 1
                     content,
                     parent_comment=parent_comment,
                     attachments=attachments,
+                    meta=marker,
                 )
             else:
                 data_payload = self._erp_graphql(
-                    "mutation AddTaskComment($name: String!, $content: String!, $attachments: [String!]) { addTaskComment(name: $name, content: $content, attachments: $attachments) }",
-                    {"name": task_id, "content": content, "attachments": attachments},
+                    "mutation AddTaskComment($name: String!, $content: String!, $attachments: [String!], $meta: String) "
+                    "{ addTaskComment(name: $name, content: $content, attachments: $attachments, meta: $meta) }",
+                    {"name": task_id, "content": content, "attachments": attachments, "meta": marker},
                     "AddTaskComment",
                     key=key,
                     token=token,
@@ -14253,8 +15311,13 @@ exit 1
                     key,
                     token,
                     task_id,
-                    f"[FLOW_V2_ARTIFACT] {name}\n\n{public_url}",
+                    "\n\n".join(
+                        part
+                        for part in (comment_text if comment_text != fallback_text else "", public_url)
+                        if part
+                    ),
                     parent_comment=parent_comment,
+                    meta=marker,
                 )
             return {
                 "id": public_url,
@@ -14270,7 +15333,9 @@ exit 1
         raise RuntimeError("Flow v2 không sửa Task ERP trong luồng này; chỉ comment artefact đã duyệt được phép.")
 
     def _erp_delete_json(self, path: str, key: str, token: str) -> Any:
-        raise RuntimeError("Flow v2 không xóa dữ liệu ERP.")
+        # The one deletion this app performs - gỡ comment ảnh bị người duyệt bỏ -
+        # goes through _erp_delete_task_comment, not this generic REST path.
+        raise RuntimeError("Flow v2 không xóa dữ liệu ERP qua REST; chỉ gỡ được comment ảnh bị từ chối.")
 
     def _erp_delete_attachment(self, key: str, token: str, task_id: str, attachment_id: str) -> Any:
         return self._erp_delete_json(
@@ -14352,6 +15417,8 @@ exit 1
         name: str,
         set_cover: bool,
         parent_comment: str = "",
+        comment_text: str = "",
+        silent_comment: bool = False,
     ) -> Dict[str, Any]:
         mime = mime_type or mimetypes.guess_type(name)[0] or "image/jpeg"
         # Two steps, because ERP has no single file-attach mutation: park the
@@ -14366,6 +15433,8 @@ exit 1
                 "hostedPath": hosted_path,
                 "setCover": "true" if set_cover else "false",
                 "parentComment": parent_comment,
+                "comment": comment_text,
+                "silentComment": "true" if silent_comment else "",
             },
         )
         attachment = attachment if isinstance(attachment, dict) else {}
@@ -14382,6 +15451,99 @@ exit 1
         if not value:
             return True
         return value not in {"0", "false", "no", "off"}
+
+    def _flow_upsample_concurrency(self) -> int:
+        """How many 2K upscales a batch may have in the air at once.
+
+        One, on measurement. Sending four at a time was tried on two live
+        twelve-image cards and lost on both counts: 40-50s an image against
+        27.5s one at a time, and four of those twenty-four images came back
+        un-upscaled, against none in the sequential run. Google appears to
+        queue the upscales per account, so the extra requests only add
+        timeouts. The knob stays so the measurement can be repeated.
+        """
+        raw = os.getenv("FLOW_UPSAMPLE_CONCURRENCY", "").strip()
+        try:
+            return max(1, min(8, int(raw))) if raw else 1
+        except ValueError:
+            return 1
+
+    FLOW_UPSAMPLE_RECAPTCHA_BACKOFF_S = 2.0
+
+    def _flow_upsample_recaptcha_rounds(self) -> int:
+        """How many times an upscale may re-mint its reCAPTCHA token.
+
+        One token, one chance was the old behaviour, and a single refused
+        token left the image at 1024 for good - that 403 accounted for every
+        un-upscaled image on the live cards. Three rounds because the token
+        is the thing being retried, not the upscale itself: if a fresh token
+        is refused twice the problem is not the token.
+        """
+        raw = os.getenv("FLOW_UPSAMPLE_RECAPTCHA_ROUNDS", "").strip()
+        try:
+            return max(1, min(5, int(raw))) if raw else 3
+        except ValueError:
+            return 3
+
+    FLOW_UPSAMPLE_RECAPTCHA_GIVE_UP_AFTER = 2
+
+    def _flow_upsample_rounds_for_next_image(self) -> int:
+        """Rounds to allow this image, given how the last few images went.
+
+        Measured on the live board: when Google starts answering
+        upsampleImage with "reCAPTCHA evaluation failed" it answers every
+        round the same way, fresh token or not - three rounds refused in a
+        row, then again on the next image. The rounds are still worth paying
+        for the first couple of images, because a genuinely raced token does
+        clear on a retry. After that they buy nothing and the image needs the
+        UI download anyway, so drop to a single try: one probe per image so
+        the app notices the moment Google starts accepting tokens again.
+        """
+        if self._flow_upsample_recaptcha_streak >= self.FLOW_UPSAMPLE_RECAPTCHA_GIVE_UP_AFTER:
+            return 1
+        return self._flow_upsample_recaptcha_rounds()
+
+    async def _flow_upsample_client_context(
+        self, client: Any, *, session_lock_held: bool = True
+    ) -> Dict[str, Any]:
+        """Build the client context for one upscale, minting a fresh token.
+
+        ``_client_context`` reaches into the page: it runs
+        ``grecaptcha.enterprise.execute`` through ``page.evaluate``, and
+        reloads the page when the first try comes back empty. The 2K batch
+        hands the browser session back so the next card can generate, so
+        doing that unguarded means evaluating - and possibly reloading -
+        the very page another card is generating on. Google then answers the
+        upscale with "HTTP 403 ... reCAPTCHA evaluation failed", which is why
+        images came back un-upscaled whenever two cards were in flight.
+
+        So the token is minted under ``_browser_session_lock`` when the caller
+        no longer holds it. Only the mint: the upscale itself stays outside,
+        which is the part worth overlapping.
+        """
+        if session_lock_held:
+            return dict(await client._api._client_context())
+        async with self._browser_session_lock:
+            return dict(await client._api._client_context())
+
+    def _flow_agent_network_wait_seconds(self) -> float:
+        """How long to wait for batchGenerateImages before reading the project.
+
+        In Agent mode this wait almost always runs out in full: the panel
+        does not produce a successful batchGenerateImages response, so the
+        app times out and then finds the images by polling the project about
+        ten seconds later. That is roughly 45s a card spent learning nothing,
+        and it is paid once per idea. The knob is here so the wait can be
+        shortened and measured without editing code; the default keeps the
+        behaviour that is known to work.
+        """
+        raw = os.getenv("FLOW_AGENT_NETWORK_WAIT_SECONDS", "").strip()
+        if not raw:
+            return 45.0
+        try:
+            return max(5.0, min(120.0, float(raw)))
+        except ValueError:
+            return 45.0
 
     def _erp_fake_2k_resize_enabled(self) -> bool:
         value = os.getenv("ERP_FAKE_2K_RESIZE_ENABLED", "").strip().lower()
@@ -14694,11 +15856,18 @@ exit 1
         media_generation_id: str = "",
         workflow_id: str = "",
         prompt: str = "",
+        session_lock_held: bool = True,
     ) -> bytes:
         """Call POST /v1/flow/upsampleImage and return the upscaled JPEG bytes.
 
         Returns the original bytes on any failure so the caller can still
         upload the source image.
+
+        Everything here is HTTPS through the browser's request context except
+        the last-resort UI download, which clicks through the page. Pass
+        ``session_lock_held=False`` when the caller let go of the browser
+        session lock, so that fallback can take it back before touching the
+        page a generating card may be sitting on.
         """
         if not jpeg_bytes:
             return jpeg_bytes
@@ -14706,57 +15875,93 @@ exit 1
         if not media_id:
             log.warning("flow/upsampleImage skipped: missing Flow media id")
             return jpeg_bytes
-        try:
-            client_context = await client._api._client_context()
-        except Exception as exc:
-            log.warning("flow/upsampleImage client context failed: %s", self._flow_error_detail(exc))
-            client_context = {}
-
-        payloads = self._flow_upsample_payloads(media_id, client_context=client_context)
-        for attempt, payload in enumerate(payloads, start=1):
+        # A reCAPTCHA token is minted per round and Google rejects a stale or
+        # raced one outright, so a round that comes back "reCAPTCHA evaluation
+        # failed" is retried with a fresh token rather than written off. That
+        # 403 was every un-upscaled image on the live cards.
+        rounds = self._flow_upsample_rounds_for_next_image()
+        refused_every_round = False
+        for round_index in range(1, rounds + 1):
             try:
-                data = await client._api._fetch(
-                    "POST",
-                    "flow/upsampleImage",
-                    payload,
+                client_context = await self._flow_upsample_client_context(
+                    client, session_lock_held=session_lock_held
                 )
             except Exception as exc:
+                log.warning("flow/upsampleImage client context failed: %s", self._flow_error_detail(exc))
+                client_context = {}
+
+            recaptcha_rejected = False
+            payloads = self._flow_upsample_payloads(media_id, client_context=client_context)
+            for attempt, payload in enumerate(payloads, start=1):
+                try:
+                    data = await client._api._fetch(
+                        "POST",
+                        "flow/upsampleImage",
+                        payload,
+                    )
+                except Exception as exc:
+                    recaptcha_rejected = recaptcha_rejected or self._is_recaptcha_error(exc)
+                    log.warning(
+                        "flow/upsampleImage round %s attempt %s media=%s failed: %s",
+                        round_index,
+                        attempt,
+                        media_id,
+                        self._flow_error_detail(exc),
+                    )
+                    continue
+                decoded, _mime = await self._flow_upsample_response_bytes(
+                    client,
+                    data,
+                    fallback_media_id=media_id,
+                )
+                if not decoded:
+                    log.warning(
+                        "flow/upsampleImage: response missing image bytes/url/media field (keys=%s)",
+                        list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                    )
+                    continue
+                if decoded == jpeg_bytes:
+                    log.warning(
+                        "flow/upsampleImage round %s attempt %s media=%s returned original bytes",
+                        round_index,
+                        attempt,
+                        media_id,
+                    )
+                    continue
+                decoded_size = self._image_size_from_bytes(decoded)
+                if decoded_size and max(decoded_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
+                    # Tokens are being accepted again, so let the next image
+                    # have its retries back.
+                    self._flow_upsample_recaptcha_streak = 0
+                    return decoded
                 log.warning(
-                    "flow/upsampleImage attempt %s media=%s failed: %s",
+                    "flow/upsampleImage round %s attempt %s media=%s returned non-2K bytes (%sx%s)",
+                    round_index,
                     attempt,
                     media_id,
-                    self._flow_error_detail(exc),
+                    decoded_size[0] if decoded_size else 0,
+                    decoded_size[1] if decoded_size else 0,
                 )
-                continue
-            decoded, _mime = await self._flow_upsample_response_bytes(
-                client,
-                data,
-                fallback_media_id=media_id,
-            )
-            if not decoded:
-                log.warning(
-                    "flow/upsampleImage: response missing image bytes/url/media field (keys=%s)",
-                    list(data.keys()) if isinstance(data, dict) else type(data).__name__,
-                )
-                continue
-            if decoded == jpeg_bytes:
-                log.warning(
-                    "flow/upsampleImage attempt %s media=%s returned original bytes",
-                    attempt,
-                    media_id,
-                )
-                continue
-            decoded_size = self._image_size_from_bytes(decoded)
-            if decoded_size and max(decoded_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
-                return decoded
-            log.warning(
-                "flow/upsampleImage attempt %s media=%s returned non-2K bytes (%sx%s)",
-                attempt,
-                media_id,
-                decoded_size[0] if decoded_size else 0,
-                decoded_size[1] if decoded_size else 0,
-            )
-        ui_downloaded = await self._upsample_image_via_flow_ui_download(client, media_id)
+            if not recaptcha_rejected:
+                # Anything other than a refused token will fail the same way
+                # with a new one, so stop paying for it.
+                break
+            refused_every_round = True
+            if round_index < rounds:
+                await asyncio.sleep(self.FLOW_UPSAMPLE_RECAPTCHA_BACKOFF_S)
+        if refused_every_round:
+            self._flow_upsample_recaptcha_streak += 1
+        async with contextlib.AsyncExitStack() as stack:
+            # This one goes through the Flow page itself, so it cannot share the
+            # browser with the sibling upscales running next to it, nor with
+            # another card's generation if this batch gave the session lock back.
+            # Session lock first, then the UI lock, always in that order: a
+            # caller that already holds the session lock takes the UI lock next,
+            # so taking them the other way round here would deadlock the pair.
+            if not session_lock_held:
+                await stack.enter_async_context(self._browser_session_lock)
+            await stack.enter_async_context(self._flow_upsample_ui_lock)
+            ui_downloaded = await self._upsample_image_via_flow_ui_download(client, media_id)
         if ui_downloaded and ui_downloaded != jpeg_bytes:
             ui_size = self._image_size_from_bytes(ui_downloaded)
             if ui_size and max(ui_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
@@ -14853,15 +16058,98 @@ exit 1
             log.warning("local 2K image upscaling failed: %s", exc)
             return image_bytes, mime_type or "image/jpeg", False, (0, 0), (0, 0)
 
+    async def _upsample_artifacts_bytes(
+        self,
+        items: List[tuple[int, JobArtifact, str]],
+    ) -> Dict[int, ImageUpscaleResult]:
+        """2K a whole batch of images inside one Flow session.
+
+        _with_client opens and validates a Flow project page every time it is
+        called, so the batch shares one session instead of paying that per
+        image. What is left is Google's own upscale, and it is the slow part -
+        about twenty-five seconds an image, five and a half minutes for twelve
+        of them.
+
+        Those five and a half minutes are spent waiting on an HTTPS call, not
+        driving the page, so the batch hands the browser session lock back as
+        soon as its client exists (hold_session_lock=False). That is what makes
+        running two idea cards at once worth anything: without it the second
+        card sat behind the first one's upscales, which is most of a card.
+
+        What it must NOT overlap is another card's batch. Google queues these
+        per account, and two batches in flight cost far more than they save:
+        measured on live cards, 87-105s an image against 31s with the batch
+        alone, and 5 of one card's 12 images came back un-upscaled. So the
+        batches take turns on _flow_upsample_batch_lock while the browser stays
+        free for the next card's generation - which is the overlap that pays.
+
+        Sending several at once inside one batch does not help either: see
+        _flow_upsample_concurrency, which measured it and went back to one. The
+        gate stays because the knob is worth being able to turn.
+        """
+        results: Dict[int, ImageUpscaleResult] = {}
+        if not items or not self._flow_upsample_api_enabled():
+            return results
+        workflow_id = next(
+            (
+                str(artifact.workflow_id or "").strip()
+                for _index, artifact, _url in items
+                if str(artifact.workflow_id or "").strip()
+            ),
+            "",
+        )
+
+        async def _run(client: Any) -> None:
+            gate = asyncio.Semaphore(self._flow_upsample_concurrency())
+
+            async def _one(index: int, artifact: JobArtifact, artifact_url: str) -> None:
+                async with gate:
+                    try:
+                        results[index] = await self._upsample_artifact_bytes(
+                            artifact,
+                            artifact_url,
+                            client=client,
+                            session_lock_held=False,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        # A failed upscale must never cost the image: the caller
+                        # falls back to the original bytes, exactly as it does for
+                        # a single-image failure.
+                        results[index] = ImageUpscaleResult(
+                            failure_reason=humanize_flow_error(str(exc))
+                        )
+
+            await asyncio.gather(
+                *(_one(index, artifact, url) for index, artifact, url in items)
+            )
+
+        try:
+            async with self._flow_upsample_batch_lock:
+                await self._with_client(_run, workflow_id=workflow_id, hold_session_lock=False)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("Flow 2K batch upscaling failed: %s", self._flow_error_detail(exc))
+        return results
+
     async def _upsample_artifact_bytes(
         self,
         artifact: JobArtifact,
         artifact_url: str,
+        *,
+        client: Any = None,
+        session_lock_held: bool = True,
     ) -> ImageUpscaleResult:
         """Fetch an artifact and prepare 2K bytes for ERP upload.
 
         Flow's own 2K upsampler is tried first. Local resize is disabled by
         default because it creates a larger but still blurry file.
+
+        Pass ``client`` to reuse a Flow session the caller already opened;
+        without one this opens its own, which costs a project page load.
+        ``session_lock_held`` says whether that session still owns the browser.
         """
         local_path = str(artifact.local_path or "").strip()
         source_bytes: bytes = b""
@@ -14887,18 +16175,22 @@ exit 1
         if source_size and max(source_size) >= self.ERP_UPSCALE_LONG_EDGE_PX:
             return ImageUpscaleResult()
 
-        async def _go(client: Any) -> bytes:
+        async def _go(client: Any, *, lock_held: bool = True) -> bytes:
             return await self._upsample_image_via_flow(
                 client,
                 source_bytes,
                 media_generation_id=media_generation_id,
                 workflow_id=workflow_id,
+                session_lock_held=lock_held,
             )
 
         flow_upscaled: bytes = b""
         if self._flow_upsample_api_enabled():
             try:
-                flow_upscaled = await self._with_client(_go, workflow_id=workflow_id)
+                if client is not None:
+                    flow_upscaled = await _go(client, lock_held=session_lock_held)
+                else:
+                    flow_upscaled = await self._with_client(_go, workflow_id=workflow_id)
             except Exception as exc:
                 log.warning("Flow 2K upscaling client failed: %s", self._flow_error_detail(exc))
 
@@ -15511,7 +16803,10 @@ exit 1
     # write stays gated in exactly one place.
 
     ERP_REVIEW_PREFIX = "FLOW_V2_REVIEW"
-    ERP_REVIEW_INSTRUCTION = 'Trả lời comment này "DUYỆT" để lấy ảnh, hoặc "BỎ" để loại.'
+    ERP_REVIEW_INSTRUCTION = (
+        'Trả lời comment này 👍 (hoặc "DUYỆT") để lấy ảnh, 👎 (hoặc "BỎ") để loại. '
+        "Ảnh bị 👎 sẽ được gỡ khỏi thẻ."
+    )
     # Reject is matched first on purpose: "không duyệt" contains "duyệt", and a
     # reviewer who writes both words is refusing the image, not approving it.
     ERP_REVIEW_REJECT_WORDS = (
@@ -15532,10 +16827,35 @@ exit 1
         return f"[{self.ERP_REVIEW_PREFIX} {job_id}#{index}]"
 
     def _erp_review_body(self, job_id: str, index: int, total: int) -> str:
-        return (
-            f"{self._erp_review_tag(job_id, index)} Ảnh {index + 1}/{total} chờ duyệt\n\n"
-            f"{self.ERP_REVIEW_INSTRUCTION}"
-        )
+        """Thân bình luận ảnh chờ duyệt: rỗng, để thẻ chỉ có tấm ảnh.
+
+        Dấu và lời hướng dẫn từng nằm ở đây, và trên một thẻ mười hai ảnh thì
+        mười hai lần lặp lại chúng chính là thứ lấp mất ảnh. Dấu chuyển sang
+        ``meta``, lời hướng dẫn về nhật ký lượt chạy; người duyệt vẫn trả lời
+        ngay dưới ảnh như cũ.
+        """
+        return self.ERP_SILENT_COMMENT_BODY
+
+    def _erp_review_meta(self, job_id: str, index: int) -> str:
+        """Dấu máy đọc của một ảnh chờ duyệt, cất ngoài tầm mắt người xem."""
+        return self._erp_review_tag(job_id, index)
+
+    # Thẻ chỉ nên có tấm ảnh. Bỏ trống hẳn thân bình luận thì ERP tự chèn
+    # "(đã đính kèm tệp)", nên thân là một ký tự vô hình: mặt thẻ sạch chữ mà
+    # ERP vẫn nhận đây là bình luận hợp lệ.
+    ERP_SILENT_COMMENT_BODY = "\u200b"
+
+    def _erp_comment_markers(self, comment: Any) -> str:
+        """Mọi dấu app từng ghi lên một bình luận, ghi ở đâu cũng đọc ra.
+
+        Dấu mới nằm trong ``meta`` để mặt thẻ chỉ còn tấm ảnh; bình luận của
+        các lượt chạy cũ vẫn mang dấu trong thân, và chúng phải tiếp tục nhận
+        ra được - nếu không, thẻ đã chạy rồi sẽ bị coi là chưa chạy.
+        """
+        if not isinstance(comment, dict):
+            return ""
+        parts = (str(comment.get("meta") or ""), self._erp_plain_text(comment.get("content")))
+        return " ".join(part for part in parts if part)
 
     def _erp_plain_text(self, content: Any) -> str:
         """Comment bodies arrive as editor HTML; decisions are read as text."""
@@ -15591,6 +16911,7 @@ exit 1
         file_bytes: bytes,
         mime_type: str,
         name: str,
+        meta: str = "",
     ) -> Dict[str, Any]:
         """Post one image with a review body of our own wording.
 
@@ -15600,9 +16921,9 @@ exit 1
         """
         hosted_path = self._erp_upload_file(key, token, task_id, file_bytes, mime_type, name)
         payload = self._erp_graphql(
-            "mutation AddTaskComment($name: String!, $content: String!, $attachments: [String!]) "
-            "{ addTaskComment(name: $name, content: $content, attachments: $attachments) }",
-            {"name": task_id, "content": content, "attachments": [hosted_path]},
+            "mutation AddTaskComment($name: String!, $content: String!, $attachments: [String!], $meta: String) "
+            "{ addTaskComment(name: $name, content: $content, attachments: $attachments, meta: $meta) }",
+            {"name": task_id, "content": content, "attachments": [hosted_path], "meta": meta},
             "AddTaskComment",
             key=key,
             token=token,
@@ -15626,11 +16947,104 @@ exit 1
         for comment in (detail.get("comments") if isinstance(detail, dict) else None) or []:
             if not isinstance(comment, dict):
                 continue
-            match = pattern.search(self._erp_plain_text(comment.get("content")))
+            match = pattern.search(self._erp_comment_markers(comment))
             if match is None or match.group(1) != job_id:
                 continue
             found.setdefault(match.group(2), comment)
         return found
+
+    def _erp_unposted_review_indices(self, job: Any, child_detail: Dict[str, Any]) -> List[int]:
+        """Ảnh của một lượt chạy chưa ai quyết mà cũng chưa có mặt trên thẻ."""
+        approvals = (job.result or {}).get("dashboard_approvals")
+        decided = approvals if isinstance(approvals, dict) else {}
+        on_card = self._erp_review_comment_index(child_detail, job.id)
+        return [
+            index
+            for index in range(len(job.artifacts or []))
+            if str((decided.get(str(index)) or {}).get("status") or "") not in {"approved", "rejected"}
+            and str(index) not in on_card
+        ]
+
+    def _erp_unfinished_review_job_id(self, child_task_id: str, child_detail: Dict[str, Any]) -> str:
+        """Lượt chạy còn ảnh chưa lên được thẻ, khi đăng bù là việc an toàn.
+
+        Ảnh tạo xong rồi mà thẻ vẫn trắng là chuyện thật hay gặp: mạng rớt
+        đúng lúc đăng là đủ, và lượt chạy vẫn ghi ``completed`` nên từ đó về
+        sau thẻ bị coi như đã chạy và cứ thế đứng im. Đăng bù không tốn thêm
+        một lượt Flow nào, nên nó đáng được làm lấy.
+
+        Chỉ ở hai cảnh nắm chắc, để không bao giờ chồng một bộ ảnh nữa lên chỗ
+        người ta đang duyệt dở:
+
+        * **Đúng lượt đang chiếm mặt thẻ** còn sót ảnh chưa đăng — phần còn
+          lại của chính bộ ảnh người ta đang xem, không phải một bộ khác.
+        * **Thẻ trắng trơn** và lượt mới nhất chưa ai quyết tấm nào. Thẻ trắng
+          vì người duyệt vừa bỏ hết ảnh thì lượt ấy có quyết định rồi, nên nó
+          không rơi vào đây, và một lượt cũ hơn không được lôi lên thay chỗ.
+        """
+        jobs = [
+            job
+            for job in self._erp_child_jobs(child_task_id)
+            if str(job.status or "") == "completed" and (job.artifacts or [])
+        ]
+        if not jobs:
+            return ""
+        jobs.sort(key=lambda job: str(job.created_at or ""), reverse=True)
+        owner = next(
+            (job for job in jobs if self._erp_review_comment_index(child_detail, job.id)),
+            None,
+        )
+        if owner is not None:
+            return owner.id if self._erp_unposted_review_indices(owner, child_detail) else ""
+        if self._erp_task_has_flow_output(child_detail) or self._erp_task_has_pending_review(child_detail):
+            # Thẻ có ảnh Flow nhưng không lượt nào ở đây nhận là của mình:
+            # ảnh của một cài đặt khác, hoặc dấu đã bị xoá. Không đụng vào.
+            return ""
+        newest = jobs[0]
+        approvals = (newest.result or {}).get("dashboard_approvals")
+        if isinstance(approvals, dict) and any(
+            str((entry or {}).get("status") or "") in {"approved", "rejected"} for entry in approvals.values()
+        ):
+            return ""
+        return newest.id if self._erp_unposted_review_indices(newest, child_detail) else ""
+
+    def _erp_review_autopublish_enabled(self) -> bool:
+        """Whether a finished job pushes its images onto the card by itself."""
+        raw = os.getenv("ERP_REVIEW_AUTOPUBLISH", "").strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    async def _auto_publish_erp_review(self, job_id: str, request: CreateJobRequest) -> int:
+        """Send the undecided images to the card this job writes to.
+
+        The reviewers live on the ERP board, so a run that stops at the local
+        dashboard looks to them like nothing happened. Best effort: a failed
+        publish leaves the images pending on the dashboard instead of failing
+        a job whose images are already made.
+        """
+        if not request.erp_enabled or not self._erp_review_autopublish_enabled():
+            return 0
+        if not self._erp_output_task_id(request):
+            return 0
+        key, token = self._erp_credentials()
+        if not key or not token:
+            return 0
+        try:
+            posted = await self.publish_erp_review(job_id)
+        except asyncio.CancelledError:
+            raise
+        except HTTPException as exc:
+            await self.store.append_log(
+                job_id,
+                f"Không đăng được ảnh lên thẻ ERP để duyệt: {self._flow_error_detail(exc)}",
+            )
+            return 0
+        except Exception as exc:
+            await self.store.append_log(
+                job_id,
+                f"Không đăng được ảnh lên thẻ ERP để duyệt: {humanize_flow_error(str(exc))}",
+            )
+            return 0
+        return int(posted.get("published") or 0)
 
     async def publish_erp_review(self, job_id: str) -> Dict[str, Any]:
         """Put every undecided image on the ERP card as its own review comment."""
@@ -15653,6 +17067,7 @@ exit 1
         total = len(artifacts)
         published = 0
         failed = 0
+        pending_uploads: List[tuple[int, JobArtifact, str]] = []
         for index, artifact in enumerate(artifacts):
             key_text = str(index)
             decided = str((approvals.get(key_text) or {}).get("status") or "")
@@ -15671,9 +17086,19 @@ exit 1
                     "name": self._erp_attachment_name(job_id, artifact, index),
                 }
                 continue
-            artifact_url = str(artifact.url or artifact.public_url or "").strip()
+            pending_uploads.append((index, artifact, str(artifact.url or artifact.public_url or "").strip()))
+
+        # Every image that is actually going up gets its 2K pass in one Flow
+        # session, before the first upload, instead of reopening a project page
+        # per image while ERP waits.
+        upscaled_by_index = await self._upsample_artifacts_bytes(pending_uploads)
+
+        for index, artifact, artifact_url in pending_uploads:
+            key_text = str(index)
             try:
-                file_bytes, mime_type = await self._erp_outgoing_file_bytes(job_id, artifact, index, artifact_url)
+                file_bytes, mime_type = await self._erp_outgoing_file_bytes(
+                    job_id, artifact, index, artifact_url, upscaled=upscaled_by_index.get(index)
+                )
                 posted = await asyncio.to_thread(
                     self._erp_publish_review_comment,
                     key,
@@ -15683,6 +17108,7 @@ exit 1
                     file_bytes,
                     mime_type,
                     self._erp_attachment_name(job_id, artifact, index),
+                    self._erp_review_meta(job_id, index),
                 )
             except asyncio.CancelledError:
                 raise
@@ -15722,6 +17148,9 @@ exit 1
                 job_id,
                 f"Đã đăng {published} ảnh lên ERP Task {task_id} để duyệt. {self.ERP_REVIEW_INSTRUCTION}",
             )
+            # The card is now waiting on a person, so the board should say so
+            # instead of leaving the idea sitting in "Cần làm".
+            await self._erp_advance_task_status(job_id, task_id, self.ERP_STATUS_PENDING_REVIEW)
         return {
             "job_id": job_id,
             "task_id": task_id,
@@ -15778,16 +17207,10 @@ exit 1
                 if exc.status_code != 409:
                     raise
                 continue
+            # Không viết gì lên thẻ để xác nhận: ảnh được duyệt thì nó ở lại,
+            # ảnh bị bỏ thì bình luận của nó biến mất - thẻ tự nói điều đó rõ
+            # hơn mọi dòng chữ, và dòng chữ ấy thì không ai dọn.
             applied.append({"artifact_index": index, "status": decision, "reviewer": reviewer})
-            await self._erp_confirm_review_decision(
-                job_id,
-                key,
-                token,
-                task_id,
-                str(comment.get("name") or ""),
-                index,
-                decision,
-            )
 
         latest = self.store.get_job(job_id)
         latest_approvals = (latest.result or {}).get("dashboard_approvals") if latest is not None else {}
@@ -15943,6 +17366,288 @@ exit 1
                 except Exception as exc:
                     log.warning("Không đọc được kết quả duyệt ERP của %s: %s", job_id, exc)
 
+    # ── Tự động chạy thẻ con chưa có ảnh ─────────────────────────────────
+    # Adding a card under "Phân rã công việc" is the whole instruction: the
+    # watcher re-reads the configured Idea card and runs the children that
+    # carry no images yet, so nobody has to come back to this app and press a
+    # button for every idea they add.
+
+    ERP_IDEA_AUTORUN_DEFAULT_S = 180
+
+    def _erp_idea_autorun_seconds(self) -> int:
+        raw = os.getenv("ERP_IDEA_AUTORUN_SECONDS", "").strip()
+        if not raw:
+            return self.ERP_IDEA_AUTORUN_DEFAULT_S
+        try:
+            return max(0, int(raw))
+        except ValueError:
+            return self.ERP_IDEA_AUTORUN_DEFAULT_S
+
+    def _erp_idea_autorun_parent_id(self) -> str:
+        """The one Idea card the watcher is allowed to fan out.
+
+        Deliberately the card configured in the ERP panel and nothing else: an
+        empty setting means the watcher does nothing, which is what keeps a
+        fresh install from generating images on cards nobody asked about.
+        """
+        return self._normalize_erp_task_id(
+            str(self.store.snapshot().erp_config.task_id or "").strip()
+            or os.getenv("ERP_TASK_ID", "").strip()
+        )
+
+    def _erp_idea_autorun_count(self) -> int:
+        raw = os.getenv("ERP_IDEA_AUTORUN_COUNT", "").strip()
+        try:
+            return max(0, int(raw)) if raw else 0
+        except ValueError:
+            return 0
+
+    #: Quá bấy nhiêu lượt chạy cho một thẻ idea thì thôi bù thêm.
+    ERP_IDEA_TOPUP_MAX_JOBS = 3
+
+    def _erp_idea_topup_enabled(self) -> bool:
+        """Có tự chạy bù phần ảnh chưa từng được tạo ra hay không."""
+        return os.getenv("ERP_IDEA_TOPUP", "").strip().lower() not in {"0", "false", "no", "off"}
+
+    async def repair_erp_idea_children(self, parent_task_id: str = "") -> Dict[str, Any]:
+        """Vá những thẻ idea đứng im dù app tưởng đã chạy xong.
+
+        Một lượt chạy ghi ``completed`` là từ đó thẻ của nó bị coi như đã xong,
+        kể cả khi mặt thẻ chẳng có tấm ảnh nào. Đó chính là những thẻ "sao nó
+        không chịu chạy": không ai chạy chúng nữa, mãi mãi. Hai chỗ hỏng khác
+        hẳn nhau cùng dẫn tới cảnh ấy, nên có hai cách vá:
+
+        * Ảnh **đã tạo** mà không lên được thẻ (mạng rớt giữa chừng là đủ) —
+          đăng bù đúng bộ ảnh cũ, không tốn thêm lượt Flow nào.
+        * Ảnh **chưa từng được tạo** — lượt chạy hứa mười hai, trả về một. Chỗ
+          thiếu ấy phải chạy thật, nên app xếp một lượt mới cho đúng phần thiếu
+          chứ không chạy lại cả mười hai.
+
+        Thẻ đã ``Completed`` đứng ngoài cả hai: người ta chốt xong rồi.
+        """
+        blank: Dict[str, Any] = {"parent_task_id": "", "republished": [], "topped_up": [], "skipped": []}
+        parent_id = self._normalize_erp_task_id(parent_task_id) or self._erp_idea_autorun_parent_id()
+        if not parent_id:
+            return {**blank, "reason": "chưa cấu hình thẻ Idea cha"}
+        key, token = self._erp_credentials()
+        if not key or not token:
+            return {**blank, "parent_task_id": parent_id, "reason": "chưa có ERP key/secret"}
+
+        detail = await asyncio.to_thread(self._erp_task_detail, key, token, parent_id)
+        republished: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        shortfalls: Dict[int, List[str]] = {}
+        for child in detail.get("children") or []:
+            child_id = (
+                self._normalize_erp_task_id(str(child.get("name") or "")) if isinstance(child, dict) else ""
+            )
+            if not child_id:
+                continue
+            child_detail = await asyncio.to_thread(self._erp_task_detail, key, token, child_id)
+            if self._normalize_erp_id(str(child_detail.get("status") or "")) == self.ERP_STATUS_COMPLETED:
+                continue
+            job_id = self._erp_unfinished_review_job_id(child_id, child_detail)
+            if job_id:
+                try:
+                    outcome = await self.publish_erp_review(job_id)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    skipped.append({"task_id": child_id, "reason": humanize_flow_error(str(exc))})
+                    continue
+                republished.append(
+                    {"task_id": child_id, "job_id": job_id, "published": int(outcome.get("published") or 0)}
+                )
+                continue
+            shortfall = self._erp_idea_image_shortfall(child_id)
+            if not shortfall:
+                continue
+            if not self._erp_idea_topup_enabled():
+                skipped.append({"task_id": child_id, "reason": f"thiếu {shortfall} ảnh, ERP_IDEA_TOPUP đang tắt"})
+                continue
+            if len(self._erp_child_jobs(child_id)) >= self.ERP_IDEA_TOPUP_MAX_JOBS:
+                # Chạy bù mãi mà vẫn thiếu thì chỗ hỏng không nằm ở đây nữa.
+                skipped.append({"task_id": child_id, "reason": f"thiếu {shortfall} ảnh nhưng đã chạy quá nhiều lượt"})
+                continue
+            shortfalls.setdefault(shortfall, []).append(child_id)
+
+        topped_up: List[Dict[str, Any]] = []
+        paused = self._flow_quota_pause_reason() if shortfalls else ""
+        if paused:
+            for count, task_ids in sorted(shortfalls.items()):
+                skipped.extend(
+                    {"task_id": task_id, "reason": f"thiếu {count} ảnh nhưng {paused}"}
+                    for task_id in task_ids
+                )
+            shortfalls = {}
+        for count, task_ids in sorted(shortfalls.items()):
+            outcome = await self.enqueue_erp_idea_jobs(
+                ERPIdeaBatchRequest(
+                    task_id=parent_id,
+                    child_task_ids=task_ids,
+                    count=count,
+                    # Đúng những thẻ vừa đếm ra là thiếu: ba lớp kiểm tra kia
+                    # chính là thứ đang chặn chúng, nên phải bỏ qua.
+                    include_done=True,
+                )
+            )
+            topped_up.append({"count": count, "task_ids": task_ids, "queued": outcome.get("queued") or []})
+        return {
+            "parent_task_id": parent_id,
+            "republished": republished,
+            "topped_up": topped_up,
+            "skipped": skipped,
+        }
+
+    async def autorun_erp_idea_children(self) -> Dict[str, Any]:
+        """Queue every child card of the configured Idea card that has no images."""
+        parent_id = self._erp_idea_autorun_parent_id()
+        if not parent_id:
+            return {"parent_task_id": "", "queued": [], "skipped": [], "reason": "chưa cấu hình thẻ Idea cha"}
+        key, token = self._erp_credentials()
+        if not key or not token:
+            return {"parent_task_id": parent_id, "queued": [], "skipped": [], "reason": "chưa có ERP key/secret"}
+        if any(not task.done() for task in self._tasks.values()):
+            # One browser, one Flow session: let the run in flight finish
+            # instead of queueing a second fan-out on top of it.
+            return {"parent_task_id": parent_id, "queued": [], "skipped": [], "reason": "đang có lượt chạy"}
+        # Vá trước, chạy mới sau: thẻ đứng im vì một lượt chạy hỏng dở thì nó
+        # không nằm trong danh sách "chưa chạy" của bước dưới, nên bước dưới
+        # không bao giờ nhìn thấy nó.
+        repaired = await self.repair_erp_idea_children(parent_id)
+        # Vá xong mới hỏi quota: đăng bù ảnh đã tạo sẵn không cần Flow.
+        paused = self._flow_quota_pause_reason()
+        if paused:
+            return {
+                "parent_task_id": parent_id,
+                "queued": [],
+                "skipped": [],
+                "reason": paused,
+                "repaired": repaired,
+            }
+        outcome = await self.enqueue_erp_idea_jobs(
+            ERPIdeaBatchRequest(task_id=parent_id, count=self._erp_idea_autorun_count())
+        )
+        outcome["repaired"] = repaired
+        return outcome
+
+    async def watch_erp_idea_children(self) -> None:
+        """Poll the Idea card so a newly added child runs on its own."""
+        interval = self._erp_idea_autorun_seconds()
+        if interval <= 0:
+            return
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                outcome = await self.autorun_erp_idea_children()
+            except asyncio.CancelledError:
+                raise
+            except HTTPException as exc:
+                # No children yet, or the card moved out of the project: both
+                # are ordinary states of a board people are still editing.
+                log.debug("Bỏ qua lượt tự chạy idea: %s", exc.detail)
+                continue
+            except Exception as exc:
+                log.warning("Không tự chạy được thẻ con ERP: %s", exc)
+                continue
+            created = outcome.get("created") or []
+            if created:
+                log.info(
+                    "Ảnh mới thả trên %s đã thành %s thẻ con: %s.",
+                    outcome.get("parent_task_id"),
+                    len(created),
+                    ", ".join(str(item.get("task_id")) for item in created),
+                )
+            queued = outcome.get("queued") or []
+            if queued:
+                log.info(
+                    "Tự chạy %s thẻ con mới của %s: %s",
+                    len(queued),
+                    outcome.get("parent_task_id"),
+                    ", ".join(str(item.get("task_id")) for item in queued),
+                )
+            for item in (outcome.get("repaired") or {}).get("republished") or []:
+                log.info(
+                    "Đăng bù %s ảnh đã tạo lên %s.", item.get("published"), item.get("task_id")
+                )
+            for item in (outcome.get("repaired") or {}).get("topped_up") or []:
+                log.info(
+                    "Chạy bù %s ảnh còn thiếu cho %s.",
+                    item.get("count"),
+                    ", ".join(str(task_id) for task_id in item.get("task_ids") or []),
+                )
+
+    # ── Agent bot ────────────────────────────────────────────────────────
+    # The watcher above needs one Idea card named in the settings panel. The
+    # agent bot needs nothing named anywhere: whoever attaches the bot to a
+    # card on the ERP has already said which cards it runs, and the same bot
+    # identity then cleans up its own images according to 👍/👎. This section
+    # is only the wiring — the bot itself lives in `agent_bot.py`, because it
+    # authenticates as a different identity than every other ERP call here.
+
+    def agent_bot(self) -> AgentBot | None:
+        """The configured agent bot, built once, or None when it has no token."""
+        existing = getattr(self, "_agent_bot", None)
+        if existing is not None:
+            return existing
+        config = AgentBotConfig.from_env(self._erp_base_url())
+        # Một agent, hai loại thẻ. Thẻ ảnh đi vào `_agent_bot_autorun` như cũ;
+        # thẻ viết `action_1: listing` đi sang bản Listing qua cầu HTTP. Chưa
+        # đặt ERP_LISTING_API_URL thì hook là None và bot chỉ nhận diện rồi
+        # để yên — đúng trạng thái của một máy chưa dựng bản Listing.
+        listing = ListingBridge(ListingBridgeConfig.from_env())
+        bot = build_agent_bot(
+            config,
+            autorun_hook=self._agent_bot_autorun,
+            listing_hook=build_listing_hook(listing),
+        )
+        self._agent_bot = bot
+        return bot
+
+    async def _agent_bot_autorun(self, parent_task_id: str) -> Dict[str, Any]:
+        """Run the Idea card the agent was attached to.
+
+        Deliberately the same entry point the dashboard button uses, so an
+        agent-triggered run and a hand-triggered one cannot drift apart: it
+        already skips children that carry images and already refuses a card
+        outside the allowed projects.
+        """
+        if any(not task.done() for task in self._tasks.values()):
+            # One browser, one Flow session. Letting the run in flight finish
+            # is what keeps the agent from stacking fan-outs on top of it.
+            return {"parent_task_id": parent_task_id, "queued": [], "reason": "đang có lượt chạy"}
+        repaired = await self.repair_erp_idea_children(parent_task_id)
+        paused = self._flow_quota_pause_reason()
+        if paused:
+            return {
+                "parent_task_id": parent_task_id,
+                "queued": [],
+                "reason": paused,
+                "repaired": repaired,
+            }
+        outcome = await self.enqueue_erp_idea_jobs(
+            ERPIdeaBatchRequest(task_id=parent_task_id, count=self._erp_idea_autorun_count())
+        )
+        outcome["repaired"] = repaired
+        return outcome
+
+    async def run_agent_bot_once(self) -> Dict[str, Any]:
+        """One scan now, for the dashboard button and for tests."""
+        bot = self.agent_bot()
+        if bot is None:
+            return {"enabled": False, "reason": "chưa cấu hình ERP_AGENT_TOKEN"}
+        try:
+            return await bot.run_once()
+        except AgentBotError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def watch_agent_bot(self) -> None:
+        """Poll on a timer so attaching the agent is the only thing to do."""
+        bot = self.agent_bot()
+        if bot is None:
+            return
+        await bot.run_forever()
+
     def _erp_reply_decision(self, comment: Dict[str, Any]) -> tuple[str, str]:
         """The first decisive human reply under a review comment.
 
@@ -15962,47 +17667,106 @@ exit 1
             decision = self._erp_review_decision(body)
             if decision:
                 return decision, str(reply.get("by_name") or reply.get("comment_by") or "").strip()
+        return self._erp_vote_decision(comment)
+
+    def _erp_vote_decision(self, comment: Dict[str, Any]) -> tuple[str, str]:
+        """The 👍/👎 buttons on the comment itself, when nobody typed a reply.
+
+        The ERP grew vote buttons after this flow was built, and a reviewer who
+        presses one has plainly answered — leaving those images pending forever
+        because the answer was not typed out would be the app ignoring the
+        reviewer. Read second, though: a reply says who decided and why, a
+        count does not.
+
+        A tie is deliberately no decision at all, the same rule the agent bot
+        uses: rejection deletes the image off the card and cannot be undone.
+        """
+        if not isinstance(comment, dict):
+            return "", ""
+        like = int(comment.get("like_count") or 0)
+        dislike = int(comment.get("dislike_count") or 0)
+        if dislike > like:
+            return "rejected", "👎 trên thẻ ERP"
+        if like > dislike:
+            return "approved", "👍 trên thẻ ERP"
         return "", ""
 
-    async def _erp_confirm_review_decision(
+    # Sources whose rejection is a person saying "không thích". The watermark
+    # gate also writes rejections, and those images must stay on the card:
+    # reopen_watermark_rejections hands them back once the mark is cleaned.
+    ERP_REVIEW_HUMAN_SOURCES = ("dashboard", "erp", "telegram")
+
+    async def _erp_discard_rejected_review_image(
         self,
         job_id: str,
-        key: str,
-        token: str,
-        task_id: str,
-        parent_comment: str,
-        index: int,
-        decision: str,
-    ) -> None:
-        """Answer the reviewer on the card so the decision is visible there."""
-        if not parent_comment:
-            return
-        mark = "✅ Đã duyệt" if decision == "approved" else "❌ Đã bỏ"
-        body = (
-            f"[{self.ERP_REVIEW_PREFIX}_RESULT] {mark} ảnh {index + 1}."
-            + (
-                ""
-                if decision == "approved"
-                else " Ảnh vẫn giữ trên thẻ để đối chiếu, không ghi vào kết quả cuối."
-            )
-        )
+        artifact_index: int,
+        reviewer: str = "",
+    ) -> bool:
+        """Take a disliked image off the ERP card.
+
+        A rejected image used to stay on the card "để đối chiếu", which left
+        the reviewers scrolling past pictures they had already turned down. The
+        comment carrying the image is removed instead.
+
+        Deliberately no note is left behind. There used to be one per rejected
+        image, and on a card with a dozen images those notes became the thing
+        the reviewer had to scroll past - the same clutter, one step removed.
+        The reviewer pressed the button themselves, so the card needs no receipt;
+        the trail lives in the job log on the dashboard.
+        """
+        job = self.store.get_job(job_id)
+        if job is None:
+            return False
+        result = dict(job.result or {})
+        review = result.get("erp_review") if isinstance(result.get("erp_review"), dict) else {}
+        items = dict(review.get("items") or {}) if isinstance(review.get("items"), dict) else {}
+        entry = items.get(str(artifact_index))
+        entry = dict(entry) if isinstance(entry, dict) else {}
+        comment_id = str(entry.get("comment") or "").strip()
+        task_id = self._normalize_erp_task_id(str(review.get("task_id") or ""))
+        if not comment_id or not task_id or entry.get("deleted_at"):
+            return False
+        key, token = self._erp_credentials()
+        if not key or not token:
+            return False
+
+        who = str(reviewer or "").strip()
         try:
-            await asyncio.to_thread(
-                self._erp_reply_comment,
-                key,
-                token,
-                task_id,
-                body,
-                parent_comment=parent_comment,
-            )
+            await asyncio.to_thread(self._erp_delete_task_comment, key, token, task_id, comment_id)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             await self.store.append_log(
                 job_id,
-                f"Đã ghi nhận quyết định ảnh {index + 1} nhưng không trả lời được trên ERP: "
-                f"{humanize_flow_error(str(exc))}",
+                f"Không gỡ được ảnh {artifact_index + 1} khỏi ERP Task {task_id}: {humanize_flow_error(str(exc))}",
             )
+            return False
+
+        # Re-read: the approval that triggered this has just been written.
+        latest = self.store.get_job(job_id)
+        result = dict((latest.result if latest is not None else job.result) or {})
+        review = dict(result.get("erp_review") or {}) if isinstance(result.get("erp_review"), dict) else {}
+        items = dict(review.get("items") or {}) if isinstance(review.get("items"), dict) else {}
+        # The comment is gone, so nothing may point at it again: publish skips
+        # decided images and the archive only ever reuses approved ones.
+        items[str(artifact_index)] = {**entry, "comment": "", "url": "", "id": "", "deleted_at": utc_now()}
+        review["items"] = items
+        result["erp_review"] = review
+        await self.store.patch_job(job_id, result=result)
+        # The card no longer carries a note, so this line is the only record of
+        # who dropped the image: name them here. A vote names the button rather
+        # than a person, so it reads "theo 👎 trên thẻ ERP" instead.
+        if who.startswith(("👍", "👎")):
+            reason = f"theo {who}"
+        elif who:
+            reason = f"vì {who} không thích"
+        else:
+            reason = "vì người duyệt không thích"
+        await self.store.append_log(
+            job_id,
+            f"Đã gỡ ảnh {artifact_index + 1} khỏi ERP Task {task_id} {reason}.",
+        )
+        return True
 
     async def apply_dashboard_approval(
         self,
@@ -16061,6 +17825,8 @@ exit 1
         label = "đã duyệt" if decision == "approved" else "đã từ chối"
         surface = "trên ERP" if str(source or "") == "erp" else "trên dashboard"
         await self.store.append_log(job_id, f"{reviewer_name} {label} ảnh {artifact_index + 1} {surface}.")
+        if decision == "rejected" and str(source or "dashboard") in self.ERP_REVIEW_HUMAN_SOURCES:
+            await self._erp_discard_rejected_review_image(job_id, artifact_index, reviewer_name)
         if approval_module_id and summary.get("pending") == 0:
             await self._resume_automation_after_approval(job_id, approval_module_id)
         return approval
@@ -16458,7 +18224,23 @@ exit 1
         fn: Callable[[Any], Any],
         workflow_id: str = "",
         timeout_s: int = 0,
+        hold_session_lock: bool = True,
     ) -> Any:
+        """Run ``fn`` against a Flow client.
+
+        There is one browser, so opening and validating the project page is
+        always exclusive. Whether ``fn`` itself is exclusive is the caller's
+        call. The default says yes, because most callers drive the page - the
+        Agent panel, the prompt box, the download menu - and two of those at
+        once would read each other's output.
+
+        ``hold_session_lock=False`` releases the lock the moment the client
+        exists. Only pass it for work that stays inside ``client._api``, which
+        is plain HTTPS through the browser's request context and touches the
+        page only to read a token. The 2K batch is the case it was written
+        for: twelve images, about five and a half minutes, nearly all of it
+        waiting on Google with the browser sitting idle underneath.
+        """
         FlowClient, _, _, _, _ = self._flow_modules(client_only=True)
         config = self._normalized_config(self.store.snapshot().config)
         profiles = self._flow_profile_specs() if self._should_keep_flow_browser_open(config) else []
@@ -16468,12 +18250,14 @@ exit 1
         resolved_workflow_id = workflow_id or config.active_workflow_id or None
 
         if self._should_keep_flow_browser_open(config):
-            async with self._browser_session_lock:
-                attempts = max(1, len(profiles))
-                last_quota_error: Exception | None = None
-                attempted_source_profiles: set[str] = set()
-                attempted_try_again_profiles: set[str] = set()
-                for _ in range(attempts):
+            attempts = max(1, len(profiles))
+            last_quota_error: Exception | None = None
+            attempted_source_profiles: set[str] = set()
+            attempted_try_again_profiles: set[str] = set()
+            for _ in range(attempts):
+                await self._browser_session_lock.acquire()
+                session_held = True
+                try:
                     profile = self._current_flow_profile()
                     if self._flow_profile_is_quota_blocked(profile):
                         raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail())
@@ -16488,6 +18272,12 @@ exit 1
                             workflow_id=resolved_workflow_id,
                             timeout_s=effective_timeout_s,
                         )
+                        if not hold_session_lock:
+                            # The page is built and valid; from here on this
+                            # caller only talks HTTPS, so the next job can have
+                            # the browser.
+                            self._browser_session_lock.release()
+                            session_held = False
                         result = await fn(client)
                         await self._reset_flow_profile_agent_try_again_errors(profile)
                         return result
@@ -16543,12 +18333,17 @@ exit 1
                             status_code=self._flow_error_status(exc),
                             detail=self._flow_error_detail(exc),
                         ) from exc
+                finally:
+                    # A retry re-enters the loop and takes the lock again, so
+                    # release it on every way out of the attempt.
+                    if session_held:
+                        self._browser_session_lock.release()
 
-                if last_quota_error is not None:
-                    raise HTTPException(
-                        status_code=429,
-                        detail=self._flow_error_detail(last_quota_error),
-                    ) from last_quota_error
+            if last_quota_error is not None:
+                raise HTTPException(
+                    status_code=429,
+                    detail=self._flow_error_detail(last_quota_error),
+                ) from last_quota_error
 
         try:
             client = await FlowClient.create(
@@ -16576,7 +18371,14 @@ exit 1
             await client.close()
 
     def _should_keep_flow_browser_open(self, config: AppConfig) -> bool:
-        return not config.headless and not config.cdp_url
+        """Chỉ ``cdp_url`` mới đẩy Flow ra khỏi trình duyệt dùng chung.
+
+        ``headless`` từng nằm ở đây, và nó biến việc tắt cửa sổ thành một cái
+        giá quá đắt: mỗi job dựng riêng một trình duyệt, danh sách profile bị
+        bỏ trắng, hết lượt cũng không xoay vòng. Giờ ``headless`` chỉ còn quyết
+        định cửa sổ có hiện ra hay không, đúng nghĩa của nó.
+        """
+        return not config.cdp_url
 
     def _split_flow_profile_env(self, raw: str) -> List[str]:
         normalized = str(raw or "").replace("\r", "\n").replace("|", "\n")
@@ -16702,14 +18504,44 @@ exit 1
     def _flow_profile_project_id(self, profile: FlowBrowserProfile, fallback_project_id: str = "") -> str:
         return self._normalize_project_id(profile.project_id or fallback_project_id)
 
+    #: Google trả quota Agent theo ngày múi giờ Thái Bình Dương.
+    FLOW_QUOTA_RESET_TZ = "America/Los_Angeles"
+    #: Đến mốc reset mà quota vẫn chưa về thì chờ chừng này rồi thăm dò tiếp.
+    FLOW_QUOTA_MIN_BLOCK_S = 30.0 * 60.0
+
     def _flow_profile_block_seconds(self) -> float:
+        """Khoá một profile bao lâu sau khi nó báo hết quota Agent.
+
+        Khoá cứng 24 giờ là sai chu kỳ: quota về vào nửa đêm giờ Thái Bình
+        Dương, nên profile hết quota lúc 05:36 sáng PT ngày 18/08 vẫn bị app
+        nhốt tới 05:36 sáng hôm sau, trong khi 01:00 PT chạy lại đã ra ảnh
+        bình thường — gần năm tiếng đứng im vì chính app, không phải vì Google.
+        Mốc mở khoá vì thế là nửa đêm PT gần nhất, kèm sàn nửa giờ để lỡ
+        Google trả muộn thì app cũng không thử lại liên tục.
+        """
         raw = os.getenv("FLOW_CHROME_PROFILE_QUOTA_BLOCK_S", "").strip()
         if not raw:
             raw = os.getenv("FLOW_PROFILE_QUOTA_BLOCK_S", "").strip()
+        if raw:
+            try:
+                return max(60.0, float(raw))
+            except ValueError:
+                pass
+        return max(self.FLOW_QUOTA_MIN_BLOCK_S, self._seconds_until_flow_quota_reset())
+
+    def _seconds_until_flow_quota_reset(self) -> float:
+        """Còn bao lâu tới nửa đêm giờ Thái Bình Dương kế tiếp."""
         try:
-            return max(60.0, float(raw)) if raw else 24.0 * 60.0 * 60.0
-        except ValueError:
-            return 24.0 * 60.0 * 60.0
+            from zoneinfo import ZoneInfo
+
+            tz: Any = ZoneInfo(self.FLOW_QUOTA_RESET_TZ)
+        except Exception:
+            # Thiếu tzdata thì lấy PT mùa hè; lệch một giờ vào mùa đông,
+            # vẫn đúng hơn nhiều so với khoá cứng cả ngày.
+            tz = timezone(timedelta(hours=-7))
+        now = datetime.now(tz)
+        reset = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        return max(0.0, (reset - now).total_seconds())
 
     def _flow_agent_try_again_threshold(self) -> int:
         raw = (
@@ -16771,6 +18603,27 @@ exit 1
             return True
         self._flow_profile_quota_blocked_until.pop(profile.key, None)
         return False
+
+    def _flow_quota_pause_reason(self) -> str:
+        """Lý do hoãn một lượt chạy tự động, rỗng nếu còn profile dùng được.
+
+        Lượt chạy nào cũng chết ngay ở bước mở Flow khi mọi profile đang bị
+        khoá quota, mà mỗi lượt vẫn kịp đẻ ra một job hỏng cho từng thẻ con.
+        Watcher ba phút một vòng nên chỉ trong buổi sáng 19/08, sáu thẻ đã
+        sinh đủ 50 job hỏng và đẩy sạch lịch sử thật ra khỏi dashboard. Hoãn
+        hẳn vòng chạy là cách giữ lịch sử ấy.
+        """
+        profiles = self._flow_profile_specs()
+        if not profiles:
+            return ""
+        if not all(self._flow_profile_is_quota_blocked(profile) for profile in profiles):
+            return ""
+        blocked_until = max(
+            float(self._flow_profile_quota_blocked_until.get(profile.key, 0.0) or 0.0)
+            for profile in profiles
+        )
+        stamp = datetime.fromtimestamp(blocked_until).astimezone().strftime("%H:%M %d/%m")
+        return f"mọi profile Flow đang hết quota Agent, chờ tới {stamp}"
 
     def _current_flow_profile(self) -> FlowBrowserProfile:
         profiles = self._flow_profile_specs()
@@ -16856,7 +18709,16 @@ exit 1
 
     async def _mark_flow_profile_quota_limited(self, profile: FlowBrowserProfile, exc: Exception) -> None:
         self._flow_profile_quota_blocked_until = self._valid_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
-        self._flow_profile_quota_blocked_until[profile.key] = time.time() + self._flow_profile_block_seconds()
+        blocked_until = time.time() + self._flow_profile_block_seconds()
+        self._flow_profile_quota_blocked_until[profile.key] = blocked_until
+        # Khoá quota trước đây không để lại dòng nào trong log, nên khi cả một
+        # buổi sáng không thẻ nào chạy thì log chẳng nói được vì sao.
+        log.info(
+            "Flow profile %s hết quota Agent, khoá tới %s (%s).",
+            profile.label,
+            datetime.fromtimestamp(blocked_until).astimezone().strftime("%H:%M %d/%m"),
+            humanize_flow_error(str(exc)),
+        )
         await self.store.replace_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
         self._flow_profile_agent_retry_error_counts.pop(profile.key, None)
         await self.store.replace_flow_profile_agent_retry_error_counts(self._flow_profile_agent_retry_error_counts)
@@ -17039,6 +18901,7 @@ exit 1
         browser = self._shared_browser
         self._shared_browser = None
         self._shared_browser_profile_key = ""
+        self._shared_browser_headless = False
         if browser is None:
             return
         try:
@@ -17046,11 +18909,15 @@ exit 1
         except Exception:
             pass
 
-    async def _shared_browser_is_usable(self, profile: FlowBrowserProfile | None = None) -> bool:
+    async def _shared_browser_is_usable(
+        self, profile: FlowBrowserProfile | None = None, headless: bool | None = None
+    ) -> bool:
         browser = self._shared_browser
         if browser is None or getattr(browser, "_ctx", None) is None:
             return False
         if profile is not None and self._shared_browser_profile_key != profile.key:
+            return False
+        if headless is not None and bool(self._shared_browser_headless) != bool(headless):
             return False
         try:
             page = await browser.page()
@@ -17061,9 +18928,23 @@ exit 1
         except Exception:
             return False
 
-    async def _ensure_shared_browser(self, profile: FlowBrowserProfile | None = None) -> Any:
+    async def _ensure_shared_browser(
+        self, profile: FlowBrowserProfile | None = None, *, visible: bool = False
+    ) -> Any:
+        """Trình duyệt dùng chung, ẩn hay hiện là do ``headless`` trong cấu hình.
+
+        ``visible=True`` ép hiện cửa sổ bất kể cấu hình - dành cho những việc
+        người dùng phải tự tay làm, mà trước hết là đăng nhập Google. Bật
+        ``headless`` rồi thì mọi việc chạy job đều không còn cửa sổ nào nhảy ra
+        giữa màn hình, nhưng vẫn đúng một trình duyệt sống lâu dùng chung, vẫn
+        đủ danh sách profile và vẫn xoay vòng khi một profile hết lượt - khác
+        hẳn lối cũ, nơi bật ``headless`` là rơi sang một client dựng mới cho
+        từng job và bỏ quên cả cơ chế profile.
+        """
+        config = self.store.snapshot().config
+        headless = bool(getattr(config, "headless", False)) and not visible
         selected_profile = profile or self._current_flow_profile()
-        if await self._shared_browser_is_usable(selected_profile):
+        if await self._shared_browser_is_usable(selected_profile, headless):
             return self._shared_browser
         await self._close_shared_browser()
         # A first-time install downloads ~150MB, so keep it off the event loop
@@ -17074,14 +18955,14 @@ exit 1
             selected_profile.path.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
-        browser = BrowserManager(headless=False, profile_dir=selected_profile.path)
+        browser = BrowserManager(headless=headless, profile_dir=selected_profile.path)
         await browser.start()
-        config = self.store.snapshot().config
         project_id = self._flow_profile_project_id(selected_profile, self._normalize_project_id(config.project_id or config.project_url))
         target_url = self._project_url(project_id) if project_id else "https://labs.google/fx/tools/flow"
         await self._close_placeholder_flow_tabs(browser, target_url)
         self._shared_browser = browser
         self._shared_browser_profile_key = selected_profile.key
+        self._shared_browser_headless = headless
         return browser
 
     async def _build_client_from_shared_browser(
@@ -17143,7 +19024,23 @@ exit 1
 
         return BrowserManager, is_authenticated, load_projects, get_active_project, sync_project
 
+    @classmethod
+    def _patch_playwright_headless_channel(cls) -> None:
+        """Vá một lần cho cả tiến trình: mở ẩn là dùng Chromium đầy đủ."""
+        if cls._PLAYWRIGHT_HEADLESS_PATCHED:
+            return
+        try:
+            from playwright.async_api import BrowserType
+        except Exception:  # pragma: no cover - không có Playwright thì thôi
+            cls._PLAYWRIGHT_HEADLESS_PATCHED = True
+            return
+        original = BrowserType.launch_persistent_context
+        if not getattr(original, "__flow_v2_full_chromium__", False):
+            BrowserType.launch_persistent_context = _full_chromium_headless_launcher(original)
+        cls._PLAYWRIGHT_HEADLESS_PATCHED = True
+
     def _patch_flow_runtime_compat(self) -> None:
+        self._patch_playwright_headless_channel()
         if self.__class__._FLOW_RUNTIME_PATCHED:
             return
 
@@ -22231,7 +24128,11 @@ exit 1
                     ),
                 )
 
-        network_wait_s = min(ui_timeout_s, 45.0) if flow_agent_enabled else ui_timeout_s
+        network_wait_s = (
+            min(ui_timeout_s, self._flow_agent_network_wait_seconds())
+            if flow_agent_enabled
+            else ui_timeout_s
+        )
         try:
             result = await interceptor.wait_for(
                 "batchGenerateImages",
@@ -23001,13 +24902,13 @@ exit 1
                   const text = panel.text || '';
                   const probe = String(promptProbe || '').trim();
                   const composerText = textboxes
-                    .map((el) => `${el.value || ''} ${el.textContent || ''}`.replace(/\s+/g, ' ').trim())
+                    .map((el) => `${el.value || ''} ${el.textContent || ''}`.replace(/\\s+/g, ' ').trim())
                     .join('\\n');
                   const transcript = panel.el.cloneNode(true);
                   for (const editor of transcript.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')) {
                     editor.remove();
                   }
-                  const transcriptText = (transcript.textContent || '').replace(/\s+/g, ' ').trim();
+                  const transcriptText = (transcript.textContent || '').replace(/\\s+/g, ' ').trim();
                   const hasPrompt = probe.length >= 16 && transcriptText.includes(probe);
                   const hasPromptInTextbox = probe.length >= 16 && composerText.includes(probe);
                   return {
@@ -23133,7 +25034,7 @@ exit 1
                       const rightZone = rect.left >= composerRect.left + composerRect.width * 0.62;
                       const compact = rect.width <= 96 && rect.height <= 96;
                       const sendish = /arrow_forward|arrow_upward|send|gửi|gui|tạo|tao|create/i.test(label);
-                      const excluded = /close|cancel|dismiss|attach|add|plus|settings|tune|menu|more|delete|remove|clear|đóng|dong|hủy|huy|đính\s*kèm|dinh\s*kem|cài\s*đặt|cai\s*dat/i.test(label);
+                      const excluded = /close|cancel|dismiss|attach|add|plus|settings|tune|menu|more|delete|remove|clear|đóng|dong|hủy|huy|đính\\s*kèm|dinh\\s*kem|cài\\s*đặt|cai\\s*dat/i.test(label);
                       const score = (inRightPanel ? 700 : -1000)
                         + (nearComposerBottom ? 1200 : -700)
                         + (insideComposerY ? 700 : -400)
@@ -23672,10 +25573,10 @@ exit 1
                       return { label: labelFor(el), area: rect.width * rect.height };
                     })
                     .filter((item) => item.area >= 900 && item.label.length > 0 && item.label.length <= 220)
-                    .filter((item) => /upload|attached|attachment|thumbnail|preview|file|media|image|photo|picture|remove.*image|xoa.*anh|áº£nh|anh/i.test(item.label))
+                    .filter((item) => /upload|attached|attachment|thumbnail|preview|file|media|image|photo|picture|remove.*image|xoa.*anh|ảnh|anh/i.test(item.label))
                     .map((item) => item.label.slice(0, 80))
                     .slice(0, 12);
-                  const busyLabel = (label) => /uploading|loading|progress|spinner|pending|processing|dang\s*tai|dang\s*upload|tai\s*len|cho\s*tai|Ä‘ang\s*táº£i|Ä‘ang\s+upload|Ä‘ang\s+xá»­\s*lÃ½|ch\u1edd\s*t\u1ea3i/i.test(label || '');
+                  const busyLabel = (label) => /uploading|loading|progress|spinner|pending|processing|dang\\s*tai|dang\\s*upload|tai\\s*len|cho\\s*tai|đang\\s*tải|đang\\s+upload|đang\\s+xử\\s*lý|ch\u1edd\\s*t\u1ea3i/i.test(label || '');
                   const busyIndicators = deepQuery('[role="progressbar"], progress, mat-spinner, [class*="spinner" i], [class*="loading" i], [aria-busy="true"]', panel.el)
                     .filter((el) => visible(el, 12, 12))
                     .filter((el) => inPanelAttachmentArea(el) && !insideTextbox(el))
@@ -23693,7 +25594,7 @@ exit 1
                     .filter((el) => inCurrentComposer(el))
                     .map((el) => labelFor(el))
                     .filter((label) => label.length > 0 && label.length <= 220)
-                    .filter((label) => /\.jpe?g|\.png|\.webp|\.heic|erp-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label));
+                    .filter((label) => /\\.jpe?g|\\.png|\\.webp|\\.heic|erp-|source|upload(ed)?|attached|attachment|thumbnail|preview|file|media|ảnh|anh|image/i.test(label));
                   const composerCards = deepQuery('[data-testid], [aria-label], [title], [class]', panel.el)
                     .filter((el) => visible(el, 24, 18))
                     .filter((el) => inCurrentComposer(el))
@@ -24033,7 +25934,7 @@ exit 1
                     el?.getAttribute?.('aria-label') || '',
                     el?.getAttribute?.('title') || '',
                     el?.getAttribute?.('data-testid') || '',
-                  ].join(' ').replace(/\s+/g, ' ').trim();
+                  ].join(' ').replace(/\\s+/g, ' ').trim();
                   const clippedRect = (rect) => ({
                     left: Math.max(0, rect.left),
                     top: Math.max(0, rect.top),
@@ -24059,7 +25960,7 @@ exit 1
                         const rect = candidate.getBoundingClientRect();
                         const text = labelFor(candidate);
                         const hasTextbox = Boolean(candidate.querySelector('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]'));
-                        const agentish = /Flow\s+Agent|Tác\s*nhân|Tac\s*nhan|Bạn\s*muốn|Ban\s*muon|What\s+do\s+you|Phiên\s+không\s+có\s+tiêu\s+đề|Phien\s+khong\s+co\s+tieu\s+de/i.test(text);
+                        const agentish = /Flow\\s+Agent|Tác\\s*nhân|Tac\\s*nhan|Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|Phiên\\s+không\\s+có\\s+tiêu\\s+đề|Phien\\s+khong\\s+co\\s+tieu\\s+de/i.test(text);
                         const score = (hasTextbox ? 900 : 0) + (agentish ? 700 : 0) + rect.right / 10 + rect.height / 20;
                         return { el: candidate, rect, score };
                       })
@@ -24084,7 +25985,7 @@ exit 1
                           && style.display !== 'none'
                           && style.visibility !== 'hidden'
                           && style.opacity !== '0';
-                        const addish = /\+|add_2|add|attach|upload|image|media|file|ảnh|anh|hình|hinh|thêm|them/i.test(label);
+                        const addish = /\\+|add_2|add|attach|upload|image|media|file|ảnh|anh|hình|hinh|thêm|them/i.test(label);
                         const leftish = rect.left <= panelRect.left + panelRect.width * 0.32;
                         const nearBottom = rect.bottom >= panelRect.bottom - Math.max(180, panelRect.height * 0.28);
                         const score = (visibleControl ? 1000 : -9999) + (addish ? 1000 : 0) + (leftish ? 350 : 0) + (nearBottom ? 350 : 0) - Math.abs(rect.bottom - panelRect.bottom) / 4;
@@ -24116,7 +26017,7 @@ exit 1
                         const rect = candidate.getBoundingClientRect();
                         const clipped = clippedRect(rect);
                         const label = labelFor(candidate);
-                        const agentish = /Bạn\s*muốn\s*tạo\s*gì|Ban\s*muon\s*tao\s*gi|What\s+do\s+you|prompt|create/i.test(label);
+                        const agentish = /Bạn\\s*muốn\\s*tạo\\s*gì|Ban\\s*muon\\s*tao\\s*gi|What\\s+do\\s+you|prompt|create/i.test(label);
                         const score = (agentish ? 800 : 0) + clipped.bottom / 10 + clipped.height / 30;
                         return { candidate, rect, clipped, label, score };
                       })

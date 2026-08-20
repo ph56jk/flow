@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
@@ -68,20 +69,51 @@ def load_local_env() -> None:
         os.environ[key] = _strip_env_quotes(value)
 
 
+def configure_logging() -> None:
+    """Cho log của app đi ra cùng chỗ với log uvicorn.
+
+    Uvicorn chỉ gắn handler cho logger của chính nó, nên khi máy trung tâm
+    chạy 24/7 không ai ngồi trước màn hình thì mọi dòng INFO của agent bot và
+    các watcher rơi vào hư không. Gắn handler cho root logger một lần lúc
+    khởi động để file log ghi lại được bot đã quét và chạy thẻ nào.
+    """
+
+    level_name = os.environ.get("FLOW_LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    level = getattr(logging, level_name, logging.INFO)
+    root = logging.getLogger()
+    root.setLevel(level)
+    if not any(getattr(handler, "_flow_web_handler", False) for handler in root.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+        )
+        handler._flow_web_handler = True  # type: ignore[attr-defined]
+        root.addHandler(handler)
+    logging.getLogger("flow_web").setLevel(level)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_app_dirs()
     load_local_env()
+    configure_logging()
     store = StateStore()
     app.state.flow_service = FlowWebService(store)
     sync_task = asyncio.create_task(app.state.flow_service.ensure_media_skill_library())
     # Reviewers answer on the ERP card, so the decisions have to be fetched
     # here instead of waiting for somebody to open this app.
     erp_review_task = asyncio.create_task(app.state.flow_service.watch_erp_reviews())
+    # Adding a child card under the Idea card is the only instruction needed:
+    # this picks up the ones that still have no images and runs them.
+    erp_idea_task = asyncio.create_task(app.state.flow_service.watch_erp_idea_children())
+    # Attaching the agent bot to a card on the ERP is the whole instruction:
+    # this reads those cards, applies 👍/👎, and runs the ones that need work.
+    # No token configured means the coroutine returns at once.
+    agent_bot_task = asyncio.create_task(app.state.flow_service.watch_agent_bot())
     try:
         yield
     finally:
-        for task in (sync_task, erp_review_task):
+        for task in (sync_task, erp_review_task, erp_idea_task, agent_bot_task):
             task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
@@ -145,6 +177,24 @@ async def ready_erp_status(request: Request, payload: ResetReadyERPRequest) -> D
 @app.post("/api/erp/idea-batch")
 async def enqueue_erp_idea_jobs(request: Request, payload: ERPIdeaBatchRequest) -> Dict[str, Any]:
     return await service(request).enqueue_erp_idea_jobs(payload)
+
+
+@app.post("/api/erp/idea-batch/auto")
+async def autorun_erp_idea_children(request: Request) -> Dict[str, Any]:
+    """Run the watcher's pass now, against the configured Idea card."""
+    return await service(request).autorun_erp_idea_children()
+
+
+@app.post("/api/erp/idea-batch/repair")
+async def repair_erp_idea_children(request: Request) -> Dict[str, Any]:
+    """Đăng bù ảnh đã tạo và chạy bù ảnh còn thiếu cho thẻ Idea đang cấu hình."""
+    return await service(request).repair_erp_idea_children()
+
+
+@app.post("/api/agent-bot/run")
+async def run_agent_bot_once(request: Request) -> Dict[str, Any]:
+    """Run one agent-bot scan now instead of waiting for the timer."""
+    return await service(request).run_agent_bot_once()
 
 
 @app.get("/api/erp/tasks/{task_id}/attachments/{attachment_id}/preview")

@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi import HTTPException
 
 from flow_web import watermark_repair
 from flow_web.schemas import JobArtifact, JobRecord
-from flow_web.service import FlowWebService
+from flow_web.service import FlowWebService, RemoveLogoNoWatermarkError
 from flow_web.store import StateStore
 
 from tests.test_flow_web_smoke import TempAppPathsMixin
@@ -227,6 +228,78 @@ class RetryWatermarkServiceTest(TempAppPathsMixin, unittest.TestCase):
         data, mime = asyncio.run(self.service._erp_unmarked_bytes("job-door", 0, marked, "image/png"))
 
         self.assertEqual("image/png", mime)
+        self.assertLess(watermark_repair.measure_image_bytes(data), watermark_repair.MIN_STRENGTH)
+
+    def test_the_upload_door_sends_the_2k_bytes_through_removelogo(self) -> None:
+        # The strong cleaner used to see only the pre-upscale file, so the
+        # sparkle Google stamps back on during the 2K pass was left to the
+        # local patcher alone - and stayed visible on the pictures that
+        # actually reached the card.
+        asyncio.run(
+            self.store.add_job(JobRecord(id="job-door-3", type="image", status="completed", artifacts=[]))
+        )
+        marked = _encode(_synthetic())
+        cleaned = _encode(_synthetic(strength=0.0))
+        seen: list[bytes] = []
+
+        def _process(_base_url, image_bytes, _mime, _name):
+            seen.append(image_bytes)
+            return cleaned
+
+        with patch.object(self.service, "_removelogo_enabled", return_value=True), patch.object(
+            self.service, "_removelogo_base_url", return_value="http://127.0.0.1:8788"
+        ), patch.object(self.service, "_removelogo_process_bytes", side_effect=_process):
+            data, mime = asyncio.run(self.service._erp_unmarked_bytes("job-door-3", 0, marked, "image/png"))
+
+        self.assertEqual([marked], seen)
+        self.assertEqual(cleaned, data)
+        self.assertEqual("image/png", mime)
+        job = self.store.get_job("job-door-3")
+        self.assertIn("removelogo", job.logs[-1].message)
+
+    def test_the_upload_door_cleans_what_the_local_detector_cannot_see(self) -> None:
+        # The local reading used to decide whether removelogo got to look at
+        # the file at all. On wood grain and linen it comes back around 0.1 -
+        # under the threshold - while the sparkle sits plainly visible in the
+        # corner, so a whole card's worth of pictures shipped marked.
+        asyncio.run(
+            self.store.add_job(JobRecord(id="job-door-5", type="image", status="completed", artifacts=[]))
+        )
+        faint = _encode(_synthetic(strength=0.05))
+        self.assertLess(watermark_repair.measure_image_bytes(faint), watermark_repair.MIN_STRENGTH)
+        cleaned = _encode(_synthetic(strength=0.0))
+        seen: list[bytes] = []
+
+        def _process(_base_url, image_bytes, _mime, _name):
+            seen.append(image_bytes)
+            return cleaned
+
+        with patch.object(self.service, "_removelogo_enabled", return_value=True), patch.object(
+            self.service, "_removelogo_base_url", return_value="http://127.0.0.1:8788"
+        ), patch.object(self.service, "_removelogo_process_bytes", side_effect=_process):
+            data, _mime = asyncio.run(self.service._erp_unmarked_bytes("job-door-5", 0, faint, "image/png"))
+
+        self.assertEqual([faint], seen)
+        self.assertEqual(cleaned, data)
+
+    def test_the_upload_door_falls_back_when_removelogo_cannot_help(self) -> None:
+        # removelogo answers 422 on linen and flat walls it cannot see the mark
+        # on. Our own measurement already said the mark is there, so the local
+        # patcher still gets its turn instead of the file going out marked.
+        asyncio.run(
+            self.store.add_job(JobRecord(id="job-door-4", type="image", status="completed", artifacts=[]))
+        )
+        marked = _encode(_synthetic())
+
+        with patch.object(self.service, "_removelogo_enabled", return_value=True), patch.object(
+            self.service, "_removelogo_base_url", return_value="http://127.0.0.1:8788"
+        ), patch.object(
+            self.service,
+            "_removelogo_process_bytes",
+            side_effect=RemoveLogoNoWatermarkError("no watermark"),
+        ):
+            data, _mime = asyncio.run(self.service._erp_unmarked_bytes("job-door-4", 0, marked, "image/png"))
+
         self.assertLess(watermark_repair.measure_image_bytes(data), watermark_repair.MIN_STRENGTH)
 
     def test_the_upload_door_leaves_a_clean_image_byte_for_byte(self) -> None:
