@@ -414,6 +414,69 @@ def inline_needles_not_written_on_their_own_line(
     return reports
 
 
+@lru_cache(maxsize=1)
+def statement_spans() -> dict[tuple[str, int], tuple[int, int]]:
+    """``(tên hàm, dòng)`` → khoảng của **câu lệnh nhỏ nhất** bọc dòng ấy.
+
+    Đọc lại từ cây, độc lập với lượt quét kim.
+    """
+    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+    table: dict[tuple[str, int], tuple[int, int]] = {}
+    for outer in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if not isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(outer):
+            if not isinstance(node, ast.stmt):
+                continue
+            span = (node.lineno, node.end_lineno or node.lineno)
+            for line in range(span[0], span[1] + 1):
+                held = table.get((outer.name, line))
+                if held is None or span[1] - span[0] < held[1] - held[0]:
+                    table[(outer.name, line)] = span
+    return table
+
+
+def anchors_outside_their_statement(
+    literal_at: dict[str, dict[str, int]],
+    boxes: dict[tuple[str, int], tuple[int, int]] | None = None,
+) -> list[str]:
+    """Luật (e): mốc của kim phải nằm trong **chính câu lệnh** đã ghi nó.
+
+    Luật chữ một mình không đủ, và đây là chỗ nó mù theo **cấu trúc** chứ
+    không phải vì trùng hợp: hễ trong cùng hàm có dòng khác cũng viết đúng
+    hằng ấy thì đẩy mốc sang đó, luật chữ vẫn thấy chữ nên **im hoàn toàn**.
+    Đo trên cây thật: 18 kim đẩy được như thế, luật chữ bắt **0**.
+
+    Chia hai loại thì mới biết cần canh cái gì — 4 ca đẩy **trong cùng câu
+    lệnh** (kim thật sự viết ở cả hai dòng, mốc nào cũng nói thật, không
+    phải nói dối) và **14 ca đẩy sang câu lệnh khác** (nói dối thật). Luật
+    này bắt đúng 14 ca sau và im với 4 ca đầu.
+
+    Ca quyết định do erplisting-21 tìm ra bên họ: cùng một kim ở hai phép so
+    khác nhau trong một hàm (``shirt``/``tshirt``). Bên tôi cũng có, ở
+    ``_flow_operator_card_product_signals`` dòng 12516 và 12592 — tôi đã bỏ
+    luật (c) sau khi đo "0 kim trùng tên **giữa hai chỗ so được canh**", mà
+    câu hỏi đúng rộng hơn: **bất kỳ dòng nào cũng mang hằng ấy** là đủ để
+    luật chữ im, dòng ấy không cần là chỗ so.
+    """
+    boxes = statement_spans() if boxes is None else boxes
+    reports = []
+    for site in sorted(literal_at):
+        name, number = parse_site(site)
+        if number is None:
+            continue  # đã có luật khác báo
+        box = boxes.get((name, number))
+        if box is None:
+            continue  # đã có luật khác báo
+        for needle, anchor in sorted(literal_at[site].items()):
+            if not box[0] <= anchor <= box[1]:
+                reports.append(
+                    f"{site}: mốc của kim {needle!r} ở dòng {anchor}, ngoài "
+                    f"câu lệnh {box}"
+                )
+    return reports
+
+
 def missing_twins(by_site: dict[str, set[str]]) -> list[str]:
     """Kim có ``_`` mà thiếu bản viết liền **ngay tại chỗ so ấy**.
 
@@ -1998,9 +2061,17 @@ class UnderscoreTwinTests(unittest.TestCase):
 
         Mốc chặt bắt được **mọi ca mà hai luật kia bắt, và cả hai ca chúng
         mù**, nên luật cửa sổ và luật (c) ("cửa sổ phải đúng bằng cửa sổ một
-        nút có thật") đã bị bỏ cùng trường ``spans_at`` — giữ lại là giữ một
-        luật canh cái không ai đọc, làm mức phủ trông dày hơn sự thật. Cách
-        chữa này của erplisting-21 (bên họ 313/383 → 383/383).
+        nút có thật") đã bị bỏ cùng trường ``spans_at``. Cách chữa này của
+        erplisting-21 (bên họ 313/383 → 383/383).
+
+        **Nhưng bỏ (c) đã mở một lỗ, và luật (e) mới là chỗ bịt.** Luật chữ
+        mù theo **cấu trúc** với ca "đẩy mốc sang dòng khác cũng viết đúng
+        hằng ấy": 18 kim đẩy được, luật chữ bắt **0**. Xem
+        :func:`anchors_outside_their_statement`. Chỗ tôi đo sai lúc bỏ (c):
+        hỏi "có kim nào trùng tên giữa hai **chỗ so được canh** không" →
+        0, rồi kết luận bỏ là an toàn. Câu hỏi đúng rộng hơn hẳn — **bất kỳ
+        dòng nào trong hàm cũng mang hằng ấy** là đủ để luật chữ im, dòng ấy
+        không cần là chỗ so. Hỏi lại cho đúng: 18.
 
         Vài ca sót là trùng hợp thật, ghi ra chứ không làm tròn lên: ``+1``
         sót 6, ``+50`` sót 4 — dòng rơi vào chỗ tình cờ cũng viết đúng hằng ấy.
@@ -2046,6 +2117,54 @@ class UnderscoreTwinTests(unittest.TestCase):
         reports = carriers_not_named_on_their_line({"f:1": {"bang"}}, carrier_lines)
         self.assertEqual(1, len(reports))
         self.assertIn("bang", reports[0])
+
+    def test_an_anchor_may_not_leave_its_own_statement(self) -> None:
+        """Luật (e) trên cây thật: mốc phải nằm trong câu lệnh đã ghi nó.
+
+        Đo ba cột trên cây thật:
+
+        ==========================================  =========  =======
+        đột biến                                    luật chữ   (e)
+        ==========================================  =========  =======
+        cây sạch                                            0        0
+        đẩy mốc sang dòng khác cũng mang hằng ấy            0    14/14
+        …trong đó phần đẩy **trong cùng câu lệnh**          0      0/4
+        ==========================================  =========  =======
+
+        Luật chữ mù ở đây theo **cấu trúc**, không phải trùng hợp: dòng đích
+        vẫn viết đúng hằng ấy nên nó vẫn thấy chữ. 4 ca trong cùng câu lệnh
+        thì (e) im là **đúng** — kim viết thật ở cả hai dòng, mốc nào cũng
+        nói thật, đó không phải nói dối.
+        """
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            swept = needles_compared_with(normalizer)
+            with self.subTest(normalizer=normalizer):
+                self.assertEqual([], anchors_outside_their_statement(swept.literal_at))
+
+    def test_the_statement_rule_is_pinned_on_made_up_data(self) -> None:
+        """Ghim theo đúng thứ tự: **đòi luật chữ im trước**, rồi (e) mới kêu.
+
+        Không khẳng định luật chữ im thì ca thử này không chứng minh được
+        (e) thêm gì — có khi (e) chỉ kêu ở chỗ luật chữ đã kêu sẵn.
+        """
+        lines = [
+            'ALL = ("shirt", "tee")',
+            "def f(x):",
+            '    if x in ("shirt",):',
+            "        pass",
+        ]
+        boxes = {("f", 3): (3, 4)}
+        bent = {"f:3": {"shirt": 1}}
+        self.assertEqual(
+            [], inline_needles_not_written_on_their_own_line(bent, lines),
+            "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
+        )
+        reports = anchors_outside_their_statement(bent, boxes)
+        self.assertEqual(1, len(reports))
+        self.assertIn("ngoài câu lệnh", reports[0])
+
+        honest = {"f:3": {"shirt": 3}}
+        self.assertEqual([], anchors_outside_their_statement(honest, boxes))
 
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
         """Phủ kín ở mức CHỖ SO, không chỉ ở mức nhãn hình dạng.
