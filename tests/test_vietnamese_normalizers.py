@@ -561,11 +561,18 @@ def missing_twins(by_site: dict[str, set[str]]) -> list[str]:
 
     Tách ra thành hàm thuần để kiểm được bằng dữ liệu bịa: chọn phạm vi nào
     là một quyết định, và quyết định thì phải có ca chứng minh nó gánh việc.
+
+    Vế ``"_" not in needle`` thì **không** phải một quyết định như thế: kim
+    không có ``_`` thì ``twin`` chính là ``needle``, mà ``needle`` vừa lấy ra
+    từ ``needles`` — nên ``twin not in needles`` không bao giờ đúng. Bỏ hẳn
+    vế ấy đi, cả suite vẫn xanh 70/70 (đã đo). Nó là chỗ rẽ nhanh, không phải
+    chỗ chọn phạm vi, nên đừng bịa ca ghim cho nó: ca ấy sẽ xanh với cả bản
+    có lẫn bản không, tức không chứng minh gì.
     """
     reports = []
     for site, needles in sorted(by_site.items()):
         for needle in sorted(needles):
-            if "_" not in needle:
+            if "_" not in needle:  # rẽ nhanh, dư về logic — xem docstring
                 continue
             twin = needle.replace("_", "")
             if twin not in needles:
@@ -2472,6 +2479,53 @@ class UnderscoreTwinTests(unittest.TestCase):
             1, len(sites_pointing_nowhere({"_parse_aspect": {"portrait"}}, lines)),
             "luat khac phai that su gach ten khoa hong — khong thi ca kia im vo chu",
         )
+
+    def test_the_other_lost_measurement_branches_are_guarded_too(self) -> None:
+        """Quét AST cả họ, không dừng ở ca đầu tiên tìm được.
+
+        erplisting-21 chỉ ra: nhánh mất-số-đo sinh ra từ **thói quen viết
+        luật**, nên ca đầu tiên gần như không bao giờ là ca duy nhất. Liệt kê
+        bằng AST mọi ``if ...: continue`` trong thân các luật ra **10** nhánh;
+        đột biến từng cái đo được **8 có người canh, 2 không**:
+
+        * ``inline_needles_not_written_on_their_own_line`` — vế kim trỏ ra
+          ngoài file: cấm báo mà suite vẫn xanh 69/69.
+        * ``carriers_not_named_on_their_line`` — mệnh đề gộp hai vế (khoá
+          cong **và** ngoài file): cho nó báo bừa mà suite vẫn xanh 69/69,
+          tức không ai ghim lời khẳng định ``# đã có luật khác báo``.
+
+        Hai ca này là hai kiểu khác nhau: (b) **tự báo** nên phải ghim là nó
+        không được câm; carriers **nhường** nên phải ghim là có luật khác
+        thật sự gánh — và luật ấy phải nhìn thấy cùng khoá thì mới gánh nổi.
+        """
+        lines = ["mot", "hai", "ba"]
+        for lech in (0, -1, len(lines) + 1):
+            self.assertEqual(
+                1,
+                len(inline_needles_not_written_on_their_own_line({"f:2": {"shirt": lech}}, lines)),
+                f"(b) mốc {lech} ngoài file thì phải BÁO, không được câm",
+            )
+
+        # carriers nhường cả hai vế — nhưng chỉ nhường được nếu luật kia
+        # thật sự gạch tên đúng khoá ấy.
+        for cong in ({"f:khong-phai-so": {"bang"}}, {"f:999999": {"bang"}}):
+            self.assertEqual(
+                [], carriers_not_named_on_their_line(cong, lines),
+                "carriers phải nhường khoá cong / ngoài file",
+            )
+            self.assertEqual(
+                1, len(sites_pointing_nowhere({k: {"shirt"} for k in cong}, lines)),
+                "luật khác phải thật sự báo — không thì cả hai cùng im",
+            )
+
+        # Và trên cây thật, mọi khoá carriers phải là khoá by_site, vì
+        # sites_pointing_nowhere chỉ đọc by_site. Khoá nào chỉ có ở
+        # carriers_at là khoá không ai gạch tên hộ.
+        rieng = 0
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            swept = needles_compared_with(normalizer)
+            rieng += len(set(swept.carriers_at) - set(swept.by_site))
+        self.assertEqual(0, rieng, "khoá carriers nằm ngoài by_site thì không ai gánh hộ")
 
     def test_a_widened_ruler_kills_g_but_leaves_e_speaking(self) -> None:
         """Vì sao giữ (e) dù (g) chặt hơn: hai luật hỏng theo hai kiểu.
