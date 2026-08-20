@@ -288,17 +288,59 @@ def sites_pointing_nowhere(by_site: dict[str, set[str]], lines: list[str]) -> li
     """
     reports = []
     for site in sorted(by_site):
-        _, colon, tail = site.rpartition(":")
-        if not colon or not tail.isdigit():
+        _, number = parse_site(site)
+        if number is None:
             reports.append(f"{site}: khoá chỗ so không còn mang số dòng")
             continue
-        number = int(tail)
         if not 0 < number <= len(lines):
             reports.append(f"{site}: số dòng nằm ngoài file ({len(lines)} dòng)")
             continue
         text = lines[number - 1]
         if not any(mark in text for mark in MARKS_OF_A_COMPARISON):
             reports.append(f"{site} trỏ vào {text.strip()[:60]!r}")
+    return reports
+
+
+def parse_site(site: str) -> tuple[str, int | None]:
+    """Đọc khoá chỗ so. **Một** bản cài đặt cho mọi luật dùng nó.
+
+    Hai luật cùng bóc khoá là hai bản cài đặt có thể lệch nhau — đúng cái
+    bẫy làm mốc ``paired`` bên nửa listing đánh rơi bộ lọc.
+    """
+    name, colon, tail = site.rpartition(":")
+    if not colon or not tail.isdigit():
+        return site, None
+    return name, int(tail)
+
+
+@lru_cache(maxsize=1)
+def function_line_ranges() -> dict[str, tuple[tuple[int, int], ...]]:
+    """Tên hàm → các khoảng dòng của thân hàm ấy trong service.py.
+
+    Dựng riêng từ AST, không dùng lại số nào của bước ghi chỗ so, nên hai
+    đường suy ra soi lẫn nhau chứ không cùng sai một kiểu.
+    """
+    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+    ranges: dict[str, list[tuple[int, int]]] = {}
+    for node in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            ranges.setdefault(node.name, []).append((node.lineno, node.end_lineno or node.lineno))
+    return {name: tuple(spans) for name, spans in ranges.items()}
+
+
+def sites_outside_their_function(by_site: dict[str, set[str]]) -> list[str]:
+    """Dòng ghi lại phải nằm trong thân chính HÀM đã ghi nó."""
+    ranges = function_line_ranges()
+    reports = []
+    for site in sorted(by_site):
+        name, number = parse_site(site)
+        if number is None:
+            continue  # khoá cong: để sites_pointing_nowhere báo, đừng báo hai lần
+        spans = ranges.get(name)
+        if not spans:
+            reports.append(f"{site}: service.py không có hàm tên {name!r}")
+        elif not any(start <= number <= end for start, end in spans):
+            reports.append(f"{site}: dòng nằm ngoài thân {name!r} {list(spans)}")
     return reports
 
 
@@ -1710,6 +1752,46 @@ class UnderscoreTwinTests(unittest.TestCase):
                 sites_pointing_nowhere(needles_compared_with(normalizer).by_site, lines)
             )
         self.assertEqual([], wrong[:5], f"{len(wrong)} chỗ so trỏ sai dòng")
+
+
+    def test_every_recorded_line_sits_inside_the_function_that_recorded_it(self) -> None:
+        """Câu hỏi vị trí thứ ba, và nó bắt được thứ hai câu kia không bắt.
+
+        Ba câu không thay nhau được, mỗi câu lộ ra vì có đột biến vượt qua
+        được câu trước:
+
+        * *nói thật* — dòng có phép so không? Lọt khi dồn về một dòng hợp lệ.
+        * *còn tách nhau* — các dòng có còn khác nhau không? Lọt khi hoán vị
+          mỗi chỗ so sang một dòng **riêng biệt** của hàm khác.
+        * *đúng nhà* — câu này. Đo ca hoán vị ấy trên 87 khoá: nói thật báo
+          **0**, còn tách nhau vẫn **18** hàm y như cũ, đúng nhà báo **86**.
+
+        Bảng khoảng dòng dựng riêng từ AST chứ không dùng lại số của bước
+        ghi, nên hai đường suy ra soi lẫn nhau.
+        """
+        wrong = []
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            wrong.extend(sites_outside_their_function(needles_compared_with(normalizer).by_site))
+        self.assertEqual([], wrong[:5], f"{len(wrong)} chỗ so ghi sai nhà")
+
+    def test_a_line_from_the_wrong_function_is_reported(self) -> None:
+        """Ghim luật bằng dữ liệu bịa, hai chiều, và nói rõ ai KHÔNG bắt.
+
+        Vế "hai luật kia phải xanh" mới là vế chứng minh câu này bắt thêm
+        được thứ gì; thiếu nó thì chỉ chứng minh được nó cũng đỏ.
+        """
+        inside = min(function_line_ranges()["_compact_match_text"])[0]
+        self.assertEqual([], sites_outside_their_function({f"_compact_match_text:{inside}": {"a"}}))
+        for bent, why in (
+            (f"_compact_match_text:{inside + 10_000}", "dòng ngoài thân hàm"),
+            ("_khong_ton_tai_dau:1", "hàm không có thật"),
+        ):
+            with self.subTest(bent=bent, why=why):
+                reports = sites_outside_their_function({bent: {"a"}})
+                self.assertEqual(1, len(reports))
+                self.assertIn(bent, reports[0])
+        self.assertEqual([], sites_outside_their_function({"f": {"a"}}),
+                         "khoá cong là việc của sites_pointing_nowhere, đừng báo hai lần")
 
     def test_a_bent_key_is_reported_not_crashed_on(self) -> None:
         """Khoá cong phải ra LỜI BÁO, không ra vết đổ.
