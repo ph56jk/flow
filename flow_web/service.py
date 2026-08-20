@@ -20750,9 +20750,36 @@ exit 1
         # vựng đóng, mà gấp trong từ vựng đóng thì hai tên khác nhau có thể đụng
         # nhau ("dòng hàng" và "đóng hàng" cùng ra ``donghang``). Ở đây đầu vào
         # là câu người dùng gõ tự do và các bảng so khớp đều viết ASCII, nên
-        # không gấp mới là hỏng: "bắt đầu" ra ``bat_au``, "điều khiển flow" ra
-        # ``ieu_khien_flow``, "hệ thống tự động" ra ``he_thong_tu_ong`` — cả ba
-        # khoá tương ứng không bao giờ khớp.
+        # không gấp mới là hỏng.
+        #
+        # Đếm trên tập đóng, không ước lượng. Quét AST 33 hàm gọi hàm này, gom
+        # mọi hằng ASCII được đem so với kết quả của nó (so thẳng, ``any(term in
+        # normalized ...)``, và dict tra bằng ``.get(normalized)``): 293 kim,
+        # trong đó 70 kim có chữ ``d``:
+        #
+        #   70 kim co 'd' ├─  8 la 'd' vốn là 'đ'  → CHET truoc ban va
+        #                 └─ 62 la 'd' that (dress, handmade, wedding_hoop, ...)
+        #
+        # Tám kim ấy, kèm câu người gõ ra chúng — đo trên cả hai bản hàm (trước
+        # 9778758 và hiện tại), 8/8 chết trước, 8/8 sống sau:
+        #
+        #   bat_dau            ← "bắt đầu"            (ra bat_au)
+        #   dieu_khien_flow    ← "điều khiển flow"    (ra ieu_khien_flow)
+        #   he_thong_tu_dong   ← "hệ thống tự động"   (ra he_thong_tu_ong)
+        #   chuyen_dong_camera ← "chuyển động camera" (ra chuyen_ong_camera)
+        #   do_phan_giai       ← "độ phân giải"       (ra o_phan_giai)
+        #   dang_nhap          ← "đăng nhập"          (ra ang_nhap)
+        #   dung               ← "đứng" (khung dọc)   (ra ung)
+        #   dem                ← "đêm" (ánh sáng)     (ra em)
+        #
+        # Chú thích cũ ở đây nêu tên ba khoá đầu; ba khoá ấy chỉ là ba khoá được
+        # nhớ tên chứ không phải cả tập — bán kính thật gấp hơn hai lần.
+        #
+        # Ghim ở `SkillTokenClosedSetTests` (tests/test_vietnamese_normalizers.py).
+        # Nói thẳng phần KHÔNG được canh: 62 kim còn lại phân loại tay ngày
+        # 2026-08-20 và không ghim, vì đó là từ vựng sản phẩm còn mọc thêm. Nên
+        # thêm một kim tiếng Việt có ``đ`` sẽ không tự động bị bắt; chỉ tám kim
+        # trên và các dạng hỏng của chúng là có test canh.
         text = str(text or "").replace("đ", "d").replace("Đ", "D")
         stripped = self._strip_accents(text or "").lower()
         stripped = re.sub(r"[^a-z0-9]+", "_", stripped)

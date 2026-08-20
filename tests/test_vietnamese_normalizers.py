@@ -13,6 +13,7 @@ Các ca dưới đây ghim **câu người ta gõ**, không ghim chuỗi đã ch
 from __future__ import annotations
 
 import ast
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -163,6 +164,170 @@ class PromptSourceHeaderClosedSetTests(unittest.TestCase):
         keys = self._key_tables()
 
         self.assertNotIn("adung", keys)
+
+
+class SkillTokenClosedSetTests(unittest.TestCase):
+    """Đếm bao nhiêu kim so khớp chết vì ``đ`` — tám, không phải ba.
+
+    Chú thích trong `_normalize_skill_token` từng nêu tên ba khoá. Quét
+    AST toàn bộ 33 hàm gọi hàm này thì ra 293 kim, 70 kim có chữ ``d``,
+    và **tám** trong số đó sinh ra từ ``đ``. Ba khoá kia chỉ là ba khoá
+    được nhớ tên, không phải cả tập.
+
+    Sáu mươi hai kim còn lại đã phân loại tay ngày 2026-08-20 và KHÔNG
+    ghim ở đây: chúng là từ vựng sản phẩm (`wedding_hoop`,
+    `stuffed_animal`, ...) còn đang mọc thêm, ghim vào chỉ tổ đỏ vặt.
+    Hệ quả phải nói thẳng: **thêm một kim tiếng Việt có ``đ`` sẽ KHÔNG
+    tự động bị bắt** — chỉ có tám kim dưới đây và các dạng hỏng của
+    chúng là được canh.
+    """
+
+    FUNCTIONS_CALLING_THE_NORMALIZER = 33
+    # Kim → câu người thật gõ ra nó. Ghim câu gõ, không ghim chuỗi đã
+    # chuẩn hoá, để test còn đúng nếu bộ chuẩn hoá đổi cách viết.
+    NEEDLES_BORN_FROM_D_STROKE = (
+        ("bat_dau", "bắt đầu"),
+        ("dieu_khien_flow", "điều khiển flow giúp tôi"),
+        ("he_thong_tu_dong", "dùng hệ thống tự động"),
+        ("chuyen_dong_camera", "chuyển động camera"),
+        ("do_phan_giai", "độ phân giải"),
+        ("dang_nhap", "đăng nhập"),
+        ("dung", "đứng"),
+        ("dem", "cảnh đêm"),
+    )
+    # Đúng những gì bộ chuẩn hoá nhả ra TRƯỚC bản vá. Không kim nào được
+    # phép mang hình dạng này: có nghĩa là ai đó đã "vá" bằng cách chép
+    # luôn chuỗi hỏng vào bảng, và bước gấp ``đ`` sẽ làm hỏng lại chỗ ấy.
+    DAMAGED_SPELLINGS = (
+        "bat_au",
+        "ieu_khien_flow",
+        "he_thong_tu_ong",
+        "chuyen_ong_camera",
+        "o_phan_giai",
+        "ang_nhap",
+    )
+
+    def _needles(self) -> set[str]:
+        """Mọi hằng ASCII được đem so với kết quả `_normalize_skill_token`."""
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        shape = re.compile(r"^[a-z0-9]+(_[a-z0-9]+)*$")
+
+        def is_norm_call(node: ast.AST) -> bool:
+            return (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_normalize_skill_token"
+            )
+
+        found: set[str] = set()
+
+        def keep(value: object) -> None:
+            if isinstance(value, str) and len(value) >= 2 and shape.match(value):
+                found.add(value)
+
+        def elements(node: ast.AST) -> list[ast.expr]:
+            if isinstance(node, ast.Constant):
+                return [node]
+            if isinstance(node, (ast.Set, ast.List, ast.Tuple)):
+                return list(node.elts)
+            return []
+
+        functions = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(is_norm_call(child) for child in ast.walk(node))
+        ]
+        self.assertEqual(self.FUNCTIONS_CALLING_THE_NORMALIZER, len(functions))
+
+        for function in functions:
+            literal_dicts: dict[str, ast.Dict] = {}
+            normalized_names: set[str] = set()
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                    continue
+                target = node.targets[0]
+                if not isinstance(target, ast.Name):
+                    continue
+                if any(is_norm_call(child) for child in ast.walk(node.value)):
+                    normalized_names.add(target.id)
+                if isinstance(node.value, ast.Dict):
+                    literal_dicts[target.id] = node.value
+
+            def looks_normalized(node: ast.AST) -> bool:
+                return any(
+                    is_norm_call(child)
+                    or (isinstance(child, ast.Name) and child.id in normalized_names)
+                    for child in ast.walk(node)
+                )
+
+            for node in ast.walk(function):
+                # 1) so sánh thẳng: ``x == "kim"``, ``"kim" in x``, ``x in {...}``
+                if isinstance(node, ast.Compare) and any(
+                    isinstance(op, (ast.In, ast.NotIn, ast.Eq, ast.NotEq)) for op in node.ops
+                ):
+                    for part in (node.left, *node.comparators):
+                        for element in elements(part):
+                            if isinstance(element, ast.Constant):
+                                keep(element.value)
+                # 2) ``any(term in normalized for term in (...))``
+                if (
+                    isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp))
+                    and isinstance(node.elt, ast.Compare)
+                    and any(
+                        isinstance(op, (ast.In, ast.NotIn, ast.Eq, ast.NotEq))
+                        for op in node.elt.ops
+                    )
+                ):
+                    for generator in node.generators:
+                        for element in elements(generator.iter):
+                            if isinstance(element, ast.Constant):
+                                keep(element.value)
+                # 3) ``mapping.get(normalized)`` — chỉ dict thật sự bị tra bằng token
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get"
+                    and node.args
+                    and looks_normalized(node.args[0])
+                ):
+                    receiver = node.func.value
+                    table = receiver if isinstance(receiver, ast.Dict) else (
+                        literal_dicts.get(receiver.id) if isinstance(receiver, ast.Name) else None
+                    )
+                    if isinstance(table, ast.Dict):
+                        for key in table.keys:
+                            if isinstance(key, ast.Constant):
+                                keep(key.value)
+        return found
+
+    def test_the_sweep_finds_the_needles_at_all(self) -> None:
+        # Chống rỗng: quét hỏng thì mọi test dưới đây xanh vô nghĩa.
+        needles = self._needles()
+
+        self.assertGreater(len(needles), 200)
+        self.assertIn("dieu_khien_flow", needles)
+
+    def test_every_needle_born_from_d_stroke_is_still_a_needle(self) -> None:
+        # Đổi tên hay bỏ một trong tám kim thì phải thấy ngay, vì các ca
+        # đo dưới đây đứng trên đúng tám tên ấy.
+        needles = self._needles()
+        for needle, _typed in self.NEEDLES_BORN_FROM_D_STROKE:
+            with self.subTest(needle=needle):
+                self.assertIn(needle, needles)
+
+    def test_every_needle_born_from_d_stroke_is_reachable(self) -> None:
+        svc = service()
+        for needle, typed in self.NEEDLES_BORN_FROM_D_STROKE:
+            with self.subTest(needle=needle):
+                self.assertIn(needle, svc._normalize_skill_token(typed))
+
+    def test_no_needle_was_written_in_its_damaged_spelling(self) -> None:
+        needles = self._needles()
+        for damaged in self.DAMAGED_SPELLINGS:
+            with self.subTest(damaged=damaged):
+                self.assertNotIn(damaged, needles)
 
 
 class SkillTokenIntentTests(unittest.TestCase):
