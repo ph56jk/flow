@@ -5029,6 +5029,48 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("lam dep", self.service._normalize_policy_text("làm đẹp"))
         self.assertEqual("dong phuc", self.service._normalize_policy_text("Đồng phục"))
 
+    # ── Tập đóng, không lấy mẫu ────────────────────────────────────────
+    # Ba bảng POLICY_* cộng lại 48 mục; 15 mục có chữ ``d``; 9 trong số đó là
+    # ``d`` vốn là ``đ`` và chết sạch trước bản vá; 6 mục còn lại là ``d`` thật
+    # (toàn từ tiếng Anh) và bản vá không được phép đụng vào.
+    #
+    # Ghim CÂU NGƯỜI GÕ, không ghim chuỗi đã chuẩn hoá — ghim chuỗi sau chuẩn
+    # hoá thì test xanh với mọi bộ chuẩn hoá, kể cả bộ hỏng.
+    POLICY_TERMS_FROM_D_STROKE = (
+        ("dep trai hon", "làm cho anh ấy đẹp trai hơn"),
+        ("dep gai hon", "sửa cho cô ấy đẹp gái hơn"),
+        ("dep hon", "chỉnh mặt đẹp hơn chút"),
+        ("lam dep", "làm đẹp khuôn mặt giúp tôi"),
+        ("trang diem", "trang điểm nhẹ cho người mẫu"),
+        ("thay do", "thay đồ cho bạn nhỏ này"),
+        ("mac do", "cho bé mặc đồ mùa đông"),
+        ("thu do", "cho chị ấy thử đồ mới"),
+        ("dong phuc", "cho các em mặc đồng phục"),
+    )
+    POLICY_TERMS_WITH_A_REAL_D = ("body", "child", "dress", "kid", "model", "underage")
+
+    def test_every_policy_term_born_from_d_stroke_is_reachable(self) -> None:
+        for term, typed in self.POLICY_TERMS_FROM_D_STROKE:
+            with self.subTest(term=term):
+                self.assertIn(term, self.service._normalize_policy_text(typed))
+
+    def test_the_policy_terms_holding_a_d_are_a_closed_set(self) -> None:
+        # Không tin con số 9 vì đã đếm tay: dựng lại tập đóng từ chính ba bảng.
+        # Ai thêm một mục tiếng Việt có ``đ`` mà quên ghim nó thì test này đỏ.
+        terms = set(self.service.POLICY_MINOR_TERMS)
+        terms |= set(self.service.POLICY_APPEARANCE_TERMS)
+        terms |= set(self.service.POLICY_APPAREL_TERMS)
+        with_d = {term for term in terms if "d" in term}
+        pinned = {term for term, _ in self.POLICY_TERMS_FROM_D_STROKE}
+
+        self.assertEqual(with_d, pinned | set(self.POLICY_TERMS_WITH_A_REAL_D))
+
+    def test_policy_terms_with_a_real_d_survive_the_fold(self) -> None:
+        # Nhóm đối chứng: gấp ``đ`` không được đụng tới ``d`` thật.
+        for term in self.POLICY_TERMS_WITH_A_REAL_D:
+            with self.subTest(term=term):
+                self.assertIn(term, self.service._normalize_policy_text(f"ảnh {term} này"))
+
     def test_default_title_marks_video_from_image(self) -> None:
         request = CreateJobRequest(
             type="video",

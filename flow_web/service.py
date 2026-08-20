@@ -22372,9 +22372,29 @@ exit 1
         # bước lọc ``[^a-zA-Z0-9\s]`` bên dưới xoá thẳng nó thành khoảng trắng:
         # "đẹp" ra "ep", "đồng phục" ra "ong phuc", "thay đồ" ra "thay o".
         # Các bảng POLICY_* lại viết bằng ASCII thường ("dep hon", "dong phuc",
-        # "thay do"), nên chín mục trong đó KHÔNG BAO GIỜ khớp — kể cả hai cách
-        # nói mà chính câu cảnh báo nêu tên. Không có lỗi nào được ném ra, chỉ
-        # là lời nhắc an toàn im lặng không hiện.
+        # "thay do"), nên những mục ấy KHÔNG BAO GIỜ khớp — kể cả hai cách nói
+        # mà chính câu cảnh báo nêu tên. Không lỗi nào được ném ra, chỉ là lời
+        # nhắc an toàn im lặng không hiện.
+        #
+        # Đếm trên tập đóng, không ước lượng — ba bảng POLICY_* cộng lại 48 mục:
+        #
+        #   48 muc  ├─ 33 khong co chu 'd'          → khong dinh dang gi
+        #           └─ 15 co chu 'd'
+        #                ├─  9 la 'd' vốn là 'đ'    → CHET truoc ban va
+        #                └─  6 la 'd' that (body, child, dress, kid, model,
+        #                                   underage — toan tu tieng Anh)
+        #
+        # Chín mục ấy: dep trai hon, dep gai hon, dep hon, lam dep, trang diem,
+        # thay do, mac do, thu do, dong phuc. Đo cả chín bằng câu tiếng Việt một
+        # người thật sẽ gõ, trên hai bản hàm: 9/9 chết trước bản vá, 9/9 sống
+        # sau. Chín câu ấy ghim ở `POLICY_TERMS_FROM_D_STROKE` trong
+        # tests/test_flow_web_smoke.py (grep tên hằng, đừng tìm theo số dòng);
+        # sáu mục tiếng Anh ghim ngay cạnh làm nhóm đối chứng, để bản vá không
+        # được phép đụng vào chúng. Test thứ ba dựng lại tập đóng từ chính ba
+        # bảng, nên thêm một mục tiếng Việt có ``đ`` mà quên ghim là đỏ ngay.
+        #
+        # Ghim câu người gõ chứ đừng ghim chuỗi đã chuẩn hoá: ghim chuỗi sau
+        # chuẩn hoá thì test đúng với mọi bộ chuẩn hoá, kể cả bộ hỏng.
         raw = raw.replace("đ", "d").replace("Đ", "D")
         normalized = unicodedata.normalize("NFD", raw)
         normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
