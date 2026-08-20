@@ -32,6 +32,189 @@ def service() -> FlowWebService:
     return FlowWebService.__new__(FlowWebService)
 
 
+FOLDERS = (
+    "_normalize_skill_token",
+    "_compact_match_text",
+    "_tokenize_match_words",
+)
+
+# Hàm TRẢ VỀ giá trị đã gấp sẵn, nên biến nhận kết quả của nó cũng là "đã
+# gấp". Danh sách do người viết nên phải có chỗ canh — và phải canh đúng
+# thứ: tôi đã suýt nhận nhầm ``_erp_query_aliases`` vào đây. Hàm ấy CÓ gấp
+# bên trong (``key = self._compact_match_text(cleaned)`` để khử trùng lặp)
+# nhưng lại trả về ``cleaned`` — chữ người đọc được, còn nguyên dấu cách.
+# Nhận nhầm là tự tay tắt ca ghép-đôi cho mọi biến ăn kết quả của nó, mà
+# ca canh "hàm này có gấp gì không" vẫn xanh. Nên phải hỏi: **cái được
+# TRẢ VỀ** có gấp không.
+FOLDING_HELPERS = ("_user_assistant_erp_query_groups",)
+
+
+def literal_bindings_of(function: ast.AST) -> dict[str, object]:
+    """Tên → giá trị hằng gán cho nó ngay trong hàm."""
+    bindings: dict[str, object] = {}
+    for node in ast.walk(function):
+        targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            targets = [node.targets[0]]
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets = [node.target]
+        if len(targets) == 1 and isinstance(targets[0], ast.Name):
+            try:
+                bindings[targets[0].id] = ast.literal_eval(node.value)
+            except Exception:
+                pass
+    return bindings
+
+
+def literal_loop_names(function: ast.AST) -> set[str]:
+    """Biến chạy của vòng lặp duyệt trên hằng — tức cây kim viết thẳng.
+
+    Phải gỡ tuple theo CỘT: ``for triggers, values in alias_groups`` rồi
+    ``for trigger in triggers``. Dàn phẳng thì cột bí danh trả về bị lẫn
+    vào cột cây kim.
+    """
+    bindings = literal_bindings_of(function)
+    values: dict[str, list] = {}
+
+    def resolve(expr: ast.AST) -> list:
+        if isinstance(expr, (ast.Set, ast.List, ast.Tuple)):
+            try:
+                return list(ast.literal_eval(expr))
+            except Exception:
+                return []
+        if isinstance(expr, ast.Name):
+            bound = bindings.get(expr.id)
+            if isinstance(bound, (list, tuple, set)):
+                return list(bound)
+            spread: list = []
+            for value in values.get(expr.id, ()):
+                if isinstance(value, (list, tuple, set)):
+                    spread.extend(value)
+            return spread
+        return []
+
+    def bind(target: ast.expr, items: list) -> None:
+        if isinstance(target, ast.Name):
+            values.setdefault(target.id, []).extend(items)
+        elif isinstance(target, ast.Tuple):
+            for index, element in enumerate(target.elts):
+                bind(
+                    element,
+                    [
+                        item[index]
+                        for item in items
+                        if isinstance(item, (list, tuple)) and len(item) > index
+                    ],
+                )
+
+    for _ in range(3):
+        for node in ast.walk(function):
+            if isinstance(node, ast.For):
+                bind(node.target, resolve(node.iter))
+            elif isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+                for generator in node.generators:
+                    bind(generator.target, resolve(generator.iter))
+
+    return {
+        name
+        for name, items in values.items()
+        if items and all(isinstance(item, str) for item in items)
+    }
+
+
+def folded_names(function: ast.AST) -> set[str]:
+    """Mọi biến mang giá trị ĐÃ gấp, tính cả lan truyền.
+
+    Ba đường lan: dẫn xuất (``x = y.replace(...)`` với ``y`` đã gấp), biến
+    chạy vòng lặp trên tập đã gấp, và bộ tích luỹ (``seen.add(key)``).
+    Thiếu lan truyền thì 14 phép so hiện ra như lệch, cả 14 đều là oan.
+    """
+
+    def calls_folder(node: ast.AST) -> bool:
+        return any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr in (*FOLDERS, *FOLDING_HELPERS)
+            for child in ast.walk(node)
+        )
+
+    def loads(node: ast.AST) -> set[str]:
+        return {
+            child.id
+            for child in ast.walk(node)
+            if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Load)
+        }
+
+    folded: set[str] = set()
+    for _ in range(8):
+        before = len(folded)
+        for node in ast.walk(function):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if len(targets) == 1 and isinstance(targets[0], ast.Name) and node.value is not None:
+                    sources = loads(node.value)
+                    if calls_folder(node.value) or (sources and sources <= folded):
+                        folded.add(targets[0].id)
+            if isinstance(node, ast.For) and isinstance(node.target, ast.Name):
+                sources = loads(node.iter)
+                if calls_folder(node.iter) or (sources and sources <= folded):
+                    folded.add(node.target.id)
+            if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+                for generator in node.generators:
+                    if not isinstance(generator.target, ast.Name):
+                        continue
+                    sources = loads(generator.iter)
+                    if calls_folder(generator.iter) or (sources and sources <= folded):
+                        folded.add(generator.target.id)
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {"add", "append", "update", "extend"}
+                and isinstance(node.func.value, ast.Name)
+                and node.args
+            ):
+                sources = loads(node.args[0])
+                if sources and sources <= folded:
+                    folded.add(node.func.value.id)
+        if len(folded) == before:
+            break
+    return folded
+
+
+def both_sides_folded_functions() -> list[ast.FunctionDef]:
+    """Họ hàm gấp CẢ HAI PHÍA: gấp từ hai nguồn khác nhau trong cùng hàm.
+
+    Tự tìm chứ đừng chép tay danh sách — danh sách chép tay mục ngay: lúc
+    viết ba hàm luật sản phẩm thì họ này đã có 13 thành viên.
+    """
+    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    family: list[ast.FunctionDef] = []
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef):
+            continue
+        sources: set[str] = set()
+        for node in ast.walk(function):
+            if not (isinstance(node, ast.Assign) and len(node.targets) == 1):
+                continue
+            if not isinstance(node.targets[0], ast.Name):
+                continue
+            for child in ast.walk(node.value):
+                if (
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr in FOLDERS
+                ):
+                    sources |= {
+                        argument.id
+                        for argument in child.args
+                        if isinstance(argument, ast.Name)
+                    }
+        if len(sources) >= 2:
+            family.append(function)
+    return family
+
+
 class SweptNeedles(NamedTuple):
     """Kết quả quét: cây kim ASCII, kèm nơi tìm thấy, kèm các hàm đã quét."""
 
@@ -83,6 +266,99 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
     for function in functions:
         holders: set[str] = set()
         literal_dicts: dict[str, ast.Dict] = {}
+
+        # Cây kim có thể không nằm ngay tại phép so: nó nằm trong một bảng
+        # hằng, và chỗ so chỉ thấy BIẾN CHẠY của vòng lặp —
+        # ``for trigger in triggers: ... trigger in normalized``. Lượt quét
+        # đầu đòi vế lặp phải là tuple hằng viết tại chỗ, nên cả bảng
+        # ``alias_groups`` của ``_erp_query_aliases`` (20 cây kim) lọt lưới.
+        # Gỡ tuple theo CỘT chứ đừng dàn phẳng: cùng bảng ấy, cột 0 là kim
+        # đem so, cột 1 là bí danh trả về — dàn phẳng thì ``"tap de"`` ở cột
+        # 1 bị báo oan là sai bảng chữ cái.
+        literal_bindings: dict[str, object] = {}
+        for node in ast.walk(function):
+            targets: list[ast.expr] = []
+            if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                targets = [node.targets[0]]
+            elif isinstance(node, ast.AnnAssign) and node.value is not None:
+                targets = [node.target]
+            if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                try:
+                    literal_bindings[targets[0].id] = ast.literal_eval(node.value)
+                except Exception:
+                    pass
+
+        def iterable_values(expr: ast.AST, scope: dict[str, list]) -> list:
+            if isinstance(expr, (ast.Set, ast.List, ast.Tuple)):
+                try:
+                    return list(ast.literal_eval(expr))
+                except Exception:
+                    return []
+            if isinstance(expr, ast.Name):
+                bound = literal_bindings.get(expr.id)
+                if isinstance(bound, (list, tuple, set)):
+                    return list(bound)
+                spread: list = []
+                for value in scope.get(expr.id, ()):
+                    if isinstance(value, (list, tuple, set)):
+                        spread.extend(value)
+                return spread
+            return []
+
+        def bind(target: ast.expr, values: list, scope: dict[str, list]) -> None:
+            if isinstance(target, ast.Name):
+                # GHI ĐÈ, không cộng dồn: cùng một hàm có thể dùng lại tên
+                # ``token`` ở hai vòng khác nhau. Cộng dồn thì cây kim của
+                # vòng này bị quy oan cho vòng kia — đúng cái đã làm 14 slug
+                # của ``_select_prompt_skills`` hiện ra như lỗi bảng chữ cái.
+                scope[target.id] = list(values)
+            elif isinstance(target, ast.Tuple):
+                for index, element in enumerate(target.elts):
+                    bind(
+                        element,
+                        [
+                            value[index]
+                            for value in values
+                            if isinstance(value, (list, tuple)) and len(value) > index
+                        ],
+                        scope,
+                    )
+
+        def scan(node: ast.AST, scope: dict[str, list]) -> None:
+            """Đi cây theo PHẠM VI, mỗi vòng lặp một bản sao ràng buộc."""
+            if isinstance(node, ast.For):
+                scan(node.iter, scope)
+                inner = dict(scope)
+                bind(node.target, iterable_values(node.iter, scope), inner)
+                for child in [*node.body, *node.orelse]:
+                    scan(child, inner)
+                return
+            if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp, ast.DictComp)):
+                inner = dict(scope)
+                for generator in node.generators:
+                    scan(generator.iter, inner)
+                    bind(generator.target, iterable_values(generator.iter, inner), inner)
+                for child in ast.iter_child_nodes(node):
+                    if child not in node.generators:
+                        scan(child, inner)
+                for generator in node.generators:
+                    for condition in generator.ifs:
+                        scan(condition, inner)
+                return
+            if isinstance(node, ast.Compare) and any(
+                isinstance(op, (ast.In, ast.NotIn, ast.Eq, ast.NotEq)) for op in node.ops
+            ):
+                parts = [node.left, *node.comparators]
+                if any(holds_result(part) for part in parts):
+                    for part in parts:
+                        if holds_result(part) or not isinstance(part, ast.Name):
+                            continue
+                        for value in scope.get(part.id, ()):
+                            if isinstance(value, str):
+                                keep(value, "loop-var")
+            for child in ast.iter_child_nodes(node):
+                scan(child, scope)
+
         for node in ast.walk(function):
             if not isinstance(node, ast.Assign) or len(node.targets) != 1:
                 continue
@@ -100,6 +376,9 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         def keep(value: object, why: str) -> None:
             if isinstance(value, str) and value:
                 found.setdefault(value, set()).add(f"{function.name}:{why}")
+
+        for statement in function.body:
+            scan(statement, {})
 
         for node in ast.walk(function):
             if isinstance(node, ast.Compare) and any(
@@ -174,19 +453,59 @@ class NormalizedNeedleAlphabetTests(unittest.TestCase):
     ALPHABETS = {
         "_normalize_skill_token": r"[a-z0-9_]*",
         "_normalize_prompt_source_header": r"[a-z0-9]*",
+        "_compact_match_text": r"[a-z0-9]*",
     }
 
     def test_every_needle_uses_the_alphabet_its_normalizer_emits(self) -> None:
-        for normalizer, alphabet in self.ALPHABETS.items():
+        """Đúng luật là **hợp ít nhất MỘT** bảng chữ nó thật sự bị đem so.
+
+        Không phải "hợp bảng chữ của từng bộ chuẩn hoá gặp nó". Có chỗ cố ý
+        so một cây kim với hai bộ cùng lúc —
+        ``trigger in normalized or trigger in compact`` ở
+        ``_erp_query_aliases`` — nên ``"tap_de"`` sai bảng chữ của
+        `_compact_match_text` mà vẫn sống nhờ vế `normalized`. Bắt nó hợp cả
+        hai là đòi một thứ code không cần, và sẽ đẩy người sửa sau đi xoá
+        gạch dưới, tức là giết cây kim thật.
+        """
+        seen: dict[str, set[str]] = {}
+        for normalizer in self.ALPHABETS:
             swept = needles_compared_with(normalizer)
             with self.subTest(normalizer=normalizer):
                 self.assertTrue(swept.by_text, "quét rỗng thì test này vô nghĩa")
-                wrong = {
-                    text: sorted(where)
-                    for text, where in swept.by_text.items()
-                    if not re.fullmatch(alphabet, text)
-                }
-                self.assertEqual({}, wrong)
+            for text in swept.by_text:
+                seen.setdefault(text, set()).add(normalizer)
+
+        wrong = {
+            text: sorted(normalizers)
+            for text, normalizers in seen.items()
+            if not any(
+                re.fullmatch(self.ALPHABETS[normalizer], text) for normalizer in normalizers
+            )
+        }
+        self.assertEqual({}, wrong)
+
+    def test_a_needle_compared_with_two_normalizers_needs_only_one_alphabet(self) -> None:
+        """Ghim chính nhóm khiến luật phải nới, kèm bằng chứng nó sống.
+
+        Bảng ``alias_groups`` cố ý viết cặp: dạng có gạch dưới cho
+        `_normalize_skill_token`, dạng liền cho `_compact_match_text`.
+        """
+        svc = service()
+        skill = needles_compared_with("_normalize_skill_token").by_text
+        compact = needles_compared_with("_compact_match_text").by_text
+
+        for underscored, joined, typed in (
+            ("tap_de", "tapde", "tạp dề"),
+            ("gau_bong", "gaubong", "gấu bông"),
+            ("bup_be", "bupbe", "búp bê"),
+            ("ao_tre_em", "aotreem", "áo trẻ em"),
+        ):
+            with self.subTest(needle=underscored):
+                self.assertIn(underscored, skill)
+                self.assertIn(underscored, compact)
+                self.assertNotRegex(underscored, r"^[a-z0-9]*$")
+                self.assertIn(underscored, svc._normalize_skill_token(typed))
+                self.assertIn(joined, svc._compact_match_text(typed))
 
     def test_the_same_string_is_correct_for_the_other_normalizer(self) -> None:
         # Nhóm đối chứng, và là lý do không thể sửa bằng cách cấm dấu cách
@@ -568,15 +887,6 @@ class ProductRuleBothSidesNormalizedTests(unittest.TestCase):
         "_flow_operator_product_rule_key_from_visual_text",
     )
 
-    # Ba bộ gấp chạy song song ở phía kim. Chúng dư thừa cho nhau, nên hỏng
-    # MỘT cái thì không ca hành vi nào đỏ — đo rồi, không đoán. Vì vậy tính
-    # chất phải được ghim thẳng bằng cấu trúc, đừng trông vào hành vi.
-    FOLDERS = (
-        "_normalize_skill_token",
-        "_compact_match_text",
-        "_tokenize_match_words",
-    )
-
     # Bốn bí danh này có khớp, nhưng luật đứng trước trong thứ tự ưu tiên
     # giành mất — ``album`` ở vị trí 15, ``guest_book`` ở 17, và ``album``
     # đã tự khai đúng bốn cách viết ấy. Đây là chuyện phân loại sản phẩm,
@@ -664,59 +974,118 @@ class ProductRuleBothSidesNormalizedTests(unittest.TestCase):
                     shadowed.add((key, alias, got))
         self.assertEqual(self.ALIASES_SHADOWED_BY_AN_EARLIER_RULE, shadowed)
 
-    def test_the_needle_side_is_folded_before_every_comparison(self) -> None:
-        """Kim phải được gấp TRƯỚC khi so, ở mọi nhánh, không chỉ nhánh nhớ tên.
+    def test_the_family_is_bigger_than_the_three_rule_functions(self) -> None:
+        """Sàn chống ca rỗng, và lời nhắc vì sao phải tự tìm họ.
 
-        Bỏ một trong ba bộ gấp phía kim thì mọi ca hành vi vẫn xanh — hai
-        nhánh còn lại đỡ hộ. Ca này đọc thẳng cấu trúc nên đỏ ngay từ nhánh
-        đầu tiên bị bỏ.
+        Tôi mở màn bằng ba hàm luật sản phẩm vì grep "passport" dẫn tới đó.
+        Quét đúng hình dạng "gấp cả hai phía" thì ra **13** hàm — mười cái
+        kia chưa từng ai soi. Danh sách chép tay mục ngay lúc viết.
+        """
+        family = {function.name for function in both_sides_folded_functions()}
+        self.assertGreaterEqual(len(family), 13)
+        self.assertTrue(set(self.CONSUMERS) <= family)
+        self.assertIn("_erp_task_matches_query", family)
+        self.assertIn("_flow_agent_text_matches_terms", family)
+
+    def test_the_folding_helpers_really_fold(self) -> None:
+        """``FOLDING_HELPERS`` do người viết, nên phải có chỗ canh nó mục.
+
+        Nhận sai một tên vào đây là tự tay tắt ca ghép-đôi cho mọi biến ăn
+        kết quả của nó. Tính chất cần đúng: **mọi thứ hàm ấy có thể trả về
+        đều nằm trong bảng chữ đã gấp** — hoặc vì nó được gấp, hoặc vì nó
+        được viết sẵn bằng đúng bảng chữ ấy.
+
+        Đừng canh bằng "hàm này có gấp gì không": ``_erp_query_aliases``
+        thoả điều đó (nó gấp để khử trùng lặp) mà vẫn trả về chữ có dấu
+        cách. Nó là nhóm đối chứng ở dưới.
         """
         source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
+        seen = {
+            function.name: function
+            for function in ast.walk(tree)
+            if isinstance(function, ast.FunctionDef)
+        }
+        emitted = re.compile(r"[a-z0-9]*")
 
-        def folds(node: ast.AST) -> bool:
-            return any(
-                isinstance(child, ast.Call)
-                and isinstance(child.func, ast.Attribute)
-                and child.func.attr in self.FOLDERS
-                for child in ast.walk(node)
+        def literals(function: ast.FunctionDef) -> list[str]:
+            return sorted(
+                {
+                    node.value
+                    for node in ast.walk(function)
+                    if isinstance(node, ast.Constant) and isinstance(node.value, str)
+                }
             )
 
-        checked = 0
-        for function in ast.walk(tree):
-            if not isinstance(function, ast.FunctionDef):
-                continue
-            if function.name not in self.CONSUMERS:
-                continue
-            folded: set[str] = set()
-            for node in ast.walk(function):
-                if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                    target = node.targets[0]
-                    if isinstance(target, ast.Name) and folds(node.value):
-                        folded.add(target.id)
+        for helper in FOLDING_HELPERS:
+            with self.subTest(helper=helper):
+                self.assertIn(helper, seen, "tên trong danh sách không còn là hàm nào")
+                function = seen[helper]
+                self.assertTrue(
+                    any(
+                        isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr in FOLDERS
+                        for node in ast.walk(function)
+                    ),
+                    "hàm này không hề gấp gì",
+                )
+                self.assertEqual(
+                    [],
+                    [text for text in literals(function) if not emitted.fullmatch(text)],
+                    "có hằng viết ngoài bảng chữ đã gấp lọt được ra ngoài",
+                )
 
-            # Biến chạy của một comprehension duyệt trên toàn hằng chuỗi —
-            # ``any(marker in compact for marker in ("taoanh", ...))`` — là
-            # cây kim viết thẳng, không phải biến quên gấp. Họ lỗi của nó là
-            # "viết sai bảng chữ cái", và NormalizedNeedleAlphabetTests mới
-            # là chỗ canh; ở đây tính nó như hằng.
-            literal_loops: set[str] = set()
-            for node in ast.walk(function):
-                if not isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
-                    continue
-                for generator in node.generators:
-                    if not isinstance(generator.target, ast.Name):
-                        continue
-                    iterable = generator.iter
-                    if isinstance(iterable, (ast.Set, ast.List, ast.Tuple)) and all(
-                        isinstance(element, ast.Constant) for element in iterable.elts
-                    ):
-                        literal_loops.add(generator.target.id)
+    def test_a_function_that_folds_inside_is_not_a_folding_helper(self) -> None:
+        """Nhóm đối chứng sống: chứng minh ca trên phân biệt được thật.
+
+        ``_erp_query_aliases`` gấp bên trong nhưng trả về ``cleaned`` — còn
+        nguyên dấu cách. Nếu ca trên chỉ hỏi "có gấp không" thì hàm này lọt,
+        và tôi đã suýt nhận nó vào danh sách.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        control = next(
+            function
+            for function in ast.walk(tree)
+            if isinstance(function, ast.FunctionDef) and function.name == "_erp_query_aliases"
+        )
+
+        self.assertNotIn("_erp_query_aliases", FOLDING_HELPERS)
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in FOLDERS
+                for node in ast.walk(control)
+            ),
+            "nhóm đối chứng phải THOẢ tiêu chí yếu, nếu không nó không chứng minh gì",
+        )
+        spaced = [
+            node.value
+            for node in ast.walk(control)
+            if isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and " " in node.value
+        ]
+        self.assertTrue(spaced, "không còn hằng có dấu cách thì đối chứng hết tác dụng")
+
+    def test_the_needle_side_is_folded_before_every_comparison(self) -> None:
+        """Nửa một: không phép so nào một phía đã gấp mà phía kia thì chưa.
+
+        Quét cả HỌ tự tìm được, không riêng ba hàm luật sản phẩm. Ba bộ gấp
+        phía kim dư thừa cho nhau nên bỏ một cái vẫn không ca hành vi nào
+        đỏ — đo rồi, không đoán.
+        """
+        checked = 0
+        for function in both_sides_folded_functions():
+            folded = folded_names(function)
+            literals = literal_loop_names(function)
 
             def side(node: ast.AST) -> str:
                 if isinstance(node, ast.Name) and node.id in folded:
                     return "folded"
-                if isinstance(node, ast.Name) and node.id not in literal_loops:
+                if isinstance(node, ast.Name) and node.id not in literals:
                     return "raw"
                 return "other"
 
@@ -744,10 +1113,52 @@ class ProductRuleBothSidesNormalizedTests(unittest.TestCase):
                     self.assertNotIn(
                         "raw",
                         kinds,
+                        f"{ast.unparse(left)} <-> {ast.unparse(right)}: "
                         "một phía đã gấp, phía kia chưa — kim không bao giờ khớp",
                     )
 
-        self.assertGreaterEqual(checked, 9, "không quét trúng phép so nào")
+        self.assertGreaterEqual(checked, 60, "không quét trúng phép so nào")
+
+    def test_no_folded_needle_is_left_unread(self) -> None:
+        """Nửa thứ hai: biến đã gấp mà không còn ai đọc = một mắt lưới vừa chết.
+
+        Ca ghép-đôi ở trên chỉ soi phép so CÒN SỐNG. Xoá hẳn một nhánh thì
+        không còn phép so nào để soi, mà dòng gấp vẫn nằm đó trơ ra — đo
+        rồi: ba đột biến "xoá hẳn nhánh" đều xanh dưới ca ghép-đôi. Phiên
+        listing đo độc lập ở nửa họ và ra cùng kết quả.
+
+        "Được đọc" phải là **mọi lần đọc biến**, đừng thu hẹp thành "làm
+        toán hạng của phép so": ``term_tokens`` chỉ xuất hiện ở
+        ``len(term_tokens) == 1``, định nghĩa hẹp biến nó thành mồ côi giả
+        ngay ở bản sạch.
+        """
+        orphans: list[tuple[str, str, int]] = []
+        checked = 0
+        for function in both_sides_folded_functions():
+            reads: set[str] = {
+                node.id
+                for node in ast.walk(function)
+                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+            }
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+                    continue
+                target = node.targets[0]
+                if not isinstance(target, ast.Name):
+                    continue
+                if not any(
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr in FOLDERS
+                    for child in ast.walk(node.value)
+                ):
+                    continue
+                checked += 1
+                if target.id not in reads:
+                    orphans.append((function.name, target.id, node.lineno))
+
+        self.assertGreaterEqual(checked, 40, "không quét trúng chỗ gấp nào")
+        self.assertEqual([], orphans)
 
     def test_a_spaced_and_an_accented_needle_both_route(self) -> None:
         """Chứng cứ sống cho việc phía KIM cũng được gấp, không riêng phía kia."""
