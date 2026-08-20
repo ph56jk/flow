@@ -449,11 +449,11 @@ def anchors_outside_their_statement(
     luật chữ bắt **0**. (Số cũ ghi ở đây là 18 lượt — sai, vì dụng cụ khi ấy
     lấy ``elsewhere[0]``, tức dòng nhỏ nhất, nên chỉ đếm một chiều.)
 
-    Chia ba thì mới biết cần canh cái gì — **33 lượt lùi** và **6 lượt tiến**
-    sang câu lệnh khác (nói dối thật), **9 lượt vẫn trong câu lệnh** (kim
-    viết ở cả hai dòng, mốc nào cũng nói thật). Luật này bắt đúng 39 lượt
-    đầu và im với 9 lượt sau. Cả hai chiều đều phải có mẫu: nửa
-    ``anchor <= box[1]`` từng không phép thử nào giữ đúng vì thế.
+    Chia ba theo *hộp của dòng mốc*: **14 lượt** hộp bắt đầu sau chỗ so,
+    **31 lượt** hộp khép trước chỗ so — luật này bắt đủ 45 — và **3 lượt**
+    vẫn đúng một câu lệnh với chỗ so, luật này im, phải để (g) gánh. Cả hai
+    nửa đều phải có mẫu: nửa ``number <= box[1]`` từng không phép thử nào
+    giữ đúng vì rổ chỉ được đo một chiều.
 
     Ca quyết định do erplisting-21 tìm ra bên họ: cùng một kim ở hai phép so
     khác nhau trong một hàm (``shirt``/``tshirt``). Bên tôi cũng có, ở
@@ -468,14 +468,58 @@ def anchors_outside_their_statement(
         name, number = parse_site(site)
         if number is None:
             continue  # đã có luật khác báo
-        box = boxes.get((name, number))
-        if box is None:
-            continue  # đã có luật khác báo
         for needle, anchor in sorted(literal_at[site].items()):
-            if not box[0] <= anchor <= box[1]:
+            # Neo hộp theo **dòng mốc**, không theo dòng chỗ so. Neo nhầm đầu
+            # thì ``if x in {...}:`` một dòng, ``return "portrait"`` dòng sau
+            # lọt sạch: câu lệnh nhỏ nhất bọc *dòng chỗ so* là cả cái ``if``
+            # nên nuốt luôn thân, còn câu lệnh bọc *dòng mốc* là chính cái
+            # ``return`` và nó không chứa chỗ so.
+            box = boxes.get((name, anchor))
+            if box is None:
+                reports.append(
+                    f"{site}: mốc của kim {needle!r} ở dòng {anchor}, không "
+                    f"nằm trong câu lệnh nào của hàm"
+                )
+                continue
+            if not box[0] <= number <= box[1]:
+                reports.append(
+                    f"{site}: mốc của kim {needle!r} ở dòng {anchor}, câu lệnh "
+                    f"{box} của nó không chứa chỗ so"
+                )
+    return reports
+
+
+def anchors_outside_their_comparison_node(
+    literal_at: dict[str, dict[str, int]],
+    node_at: dict[str, dict[str, tuple[int, int]]],
+) -> list[str]:
+    """Luật (g): mốc phải nằm trong **khoảng của chính nút so** đã ghi nó.
+
+    Đây mới là bất biến thật, và hai luật theo *dòng* ở trên chỉ là xấp xỉ
+    của nó. erplisting-21 chỉ đúng chỗ: hằng cùng câu lệnh có thể là hằng
+    của **một phép so khác**. Câu lệnh boolean dài
+    ``_flow_operator_card_product_signals`` trải 12522–12595 và chứa nhiều
+    phép so; đẩy mốc của ``banner`` từ 12551 sang 12585 thì cả (e) lẫn (f)
+    đều im vì vẫn "cùng câu lệnh" và vẫn đi xuôi — chỉ luật này kêu.
+
+    Đo trên cây thật: bắt **48/48** lượt đẩy, báo oan **0** trên tập sạch.
+    Nó bao trùm (e) và (f) không chỉ bằng số mà bằng chứng minh — span của
+    nút nằm gọn trong span câu lệnh, và ``node.lineno`` chính là dòng chỗ
+    so, nên mốc lọt (g) thì không thể phạm (e) hay (f). Giữ cả ba vì mỗi
+    luật phát biểu một điều đọc được, và vòng trước cho thấy bỏ luật dựa
+    trên phép đo sai phạm vi là cách mở lại lỗ.
+    """
+    reports = []
+    for site in sorted(literal_at):
+        for needle, anchor in sorted(literal_at[site].items()):
+            span = node_at.get(site, {}).get(needle)
+            if span is None:
+                reports.append(f"{site}: kim {needle!r} không ghi lại khoảng nút so")
+                continue
+            if not span[0] <= anchor <= span[1]:
                 reports.append(
                     f"{site}: mốc của kim {needle!r} ở dòng {anchor}, ngoài "
-                    f"câu lệnh {box}"
+                    f"nút so {span}"
                 )
     return reports
 
@@ -546,6 +590,7 @@ class SweptNeedles(NamedTuple):
     carriers_at: dict[str, set[str]] = {}
     inline_at: dict[str, set[str]] = {}
     literal_at: dict[str, dict[str, int]] = {}
+    node_at: dict[str, dict[str, tuple[int, int]]] = {}
 
 
 def needles_compared_with(normalizer: str) -> SweptNeedles:
@@ -587,6 +632,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
     carriers: dict[str, set[str]] = {}
     inline: dict[str, set[str]] = {}
     literals: dict[str, dict[str, int]] = {}
+    nodes: dict[str, dict[str, tuple[int, int]]] = {}
     functions = [
         node
         for node in ast.walk(tree)
@@ -712,6 +758,13 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                     # đó cách nhau xa, và cửa sổ rộng làm luật dễ xanh.
                     anchor = getattr(literal or node, "lineno", 0)
                     literals.setdefault(site, {})[value] = anchor
+                    # Khoảng của CHÍNH nút so ấy. Luật theo *dòng* không
+                    # tách được hai phép so nằm chung một câu lệnh dài —
+                    # bất biến thật là hằng thuộc đúng nút này.
+                    nodes.setdefault(site, {})[value] = (
+                        getattr(node, "lineno", 0),
+                        getattr(node, "end_lineno", 0) or getattr(node, "lineno", 0),
+                    )
                 if carrier:
                     carriers.setdefault(site, set()).add(carrier)
 
@@ -802,6 +855,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         carriers_at=carriers,
         inline_at=inline,
         literal_at=literals,
+        node_at=nodes,
     )
 
 
@@ -2156,25 +2210,25 @@ class UnderscoreTwinTests(unittest.TestCase):
     def test_an_anchor_may_not_leave_its_own_statement(self) -> None:
         """Luật (e) trên cây thật: mốc phải nằm trong câu lệnh đã ghi nó.
 
-        Đo trên cây thật, lấy **mọi** dòng ứng viên (bảng cũ ghi 14/14 và 0/4
-        là đo bằng dụng cụ chỉ nhìn một chiều, đã bỏ):
+        Đo lại trên cây thật sau khi neo hộp theo **dòng mốc**. Hai bảng
+        trước ghi ở đây (14/14 – 0/4, rồi 33/33 – 6/6 – 0/9) đều đo bằng
+        dụng cụ hỏng, đã bỏ: bảng đầu chỉ nhìn một chiều, bảng sau neo hộp
+        theo *dòng chỗ so* nên rổ "vẫn trong câu lệnh" nuốt mất 8 ca nói dối.
 
-        ==========================================  =========  =====  =====
-        đột biến                                    luật chữ     (e)    (f)
-        ==========================================  =========  =====  =====
-        cây sạch                                            0      0      0
-        đẩy mốc **lùi** sang câu lệnh khác                  0  33/33  33/33
-        đẩy mốc **tiến** sang câu lệnh khác                 0    6/6    0/6
-        …đẩy mà **vẫn trong câu lệnh**                      0    0/9    0/9
-        ==========================================  =========  =====  =====
+        ==========================================  ========  =====  =====  =====
+        đột biến                                    luật chữ    (e)    (f)    (g)
+        ==========================================  ========  =====  =====  =====
+        cây sạch                                           0      0      0      0
+        câu lệnh của mốc **bắt đầu sau** chỗ so            0  14/14   0/14  14/14
+        câu lệnh của mốc **khép trước** chỗ so             0  31/31  31/31  31/31
+        cùng câu lệnh nhưng **khác nút so**                0    0/3    2/3    3/3
+        ==========================================  ========  =====  =====  =====
 
         Luật chữ mù ở đây theo **cấu trúc**, không phải trùng hợp: dòng đích
-        vẫn viết đúng hằng ấy nên nó vẫn thấy chữ. 9 lượt trong cùng câu lệnh
-        thì (e) im là **đúng** — kim viết thật ở cả hai dòng, và đo riêng ra
-        thì **0/9** lượt ấy lùi lên trên dòng chỗ so, nên (f) im cũng đúng.
-        Cột (f) hôm nay không bắt thêm được gì ngoài phần (e) đã bắt; nó canh
-        lớp hỏng mà erplisting-21 gặp bên họ — hằng của một phép so **khác**
-        nằm cùng câu lệnh — lớp ấy cây này chưa có ca nào.
+        vẫn viết đúng hằng ấy nên nó vẫn thấy chữ. Rổ thứ ba là chỗ (e) và
+        (f) đuối: 2/3 ca là dòng **chú thích** có viết hằng (bắt được vì đi
+        lùi), còn ca thứ ba — ``banner`` 12551 → 12585, cùng một câu lệnh
+        boolean trải 12522–12595 — thì chỉ (g) kêu.
         """
         for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
             swept = needles_compared_with(normalizer)
@@ -2183,12 +2237,18 @@ class UnderscoreTwinTests(unittest.TestCase):
                 self.assertEqual(
                     [], anchors_standing_before_their_comparison(swept.literal_at)
                 )
+                self.assertEqual(
+                    [],
+                    anchors_outside_their_comparison_node(
+                        swept.literal_at, swept.node_at
+                    ),
+                )
 
     def test_the_statement_rule_is_pinned_on_made_up_data(self) -> None:
-        """Ghim theo đúng thứ tự: **đòi luật chữ im trước**, rồi (e) mới kêu.
+        """Ghim theo đúng thứ tự: **đòi luật chữ im trước**, rồi (e)/(g) mới kêu.
 
         Không khẳng định luật chữ im thì ca thử này không chứng minh được
-        (e) thêm gì — có khi (e) chỉ kêu ở chỗ luật chữ đã kêu sẵn.
+        gì thêm — có khi luật kia chỉ kêu ở chỗ luật chữ đã kêu sẵn.
         """
         lines = [
             'ALL = ("shirt", "tee")',
@@ -2196,99 +2256,136 @@ class UnderscoreTwinTests(unittest.TestCase):
             "    if x in (",
             '        "shirt",',
             "    ):",
-            "        pass",
+            '        return "shirt"',
         ]
-        boxes = {("f", 3): (3, 5)}
+        # Hộp câu lệnh bịa: cả cái ``if`` trải 3–6, riêng ``return`` là 6–6.
+        boxes = {
+            ("f", 1): (1, 1),
+            ("f", 3): (3, 6),
+            ("f", 4): (3, 6),
+            ("f", 5): (3, 6),
+            ("f", 6): (6, 6),
+        }
+        node = {"f:3": {"shirt": (3, 5)}}
+
+        def im_het_luat_chu(bent):
+            self.assertEqual(
+                [], inline_needles_not_written_on_their_own_line(bent, lines),
+                "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
+            )
+
+        # A. Mốc lùi hẳn ra ngoài câu lệnh.
         bent = {"f:3": {"shirt": 1}}
-        self.assertEqual(
-            [], inline_needles_not_written_on_their_own_line(bent, lines),
-            "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
-        )
+        im_het_luat_chu(bent)
         reports = anchors_outside_their_statement(bent, boxes)
         self.assertEqual(1, len(reports))
-        self.assertIn("ngoài câu lệnh", reports[0])
+        self.assertIn("không chứa chỗ so", reports[0])
+        self.assertEqual(1, len(anchors_outside_their_comparison_node(bent, node)))
 
-        # Chiều XUÔI: mốc đứng **sau** câu lệnh, dòng ấy vẫn mang đúng hằng.
-        # Thiếu ca này thì nửa dưới ``anchor <= box[1]`` không ai giữ — đo
-        # được: bỏ nửa ấy mà cả suite vẫn xanh trơn. Câu lệnh khép ở dòng 2,
-        # mốc trỏ xuống dòng 4; đặt mốc **trước** câu lệnh là lặp lại chiều
-        # trên chứ không thêm được gì.
-        ahead = {"f:3": {"shirt": 4}}
-        boxes_ahead = {("f", 3): (1, 2)}
-        self.assertEqual(
-            [], inline_needles_not_written_on_their_own_line(ahead, lines),
-            "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
-        )
-        reports = anchors_outside_their_statement(ahead, boxes_ahead)
+        # B. Mốc xuôi xuống ``return "shirt"`` — đúng ca erplisting-21 bắt
+        # được. Neo hộp theo *dòng chỗ so* thì cả cái ``if`` nuốt luôn thân
+        # nên ca này lọt; neo theo *dòng mốc* thì hộp là ``return`` (6, 6).
+        bent = {"f:3": {"shirt": 6}}
+        im_het_luat_chu(bent)
+        reports = anchors_outside_their_statement(bent, boxes)
         self.assertEqual(1, len(reports))
-        self.assertIn("ngoài câu lệnh", reports[0])
+        self.assertEqual(
+            [], anchors_standing_before_their_comparison(bent),
+            "(f) phai IM o chieu xuoi — no khong gac duoc ca nay",
+        )
+        self.assertEqual(1, len(anchors_outside_their_comparison_node(bent, node)))
 
-        # Ghim PHÂN BIỆT (e) với (f): mốc lùi lên dòng 3 — vẫn trong câu lệnh
-        # (3, 5) nên (e) **im**, nhưng đứng trên dòng 4 của chỗ so nên (f)
-        # phải kêu. Đây là ca duy nhất tách được hai luật: trên cây hôm nay
-        # mọi lượt (f) bắt thì (e) cũng bắt, nên thiếu ghim này thì xoá sạch
-        # (f) đi cả suite vẫn xanh.
-        above = {"f:4": {"shirt": 3}}
-        lines_above = [
+        # C. Chỉ (g) gánh: hai phép so khác nhau trong **một** câu lệnh, mốc
+        # nhảy sang hằng của phép so kia. (e) im vì vẫn cùng câu lệnh, (f)
+        # im vì vẫn đi xuôi. Đây là hình dạng ``banner`` 12551 → 12585 trên
+        # cây thật, và là ca duy nhất tách được (g) khỏi hai luật kia.
+        doi = [
             'ALL = ("shirt", "tee")',
             "def f(x):",
-            '    if ("shirt" in x) and (',
-            '        x in ("shirt",)',
+            '    if ("shirt" in x) or (',
+            '            y in ("shirt",)',
             "    ):",
             "        pass",
         ]
+        rieng = {"f:3": {"shirt": 4}}
         self.assertEqual(
-            [], inline_needles_not_written_on_their_own_line(above, lines_above),
+            [], inline_needles_not_written_on_their_own_line(rieng, doi),
             "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
         )
         self.assertEqual(
-            [], anchors_outside_their_statement(above, {("f", 4): (3, 5)}),
+            [], anchors_outside_their_statement(rieng, {("f", 4): (3, 5)}),
+            "(e) phai IM — day moi la cho (g) ganh viec mot minh",
+        )
+        self.assertEqual(
+            [], anchors_standing_before_their_comparison(rieng),
+            "(f) phai IM — day moi la cho (g) ganh viec mot minh",
+        )
+        reports = anchors_outside_their_comparison_node(rieng, {"f:3": {"shirt": (3, 3)}})
+        self.assertEqual(1, len(reports))
+        self.assertIn("ngoài nút so", reports[0])
+
+        # D. Chỉ (f) gánh: mốc lùi lên hằng của phép so khác, vẫn trong câu
+        # lệnh nên (e) im. Đây là ca ``theu`` erplisting-21 đo được bên họ.
+        above = {"f:4": {"shirt": 3}}
+        self.assertEqual(
+            [], inline_needles_not_written_on_their_own_line(above, doi),
+            "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
+        )
+        self.assertEqual(
+            [], anchors_outside_their_statement(above, {("f", 3): (3, 5)}),
             "(e) phai IM — day moi la cho (f) ganh viec mot minh",
         )
         reports = anchors_standing_before_their_comparison(above)
         self.assertEqual(1, len(reports))
         self.assertIn("trên cả dòng", reports[0])
 
-        # Chiều IM, và cố ý đặt mốc **khác dòng chỗ so** nhưng vẫn trong câu
-        # lệnh: nếu ai siết nhầm thành "mốc == dòng chỗ so" thì ca này đỏ.
-        # Bản ghim cũ đặt mốc trùng dòng chỗ so nên mù với đúng cái siết ấy —
-        # chỉ cây thật kêu (64 lời báo oan). Ghim mà không cắn thì chưa phải ghim.
+        # E. Chiều IM: mốc khác dòng chỗ so nhưng vẫn trong đúng nút so.
+        # Nếu ai siết nhầm thành "mốc == dòng chỗ so" thì ca này đỏ. Bản ghim
+        # cũ đặt mốc trùng dòng chỗ so nên mù với đúng cái siết ấy — chỉ cây
+        # thật kêu. Ghim mà không cắn thì chưa phải ghim.
         honest = {"f:3": {"shirt": 4}}
+        im_het_luat_chu(honest)
         self.assertEqual([], anchors_outside_their_statement(honest, boxes))
         self.assertEqual([], anchors_standing_before_their_comparison(honest))
-        self.assertEqual(
-            [], inline_needles_not_written_on_their_own_line(honest, lines)
-        )
+        self.assertEqual([], anchors_outside_their_comparison_node(honest, node))
 
     def test_the_real_tree_mutation_is_caught_inside_the_suite(self) -> None:
-        """Đẩy mốc **trên cây thật** rồi đòi (e) bắt, ngay trong suite.
+        """Đẩy mốc **trên cây thật** rồi đòi từng luật trả lời, ngay trong suite.
 
         Trước đây con số "bắt 14/14" là tôi đo tay bằng script rời — suite
         không giữ nó. Suite chỉ giữ ca ghim bịa, mà ghim thì chỉ canh đúng
-        hình dạng nó viết ra. Đo tay xong không đưa vào suite thì lần sau ai
-        sửa luật cũng không có gì kêu.
+        hình dạng nó viết ra.
 
-        Đột biến: với mỗi kim, tìm dòng khác **trong cùng hàm** cũng viết
-        đúng hằng ấy rồi dời mốc sang. Chia đôi theo câu lệnh, và đòi ba
-        điều — luật chữ **im** cả hai loại (nó mù theo cấu trúc), (e) bắt
-        **hết** loại nói dối, (e) **im** với loại nói thật kiểu khác.
+        Đột biến: với mỗi kim, mọi dòng khác **trong cùng hàm** cũng viết
+        đúng hằng ấy đều được dời mốc sang. Chia rổ theo *luật nào lẽ ra
+        phải kêu*, rồi đòi:
+
+        * luật chữ **im** ở mọi lượt — nó mù theo cấu trúc, dòng đích vẫn
+          viết đúng hằng ấy nên nó vẫn thấy chữ;
+        * (g) kêu ở **mọi** lượt, kể cả rổ mà (e) và (f) đều im;
+        * (e) kêu đúng hai rổ của nó và im ở rổ thứ ba.
+
+        Rổ thứ ba là chỗ erplisting-21 bắt được lỗi của tôi: mốc vẫn "cùng
+        câu lệnh" và vẫn đi xuôi nên (e) lẫn (f) đều im, mà đó là nói dối —
+        ``return "portrait"`` viết lại đúng hằng ấy, và một câu lệnh boolean
+        dài chứa nhiều phép so khác nhau. Trước khi vá, rổ ấy bị tôi gán
+        nhãn "nói thật" nên phép thử **khẳng định im**: im vì được dạy im.
         """
         source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
         lines = source.read_text(encoding="utf-8").split("\n")
         boxes = statement_spans()
         spans = function_line_ranges()
-        lies: dict[str, list] = {}
-        honest: dict[str, dict[str, int]] = {}
+        gio: dict[str, list] = {}
         for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
             swept = needles_compared_with(normalizer)
             for site, anchors in swept.literal_at.items():
                 name, number = parse_site(site)
-                box = boxes.get((name, number or 0))
                 held = spans.get(name)
-                if box is None or not held:
+                if number is None or not held:
                     continue
                 low, high = held[0]
                 for needle, anchor in anchors.items():
+                    span = swept.node_at[site][needle]
                     for line in range(low, high + 1):
                         if line == anchor:
                             continue
@@ -2297,41 +2394,45 @@ class UnderscoreTwinTests(unittest.TestCase):
                             and f"'{needle}'" not in lines[line - 1]
                         ):
                             continue
-                        if box[0] <= line <= box[1]:
-                            honest.setdefault(site, {})[needle] = line
+                        box = boxes.get((name, line))
+                        if box is None or box[0] > number:
+                            ro = "cau-lenh-cua-moc-bat-dau-sau-cho-so"
+                        elif box[1] < number:
+                            ro = "cau-lenh-cua-moc-khep-truoc-cho-so"
                         else:
-                            way = "lui" if line < box[0] else "tien"
-                            lies.setdefault(way, []).append(({site: {needle: line}}, line))
+                            ro = "cung-cau-lenh-nhung-khac-nut-so"
+                        gio.setdefault(ro, []).append(
+                            ({site: {needle: line}}, {site: {needle: span}}, line, number)
+                        )
 
-        # Lấy **mọi** dòng ứng viên chứ không lấy dòng đầu: dòng đầu là dòng
-        # nhỏ nhất, nên rổ nói dối chỉ toàn chiều lùi và nửa ``anchor <=
-        # box[1]`` lại không ai đo. Đòi cả hai chiều đều có mẫu thật.
-        for way in ("lui", "tien"):
-            self.assertIn(way, lies, f"cay that phai co mau chieu {way}, khong thi ca nay do hut mot nua")
-            for bent, line in lies[way]:
+        # Cả ba rổ phải có mẫu thật. Lấy **mọi** dòng ứng viên chứ không lấy
+        # dòng đầu: dụng cụ cũ lấy ``elsewhere[0]`` nên chỉ đếm được một
+        # chiều, và rổ thứ ba thì không bao giờ hiện ra.
+        for ro in (
+            "cau-lenh-cua-moc-bat-dau-sau-cho-so",
+            "cau-lenh-cua-moc-khep-truoc-cho-so",
+            "cung-cau-lenh-nhung-khac-nut-so",
+        ):
+            self.assertIn(ro, gio, f"cay that phai co mau ro {ro}")
+            for bent, span_at, line, number in gio[ro]:
                 self.assertEqual(
                     [], inline_needles_not_written_on_their_own_line(bent, lines),
-                    f"luat chu phai IM o dong {line} — no mu theo cau truc chu khong phai trung hop",
+                    f"luat chu phai IM o dong {line} — no mu theo cau truc",
                 )
                 self.assertEqual(
-                    1, len(anchors_outside_their_statement(bent)),
-                    f"(e) phai bat moc bi day {way} toi dong {line}",
+                    1, len(anchors_outside_their_comparison_node(bent, span_at)),
+                    f"(g) phai bat moc bi day toi dong {line}",
                 )
-                # (f) chỉ nói về thứ tự, nên nó phải bắt chiều lùi và IM với
-                # chiều tiến — đó là cặp phân biệt lấy từ cây thật.
                 self.assertEqual(
-                    1 if way == "lui" else 0,
+                    0 if ro == "cung-cau-lenh-nhung-khac-nut-so" else 1,
+                    len(anchors_outside_their_statement(bent)),
+                    f"(e) doc sai ro {ro} o dong {line}",
+                )
+                self.assertEqual(
+                    1 if line < number else 0,
                     len(anchors_standing_before_their_comparison(bent)),
-                    f"(f) doc sai chieu {way} o dong {line}",
+                    f"(f) doc sai chieu o dong {line}",
                 )
-        self.assertEqual(
-            [], anchors_outside_their_statement(honest),
-            "moc doi trong cung cau lenh van noi that, khong duoc keu",
-        )
-        self.assertEqual(
-            [], anchors_standing_before_their_comparison(honest),
-            "moc doi trong cung cau lenh ma van sau cho so thi (f) phai im",
-        )
 
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
         """Phủ kín ở mức CHỖ SO, không chỉ ở mức nhãn hình dạng.
