@@ -75,6 +75,7 @@ def literal_bindings_of(function: ast.AST) -> dict[str, object]:
                     written[child.id] = written.get(child.id, 0) + 1
 
     bindings: dict[str, object] = {}
+    derived: list[tuple[str, ast.AST]] = []
     for node in ast.walk(function):
         targets: list[ast.expr] = []
         if isinstance(node, ast.Assign) and len(node.targets) == 1:
@@ -86,9 +87,92 @@ def literal_bindings_of(function: ast.AST) -> dict[str, object]:
                 continue
             try:
                 bindings[targets[0].id] = ast.literal_eval(node.value)
+                continue
             except Exception:
                 pass
+            # ``literal_eval`` ném cho MỌI thứ không phải hằng, kể cả bảng
+            # dẫn xuất từ một bảng hằng đã biết. Nuốt luôn chỗ ném ấy là
+            # cách một vế so biến mất khỏi lượt quét mà tổng vẫn đọc là 0.
+            derived.append((targets[0].id, node.value))
+
+    # Vòng lặp tới điểm dừng: bảng dẫn xuất có thể trỏ vào bảng dẫn xuất
+    # khác. Có chặn số vòng để một cây kỳ quặc không treo lượt kiểm.
+    for _ in range(len(derived) + 1):
+        con_lai = []
+        for name, value in derived:
+            table = table_from_comprehension(value, bindings)
+            if table is None:
+                con_lai.append((name, value))
+            else:
+                bindings[name] = table
+        if len(con_lai) == len(derived):
+            break
+        derived = con_lai
     return bindings
+
+
+def value_from(node: ast.AST, scope: dict[str, str]) -> str:
+    """Giá trị chuỗi của một biểu thức chỉ dựa vào biến chạy — hoặc ném.
+
+    Hỏi **tính chất** chứ không kể tên: "cái này có phải phương thức của
+    ``str`` trả về ``str`` không". Nên ``.replace``, ``.casefold``, hay
+    phương thức nào service.py dùng sau này cũng vào được mà không ai phải
+    sửa một danh sách. Danh sách thành viên là cái máy đẻ lỗ mà phép thử
+    trên cây hiện tại không bắt được — erplisting-21 đo được bên họ: thu
+    hẹp bộ ba comprehension về riêng ``SetComp`` thì suite vẫn xanh.
+
+    Người nhận luôn là ``str`` (hoặc đã ném trước đó), nên ``getattr`` ở
+    đây không với ra ngoài phương thức chuỗi.
+    """
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in scope:
+        return scope[node.id]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and not node.keywords:
+        receiver = value_from(node.func.value, scope)
+        method = getattr(receiver, node.func.attr, None)
+        if callable(method):
+            out = method(*[value_from(arg, scope) for arg in node.args])
+            if isinstance(out, str):
+                return out
+    raise ValueError(f"không tính được từ biến chạy: {ast.dump(node)[:60]}")
+
+
+def table_from_comprehension(node: ast.AST, bindings: dict[str, object]) -> tuple[str, ...] | None:
+    """Bảng hằng sinh ra bằng comprehension trên một bảng hằng đã biết.
+
+    Ca sống trên cây: ``generic_compact = {item.replace("_", "") for item
+    in generic_exact}`` trong ``_sanitize_user_assistant_product_filter``.
+    ``generic_exact`` đọc được, ``generic_compact`` thì không — nên vế
+    ``compact in generic_compact`` của chính câu lệnh canh ấy **chưa từng**
+    bị lượt quét nhìn thấy, và tổng vẫn đọc là 0.
+
+    Hỏi ``getattr(node, "generators", None)`` chứ không kể tên bốn lớp
+    comprehension: mọi nút comprehension đều có ``.generators``, còn danh
+    sách lớp thì thiếu một cái là tối im một chỗ (cách hỏi của
+    erplisting-21).
+    """
+    gens = getattr(node, "generators", None)
+    elt = getattr(node, "elt", None)
+    if gens is None or elt is None or len(gens) != 1:
+        return None
+    gen = gens[0]
+    if gen.ifs or getattr(gen, "is_async", 0) or not isinstance(gen.target, ast.Name):
+        return None
+    if not isinstance(gen.iter, ast.Name):
+        return None
+    source = bindings.get(gen.iter.id)
+    if not isinstance(source, (set, frozenset, list, tuple)) or not source:
+        return None
+    out: list[str] = []
+    for item in sorted(source, key=repr):
+        if not isinstance(item, str):
+            return None
+        try:
+            out.append(value_from(elt, {gen.target.id: item}))
+        except Exception:
+            return None
+    return tuple(out)
 
 
 def literal_loop_names(function: ast.AST) -> set[str]:
@@ -388,7 +472,7 @@ def tables_that_lost_their_name(nameless_at: set[str]) -> list[str]:
     chưa nhận (``RULES["x"]``, ``self.a.b``), rồi ``if carrier:`` nuốt luôn
     chuỗi rỗng ấy — chỗ so biến khỏi tầm luật (d) và tổng vẫn đọc là 0.
 
-    Trên cây hôm nay là **0/25**: mọi vế mang bảng đều gọi được tên. Nhưng
+    Trên cây hôm nay là **0/39**: mọi vế mang bảng đều gọi được tên. Nhưng
     0 ấy đo cái "chưa với tới", không đo cái "không thể" — hình chưa nhận
     thì có thật, chỉ là service.py chưa viết kiểu đó ở đúng chỗ so. Phân
     biệt hai thứ ấy là của erplisting-21, đo được bên họ ở ``else ""``.
@@ -2566,13 +2650,13 @@ class UnderscoreTwinTests(unittest.TestCase):
         hiểm nằm ở **dụng cụ**: ``box_name`` trả rỗng cho hình chưa nhận,
         rồi ``if carrier:`` nuốt mất — chỗ so rơi khỏi tầm luật (d).
 
-        Đo trên cây thật: ``box_name`` được gọi **25** lượt trong lượt quét,
+        Đo trên cây thật: ``box_name`` được gọi **39** lượt trong lượt quét,
         **0** lượt rỗng. Nhưng theo phân biệt của erplisting-21, 0 ấy là
         "chưa với tới" chứ không phải "không thể" — khác hẳn vế ``"_" not in
         needle`` của :func:`missing_twins`, cái đó không đầu vào nào chạm
         được. Bằng chứng nó đổi được kết quả: bịt mắt ``box_name`` thì
-        carrier tụt **56 → 54** và giỏ mất-tên lên **0 → 2**: luật (d) mất
-        hai chỗ trong khi cây vẫn y nguyên. Giả định đầu của tôi là "mất
+        carrier tụt **57 → 54** và giỏ mất-tên lên **0 → 3**: luật (d) mất
+        ba chỗ trong khi cây vẫn y nguyên. Giả định đầu của tôi là "mất
         sạch 56" — số đo bác bỏ, vì 54 carrier còn lại đi lối ``loop-var``
         và ``mapping.get-named`` chứ không qua ``box_name``.
         """
@@ -2604,9 +2688,67 @@ class UnderscoreTwinTests(unittest.TestCase):
             "bịt mắt thì luật (d) mất đúng phần carrier đi qua box_name",
         )
         self.assertEqual(
-            2, len([r for s in mu for r in tables_that_lost_their_name(s.nameless_at)]),
+            3, len([r for s in mu for r in tables_that_lost_their_name(s.nameless_at)]),
             "và mất bao nhiêu thì phải kêu bấy nhiêu — không thì (d) tắt lặng lẽ",
         )
+
+    def test_a_table_derived_from_a_constant_table_is_read_too(self) -> None:
+        """Bảng hằng **dẫn xuất** cũng phải đọc được, không thì nửa câu tối im.
+
+        erplisting-21 đề nghị kiểm hai cơ chế bên này. Đo ra:
+
+        * *nút so là comprehension* — **0 chỗ** trong các hàm được quét.
+          Chưa-với-tới, không phải không-thể; ghi là 0 chứ không nói "sạch".
+        * *bảng hằng pha* ở mức module/lớp — **0 bảng**. Nhưng ``literal_eval``
+          trong :func:`literal_bindings_of` nuốt **3693** lượt gán cục bộ, và
+          trong đám ấy có **12** bảng gán bằng comprehension. Mười một cái
+          lặp trên dữ liệu chạy (``row``, ``card``, ``query``) nên bỏ là
+          đúng. Cái thứ mười hai là bảng kim thật:
+
+              generic_compact = {item.replace("_", "") for item in generic_exact}
+              if normalized in generic_exact or compact in generic_compact:
+
+          Vế **trái** được quét từ lâu; vế **phải** thì chưa bao giờ — ngay
+          trong hàm mà docstring của :func:`named_set_strings` khoe là đã vá.
+          Rỗng-vì-mù đúng chỗ mình tưởng đã sáng.
+
+        Neo theo (tên hàm, tên bảng) chứ không theo số dòng service.py:
+        nguồn xê một dòng thì ghim theo dòng đỏ oan (điểm erplisting-21 nêu).
+        """
+        swept = needles_compared_with("_compact_match_text")
+        cho = [s for s, ten in swept.carriers_at.items() if "generic_compact" in ten]
+        self.assertEqual(1, len(cho), "vế compact phải được quét, kèm tên bảng cho luật (d)")
+        self.assertTrue(cho[0].startswith("_sanitize_user_assistant_product_filter:"), cho[0])
+        self.assertEqual(14, len(swept.by_site[cho[0]]), "đủ 14 kim của bảng dẫn xuất")
+
+        # Hỏi TÍNH CHẤT (``.generators``), không kể tên lớp comprehension.
+        # Cây này chỉ có SetComp, nên bản kể tên mà thiếu ListComp vẫn xanh
+        # — đúng cái bẫy erplisting-21 đo được bên họ. Ghim bằng dữ liệu bịa.
+        for ma in (
+            "{i.replace('_', '') for i in B}",
+            "[i.replace('_', '') for i in B]",
+            "(i.replace('_', '') for i in B)",
+        ):
+            node = ast.parse(ma, mode="eval").body
+            self.assertEqual(
+                ("a", "b"), table_from_comprehension(node, {"B": ("a_", "b_")}),
+                f"{ma}: mọi nút có .generators đều phải đọc được",
+            )
+
+        # value_from cũng hỏi tính chất: "phương thức của str trả về str".
+        # Không có danh sách tên phương thức nào để mà thiếu.
+        hoa = ast.parse("{i.casefold() for i in B}", mode="eval").body
+        self.assertEqual(("ab",), table_from_comprehension(hoa, {"B": ("AB",)}))
+
+        # Và chỗ nó CHỊU thì phải trả None để người sau thấy, không đoán bừa:
+        for ma, canh in (
+            ("{i.khong_co_that() for i in B}", "không phải phương thức của str"),
+            ("{i for i in B if i}", "có mệnh đề if thì không biết cái nào lọt"),
+            ("{i: i for i in B}", "DictComp không có .elt"),
+            ("{i for i in chua_biet}", "nguồn không phải bảng hằng đã biết"),
+        ):
+            node = ast.parse(ma, mode="eval").body
+            self.assertIsNone(table_from_comprehension(node, {"B": ("a",)}), canh)
 
     def test_a_widened_ruler_kills_g_but_leaves_e_speaking(self) -> None:
         """Vì sao giữ (e) dù (g) chặt hơn: hai luật hỏng theo hai kiểu.
