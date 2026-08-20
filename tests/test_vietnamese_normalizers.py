@@ -1276,11 +1276,14 @@ class SweepReachTests(unittest.TestCase):
         ("_compact_match_text", "loop-var"): 40,
         ("_compact_match_text", "comprehension"): 20,
     }
-    # Hình dạng lượt quét biết đọc nhưng repo này KHÔNG có chỗ nào dùng. Ghi
-    # thẳng ra thay vì để nó lẫn vào phần "đã phủ": đo được 0 chỗ gọi
+    # Hình dạng lượt quét biết đọc nhưng **flow-v2 (nửa làm ảnh)** không có
+    # chỗ nào dùng. Ghi kèm TÊN REPO chứ đừng ghim trống: nửa listing đo bên
+    # họ ra 2 chỗ thật (``normalized.startswith("auto_erp_etsy")`` và
+    # ``"auto_erp_amazon"``), nên "chưa có chỗ như thế" là kết luận riêng của
+    # repo này, không phải tính chất của hình dạng. Đo được 0 chỗ gọi
     # ``.startswith``/``.endswith`` trên giá trị đã gấp, trên cả sáu bộ
-    # chuẩn hoá. "0 cây kim" ở đây nghĩa là "chưa có chỗ nào như thế", không
-    # phải "hình dạng này chạy tốt".
+    # chuẩn hoá của ``flow_web/service.py``. "0 cây kim" ở đây nghĩa là "repo
+    # này chưa có chỗ nào như thế", không phải "hình dạng này chạy tốt".
     SHAPES_WITH_NO_SITE_HERE = {"startswith"}
 
     @staticmethod
@@ -1423,11 +1426,19 @@ class DiacriticFoldBoundaryTests(unittest.TestCase):
     một khác biệt vô hại lấy rủi ro trên đường chạy thật.
     """
 
+    # BA hành vi, không phải hai. Gộp KEEPS vào "không gấp" là để người đọc
+    # sau lướt thành "chỉ mất dấu thôi" — trong khi DELETES là mất hẳn con chữ.
+    KEEPS_D = ("_strip_accents",)
     FOLDS_D = ("_normalize_skill_token", "_normalize_prompt_source_header", "_normalize_policy_text")
     DELETES_D = ("_compact_match_text", "_tokenize_match_words")
 
     def test_the_boundary_is_where_it_is_recorded_to_be(self) -> None:
         svc = service()
+        for name in self.KEEPS_D:
+            with self.subTest(normalizer=name, side="giữ"):
+                # Bỏ dấu nhưng KHÔNG đụng tới ``đ``: "đồng hồ" → "đong ho".
+                self.assertEqual("đ", getattr(svc, name)("đ"))
+                self.assertEqual("đong ho", getattr(svc, name)("đồng hồ"))
         for name in self.FOLDS_D:
             with self.subTest(normalizer=name, side="gấp"):
                 self.assertEqual("d", getattr(svc, name)("đ"))
@@ -1490,3 +1501,69 @@ class DiacriticFoldBoundaryTests(unittest.TestCase):
                 if " " not in text.strip():
                     product_needle_changed.append(f"{needle!r} <- {text!r}")
         self.assertEqual([], product_needle_changed)
+
+
+class UnderscoreTwinTests(unittest.TestCase):
+    """Kim có ``_`` mà bị đo bằng bảng chữ không cho ``_`` thì phải có bản viết liền.
+
+    Bảng ``alias_groups`` cố ý gõ tay từng cặp: ``tap_de`` cho
+    `_normalize_skill_token`, ``tapde`` cho `_compact_match_text`, rồi so
+    bằng ``or``. Hôm nay đủ cả 5 cặp — nhưng "hôm nay đủ" không phải là một
+    cái lưới. Chiều nguy hiểm là **thêm kim mới**: gõ ``vo_goi`` mà quên
+    ``vogoi`` thì vế compact chết câm, và test bảng chữ cái vẫn xanh vì
+    ``vo_goi`` hợp lệ với `_normalize_skill_token`.
+
+    **Vì sao không viết thành test ĐẾM.** Đếm cũng đỏ, nhưng đỏ với lời
+    "22 != 21" — và câu đó dẫn người sửa đi sửa CON SỐ, còn cặp thì thiếu
+    vĩnh viễn. Test này phải gọi đúng tên cây kim còn thiếu.
+
+    Tập "bảng chữ không cho gạch dưới" **suy ra** từ ``ALPHABETS`` chứ
+    không gõ tay: thêm một bộ chuẩn hoá mới là nó tự vào diện kiểm.
+    """
+
+    @staticmethod
+    def _alphabets_without_underscore() -> list[str]:
+        return [
+            normalizer
+            for normalizer, alphabet in NormalizedNeedleAlphabetTests.ALPHABETS.items()
+            if not re.fullmatch(alphabet, "a_b")
+        ]
+
+    def test_the_derived_set_is_not_empty(self) -> None:
+        """Không có câu này thì cả lớp test dưới vô nghĩa mà vẫn xanh."""
+        derived = self._alphabets_without_underscore()
+        self.assertIn("_compact_match_text", derived)
+        self.assertNotIn("_normalize_skill_token", derived)
+
+    def test_every_underscored_needle_has_a_joined_twin(self) -> None:
+        missing = []
+        for normalizer in self._alphabets_without_underscore():
+            needles = set(needles_compared_with(normalizer).by_text)
+            for needle in sorted(needles):
+                if "_" not in needle:
+                    continue
+                twin = needle.replace("_", "")
+                if twin not in needles:
+                    missing.append(
+                        f"{needle!r} cần bản viết liền {twin!r} thì {normalizer} mới khớp được"
+                    )
+        self.assertEqual([], missing)
+
+    def test_both_halves_of_each_pair_really_route(self) -> None:
+        """Bằng chứng sống, không chỉ đối xứng chính tả.
+
+        Không có nhóm này thì luật trên đọc như trò chơi chuỗi ký tự, và
+        người sửa sau có thể "sửa" bằng cách bịa ra bản viết liền cho một
+        cây kim mà không bộ chuẩn hoá nào từng nhả ra nó.
+        """
+        svc = service()
+        for underscored, joined, typed in (
+            ("tap_de", "tapde", "tạp dề"),
+            ("gau_bong", "gaubong", "gấu bông"),
+            ("bup_be", "bupbe", "búp bê"),
+            ("ao_tre_em", "aotreem", "áo trẻ em"),
+            ("baby_doll", "babydoll", "baby doll"),
+        ):
+            with self.subTest(pair=underscored):
+                self.assertEqual(underscored, svc._normalize_skill_token(typed))
+                self.assertEqual(joined, svc._compact_match_text(typed))
