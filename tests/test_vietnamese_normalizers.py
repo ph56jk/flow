@@ -21,7 +21,11 @@ from typing import NamedTuple
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from flow_web.service import FlowWebService
+from flow_web.service import (
+    PRODUCT_SHOT_RULE_PRIORITY,
+    PRODUCT_SHOT_RULES,
+    FlowWebService,
+)
 
 
 def service() -> FlowWebService:
@@ -534,6 +538,225 @@ class SkillFieldKeyTests(unittest.TestCase):
 
     def test_chuyen_dong_camera_is_a_camera_motion_skill(self) -> None:
         self.assertEqual("camera_motion", service()._parse_skill_type("chuyển động camera"))
+
+
+class ProductRuleBothSidesNormalizedTests(unittest.TestCase):
+    """Vì sao hai bảng luật sản phẩm KHÔNG dính họ lỗi "sai bảng chữ cái".
+
+    Các bảng ở ``PRODUCT_SHOT_RULES`` và ở ``signatures`` bên trong
+    ``_flow_operator_product_rule_key_from_visual_text`` chứa đầy cây kim
+    có dấu cách (``"passport cover"``) và có dấu tiếng Việt
+    (``"bọc passport"``). Ở mọi bảng khác trong repo, viết như vậy là kim
+    chết — bộ chuẩn hoá phát ra ``[a-z0-9_]`` nên không chuỗi nào có dấu
+    cách hay dấu thanh khớp được.
+
+    Ở đây thì không, và lý do là cấu trúc chứ không phải may mắn: hai hàm
+    ấy **chuẩn hoá cả hai phía** trước khi so, ``alias_normalized =
+    self._normalize_skill_token(alias_text)``. Kim viết bằng chữ người đọc
+    được, rồi mới được gấp về đúng bảng chữ cái ngay lúc so.
+
+    Đó cũng là lý do lượt quét theo biến không quy được cây kim nào ở đây
+    về ``_normalize_skill_token``: chúng không phải hằng đem so trực tiếp.
+    Miễn nhiễm này mất đi lặng lẽ nếu có ai đem thẳng một hằng ra so với
+    biến đã chuẩn hoá, nên ``test_no_product_rule_needle_is_compared_raw``
+    canh đúng chỗ đó.
+    """
+
+    CONSUMERS = (
+        "_flow_operator_card_name_product_rule_key",
+        "_flow_operator_product_rule_key_from_text",
+        "_flow_operator_product_rule_key_from_visual_text",
+    )
+
+    # Ba bộ gấp chạy song song ở phía kim. Chúng dư thừa cho nhau, nên hỏng
+    # MỘT cái thì không ca hành vi nào đỏ — đo rồi, không đoán. Vì vậy tính
+    # chất phải được ghim thẳng bằng cấu trúc, đừng trông vào hành vi.
+    FOLDERS = (
+        "_normalize_skill_token",
+        "_compact_match_text",
+        "_tokenize_match_words",
+    )
+
+    # Bốn bí danh này có khớp, nhưng luật đứng trước trong thứ tự ưu tiên
+    # giành mất — ``album`` ở vị trí 15, ``guest_book`` ở 17, và ``album``
+    # đã tự khai đúng bốn cách viết ấy. Đây là chuyện phân loại sản phẩm,
+    # không phải kim chết; ghim lại để lần che khuất TIẾP THEO lộ ra.
+    ALIASES_SHADOWED_BY_AN_EARLIER_RULE = {
+        ("guest_book", "photo album", "album"),
+        ("guest_book", "wedding photo album", "album"),
+        ("guest_book", "fabric photo album", "album"),
+        ("guest_book", "embroidered photo album", "album"),
+    }
+
+    def setUp(self) -> None:
+        self.service = service()
+
+    def _signature_terms(self) -> list[tuple[str, str, str]]:
+        """Bảng ``signatures`` là biến cục bộ nên phải đọc bằng AST."""
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        terms: list[tuple[str, str, str]] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name != "_flow_operator_product_rule_key_from_visual_text":
+                continue
+            for child in ast.walk(node):
+                if not isinstance(child, ast.AnnAssign):
+                    continue
+                if getattr(child.target, "id", "") != "signatures":
+                    continue
+                for key, buckets in ast.literal_eval(child.value).items():
+                    for bucket, values in buckets.items():
+                        for value in values:
+                            terms.append((key, bucket, value))
+        return terms
+
+    def _aliases(self) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        for key in PRODUCT_SHOT_RULE_PRIORITY:
+            for alias in (PRODUCT_SHOT_RULES.get(key) or {}).get("aliases", ()):
+                pairs.append((key, alias))
+        return pairs
+
+    def test_both_tables_are_found_at_all(self) -> None:
+        """Sàn chống ca rỗng: đọc hụt bảng thì các ca dưới xanh vô nghĩa."""
+        aliases = self._aliases()
+        terms = self._signature_terms()
+        self.assertEqual(len(PRODUCT_SHOT_RULE_PRIORITY), len(PRODUCT_SHOT_RULES))
+        self.assertGreater(len(aliases), 400, "bảng bí danh đọc hụt")
+        self.assertGreater(len(terms), 600, "bảng signatures đọc hụt")
+        self.assertTrue(any(" " in alias for _, alias in aliases))
+        self.assertTrue(any("ọ" in alias for _, alias in aliases))
+
+    def test_no_product_rule_needle_is_compared_raw(self) -> None:
+        """Hằng đem so thẳng với biến đã chuẩn hoá = miễn nhiễm đã mất."""
+        swept = needles_compared_with("_normalize_skill_token")
+        for consumer in self.CONSUMERS:
+            self.assertIn(consumer, swept.functions, "hàm không còn gọi bộ chuẩn hoá")
+        raw = {
+            text: places
+            for text, places in swept.by_text.items()
+            if any(place.split(":", 1)[0] in self.CONSUMERS for place in places)
+        }
+        self.assertEqual({}, raw)
+
+    def test_every_needle_survives_the_normalizer_it_is_folded_by(self) -> None:
+        """Đo trên TẬP ĐÓNG: cả hai bảng, không lấy mẫu."""
+        alphabet = re.compile(r"[a-z0-9_]*")
+        needles = [alias for _, alias in self._aliases()]
+        needles += [term for _, _, term in self._signature_terms()]
+        for needle in needles:
+            with self.subTest(needle=needle):
+                folded = self.service._normalize_skill_token(needle)
+                self.assertTrue(folded, "kim chuẩn hoá ra rỗng thì không khớp gì")
+                self.assertRegex(folded, alphabet)
+                self.assertTrue(self.service._compact_match_text(needle))
+
+    def test_every_alias_finds_a_rule_from_its_own_text(self) -> None:
+        """Gõ đúng chữ trong bảng mà không ra luật nào = kim chết."""
+        shadowed = set()
+        for key, alias in self._aliases():
+            with self.subTest(rule=key, alias=alias):
+                got = self.service._flow_operator_product_rule_key_from_text(alias)
+                self.assertTrue(got, "không luật nào nhận")
+                if got != key:
+                    shadowed.add((key, alias, got))
+        self.assertEqual(self.ALIASES_SHADOWED_BY_AN_EARLIER_RULE, shadowed)
+
+    def test_the_needle_side_is_folded_before_every_comparison(self) -> None:
+        """Kim phải được gấp TRƯỚC khi so, ở mọi nhánh, không chỉ nhánh nhớ tên.
+
+        Bỏ một trong ba bộ gấp phía kim thì mọi ca hành vi vẫn xanh — hai
+        nhánh còn lại đỡ hộ. Ca này đọc thẳng cấu trúc nên đỏ ngay từ nhánh
+        đầu tiên bị bỏ.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+
+        def folds(node: ast.AST) -> bool:
+            return any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr in self.FOLDERS
+                for child in ast.walk(node)
+            )
+
+        checked = 0
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef):
+                continue
+            if function.name not in self.CONSUMERS:
+                continue
+            folded: set[str] = set()
+            for node in ast.walk(function):
+                if isinstance(node, ast.Assign) and len(node.targets) == 1:
+                    target = node.targets[0]
+                    if isinstance(target, ast.Name) and folds(node.value):
+                        folded.add(target.id)
+
+            # Biến chạy của một comprehension duyệt trên toàn hằng chuỗi —
+            # ``any(marker in compact for marker in ("taoanh", ...))`` — là
+            # cây kim viết thẳng, không phải biến quên gấp. Họ lỗi của nó là
+            # "viết sai bảng chữ cái", và NormalizedNeedleAlphabetTests mới
+            # là chỗ canh; ở đây tính nó như hằng.
+            literal_loops: set[str] = set()
+            for node in ast.walk(function):
+                if not isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+                    continue
+                for generator in node.generators:
+                    if not isinstance(generator.target, ast.Name):
+                        continue
+                    iterable = generator.iter
+                    if isinstance(iterable, (ast.Set, ast.List, ast.Tuple)) and all(
+                        isinstance(element, ast.Constant) for element in iterable.elts
+                    ):
+                        literal_loops.add(generator.target.id)
+
+            def side(node: ast.AST) -> str:
+                if isinstance(node, ast.Name) and node.id in folded:
+                    return "folded"
+                if isinstance(node, ast.Name) and node.id not in literal_loops:
+                    return "raw"
+                return "other"
+
+            pairs: list[tuple[ast.expr, ast.expr]] = []
+            for node in ast.walk(function):
+                if isinstance(node, ast.Compare) and any(
+                    isinstance(op, (ast.In, ast.NotIn, ast.Eq)) for op in node.ops
+                ):
+                    for right in node.comparators:
+                        pairs.append((node.left, right))
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"issubset", "issuperset"}
+                    and node.args
+                ):
+                    pairs.append((node.func.value, node.args[0]))
+
+            for left, right in pairs:
+                kinds = {side(left), side(right)}
+                if "folded" not in kinds:
+                    continue
+                checked += 1
+                with self.subTest(function=function.name, line=getattr(left, "lineno", 0)):
+                    self.assertNotIn(
+                        "raw",
+                        kinds,
+                        "một phía đã gấp, phía kia chưa — kim không bao giờ khớp",
+                    )
+
+        self.assertGreaterEqual(checked, 9, "không quét trúng phép so nào")
+
+    def test_a_spaced_and_an_accented_needle_both_route(self) -> None:
+        """Chứng cứ sống cho việc phía KIM cũng được gấp, không riêng phía kia."""
+        for typed in ("Passport Cover", "boc passport", "bọc hộ chiếu thêu tay"):
+            with self.subTest(typed=typed):
+                self.assertEqual(
+                    "passport_cover",
+                    self.service._flow_operator_product_rule_key_from_text(typed),
+                )
 
 
 if __name__ == "__main__":
