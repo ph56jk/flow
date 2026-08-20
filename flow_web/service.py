@@ -1245,8 +1245,32 @@ class FlowWebService:
         # không tách ra, và ``encode("ascii", "ignore")`` bên dưới xoá thẳng nó.
         # Cột "Đã dùng" khi ấy ra ``adung`` trong khi bảng khoá viết ``dadung``,
         # nên `_find_prompt_source_column` trả về rỗng — app coi như bảng tính
-        # không có cột đánh dấu đã dùng và chạy lại prompt cũ từ đầu. Hai khoá
-        # ``dungroi``/``xong`` không có đ nên vẫn sống, đó là lý do lỗi này im.
+        # không có cột đánh dấu đã dùng và chạy lại prompt cũ từ đầu.
+        #
+        # Đếm trên tập đóng, không ước lượng. Năm hàm dùng bộ chuẩn hoá này
+        # (`_table_rows_to_dicts`, `_prompt_source_preview_payload`,
+        # `_truthy_sheet_value`, `_config_bool`, `_find_prompt_source_column`)
+        # cộng lại 57 khoá:
+        #
+        #   57 khoa ├─ 30 khong co chu 'd'   → gap 'đ' khong the dong toi
+        #           └─ 27 co chu 'd'
+        #                ├─  1 la 'd' vốn là 'đ': dadung ("Đã dùng")
+        #                ├─  1 tieng Viet 'd' that: dungroi ("Dùng rồi")
+        #                └─ 25 tu tieng Anh (card, done, index, product, ...)
+        #
+        # Nên đây là bản vá SỐNG, nhưng bán kính đúng MỘT khoá trong 57. Và
+        # ``dungroi``/``xong`` vẫn khớp kể cả khi chưa gấp — đó là lý do cột
+        # "Đã dùng" hỏng một mình mà không ai thấy.
+        #
+        # Không khoá nào bị viết theo chuỗi hỏng (không có ``adung`` trong
+        # bảng), nên gấp ``đ`` không làm hỏng ngược chỗ nào. Ba điều trên ghim
+        # ở `PromptSourceHeaderClosedSetTests` (tests/test_vietnamese_normalizers.py),
+        # test đọc AST của chính file này nên thêm khoá mới là phải phân loại.
+        #
+        # CHƯA ĐO, đừng ghi thành số: các cách gõ khác ("Đã xong" → ``daxong``,
+        # "Đã tạo", "Hoàn thành") vẫn không khớp sau khi gấp. Đó là thiếu TỪ
+        # VỰNG chứ không phải thiếu bước gấp; thêm khoá là đoán tên cột của
+        # người dùng nên phải hỏi chủ sở hữu trước.
         raw = str(value or "").replace("đ", "d").replace("Đ", "D")
         normalized = unicodedata.normalize("NFKD", raw).encode("ascii", "ignore").decode("ascii")
         return re.sub(r"[^a-z0-9]+", "", normalized.lower())

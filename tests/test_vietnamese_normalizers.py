@@ -12,6 +12,7 @@ Các ca dưới đây ghim **câu người ta gõ**, không ghim chuỗi đã ch
 
 from __future__ import annotations
 
+import ast
 import sys
 import unittest
 from pathlib import Path
@@ -51,6 +52,117 @@ class PromptSourceHeaderTests(unittest.TestCase):
         self.assertFalse(svc._truthy_sheet_value("Đóng"))
         self.assertFalse(svc._truthy_sheet_value("Đã huỷ"))
         self.assertIsNone(svc._config_bool("Đúng", default=None))
+
+
+class PromptSourceHeaderClosedSetTests(unittest.TestCase):
+    """Đếm trên tập đóng: bảng khoá cột có bao nhiêu mục chết vì ``đ``.
+
+    Năm hàm dưới đây là toàn bộ chỗ so kết quả của
+    ``_normalize_prompt_source_header`` với một bảng khoá viết sẵn. Test
+    dựng lại bảng khoá bằng cách đọc AST của chính service.py, nên thêm
+    một khoá mới mà không phân loại nó là đỏ ngay — không phải chờ ai đó
+    nhớ ra phải sửa test.
+    """
+
+    FUNCTIONS_HOLDING_THE_KEY_TABLES = frozenset(
+        {
+            "_table_rows_to_dicts",
+            "_prompt_source_preview_payload",
+            "_truthy_sheet_value",
+            "_config_bool",
+            "_find_prompt_source_column",
+        }
+    )
+    # Khoá duy nhất có chữ ``d`` vốn là ``đ``, kèm câu người ta gõ ra nó.
+    KEY_BORN_FROM_D_STROKE = {"dadung": "Đã dùng"}
+    # Toàn bộ khoá có chữ ``d`` KHÔNG sinh ra từ ``đ``. Phải liệt kê tay:
+    # nhìn vào chuỗi ASCII thì "daxong" và "index" giống hệt nhau, không có
+    # cách máy móc nào tách được. Đổi lại, thêm bất kỳ khoá nào có ``d`` mà
+    # không xếp vào một trong hai bảng là test đỏ, tức người thêm buộc phải
+    # trả lời "chữ d này từ đâu ra".
+    KEYS_WITH_A_REAL_D = frozenset(
+        {
+            # tiếng Việt, ``d`` thật — chính chúng là lý do cột "Đã dùng"
+            # hỏng một mình mà không ai thấy.
+            "dungroi",
+            # tiếng Anh
+            "card",
+            "cardid",
+            "cardurl",
+            "completed",
+            "disabled",
+            "done",
+            "enabled",
+            "erpcard",
+            "erpcardid",
+            "erpcardurl",
+            "erplistid",
+            "generated",
+            "index",
+            "listid",
+            "processed",
+            "product",
+            "productcode",
+            "productid",
+            "productkey",
+            "productname",
+            "producttitle",
+            "promptindex",
+            "sourcecard",
+            "sourcecardurl",
+            "used",
+        }
+    )
+
+    def _key_tables(self) -> set[str]:
+        source = Path(FlowWebService.__module__.replace(".", "/") + ".py")
+        source = Path(__file__).resolve().parents[1] / source
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        keys: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name not in self.FUNCTIONS_HOLDING_THE_KEY_TABLES:
+                continue
+            for sub in ast.walk(node):
+                if not isinstance(sub, ast.Set):
+                    continue
+                values = [
+                    element.value
+                    for element in sub.elts
+                    if isinstance(element, ast.Constant) and isinstance(element.value, str)
+                ]
+                if values and len(values) == len(sub.elts):
+                    keys |= set(values)
+        return keys
+
+    def test_the_key_tables_are_found_at_all(self) -> None:
+        # Chống rỗng: nếu AST không tìm thấy bảng nào thì mọi test dưới đây
+        # xanh một cách vô nghĩa.
+        keys = self._key_tables()
+
+        self.assertGreater(len(keys), 40)
+        self.assertIn("promptcontent", keys)
+
+    def test_the_keys_holding_a_d_are_a_closed_set(self) -> None:
+        keys = self._key_tables()
+        with_d = {key for key in keys if "d" in key}
+
+        self.assertEqual(with_d, set(self.KEY_BORN_FROM_D_STROKE) | self.KEYS_WITH_A_REAL_D)
+
+    def test_the_one_d_stroke_key_is_reachable_from_what_a_person_types(self) -> None:
+        svc = service()
+        for key, typed in self.KEY_BORN_FROM_D_STROKE.items():
+            for spelling in (typed, typed.lower(), typed.upper(), typed.title()):
+                with self.subTest(typed=spelling):
+                    self.assertEqual(key, svc._normalize_prompt_source_header(spelling))
+
+    def test_no_key_was_written_to_match_the_broken_output(self) -> None:
+        # Bẫy ngược: nếu ai đó từng "vá" bằng cách viết thẳng chuỗi hỏng
+        # (``adung``) vào bảng thì bước gấp ``đ`` sẽ làm hỏng lại chỗ ấy.
+        keys = self._key_tables()
+
+        self.assertNotIn("adung", keys)
 
 
 class SkillTokenIntentTests(unittest.TestCase):
