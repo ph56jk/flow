@@ -2169,10 +2169,87 @@ class UnderscoreTwinTests(unittest.TestCase):
         # lệnh: nếu ai siết nhầm thành "mốc == dòng chỗ so" thì ca này đỏ.
         # Bản ghim cũ đặt mốc trùng dòng chỗ so nên mù với đúng cái siết ấy —
         # chỉ cây thật kêu (64 lời báo oan). Ghim mà không cắn thì chưa phải ghim.
+        # Chiều XUÔI: mốc đứng **sau** câu lệnh, dòng ấy vẫn mang đúng hằng.
+        # Thiếu ca này thì nửa dưới ``anchor <= box[1]`` không ai giữ — đo
+        # được: bỏ nửa ấy mà cả suite vẫn xanh trơn. Câu lệnh khép ở dòng 2,
+        # mốc trỏ xuống dòng 4; đặt mốc **trước** câu lệnh là lặp lại chiều
+        # trên chứ không thêm được gì.
+        ahead = {"f:3": {"shirt": 4}}
+        boxes_ahead = {("f", 3): (1, 2)}
+        self.assertEqual(
+            [], inline_needles_not_written_on_their_own_line(ahead, lines),
+            "luat chu phai IM thi ca thu nay moi chung minh duoc gi",
+        )
+        reports = anchors_outside_their_statement(ahead, boxes_ahead)
+        self.assertEqual(1, len(reports))
+        self.assertIn("ngoài câu lệnh", reports[0])
+
         honest = {"f:3": {"shirt": 4}}
         self.assertEqual([], anchors_outside_their_statement(honest, boxes))
         self.assertEqual(
             [], inline_needles_not_written_on_their_own_line(honest, lines)
+        )
+
+    def test_the_real_tree_mutation_is_caught_inside_the_suite(self) -> None:
+        """Đẩy mốc **trên cây thật** rồi đòi (e) bắt, ngay trong suite.
+
+        Trước đây con số "bắt 14/14" là tôi đo tay bằng script rời — suite
+        không giữ nó. Suite chỉ giữ ca ghim bịa, mà ghim thì chỉ canh đúng
+        hình dạng nó viết ra. Đo tay xong không đưa vào suite thì lần sau ai
+        sửa luật cũng không có gì kêu.
+
+        Đột biến: với mỗi kim, tìm dòng khác **trong cùng hàm** cũng viết
+        đúng hằng ấy rồi dời mốc sang. Chia đôi theo câu lệnh, và đòi ba
+        điều — luật chữ **im** cả hai loại (nó mù theo cấu trúc), (e) bắt
+        **hết** loại nói dối, (e) **im** với loại nói thật kiểu khác.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        lines = source.read_text(encoding="utf-8").split("\n")
+        boxes = statement_spans()
+        spans = function_line_ranges()
+        lies: dict[str, list] = {}
+        honest: dict[str, dict[str, int]] = {}
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            swept = needles_compared_with(normalizer)
+            for site, anchors in swept.literal_at.items():
+                name, number = parse_site(site)
+                box = boxes.get((name, number or 0))
+                held = spans.get(name)
+                if box is None or not held:
+                    continue
+                low, high = held[0]
+                for needle, anchor in anchors.items():
+                    for line in range(low, high + 1):
+                        if line == anchor:
+                            continue
+                        if (
+                            f'"{needle}"' not in lines[line - 1]
+                            and f"'{needle}'" not in lines[line - 1]
+                        ):
+                            continue
+                        if box[0] <= line <= box[1]:
+                            honest.setdefault(site, {})[needle] = line
+                        else:
+                            way = "lui" if line < box[0] else "tien"
+                            lies.setdefault(way, []).append(({site: {needle: line}}, line))
+
+        # Lấy **mọi** dòng ứng viên chứ không lấy dòng đầu: dòng đầu là dòng
+        # nhỏ nhất, nên rổ nói dối chỉ toàn chiều lùi và nửa ``anchor <=
+        # box[1]`` lại không ai đo. Đòi cả hai chiều đều có mẫu thật.
+        for way in ("lui", "tien"):
+            self.assertIn(way, lies, f"cay that phai co mau chieu {way}, khong thi ca nay do hut mot nua")
+            for bent, line in lies[way]:
+                self.assertEqual(
+                    [], inline_needles_not_written_on_their_own_line(bent, lines),
+                    f"luat chu phai IM o dong {line} — no mu theo cau truc chu khong phai trung hop",
+                )
+                self.assertEqual(
+                    1, len(anchors_outside_their_statement(bent)),
+                    f"(e) phai bat moc bi day {way} toi dong {line}",
+                )
+        self.assertEqual(
+            [], anchors_outside_their_statement(honest),
+            "moc doi trong cung cau lenh van noi that, khong duoc keu",
         )
 
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
