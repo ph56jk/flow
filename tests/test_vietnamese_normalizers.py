@@ -73,37 +73,41 @@ class SkillTokenIntentTests(unittest.TestCase):
 
 
 class AutoErpStopSignalTests(unittest.TestCase):
-    """Bốn trong năm câu raise thật của Auto ERP không dừng được cả loạt.
+    """Cả lưới dừng của Auto ERP, lấy bằng AST chứ không lấy bằng trí nhớ.
 
-    Đếm câu raise thật, không đếm cây kim: một cây kim chết mà không ai sinh
-    ra câu khớp nó thì không hại ai, còn một câu có thể trúng nhiều kim. Ba
-    kim ở đây (``chua xac minh duoc anh nguon``, ``khong thay attachment
-    moi``, ``request khong co anh goc``) hiện không có chỗ sinh nào trong
-    repo này; ``tat ca chrome profile flow da het quota`` cũng vậy — giữ vì
-    nửa listing sinh ra nó, nhưng không tính vào thiệt hại.
+    Lưới này khớp **chuỗi con**, nên gỡ một mắt lưới là chuyện lặng lẽ: sửa
+    câu chữ cho hay hơn — bỏ "trước khi bấm tạo", đổi "không dùng" thành
+    "không có" — thì thẻ hỏng vì không kéo được ảnh nguồn lại kéo cả loạt
+    chạy tiếp, không lỗi nào được ném ra. Ghim cả lưới chứ không ghim vài
+    mẫu, vì mẫu chọn tay đã lừa được cả hai phiên làm việc này một lượt.
 
-    Lý do chết: hàm này từng dùng ``_strip_accents``, mà ``đ`` là chữ cái
-    riêng (U+0111) nên NFD không tách nó khỏi dấu — "được" ra ``uoc`` chứ
-    không ra ``duoc``. Không lỗi nào được ném ra; thẻ hỏng vì không kéo được
-    ảnh nguồn chỉ lặng lẽ kéo cả loạt chạy tiếp.
+    Cách lấy: duyệt AST toàn bộ 251 chuỗi ``raise`` trong ``service.py``, giữ
+    lại đúng những chuỗi làm hàm trả True. Hai điều KHÔNG được làm, đều đã
+    từng làm và đều ra số sai:
+
+    * đừng tự nghĩ ra câu cho khớp cây kim — nó đo trí nhớ, không đo code;
+    * đừng ghim vế đầu của một câu dài hơn — vế sau thường chứa cây kim khác
+      còn sống, cắt đi là tưởng mình vừa vá được một lỗ đang chảy.
+
+    Đo trên toàn bộ 251 chuỗi: gấp ``đ`` ở hàm này đổi hành vi của **0** câu.
+    Đúng một câu đổi (23970) và nó đổi nhờ cây kim hẹp ``chi gui prompt``.
     """
 
-    # Chép nguyên văn từ chỗ raise trong ``service.py`` — pin câu người/máy
-    # thật sự sinh ra, không pin câu tự nghĩ ra cho khớp cây kim. Bốn câu đầu
-    # trả False trước bản vá.
-    REAL_RAISES = (
-        "Auto AI ERP chưa kéo/upload được ảnh ERP vào Tác nhân Flow.",
-        "Fallback UI Flow: chưa kéo được ảnh nguồn vào khung Tác nhân (drag_detail).",
-        "Fallback UI Flow: chưa upload được ảnh ERP vào khung Tác nhân (attach_detail).",
-        "App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: x",
-        "Auto AI ERP cần mở panel Tác nhân Flow trước khi kéo ảnh vào AI. "
-        "App đã dừng để tránh chỉ gửi prompt mà không có ảnh nguồn.",
+    # Chép bằng máy từ AST, không chép bằng tay. Chỗ ``{...}`` trong f-string
+    # bị bỏ đi nên đuôi trông cụt — không sao, lưới khớp chuỗi con. Không ghi
+    # số dòng: sửa một chú thích là số dòng mục ruỗng, chuỗi thì không.
+    STOPPING_SET = (
+        'Auto AI ERP bắt buộc dùng Tác nhân Flow. App chưa thấy nút Tác nhân trên màn hình Flow, nên đã dừng trước khi nhập lệnh để tránh tạo ảnh không dùng ảnh nguồn.',
+        'Auto AI ERP cần mở panel Tác nhân Flow trước khi kéo ảnh vào AI. App đã dừng để tránh chỉ gửi prompt mà không có ảnh nguồn.',
+        'Auto AI ERP chưa kéo/upload được ảnh ERP vào Tác nhân Flow. App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: ;',
+        'Auto AI ERP chua xac minh duoc anh nguon trong panel Tac nhan Flow. App da dung truoc khi bam tao de tranh Flow Agent dung ngu canh/anh cu. Chi tiet:',
+        'Flow vua gui request tao anh nhung request khong co anh goc dang chon. Em da dung lai de tranh luu anh moi khong dung card ERP.',
     )
 
-    def test_every_real_raise_stops_the_batch(self) -> None:
+    def test_every_raise_in_the_stopping_set_still_stops(self) -> None:
         svc = service()
 
-        for detail in self.REAL_RAISES:
+        for detail in self.STOPPING_SET:
             with self.subTest(detail=detail[:60]):
                 self.assertTrue(svc._auto_erp_should_stop_on_child_error(detail))
 

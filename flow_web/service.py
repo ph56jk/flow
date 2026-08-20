@@ -4041,29 +4041,35 @@ class FlowWebService:
         # Dùng `_flow_agent_error_match_text` chứ không `_strip_accents`: chỉ hàm
         # kia mới gấp ``đ``. Chỗ này trước dùng `_strip_accents`, mà "được" khi ấy
         # ra ``uoc`` chứ không ra ``duoc`` — ``đ`` là chữ cái riêng (U+0111) nên
-        # NFD không tách nó ra khỏi dấu.
+        # NFD không tách nó khỏi dấu.
         #
-        # Đo bằng chính hai bản hàm, trên năm câu raise thật đi tới đây (đừng
-        # đếm số cây kim: kim chết mà không ai sinh ra câu khớp nó thì không hại
-        # ai, còn một câu có thể trúng nhiều kim):
+        # Đo cho hết, đừng lấy mẫu: duyệt AST lấy toàn bộ 251 chuỗi `raise` trong
+        # file này rồi chạy qua cả hai bản hàm. Kết quả — gấp ``đ`` ở đây đổi
+        # hành vi của **0/251** chuỗi. Đúng một chuỗi đổi, và nó đổi nhờ cây kim
+        # hẹp "chi gui prompt" bên dưới: câu "...chỉ gửi prompt mà không có ảnh
+        # nguồn" của bước mở panel Tác nhân.
         #
-        #   trước  sau
-        #   False  True   "Auto AI ERP chưa kéo/upload được ảnh ERP..."
-        #   False  True   "Fallback UI Flow: chưa kéo được ảnh nguồn..."
-        #   False  True   "Fallback UI Flow: chưa upload được ảnh ERP..."
-        #   True   True   "App đã dừng trước khi bấm tạo..."   ← "dừng"/"dùng" là
-        #                 ``d`` thường nên hai kim ấy vẫn sống, đây là câu duy
-        #                 nhất tự cứu được
-        #   False  True   "...chỉ gửi prompt mà không có ảnh nguồn"  ← cây kim
-        #                 mới bên dưới, không phải nhờ gấp ``đ``
+        # Vì sao gấp ``đ`` không cứu được gì: cây kim duy nhất vừa chết vì ``đ``
+        # vừa có chỗ sinh là "chua keo/upload duoc anh erp" — mà chính câu sinh
+        # ra nó còn chứa "dừng trước khi bấm tạo" và "không dùng ảnh nguồn", cả
+        # hai đều ``d`` thường nên vẫn sống. Câu ấy dừng đúng từ trước.
         #
-        # Tức bốn trong năm câu vốn KHÔNG dừng: thẻ hỏng vì không kéo được ảnh
-        # nguồn vẫn kéo cả loạt chạy tiếp. Bảng này khoá trong
-        # `AutoErpStopSignalTests`.
+        # Lưới thật sự đứng trên BA cây kim; bảy cây còn lại vô chủ hoặc đã có
+        # cây khác đỡ hộ. Bỏ một trong ba cây này là có câu tuột lưới ngay:
         #
-        # Ba cây kim "chua xac minh duoc anh nguon", "khong thay attachment moi",
-        # "request khong co anh goc" hiện KHÔNG có câu nào sinh ra ở repo này —
-        # giữ vì nửa listing có thể sinh, nhưng đừng tính chúng vào thiệt hại.
+        #   khong dung anh nguon      ← "App chưa thấy nút Tác nhân trên màn hình"
+        #   request khong co anh goc  ← "request không có ảnh gốc đang chọn"
+        #   chi gui prompt            ← "chỉ gửi prompt mà không có ảnh nguồn"
+        #
+        # Bốn cây vô chủ ("chua keo duoc anh nguon", "chua upload duoc anh erp",
+        # "khong thay attachment moi", "tat ca chrome profile flow da het quota")
+        # hiện không có chỗ sinh nào trong repo này — giữ vì nửa listing sinh ra
+        # chúng, nhưng đừng tính vào thiệt hại của nửa này.
+        #
+        # Bài học phương pháp, trả giá hai lượt mới có: **đừng pin câu tự nghĩ
+        # ra, và đừng pin vế đầu của một câu dài hơn.** Lưới này khớp chuỗi con,
+        # nên một câu bị cắt ngắn có thể mất hết kim đỡ và làm ta tưởng vừa vá
+        # được một lỗ đang chảy. Lấy chuỗi bằng AST, không bằng trí nhớ.
         #
         # Danh sách này KHÔNG phải bản sao của danh sách trong
         # `_is_flow_agent_source_attachment_error` (18707): hai bên trả lời hai
