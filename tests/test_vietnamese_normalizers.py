@@ -1611,21 +1611,44 @@ class UnderscoreTwinTests(unittest.TestCase):
         self.assertIn("f:1", reports[0])
         self.assertIn("tapde", reports[0])
 
-    def test_the_tree_really_has_room_for_that_to_happen(self) -> None:
-        """Ca bịa ở trên chỉ đáng giá nếu cây thật có hàm nhiều chỗ so.
+    FLOOR_DISTINGUISHING_FUNCTIONS = {
+        "_compact_match_text": 3,
+        "_normalize_prompt_source_header": 1,
+    }
 
-        Không có câu này thì phạm vi chặt là phòng xa cho một hình dạng
-        không tồn tại — và đó lại là một kiểu ghim trống.
+    def test_the_tree_really_has_room_for_that_to_happen(self) -> None:
+        """Ca bịa ở trên ghim LUẬT; câu này ghim DỮ LIỆU ĐƯA VÀO luật.
+
+        Hai lỗ khác nhau. Ca bịa gọi thẳng ``missing_twins`` nên ai dồn các
+        chỗ so lại **ở chỗ gọi** — trước khi dữ liệu tới luật — thì hàm
+        thuần vẫn nguyên vẹn và ca bịa vẫn xanh, trong khi phạm vi chặt đã
+        chết. Đo thật trên cây này, gộp khoá chỗ so theo dải dòng:
+
+            nguyên  //10  //100  //1000
+              3       2      0      0    _compact_match_text
+              1       1      0      0    _normalize_prompt_source_header
+
+        Nên mốc phải là CON SỐ chứ không phải "có hay không": dồn theo //10
+        làm hụt một phần ba mà câu hỏi có-hay-không vẫn xanh. Mốc dưới đây
+        bắt được //10 ở cột compact.
+
+        Giới hạn ghi rõ: cột header chỉ có 1 hàm phân biệt được, nên mốc 1
+        ở đó chỉ bắt được lượt dồn sạch, không bắt được dồn nhẹ. Đó là số
+        đo của cây hiện tại, không phải chỗ để nâng bừa cho đẹp.
         """
         for normalizer in self._alphabets_without_underscore():
             sites = needles_compared_with(normalizer).by_site
             by_function: dict[str, set[frozenset]] = {}
             for site, needles in sites.items():
                 by_function.setdefault(site.rsplit(":", 1)[0], set()).add(frozenset(needles))
+            spread = [name for name, groups in by_function.items() if len(groups) > 1]
             with self.subTest(normalizer=normalizer):
-                self.assertTrue(
-                    [name for name, groups in by_function.items() if len(groups) > 1],
-                    "không hàm nào có hai chỗ so khác tập kim",
+                self.assertGreaterEqual(
+                    len(spread),
+                    self.FLOOR_DISTINGUISHING_FUNCTIONS[normalizer],
+                    f"{normalizer}: số hàm có hai chỗ so khác tập kim tụt xuống "
+                    f"{sorted(spread)} — nhiều khả năng khoá chỗ so vừa bị dồn "
+                    f"ở chỗ gọi, chứ luật cặp thì vẫn xanh",
                 )
 
     def test_both_halves_of_each_pair_really_route(self) -> None:
