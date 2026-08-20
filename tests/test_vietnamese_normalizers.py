@@ -2434,6 +2434,69 @@ class UnderscoreTwinTests(unittest.TestCase):
                     f"(f) doc sai chieu o dong {line}",
                 )
 
+    def test_a_widened_ruler_kills_g_but_leaves_e_speaking(self) -> None:
+        """Vì sao giữ (e) dù (g) chặt hơn: hai luật hỏng theo hai kiểu.
+
+        (g) đo bằng chính con số nút đã ghi lúc quét, nên nó **tự soi
+        mình**: nới thước là nó chết mà không có triệu chứng nào — cây sạch
+        vẫn 0, vì rỗng-vì-mù trông y hệt rỗng-vì-sạch. (e) dựng hộp bằng
+        một lượt duyệt AST **độc lập** với bước ghi, nên lượt ghi hỏng thì
+        nó vẫn kêu.
+
+        erplisting-21 đo được điều này bên họ rồi bảo tôi thử; đo bên tôi ra
+        cùng kết luận. Không phải hai bản sao của một luật — một cái CHẶT
+        hơn, một cái ĐỘC LẬP hơn, và lệ "chỉ giữ luật nào là người duy nhất
+        bắt ở một hàng sổ sách" bỏ sót đúng cái cột này, vì phép đột biến
+        quyết định nằm ở **dụng cụ** chứ không ở sổ sách.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        lines = source.read_text(encoding="utf-8").split("\n")
+        spans = function_line_ranges()
+        nghe_g = doi = mong_e = nghe_e = 0
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            swept = needles_compared_with(normalizer)
+            for site, anchors in swept.literal_at.items():
+                name, number = parse_site(site)
+                held = spans.get(name)
+                if number is None or not held:
+                    continue
+                low, high = held[0]
+                for needle, anchor in anchors.items():
+                    # Thước bị nới: span của nút thay bằng cả thân hàm.
+                    noi = {site: {needle: (low, high)}}
+                    nghe_g += len(
+                        anchors_outside_their_comparison_node(
+                            {site: {needle: anchor}}, noi
+                        )
+                    )
+                    for line in range(low, high + 1):
+                        if line == anchor:
+                            continue
+                        if (
+                            f'"{needle}"' not in lines[line - 1]
+                            and f"'{needle}'" not in lines[line - 1]
+                        ):
+                            continue
+                        doi += 1
+                        bent = {site: {needle: line}}
+                        nghe_g += len(
+                            anchors_outside_their_comparison_node(bent, noi)
+                        )
+                        keu_e = len(anchors_outside_their_statement(bent))
+                        nghe_e += keu_e
+                        mong_e += 1 if keu_e else 0
+
+        self.assertGreater(doi, 0, "khong co luot noi doi thi ca nay vo nghia")
+        self.assertEqual(
+            0, nghe_g,
+            "thuoc bi noi ma (g) van keu thi phep thu nay khong dung cai no tuong",
+        )
+        self.assertGreater(
+            mong_e, 0,
+            "(e) phai con keu khi buoc ghi hong — do la cot rieng cua no",
+        )
+        self.assertEqual(nghe_e, mong_e, "(e) phai keu dung mot loi moi luot")
+
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
         """Phủ kín ở mức CHỖ SO, không chỉ ở mức nhãn hình dạng.
 
