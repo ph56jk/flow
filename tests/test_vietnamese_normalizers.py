@@ -277,6 +277,12 @@ class SweptNeedles(NamedTuple):
 
     by_text: dict[str, set[str]]
     functions: list[str]
+    # Gom theo TỪNG CHỖ SO (hàm + số dòng), không theo hàm. Phạm vi của một
+    # bất biến quyết định đột biến có cắn hay không: ``vogoi`` nằm ở hàm
+    # khác KHÔNG cứu được vế ``compact`` của ``_erp_query_aliases``. Gom
+    # theo dòng còn gộp đúng hai vế của ``x in normalized or x in compact``
+    # thành một chỗ, vì đó mới thật là một phép so.
+    by_site: dict[str, set[str]] = {}
 
 
 def needles_compared_with(normalizer: str) -> SweptNeedles:
@@ -313,6 +319,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         return []
 
     found: dict[str, set[str]] = {}
+    sites: dict[str, set[str]] = {}
     functions = [
         node
         for node in ast.walk(tree)
@@ -401,7 +408,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                             continue
                         for value in scope.get(part.id, ()):
                             if isinstance(value, str):
-                                keep(value, "loop-var")
+                                keep(value, "loop-var", node)
             for child in ast.iter_child_nodes(node):
                 scan(child, scope)
 
@@ -419,9 +426,12 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         def holds_result(node: ast.AST) -> bool:
             return is_call(node) or (isinstance(node, ast.Name) and node.id in holders)
 
-        def keep(value: object, why: str) -> None:
+        def keep(value: object, why: str, node: ast.AST | None = None) -> None:
             if isinstance(value, str) and value:
                 found.setdefault(value, set()).add(f"{function.name}:{why}")
+                sites.setdefault(
+                    f"{function.name}:{getattr(node, 'lineno', 0)}", set()
+                ).add(value)
 
         def named_set_strings(node: ast.AST) -> list[str]:
             """Hình dạng kim thứ SÁU: ``normalized in generic_exact``.
@@ -453,9 +463,9 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                             continue
                         for element in elements(part):
                             if isinstance(element, ast.Constant):
-                                keep(element.value, "compare")
+                                keep(element.value, "compare", node)
                         for value in named_set_strings(part):
-                            keep(value, "named-set")
+                            keep(value, "named-set", node)
             if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)) and isinstance(
                 node.elt, ast.Compare
             ):
@@ -464,7 +474,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                     for generator in node.generators:
                         for element in elements(generator.iter):
                             if isinstance(element, ast.Constant):
-                                keep(element.value, "comprehension")
+                                keep(element.value, "comprehension", node)
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -479,7 +489,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                 if isinstance(table, ast.Dict):
                     for key in table.keys:
                         if isinstance(key, ast.Constant):
-                            keep(key.value, "mapping.get")
+                            keep(key.value, "mapping.get", node)
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -489,9 +499,11 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                 for argument in node.args:
                     for element in elements(argument):
                         if isinstance(element, ast.Constant):
-                            keep(element.value, "startswith")
+                            keep(element.value, "startswith", node)
 
-    return SweptNeedles(by_text=found, functions=[fn.name for fn in functions])
+    return SweptNeedles(
+        by_text=found, functions=[fn.name for fn in functions], by_site=sites
+    )
 
 
 class NormalizedNeedleAlphabetTests(unittest.TestCase):
@@ -1536,17 +1548,30 @@ class UnderscoreTwinTests(unittest.TestCase):
         self.assertNotIn("_normalize_skill_token", derived)
 
     def test_every_underscored_needle_has_a_joined_twin(self) -> None:
+        """Đôi phải nằm ở CHÍNH CHỖ SO ấy, không phải đâu đó trong repo.
+
+        Đây là chỗ tôi đã sai một lần: bản đầu soi toàn repo, nên trồng
+        ``vo_goi`` vào ``_erp_query_aliases`` mà bộ test vẫn xanh — vì
+        ``vogoi`` có sẵn ở ``_flow_operator_card_product_signals``. Cây kim
+        ở hàm khác **không cứu được** vế ``compact`` của phép so này. Lúc ấy
+        tôi kết luận "đột biến trồng hỏng"; thật ra đột biến đúng, phạm vi
+        bất biến mới là chỗ hỏng.
+
+        Gom theo dòng nên hai vế ``x in normalized or x in compact`` được
+        tính là MỘT chỗ — đúng như code định làm.
+        """
         missing = []
         for normalizer in self._alphabets_without_underscore():
-            needles = set(needles_compared_with(normalizer).by_text)
-            for needle in sorted(needles):
-                if "_" not in needle:
-                    continue
-                twin = needle.replace("_", "")
-                if twin not in needles:
-                    missing.append(
-                        f"{needle!r} cần bản viết liền {twin!r} thì {normalizer} mới khớp được"
-                    )
+            for site, needles in sorted(needles_compared_with(normalizer).by_site.items()):
+                for needle in sorted(needles):
+                    if "_" not in needle:
+                        continue
+                    twin = needle.replace("_", "")
+                    if twin not in needles:
+                        missing.append(
+                            f"{site}: {needle!r} cần bản viết liền {twin!r} "
+                            f"ngay tại chỗ so ấy thì {normalizer} mới khớp được"
+                        )
         self.assertEqual([], missing)
 
     def test_both_halves_of_each_pair_really_route(self) -> None:
