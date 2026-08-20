@@ -22303,6 +22303,15 @@ exit 1
         raw = str(value or "").strip()
         if not raw:
             return ""
+        # ``đ`` phải gấp thành ``d`` TRƯỚC khi bỏ dấu. Nó là một chữ cái riêng
+        # (U+0111), không phải ``d`` cộng dấu, nên ``NFD`` không tách nó ra và
+        # bước lọc ``[^a-zA-Z0-9\s]`` bên dưới xoá thẳng nó thành khoảng trắng:
+        # "đẹp" ra "ep", "đồng phục" ra "ong phuc", "thay đồ" ra "thay o".
+        # Các bảng POLICY_* lại viết bằng ASCII thường ("dep hon", "dong phuc",
+        # "thay do"), nên chín mục trong đó KHÔNG BAO GIỜ khớp — kể cả hai cách
+        # nói mà chính câu cảnh báo nêu tên. Không có lỗi nào được ném ra, chỉ
+        # là lời nhắc an toàn im lặng không hiện.
+        raw = raw.replace("đ", "d").replace("Đ", "D")
         normalized = unicodedata.normalize("NFD", raw)
         normalized = "".join(char for char in normalized if unicodedata.category(char) != "Mn")
         normalized = re.sub(r"[^a-zA-Z0-9\s]", " ", normalized).lower()

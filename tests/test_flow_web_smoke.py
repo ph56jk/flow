@@ -4984,6 +4984,51 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("ảnh tham chiếu", notice)
         self.assertIn("người mẫu trưởng thành", notice)
 
+    def test_policy_preflight_notice_warns_when_the_prompt_says_thay_do(self) -> None:
+        # Ghim câu người ta gõ, không ghim chuỗi đã chuẩn hoá: "thay đồ" là
+        # đúng cách nói mà chính lời cảnh báo nêu tên, nên nó phải kích hoạt
+        # được cảnh báo ấy dù bộ chuẩn hoá bên dưới có đổi kiểu.
+        request = CreateJobRequest(
+            type="image",
+            prompt="thay đồ cho người trong ảnh",
+            reference_image_paths=["/tmp/model.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        notice = self.service._policy_preflight_notice(request)
+
+        self.assertIn("ảnh tham chiếu", notice)
+
+    def test_policy_preflight_notice_warns_when_the_prompt_says_lam_dep(self) -> None:
+        request = CreateJobRequest(
+            type="image",
+            prompt="làm đẹp ngoại hình cho ảnh này",
+            reference_image_paths=["/tmp/model.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        notice = self.service._policy_preflight_notice(request)
+
+        self.assertIn("ảnh tham chiếu", notice)
+
+    def test_policy_preflight_notice_stays_quiet_for_unrelated_d_words(self) -> None:
+        # Gấp ``đ`` thành ``d`` không được biến mọi câu có chữ đ thành cảnh báo:
+        # "màu đỏ" ra "mau do", không chạm mục nào trong ba bảng.
+        request = CreateJobRequest(
+            type="image",
+            prompt="màu đỏ của chiếc túi rút dây",
+            reference_image_paths=["/tmp/bag.jpg"],
+            reference_image_roles=["base"],
+        )
+
+        self.assertEqual("", self.service._policy_preflight_notice(request))
+
+    def test_policy_text_folds_d_with_stroke_before_stripping_accents(self) -> None:
+        # ``đ`` là chữ cái riêng (U+0111), NFD không tách nó ra; không gấp trước
+        # thì bước lọc ASCII xoá thẳng nó và bảng POLICY_* mất chín mục.
+        self.assertEqual("lam dep", self.service._normalize_policy_text("làm đẹp"))
+        self.assertEqual("dong phuc", self.service._normalize_policy_text("Đồng phục"))
+
     def test_default_title_marks_video_from_image(self) -> None:
         request = CreateJobRequest(
             type="video",
