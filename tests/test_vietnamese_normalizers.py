@@ -380,76 +380,37 @@ def carriers_not_named_on_their_line(
     return reports
 
 
-def inline_needles_not_written_in_their_span(
-    inline_at: dict[str, set[str]],
-    spans_at: dict[str, tuple[int, int]],
-    lines: list[str],
+def inline_needles_not_written_on_their_own_line(
+    literal_at: dict[str, dict[str, int]], lines: list[str]
 ) -> list[str]:
-    """Kim gõ thẳng thì chữ của nó phải nằm trong khoảng dòng của nút chứa nó.
+    """Luật (b) hỏi ở mốc chặt nhất: **đúng dòng của chính hằng ấy**.
 
-    Phải là KHOẢNG chứ không phải đúng dòng ghi lại: tập hằng gõ thẳng hay
-    trải nhiều dòng, nên hỏi "có mặt trên chính dòng ấy" là báo oan hàng
-    loạt. Khoảng đi từ dòng ghi tới hết nút.
+    Bản trước hỏi "kim có nằm đâu đó trong cửa sổ ``[dòng nút bọc, hết nút]``
+    không". Cửa sổ ấy rộng tới 19 dòng, và luật nào mà **nới dữ liệu ra lại
+    làm nó dễ xanh hơn** thì tự nó không đứng được: nới ``end`` thêm 50 dòng,
+    bản cửa sổ bắt **0**.
 
-    Hỏi **có dấu nháy quanh** chứ không hỏi chuỗi con. Ở đây có 18 lượt kim
-    dài một hai ký tự (``x``, ``n``, ``_``, ``0``, ``1``, ``ao``, ``co``) —
-    hỏi lỏng thì chúng là chuỗi con của gần như mọi dòng, xanh mà vô nghĩa.
-    Siết lên không mất chỗ nào: 348/348 kim đều có mặt dưới dạng hằng chuỗi.
+    Gốc bệnh nằm ở cái mốc chứ không ở câu hỏi. Mốc cũ là dòng của nút bọc,
+    mà hằng thì nằm rải trong nút — chỉ **284/348** kim nằm đúng trên dòng
+    ấy. Lấy mốc là ``lineno`` của chính hằng: **348/348**. Đo xong mới hỏi
+    chặt được (cách chữa của erplisting-21, bên họ 313/383 → 383/383).
+
+    Hỏi **có nháy quanh** chứ không hỏi chuỗi con: ở đây có 18 lượt kim dài
+    một hai ký tự (``x``, ``n``, ``_``, ``0``, ``1``), mà chuỗi con một ký tự
+    thì gần như dòng nào cũng chứa.
     """
     reports = []
-    for site in sorted(inline_at):
-        start, end = spans_at.get(site, (0, 0))
-        if not 0 < start <= len(lines):
-            continue  # đã có luật khác báo
-        window = "\n".join(lines[start - 1 : min(end, len(lines))])
-        for needle in sorted(inline_at[site]):
-            if f'"{needle}"' not in window and f"'{needle}'" not in window:
+    for site in sorted(literal_at):
+        for needle, number in sorted(literal_at[site].items()):
+            if not 0 < number <= len(lines):
+                reports.append(f"{site}: kim {needle!r} trỏ ra ngoài file")
+                continue
+            text = lines[number - 1]
+            if f'"{needle}"' not in text and f"'{needle}'" not in text:
                 reports.append(
-                    f"{site}: kim {needle!r} gõ thẳng mà không có mặt "
-                    f"dưới dạng hằng chuỗi trong khoảng dòng {start}-{end}"
+                    f"{site}: kim {needle!r} gõ thẳng mà dòng {number} "
+                    f"không viết hằng ấy"
                 )
-    return reports
-
-
-@lru_cache(maxsize=1)
-def node_spans_by_function() -> dict[str, frozenset[tuple[int, int]]]:
-    """Mỗi hàm → tập ``(dòng đầu, dòng cuối)`` của **mọi** nút trong thân nó.
-
-    Đọc lại từ cây, độc lập với lượt quét kim — giống cách
-    :func:`function_line_ranges` được dựng riêng.
-    """
-    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
-    table: dict[str, set[tuple[int, int]]] = {}
-    for outer in ast.walk(ast.parse(source.read_text(encoding="utf-8"))):
-        if isinstance(outer, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            table.setdefault(outer.name, set()).update(
-                (node.lineno, node.end_lineno)
-                for node in ast.walk(outer)
-                if hasattr(node, "lineno") and getattr(node, "end_lineno", None)
-            )
-    return {name: frozenset(spans) for name, spans in table.items()}
-
-
-def spans_that_are_not_a_real_node(spans_at: dict[str, tuple[int, int]]) -> list[str]:
-    """Luật (c): cửa sổ ghi lại phải đúng bằng cửa sổ của **một nút có thật**.
-
-    Không có luật này thì (b) mù hoàn toàn với **cửa sổ nới rộng**: nới ``end``
-    thêm 50 dòng, kim vẫn nằm trong, (b) bắt **0**. Đây là chỗ erplisting-21 đo
-    trước bên họ (``end`` lệch +1 → (b) = 0, chỉ (c) bắt). Cửa sổ càng rộng thì
-    (b) càng dễ xanh — một luật mà nới lỏng dữ liệu lại làm nó dễ xanh hơn thì
-    tự nó không đứng được.
-    """
-    table = node_spans_by_function()
-    reports = []
-    for site in sorted(spans_at):
-        name, _ = parse_site(site)
-        if name not in table:
-            continue  # đã có luật khác báo
-        if spans_at[site] not in table[name]:
-            reports.append(
-                f"{site}: cửa sổ {spans_at[site]} không phải cửa sổ của nút nào "
-                f"trong {name}"
-            )
     return reports
 
 
@@ -486,7 +447,7 @@ class SweptNeedles(NamedTuple):
     shapes_at: dict[str, set[str]] = {}
     carriers_at: dict[str, set[str]] = {}
     inline_at: dict[str, set[str]] = {}
-    spans_at: dict[str, tuple[int, int]] = {}
+    literal_at: dict[str, dict[str, int]] = {}
 
 
 def needles_compared_with(normalizer: str) -> SweptNeedles:
@@ -527,7 +488,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
     shapes: dict[str, set[str]] = {}
     carriers: dict[str, set[str]] = {}
     inline: dict[str, set[str]] = {}
-    spans: dict[str, tuple[int, int]] = {}
+    literals: dict[str, dict[str, int]] = {}
     functions = [
         node
         for node in ast.walk(tree)
@@ -639,6 +600,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
             why: str,
             node: ast.AST | None = None,
             carrier: str | None = None,
+            literal: ast.AST | None = None,
         ) -> None:
             if isinstance(value, str) and value:
                 site = f"{function.name}:{getattr(node, 'lineno', 0)}"
@@ -647,8 +609,11 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                 shapes.setdefault(site, set()).add(why)
                 if why in SHAPES_WRITTEN_INLINE:
                     inline.setdefault(site, set()).add(value)
-                    end = getattr(node, "end_lineno", None) or getattr(node, "lineno", 0)
-                    spans[site] = (getattr(node, "lineno", 0), end)
+                    # Mốc của kim là dòng của CHÍNH HẰNG ấy, không phải dòng
+                    # của nút bọc: bảng gõ thẳng trải tới 19 dòng thì hai cái
+                    # đó cách nhau xa, và cửa sổ rộng làm luật dễ xanh.
+                    anchor = getattr(literal or node, "lineno", 0)
+                    literals.setdefault(site, {})[value] = anchor
                 if carrier:
                     carriers.setdefault(site, set()).add(carrier)
 
@@ -682,7 +647,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                             continue
                         for element in elements(part):
                             if isinstance(element, ast.Constant):
-                                keep(element.value, "compare", node)
+                                keep(element.value, "compare", node, literal=element)
                         for value in named_set_strings(part):
                             keep(value, "named-set", node, carrier=box_name(part))
             if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)) and isinstance(
@@ -693,7 +658,12 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                     for generator in node.generators:
                         for element in elements(generator.iter):
                             if isinstance(element, ast.Constant):
-                                keep(element.value, "comprehension", node)
+                                keep(
+                                    element.value,
+                                    "comprehension",
+                                    node,
+                                    literal=element,
+                                )
             if (
                 isinstance(node, ast.Call)
                 and isinstance(node.func, ast.Attribute)
@@ -724,7 +694,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                 for argument in node.args:
                     for element in elements(argument):
                         if isinstance(element, ast.Constant):
-                            keep(element.value, "startswith", node)
+                            keep(element.value, "startswith", node, literal=element)
 
     return SweptNeedles(
         by_text=found,
@@ -733,7 +703,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         shapes_at=shapes,
         carriers_at=carriers,
         inline_at=inline,
-        spans_at=spans,
+        literal_at=literals,
     )
 
 
@@ -1994,41 +1964,50 @@ class UnderscoreTwinTests(unittest.TestCase):
         self.assertIn("generic_titles", reports[0])
 
 
-    def test_an_inline_needle_is_written_inside_its_own_span(self) -> None:
-        """Luật (b): kim gõ thẳng thì chữ của nó phải nằm trong khoảng của nút.
+    def test_an_inline_needle_is_written_on_its_own_line(self) -> None:
+        """Luật (b): kim gõ thẳng thì **đúng dòng của chính hằng ấy** phải viết nó.
 
-        Phải là KHOẢNG chứ không phải đúng dòng ghi lại — tập hằng gõ thẳng
-        trải nhiều dòng thì hỏi "có trên chính dòng ấy" là báo oan hàng loạt.
+        Bản đầu hỏi lỏng hơn hai bậc, và cả hai bậc đều là bệnh thật.
 
-        Và nhóm phải xếp bằng SỐ ĐO chứ đừng xếp bằng cảm giác: tôi đã xếp
-        ``loop-var`` vào nhóm gõ thẳng, chạy ra **126 lời báo oan** — vì kim
-        của nó đến từ bảng gõ ở chỗ khác (``alias_groups`` khai ở 14930,
-        đem so ở 14940), cái nằm trên dòng so là **biến lặp**. Xếp lại sang
-        nhóm bảng, lấy tên biến lặp làm tên mang, thì cả hai luật về 0.
+        *Bậc một — hỏi chuỗi con.* Ở đây có 18 lượt kim dài một hai ký tự
+        (``x``, ``n``, ``_``, ``0``, ``1``); chuỗi con một ký tự thì dòng nào
+        chẳng chứa. Siết thành "có hằng chuỗi với nháy quanh": 348/348 vẫn
+        đạt, giá bằng 0.
 
-        **(b) và (d) canh hai thứ khác nhau, đừng gộp làm một.** Đo trên
-        cùng cây sạch, 75 chỗ so gõ thẳng:
+        *Bậc hai — mốc là nút bọc.* Cửa sổ ``[dòng nút bọc, hết nút]`` rộng
+        tới 19 dòng, nên **nới dữ liệu ra lại làm luật dễ xanh hơn**: nới
+        ``end`` thêm 50 dòng, bản cửa sổ bắt **0**. Gốc bệnh ở cái mốc chứ
+        không ở câu hỏi — chỉ **284/348** kim nằm đúng trên dòng nút bọc.
+        Lấy mốc là dòng của chính hằng: **348/348**, rồi mới hỏi chặt được.
 
-        =====================================  =======  =======  =======
-        đột biến                               (b) bắt  (c) bắt  (d) bắt
-        =====================================  =======  =======  =======
-        hoán vị khoá trong cùng một hàm              0        0       12
-        đổi span giữa các chỗ so cùng hàm          316        0        0
-        span lệch một dòng                         278       13        0
-        =====================================  =======  =======  =======
+        Đo trên 348 kim gõ thẳng, cột "cắn" là số kim mà đột biến thực sự
+        đổi được mốc — số nhỏ chưa chắc là luật yếu, phải đếm cả cái này:
 
-        Cột (c) cho thấy chiều ngược lại: **đổi span giữa hai chỗ so trong
-        cùng hàm thì (c) mù hoàn toàn** — cửa sổ mượn ấy vẫn là cửa sổ của
-        một nút có thật, chỉ là nút khác. Đúng chỗ (b) bắt 316.
+        ================================  ========  =======  ========  =======
+        đột biến                          (b) mốc   cắn      (b) cửa   (c) bắt
+                                          chặt               sổ cũ
+        ================================  ========  =======  ========  =======
+        cây sạch                                 0        –         0        0
+        mốc lệch +1                            342  348/348         0       45
+        mốc lệch −1                            347  348/348       284       75
+        mốc lệch +5                            348  348/348         0       73
+        mốc lệch +50                           344  348/348         0       75
+        đổi mốc giữa các kim cùng chỗ so         59    59/59         0        0
+        đổi mốc giữa các chỗ so cùng hàm        323  323/323         –        –
+        ================================  ========  =======  ========  =======
 
-        Cả bảng này đo lại **sau khi siết** hai luật văn bản (hỏi hằng chuỗi
-        / nguyên từ); số của bản lỏng thấp hơn, nên đừng chép lại số cũ.
+        Mốc chặt bắt được **mọi ca mà hai luật kia bắt, và cả hai ca chúng
+        mù**, nên luật cửa sổ và luật (c) ("cửa sổ phải đúng bằng cửa sổ một
+        nút có thật") đã bị bỏ cùng trường ``spans_at`` — giữ lại là giữ một
+        luật canh cái không ai đọc, làm mức phủ trông dày hơn sự thật. Cách
+        chữa này của erplisting-21 (bên họ 313/383 → 383/383).
 
-        (b) **không đọc số dòng trong khoá** nên hoán vị khoá nó không thấy —
-        lần đo đầu tôi hoán vị cả khoá lẫn span cùng lúc, tức là không đổi
-        thứ gì (b) nhìn được, rồi suýt ghi "(b) mù". (b) canh *span có nói
-        thật không*; (d) canh *số dòng trong khoá có nói thật không*. Ghép
-        lại mới phủ hết, chứ không cái nào thay được cái nào.
+        Vài ca sót là trùng hợp thật, ghi ra chứ không làm tròn lên: ``+1``
+        sót 6, ``+50`` sót 4 — dòng rơi vào chỗ tình cờ cũng viết đúng hằng ấy.
+
+        (b) và (d) vẫn khác vai: (b) canh *mốc của kim*, (d) canh *số dòng
+        trong khoá*. Hoán vị khoá trong cùng hàm thì (d) bắt 12, (b) bắt 0 —
+        (b) không đọc số dòng trong khoá. Ghép lại mới phủ hết.
         """
         source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
         lines = source.read_text(encoding="utf-8").split("\n")
@@ -2036,11 +2015,9 @@ class UnderscoreTwinTests(unittest.TestCase):
         for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
             swept = needles_compared_with(normalizer)
             wrong.extend(
-                inline_needles_not_written_in_their_span(
-                    swept.inline_at, swept.spans_at, lines
-                )
+                inline_needles_not_written_on_their_own_line(swept.literal_at, lines)
             )
-        self.assertEqual([], wrong[:5], f"{len(wrong)} kim gõ thẳng ghi sai chỗ")
+        self.assertEqual([], wrong[:5], f"{len(wrong)} kim gõ thẳng ghi sai mốc")
 
     def test_the_two_text_rules_ask_tightly_not_loosely(self) -> None:
         """Hỏi lỏng bằng chuỗi con thì xanh mà không chứng minh gì.
@@ -2058,8 +2035,8 @@ class UnderscoreTwinTests(unittest.TestCase):
         """
         kim_lines = ['if x == "gao":']
         self.assertIn("ao", kim_lines[0], "ca thu phai qua duoc hoi long")
-        reports = inline_needles_not_written_in_their_span(
-            {"f:1": {"ao"}}, {"f:1": (1, 1)}, kim_lines
+        reports = inline_needles_not_written_on_their_own_line(
+            {"f:1": {"ao": 1}}, kim_lines
         )
         self.assertEqual(1, len(reports))
         self.assertIn("ao", reports[0])
@@ -2069,41 +2046,6 @@ class UnderscoreTwinTests(unittest.TestCase):
         reports = carriers_not_named_on_their_line({"f:1": {"bang"}}, carrier_lines)
         self.assertEqual(1, len(reports))
         self.assertIn("bang", reports[0])
-
-    def test_a_widened_window_is_caught_by_the_node_rule(self) -> None:
-        """Luật (c) bịt lỗ mà (b) không thấy: cửa sổ nới rộng.
-
-        Đo trên 75 chỗ so gõ thẳng của cây thật:
-
-        ==================  =======  =======
-        đột biến            (b) bắt  (c) bắt
-        ==================  =======  =======
-        cây sạch                  0        0
-        ``end`` +1                0    45/75
-        ``end`` +5                0    73/75
-        ``end`` +50               0    75/75
-        ``end`` −1              284    75/75
-        ``start`` +1            284    75/75
-        ==================  =======  =======
-
-        Cột (b) toàn 0 ở ba hàng nới rộng: kim vẫn nằm trong cửa sổ to hơn.
-        Hàng ``end`` +1 chỉ 45/75 vì 30 cửa sổ nới thêm một dòng thì **trùng
-        khít cửa sổ của một nút cha có thật** — đó là giới hạn thật của luật
-        (c), ghi ra chứ không làm tròn lên.
-        """
-        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
-            swept = needles_compared_with(normalizer)
-            with self.subTest(normalizer=normalizer):
-                self.assertEqual([], spans_that_are_not_a_real_node(swept.spans_at))
-
-    def test_the_node_rule_is_pinned_on_made_up_data(self) -> None:
-        real = next(iter(node_spans_by_function()["_normalize_skill_token"]))
-        self.assertEqual([], spans_that_are_not_a_real_node(
-            {"_normalize_skill_token:%d" % real[0]: real}))
-        reports = spans_that_are_not_a_real_node(
-            {"_normalize_skill_token:%d" % real[0]: (real[0], real[1] + 50)})
-        self.assertEqual(1, len(reports))
-        self.assertIn("không phải cửa sổ của nút nào", reports[0])
 
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
         """Phủ kín ở mức CHỖ SO, không chỉ ở mức nhãn hình dạng.
@@ -2121,11 +2063,14 @@ class UnderscoreTwinTests(unittest.TestCase):
                 )
 
     def test_the_inline_rule_is_pinned_on_made_up_data(self) -> None:
+        """Ghim cả hai chiều, kèm ca **mốc trỏ đúng chỗ nhưng lệch một dòng**."""
         lines = ['if x in {"ao", "quan"}:', "    pass"]
-        self.assertEqual([], inline_needles_not_written_in_their_span(
-            {"f:1": {"ao"}}, {"f:1": (1, 1)}, lines))
-        reports = inline_needles_not_written_in_their_span(
-            {"f:1": {"vay"}}, {"f:1": (1, 1)}, lines)
+        self.assertEqual([], inline_needles_not_written_on_their_own_line(
+            {"f:1": {"ao": 1}}, lines))
+        self.assertEqual(1, len(inline_needles_not_written_on_their_own_line(
+            {"f:1": {"ao": 2}}, lines)), "moc lech mot dong phai keu")
+        reports = inline_needles_not_written_on_their_own_line(
+            {"f:1": {"vay": 1}}, lines)
         self.assertEqual(1, len(reports))
         self.assertIn("vay", reports[0])
 
