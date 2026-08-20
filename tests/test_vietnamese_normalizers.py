@@ -2150,10 +2150,12 @@ class UnderscoreTwinTests(unittest.TestCase):
         lines = [
             'ALL = ("shirt", "tee")',
             "def f(x):",
-            '    if x in ("shirt",):',
+            "    if x in (",
+            '        "shirt",',
+            "    ):",
             "        pass",
         ]
-        boxes = {("f", 3): (3, 4)}
+        boxes = {("f", 3): (3, 5)}
         bent = {"f:3": {"shirt": 1}}
         self.assertEqual(
             [], inline_needles_not_written_on_their_own_line(bent, lines),
@@ -2163,8 +2165,15 @@ class UnderscoreTwinTests(unittest.TestCase):
         self.assertEqual(1, len(reports))
         self.assertIn("ngoài câu lệnh", reports[0])
 
-        honest = {"f:3": {"shirt": 3}}
+        # Chiều IM, và cố ý đặt mốc **khác dòng chỗ so** nhưng vẫn trong câu
+        # lệnh: nếu ai siết nhầm thành "mốc == dòng chỗ so" thì ca này đỏ.
+        # Bản ghim cũ đặt mốc trùng dòng chỗ so nên mù với đúng cái siết ấy —
+        # chỉ cây thật kêu (64 lời báo oan). Ghim mà không cắn thì chưa phải ghim.
+        honest = {"f:3": {"shirt": 4}}
         self.assertEqual([], anchors_outside_their_statement(honest, boxes))
+        self.assertEqual(
+            [], inline_needles_not_written_on_their_own_line(honest, lines)
+        )
 
     def test_every_site_is_covered_by_one_of_the_two_text_rules(self) -> None:
         """Phủ kín ở mức CHỖ SO, không chỉ ở mức nhãn hình dạng.
