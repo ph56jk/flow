@@ -272,6 +272,25 @@ def box_name(part: ast.AST) -> str:
     return part.id if isinstance(part, ast.Name) else ""
 
 
+def missing_twins(by_site: dict[str, set[str]]) -> list[str]:
+    """Kim có ``_`` mà thiếu bản viết liền **ngay tại chỗ so ấy**.
+
+    Tách ra thành hàm thuần để kiểm được bằng dữ liệu bịa: chọn phạm vi nào
+    là một quyết định, và quyết định thì phải có ca chứng minh nó gánh việc.
+    """
+    reports = []
+    for site, needles in sorted(by_site.items()):
+        for needle in sorted(needles):
+            if "_" not in needle:
+                continue
+            twin = needle.replace("_", "")
+            if twin not in needles:
+                reports.append(
+                    f"{site}: {needle!r} cần bản viết liền {twin!r} ngay tại chỗ so ấy"
+                )
+    return reports
+
+
 class SweptNeedles(NamedTuple):
     """Kết quả quét: cây kim ASCII, kèm nơi tìm thấy, kèm các hàm đã quét."""
 
@@ -1562,17 +1581,52 @@ class UnderscoreTwinTests(unittest.TestCase):
         """
         missing = []
         for normalizer in self._alphabets_without_underscore():
-            for site, needles in sorted(needles_compared_with(normalizer).by_site.items()):
-                for needle in sorted(needles):
-                    if "_" not in needle:
-                        continue
-                    twin = needle.replace("_", "")
-                    if twin not in needles:
-                        missing.append(
-                            f"{site}: {needle!r} cần bản viết liền {twin!r} "
-                            f"ngay tại chỗ so ấy thì {normalizer} mới khớp được"
-                        )
+            missing.extend(
+                f"{report} thì {normalizer} mới khớp được"
+                for report in missing_twins(needles_compared_with(normalizer).by_site)
+            )
         self.assertEqual([], missing)
+
+    def test_the_per_site_scope_is_what_catches_it(self) -> None:
+        """Chứng minh PHẠM VI gánh việc, bằng dữ liệu bịa chứ không bằng cây thật.
+
+        Đo trên cây hiện tại thì cả ba phạm vi (toàn repo / từng hàm / từng
+        chỗ so) đều 0 vi phạm. Dừng ở đó sẽ ra kết luận dễ chịu "siết cũng
+        thế thôi" — nhưng **trùng kết quả trên cây sạch là điều kiện cần,
+        không phải điều kiện đủ**. Muốn biết phạm vi nào mạnh hơn thì phải
+        có ca mà chỉ phạm vi chặt bắt được.
+
+        Ca ấy đây: cùng một hàm, kim gạch dưới ở chỗ so này, bản viết liền ở
+        chỗ so kia. Gộp theo hàm thì "đủ đôi"; theo chỗ so thì vế ``compact``
+        của chỗ thứ nhất chết câm.
+        """
+        scattered = {"f:1": {"tap_de"}, "f:2": {"tapde"}}
+        self.assertEqual([], missing_twins({"f:1": {"tap_de", "tapde"}}))
+        self.assertEqual(
+            [], missing_twins({"f:0": set().union(*scattered.values())}),
+            "gộp theo hàm thì ca này lọt — đó chính là điều cần chứng minh",
+        )
+        reports = missing_twins(scattered)
+        self.assertEqual(1, len(reports))
+        self.assertIn("f:1", reports[0])
+        self.assertIn("tapde", reports[0])
+
+    def test_the_tree_really_has_room_for_that_to_happen(self) -> None:
+        """Ca bịa ở trên chỉ đáng giá nếu cây thật có hàm nhiều chỗ so.
+
+        Không có câu này thì phạm vi chặt là phòng xa cho một hình dạng
+        không tồn tại — và đó lại là một kiểu ghim trống.
+        """
+        for normalizer in self._alphabets_without_underscore():
+            sites = needles_compared_with(normalizer).by_site
+            by_function: dict[str, set[frozenset]] = {}
+            for site, needles in sites.items():
+                by_function.setdefault(site.rsplit(":", 1)[0], set()).add(frozenset(needles))
+            with self.subTest(normalizer=normalizer):
+                self.assertTrue(
+                    [name for name, groups in by_function.items() if len(groups) > 1],
+                    "không hàm nào có hai chỗ so khác tập kim",
+                )
 
     def test_both_halves_of_each_pair_really_route(self) -> None:
         """Bằng chứng sống, không chỉ đối xứng chính tả.
