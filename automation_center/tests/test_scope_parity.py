@@ -15,8 +15,10 @@ import importlib.util
 import json
 import shutil
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 CENTER = HERE.parent
@@ -165,3 +167,113 @@ class ScopeParity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class KhungQuyChieuDuongDan(unittest.TestCase):
+    """Lớp bảo vệ chỉ đúng khi REPO_DIR là gốc git — khoá lại điều đó.
+
+    Bốn mục trong ``PROTECTED_GLOBS`` neo ở gốc repo và không mở đầu bằng
+    ``**/``.  Nếu runner báo đường dẫn tính từ *gốc git* trong khi gốc git nằm
+    cao hơn REPO_DIR, bốn mục ấy hết tác dụng mà không kêu một tiếng.
+    """
+
+    def _repo(self, tmp: Path, nested: bool) -> Path:
+        root = tmp / "workspace"
+        work = root / "flow-v2" if nested else root
+        (work / "automation_center" / "src").mkdir(parents=True)
+        (work / "automation_center" / "src" / "worker.js").write_text("x\n")
+        (work / "flow_web").mkdir()
+        (work / "flow_web" / "service.py").write_text("x\n")
+        for args in (["init", "-q", "-b", "main"],
+                     ["config", "user.email", "t@t"],
+                     ["config", "user.name", "t"],
+                     ["add", "-A"],
+                     ["-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", "init"]):
+            subprocess.run(["git", *args], cwd=root, check=True,
+                           capture_output=True, text=True)
+        return work
+
+    def test_hai_lenh_git_dem_theo_hai_khung_khac_nhau(self):
+        # Tiền đề của cả lớp bảo vệ, đo chứ không tin: ``ls-files`` đếm từ thư
+        # mục đang đứng, ``diff --numstat`` đếm từ gốc git.  Ngày nào git đổi
+        # điều này thì test đỏ ở đây trước, chứ không đỏ ở chỗ file bị ghi.
+        with tempfile.TemporaryDirectory() as raw:
+            work = self._repo(Path(raw), nested=True)
+            (work / "automation_center" / "src" / "worker.js").write_text("x\ny\n")
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+            def run(*args):
+                return subprocess.run(["git", *args], cwd=work, check=True,
+                                      capture_output=True, text=True).stdout
+            self.assertIn("automation_center/src/worker.js\n", run("ls-files"))
+            self.assertNotIn("flow-v2/", run("ls-files"))
+            self.assertIn("flow-v2/automation_center/src/worker.js",
+                          run("diff", "--cached", "--numstat"))
+
+    def test_worker_js_chi_duoc_bao_ve_o_khung_repo(self):
+        # Đây là thiệt hại thật khi hai khung lệch nhau, viết thẳng ra để ai
+        # đọc cũng thấy vì sao `require_repo_root` là bắt buộc.
+        self.assertTrue(runner.is_protected("automation_center/src/worker.js"))
+        self.assertFalse(runner.is_protected("flow-v2/automation_center/src/worker.js"))
+        self.assertTrue(runner.is_protected("automation_center/migrations/0001.sql"))
+        self.assertFalse(runner.is_protected("flow-v2/automation_center/migrations/0001.sql"))
+
+    def test_dan_test_duong_dan_thuong_khong_bat_duoc_lech_khung(self):
+        # Vì sao lỗi này sống lâu: mọi mục còn lại đều có anh em ``**/`` nên
+        # thêm tiền tố vào cũng không đổi kết quả.  Một dàn test chỉ có .env và
+        # wrangler.jsonc sẽ xanh trong khi worker.js đã mất bảo vệ.
+        for path in (".env", ".env.local", "wrangler.jsonc", "credentials.json",
+                     "keys/server.pem"):
+            with self.subTest(path=path):
+                self.assertEqual(runner.is_protected(path),
+                                 runner.is_protected(f"flow-v2/{path}"),
+                                 f"{path}: tiền tố đổi kết quả, mục này KHÔNG che lỗi")
+
+    def test_repo_dir_la_thu_muc_con_thi_runner_tu_choi_chay(self):
+        # Điều người vận hành thấy: trỏ AGENT_REPO_DIR vào bản clone lồng nhau
+        # thì runner không chạy.  Ở bố cục này chốt chặn là ``.git`` không nằm
+        # tại REPO_DIR, nên câu báo là câu "không phải một repo git" — vẫn là
+        # từ chối, và đó mới là điều cần khoá.
+        with tempfile.TemporaryDirectory() as raw:
+            work = self._repo(Path(raw), nested=True)
+            with mock.patch.object(runner, "REPO_DIR", work):
+                with self.assertRaises(RuntimeError) as caught:
+                    runner.require_repo_root()
+                self.assertEqual(runner.repo_prefix(), "flow-v2/")
+        self.assertIn(str(work), str(caught.exception))
+
+    def test_co_git_tai_repo_dir_nhung_goc_o_cho_khac_thi_van_bi_tu_choi(self):
+        # Nhánh thứ hai của `require_repo_root`, cái mà chốt ``.git`` không đỡ
+        # được: nếu ngày nào đó chốt kia được nới ra cho chạy từ thư mục con —
+        # nghe rất tiện — thì đây là thứ giữ lớp bảo vệ lại.
+        with tempfile.TemporaryDirectory() as raw:
+            work = self._repo(Path(raw), nested=False)
+            with mock.patch.object(runner, "REPO_DIR", work), \
+                 mock.patch.object(runner, "repo_prefix", lambda: "flow-v2/"):
+                with self.assertRaises(RuntimeError) as caught:
+                    runner.require_repo_root()
+        self.assertIn("PROTECTED_GLOBS", str(caught.exception))
+
+    def test_duong_dan_staged_duoc_quy_ve_khung_repo(self):
+        # `staged_stats` tự quy đổi, không phụ thuộc vào việc ai đã gọi
+        # `require_repo_root` trước đó: dựng đúng bố cục lồng nhau rồi đọc thẳng.
+        with tempfile.TemporaryDirectory() as raw:
+            work = self._repo(Path(raw), nested=True)
+            (work / "automation_center" / "src" / "worker.js").write_text("x\ny\n")
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+            with mock.patch.object(runner, "REPO_DIR", work):
+                paths, _, _ = runner.staged_stats()
+        self.assertEqual(paths, ["automation_center/src/worker.js"])
+        self.assertTrue(runner.is_protected(paths[0]),
+                        "đường dẫn trả ra phải là thứ `is_protected` nhận ra")
+
+    def test_repo_dir_la_goc_thi_staged_stats_noi_bang_khung_repo(self):
+        with tempfile.TemporaryDirectory() as raw:
+            work = self._repo(Path(raw), nested=False)
+            (work / "automation_center" / "src" / "worker.js").write_text("x\ny\n")
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+            with mock.patch.object(runner, "REPO_DIR", work):
+                runner.require_repo_root()
+                paths, lines, _ = runner.staged_stats()
+            self.assertEqual(paths, ["automation_center/src/worker.js"])
+            self.assertTrue(runner.is_protected(paths[0]))
+            self.assertEqual(lines, 1)

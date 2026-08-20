@@ -150,9 +150,54 @@ def git(*args: str, check: bool = True) -> str:
     return result.stdout
 
 
-def require_clean_repo() -> None:
+def repo_prefix() -> str:
+    """Chỗ REPO_DIR nằm, tính từ gốc git — rỗng nếu REPO_DIR chính là gốc."""
+    return git("rev-parse", "--show-prefix").strip()
+
+
+def require_repo_root() -> None:
+    """REPO_DIR phải là *gốc* git, không được là một thư mục con.
+
+    Hai lệnh git mà runner này dùng đếm đường dẫn theo hai hệ quy chiếu khác
+    nhau — đo chứ không đoán:
+
+        git ls-files                 → tính từ THƯ MỤC ĐANG ĐỨNG
+        git diff --cached --numstat  → tính từ GỐC GIT
+
+    REPO_DIR là gốc thì hai hệ trùng nhau và không ai để ý.  REPO_DIR là thư
+    mục con (clone thành ``agent-workspace/flow-v2`` chẳng hạn) thì cùng một
+    file mang hai tên khác nhau ở hai chỗ trong cùng một tiến trình:
+    ``repo_files`` gọi nó là ``automation_center/src/worker.js`` còn
+    ``staged_stats`` gọi nó là ``flow-v2/automation_center/src/worker.js``.
+
+    Chỗ chết người là bốn mục trong ``PROTECTED_GLOBS`` —
+    ``automation_center/src/worker.js``, ``automation_center/migrations/**``,
+    ``runner/**``, ``scripts/**`` — neo ở gốc repo, không mở đầu bằng ``**/``.
+    Tên thứ hai không khớp mục nào, nên lớp bảo vệ biến mất **im lặng**: không
+    lỗi, không cảnh báo, worker.js và migrations thành file sửa tự do.  Đúng
+    thứ PRD §0 cấm.
+
+    Và nó không lộ ra trong một dàn test đường dẫn thường: mọi mục còn lại đều
+    có anh em ``**/`` (``**/.env``, ``**/wrangler.jsonc``, ``**/*credentials*``)
+    che mất khác biệt ở mức gốc — ``flow-v2/.env`` vẫn được bảo vệ.  Phải lấy
+    đúng worker.js hay migrations mới thấy đỏ.
+
+    Thà không khởi động còn hơn chạy mà không còn lớp bảo vệ.
+    """
     if not REPO_DIR or not (REPO_DIR / ".git").exists():
         raise RuntimeError(f"AGENT_REPO_DIR không phải một repo git: {REPO_DIR or '(chưa đặt)'}")
+    prefix = repo_prefix()
+    if prefix:
+        raise RuntimeError(
+            f"AGENT_REPO_DIR ({REPO_DIR}) là thư mục con '{prefix.rstrip('/')}' của một "
+            "repo git lớn hơn. Đường dẫn git khi ấy mang thêm tiền tố đó và không còn "
+            "khớp PROTECTED_GLOBS, tức worker.js cùng migrations mất lớp bảo vệ mà "
+            "không báo gì. Hãy trỏ AGENT_REPO_DIR vào đúng gốc repo."
+        )
+
+
+def require_clean_repo() -> None:
+    require_repo_root()
     if git("status", "--porcelain").strip():
         raise RuntimeError(
             "Bản làm việc của agent còn thay đổi chưa dọn. Hãy vào máy trung tâm "
@@ -400,12 +445,25 @@ def write_files(entries: list[dict[str, Any]], allow_globs: list[str], max_files
 
 
 def staged_stats() -> tuple[list[str], int, str]:
+    # ``--numstat`` đếm từ gốc git, không từ thư mục đang đứng, nên quy về khung
+    # của repo trước khi trả ra: mọi thứ phía sau — ``is_protected``, báo cáo lên
+    # Center — đều nói bằng khung repo.  ``require_repo_root`` khiến tiền tố này
+    # luôn rỗng trên máy cấu hình đúng; giữ bước quy đổi để nếu ngày nào đó cái
+    # chốt kia bị nới ra thì đường dẫn vẫn nằm trong đúng một khung.
+    prefix = repo_prefix()
     paths, lines = [], 0
     for row in git("diff", "--cached", "--numstat").splitlines():
         parts = row.split("\t")
         if len(parts) != 3:
             continue
         added, deleted, path = parts
+        if prefix:
+            if not path.startswith(prefix):
+                raise RuntimeError(
+                    f"File {path} nằm ngoài {REPO_DIR}; runner không nhận thay đổi "
+                    "ở ngoài repo của chính nó."
+                )
+            path = path[len(prefix):]
         paths.append(path)
         for value in (added, deleted):
             if value.isdigit():
@@ -527,8 +585,10 @@ def main() -> int:
     if missing:
         print(f"Thiếu {', '.join(missing)}; runner không khởi động.", file=sys.stderr)
         return 2
-    if not (REPO_DIR / ".git").exists():
-        print(f"AGENT_REPO_DIR không phải repo git: {REPO_DIR}", file=sys.stderr)
+    try:
+        require_repo_root()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
 
     print(f"{RUNNER_LABEL} · repo {REPO_DIR} · nhánh nền {BASE_BRANCH} · model {OPENAI_MODEL}")
