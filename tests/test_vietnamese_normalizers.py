@@ -2434,6 +2434,45 @@ class UnderscoreTwinTests(unittest.TestCase):
                     f"(f) doc sai chieu o dong {line}",
                 )
 
+    def test_a_rule_that_loses_its_measurements_must_speak_not_skip(self) -> None:
+        """Mệnh đề canh "thiếu số đo" phải BÁO, không được lặng lẽ bỏ qua.
+
+        Đây là mệnh đề chết trên cây hiện tại — kim nào cũng có đủ số đo —
+        nên bỏ nó đi cả suite vẫn xanh, đo được: đổi thành ``continue`` trơn
+        thì 68 phép thử vẫn qua hết. Mà nó chỉ sống dậy đúng lúc bộ quét
+        thôi ghi span hoặc bảng câu lệnh hụt: tức đúng lúc luật lặng thinh
+        **còn tổng vẫn đọc là 0**. Rỗng-vì-mù trông y hệt rỗng-vì-sạch.
+
+        erplisting-21 tìm ra lỗ này bên họ (`if span is None` không ai ghim)
+        rồi bảo tôi kiểm — bên tôi hụt cả hai chỗ, (g) lẫn (e).
+        """
+        bent = {"f:3": {"shirt": 4}}
+        self.assertEqual(
+            1, len(anchors_outside_their_comparison_node(bent, {})),
+            "(g) mat bang span thi phai BAO, khong duoc im",
+        )
+        self.assertEqual(
+            1, len(anchors_outside_their_statement(bent, {})),
+            "(e) mat bang cau lenh thi phai BAO, khong duoc im",
+        )
+
+        # Nhánh còn lại thì im là **đúng**, nhưng chỉ đúng vì có luật khác
+        # gánh. Chú thích ``# đã có luật khác báo`` trong (e) và (f) là một
+        # lời khẳng định, nên phải có ca chứng minh nó, không thì nó chỉ là
+        # một câu viết ra cho yên tâm.
+        hong = {"_parse_aspect": {"portrait": 5}}
+        for rule in (
+            anchors_outside_their_statement,
+            anchors_standing_before_their_comparison,
+        ):
+            self.assertEqual([], rule(hong), "khoa hong thi ba luat moc phai nhuong")
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        lines = source.read_text(encoding="utf-8").split("\n")
+        self.assertEqual(
+            1, len(sites_pointing_nowhere({"_parse_aspect": {"portrait"}}, lines)),
+            "luat khac phai that su gach ten khoa hong — khong thi ca kia im vo chu",
+        )
+
     def test_a_widened_ruler_kills_g_but_leaves_e_speaking(self) -> None:
         """Vì sao giữ (e) dù (g) chặt hơn: hai luật hỏng theo hai kiểu.
 
