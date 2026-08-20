@@ -100,5 +100,43 @@ class AutoErpStopSignalTests(unittest.TestCase):
         self.assertTrue(service()._auto_erp_waitable_empty_error("Chưa tìm thấy card phù hợp"))
 
 
+class AutoErpStopSignalWordingTests(unittest.TestCase):
+    """Một cây kim lệch một từ, không dính gì tới chữ ``đ``.
+
+    Thẻ báo "chỉ gửi prompt mà không CÓ ảnh nguồn", danh sách lại viết
+    "không DÙNG ảnh nguồn". Ba câu raise khác đi tới hàm này đều đã dừng
+    đúng nhờ cây kim khác che; riêng câu này không cây kim nào nhận, nên
+    panel Tác nhân Flow không mở được mà cả loạt vẫn chạy tiếp.
+    """
+
+    def test_it_stops_when_the_agent_panel_never_opened(self) -> None:
+        detail = (
+            "Auto AI ERP cần mở panel Tác nhân Flow trước khi kéo ảnh vào AI. "
+            "App đã dừng để tránh chỉ gửi prompt mà không có ảnh nguồn."
+        )
+
+        self.assertTrue(service()._auto_erp_should_stop_on_child_error(detail))
+
+    def test_one_card_without_a_fresh_source_image_does_not_stop_the_batch(self) -> None:
+        # Cây kim phải hẹp: đây là điều kiện của riêng một thẻ, thẻ sau vẫn
+        # có thể chạy được, nên nó không được kéo theo cả loạt dừng.
+        detail = "Card ERP này chỉ còn ảnh output cũ của Flow, không có ảnh nguồn mới để làm reference."
+
+        self.assertFalse(service()._auto_erp_should_stop_on_child_error(detail))
+
+
+class SkillFieldKeyTests(unittest.TestCase):
+    """Ba khoá ASCII nữa sinh ra từ chữ có ``đ``, do phiên listing chỉ ra."""
+
+    def test_do_phan_giai_is_the_resolution_field(self) -> None:
+        self.assertEqual("do_phan_giai", service()._normalize_skill_token("Độ phân giải"))
+
+    def test_dang_nhap_reaches_the_flow_answer(self) -> None:
+        self.assertEqual("dang_nhap", service()._normalize_skill_token("đăng nhập"))
+
+    def test_chuyen_dong_camera_is_a_camera_motion_skill(self) -> None:
+        self.assertEqual("camera_motion", service()._parse_skill_type("chuyển động camera"))
+
+
 if __name__ == "__main__":
     unittest.main()

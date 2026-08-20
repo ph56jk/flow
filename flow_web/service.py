@@ -4054,6 +4054,17 @@ class FlowWebService:
             "khong dung anh nguon",
             "request khong co anh goc",
             "dung truoc khi bam tao",
+            # Câu này KHÔNG phải ca chữ ``đ``: thẻ báo "chỉ gửi prompt mà không
+            # CÓ ảnh nguồn", còn cây kim bên trên viết "không DÙNG ảnh nguồn" —
+            # lệch một từ nên chưa từng khớp, kể cả sau khi gấp ``đ``. Đo trên
+            # bốn câu raise thật đi tới hàm này: ba câu kia đã dừng đúng nhờ
+            # cây kim khác che, riêng câu này không cây kim nào nhận. Panel Tác
+            # nhân không mở được thì thẻ sau cũng hỏng y hệt, đúng loại lỗi hệ
+            # thống mà danh sách này sinh ra để chặn. Lấy đoạn "chi gui prompt"
+            # cho hẹp: câu "không có ảnh nguồn mới để làm reference" ở
+            # `service.py` là điều kiện của riêng một thẻ, không được kéo theo
+            # cả loạt dừng.
+            "chi gui prompt",
             "tat ca chrome profile flow da het quota",
         )
         return any(signal in normalized for signal in stop_signals)
