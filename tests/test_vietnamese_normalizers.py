@@ -1003,6 +1003,32 @@ class NormalizedNeedleAlphabetTests(unittest.TestCase):
         "_normalize_skill_token": r"[a-z0-9_]*",
         "_normalize_prompt_source_header": r"[a-z0-9]*",
         "_compact_match_text": r"[a-z0-9]*",
+        # Hàm này trả về **danh sách token**, không phải một chuỗi gấp. Bảng
+        # chữ ghi ở đây là bảng của TỪNG token — ``re.findall(r"[a-z0-9]+")``
+        # nên token rỗng không tồn tại, khác ba dòng trên dùng ``*``.
+        # Nó vắng mặt ở đây suốt một thời gian dài dù đã có tên trong
+        # ``FOLDERS``: mọi luật trong file đều lặp theo ``ALPHABETS``, nên 7
+        # chỗ so của nó chưa từng bị luật nào rờ tới. Không luật nào đỏ, mà
+        # cũng không luật nào nhìn.
+        "_tokenize_match_words": r"[a-z0-9]+",
+        # Giữ dấu cách: đây là bảng chữ của cả CÂU, không phải của một token.
+        # Lớp viết theo lối PHỦ ĐỊNH vì hàm này không có bước ``re.sub`` gom
+        # ký tự nào — thứ nó bảo đảm là *cái không thể có*: không chữ hoa,
+        # không chữ Latin có dấu, không ``đ`` (đã gấp thành ``d``), không hai
+        # dấu cách liền, không cách ở hai đầu.
+        "_flow_agent_error_match_text": r"|[^A-ZÀ-ỹ\s](?:[^A-ZÀ-ỹ\s]| (?=[^A-ZÀ-ỹ\s]))*",
+        # Bậc nền: nhiều chỗ gấp THẲNG bằng ``self._strip_accents(x).lower()``
+        # chứ không qua một bộ chuẩn hoá có tên — 11 chỗ so, 42 cây kim, và
+        # trước dòng này không luật nào rờ tới chúng. Đo cả 13 chỗ gán/return
+        # đi ra từ ``_strip_accents``: **13/13 đều đã hạ chữ thường**
+        # (``_extract_user_assistant_batch_limit`` hạ *trước* khi gấp), nên
+        # "không chữ hoa" là tính chất có thật chứ không phải mong muốn.
+        # ``đ`` SỐNG ở đây — hàm này thuộc nhóm ``KEEPS_D``.
+        #
+        # Lớp phủ định này hẹp hơn miền ra thật với chữ Hy Lạp / Kirin: gặp
+        # kim như thế nó sẽ báo oan. Chấp nhận, vì hỏng kiểu ấy **kêu thành
+        # tiếng**, còn nới lớp ra cho an toàn thì hỏng kiểu câm.
+        "_strip_accents": r"(?:[^A-ZÀ-ỹ]|đ)*",
     }
 
     def test_every_needle_uses_the_alphabet_its_normalizer_emits(self) -> None:
@@ -1723,6 +1749,53 @@ if __name__ == "__main__":
     unittest.main()
 
 
+def folds_that_forget_to_lower(source: str) -> list[str]:
+    """Chỗ gấp dấu mà không hạ chữ — bảng chữ của ``_strip_accents`` sống nhờ nó.
+
+    Hàm ấy KHÔNG tự hạ chữ, nên "không có chữ hoa" chỉ đúng chừng nào mọi
+    chỗ gọi đều hạ. Nhận cả hai lối viết: hạ trên cùng vế phải, và hạ ở câu
+    lệnh trước rồi mới đem gấp (``_extract_user_assistant_batch_limit``).
+    """
+    tree = ast.parse(source)
+
+    def ha_chu(node: ast.AST) -> bool:
+        doan = ast.get_source_segment(source, node) or ""
+        return ".lower()" in doan or ".casefold()" in doan
+
+    ra: list[str] = []
+    for function in ast.walk(tree):
+        if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        da_ha = {
+            target.id
+            for node in ast.walk(function)
+            if isinstance(node, ast.Assign) and ha_chu(node.value)
+            for target in node.targets
+            if isinstance(target, ast.Name)
+        }
+        for node in ast.walk(function):
+            value = getattr(node, "value", None)
+            if not isinstance(node, (ast.Assign, ast.AnnAssign, ast.Return)) or value is None:
+                continue
+            goi = [
+                child
+                for child in ast.walk(value)
+                if isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "_strip_accents"
+            ]
+            if not goi or ha_chu(value):
+                continue
+            if any(
+                isinstance(arg, ast.Name) and arg.id in da_ha
+                for call in goi
+                for arg in call.args
+            ):
+                continue
+            ra.append(f"{function.name}:{node.lineno}")
+    return ra
+
+
 class SweepReachTests(unittest.TestCase):
     """Ghim TẦM VỚI của chính lượt quét, không chỉ kết quả nó trả về.
 
@@ -1741,11 +1814,20 @@ class SweepReachTests(unittest.TestCase):
         "_normalize_skill_token": 284,
         "_normalize_prompt_source_header": 18,
         "_compact_match_text": 42,
+        # Sàn đo ngày 2026-08-21, lượt vá "phủ sóng theo CÂU LỆNH": ba bộ này
+        # có tên trong file từ lâu (``FOLDERS``, ``DELETES_D``) mà chưa từng
+        # nằm trong ``ALPHABETS``, nên chưa luật nào rờ tới.
+        "_tokenize_match_words": 9,
+        "_flow_agent_error_match_text": 21,
+        "_strip_accents": 42,
     }
     FLOOR_FUNCTIONS = {
         "_normalize_skill_token": 33,
         "_normalize_prompt_source_header": 4,
         "_compact_match_text": 20,
+        "_tokenize_match_words": 15,
+        "_flow_agent_error_match_text": 5,
+        "_strip_accents": 11,
     }
     # (bộ chuẩn hoá, hình dạng) → số ĐIỂM kim tối thiểu. Chia theo hình dạng
     # mới bắt được ca "hình dạng A chết trong khi hình dạng B mọc thêm", vì
@@ -1760,6 +1842,13 @@ class SweepReachTests(unittest.TestCase):
         ("_compact_match_text", "compare"): 7,
         ("_compact_match_text", "loop-var"): 40,
         ("_compact_match_text", "comprehension"): 20,
+        ("_tokenize_match_words", "compare"): 15,
+        ("_flow_agent_error_match_text", "compare"): 14,
+        ("_flow_agent_error_match_text", "loop-var"): 18,
+        ("_flow_agent_error_match_text", "comprehension"): 8,
+        ("_strip_accents", "compare"): 10,
+        ("_strip_accents", "loop-var"): 39,
+        ("_strip_accents", "comprehension"): 8,
     }
     # Hình dạng lượt quét biết đọc nhưng **flow-v2 (nửa làm ảnh)** không có
     # chỗ nào dùng. Ghi kèm TÊN REPO chứ đừng ghim trống: nửa listing đo bên
@@ -1829,6 +1918,193 @@ class SweepReachTests(unittest.TestCase):
                 ):
                     sites.append(f"{function.name}:{node.lineno}")
         self.assertEqual([], sites, "có chỗ dùng rồi thì phải bỏ khỏi danh sách 'chưa có chỗ'")
+
+    # Đầu vào để đối chất bảng chữ với chính cái hàm. Toàn chữ Latin/Việt —
+    # xem ghi chú "hẹp hơn miền ra thật" ở ``ALPHABETS``.
+    BATTERY = (
+        "",
+        "   ",
+        "Đã XẢY ra   lỗi\t\nrồi ",
+        "ABC àáâ",
+        "Áo Trẻ Em / Gối",
+        "x_y-z 09",
+        "  Bảng   Chữ  ",
+        "TShirt",
+        "ĐĐĐ",
+        "công ty 100%",
+    )
+
+    def test_the_alphabet_regex_agrees_with_the_function_itself(self) -> None:
+        """Bảng chữ gõ tay thì phải đối chất với hàm, không thì nó là lời khai.
+
+        Hai dòng mới thêm (`_flow_agent_error_math_text`, `_strip_accents`)
+        viết theo lối PHỦ ĐỊNH, mà lớp phủ định rất dễ viết chặt quá tay:
+        chặt quá thì luật báo oan, lỏng quá thì luật gật bừa. Cách duy nhất
+        biết được là **cho hàm chạy rồi soi đầu ra bằng chính lớp ấy**.
+
+        ``_strip_accents`` không tự hạ chữ, nên câu này phải kèm đuôi
+        ``.lower()``. Đuôi ấy không phải giả định: dưới đây đếm lại **mọi**
+        chỗ gán/return đi ra từ nó trong ``service.py`` và đòi tất cả đều hạ
+        chữ. Ngày mai có ai gấp mà quên hạ, câu này đỏ trước khi bảng chữ
+        kịp nói dối.
+        """
+        svc = service()
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        text = source.read_text(encoding="utf-8")
+
+        khong_ha = folds_that_forget_to_lower(text)
+        self.assertEqual([], khong_ha, "có chỗ gấp mà không hạ chữ thì bảng chữ của _strip_accents sai")
+
+        # Chứng minh phép dò CÓ răng, bằng mã bịa — trên cây thật nó trả rỗng,
+        # mà rỗng-vì-mù với rỗng-vì-sạch đọc y hệt nhau.
+        self.assertEqual(
+            ["xau:3"],
+            folds_that_forget_to_lower(
+                "class S:\n"
+                "    def xau(self, x):\n"
+                "        a = self._strip_accents(x)\n"
+                "        return a\n"
+            ),
+        )
+        for lanh in (
+            "class S:\n    def a(self, x):\n        return self._strip_accents(x).lower()\n",
+            "class S:\n    def b(self, x):\n        r = x.lower()\n        return self._strip_accents(r)\n",
+        ):
+            self.assertEqual([], folds_that_forget_to_lower(lanh), lanh)
+
+        for normalizer, alphabet in NormalizedNeedleAlphabetTests.ALPHABETS.items():
+            fold = getattr(svc, normalizer)
+            for raw in self.BATTERY:
+                with self.subTest(normalizer=normalizer, raw=raw):
+                    out = fold(raw)
+                    if normalizer == "_strip_accents":
+                        out = out.lower()
+                    for piece in out if isinstance(out, list) else [out]:
+                        self.assertRegex(
+                            piece,
+                            f"\\A(?:{alphabet})\\Z",
+                            f"{normalizer} nhả ra {piece!r} mà bảng chữ không nhận",
+                        )
+
+    def test_the_alphabet_table_covers_every_accent_folding_function(self) -> None:
+        """Lỗ PHẠM VI: mọi luật trong file lặp theo ``ALPHABETS``.
+
+        Một bộ chuẩn hoá không có tên trong bảng ấy thì **không luật nào
+        nhìn nó** — và im lặng ấy đọc y hệt "sạch". Đó không phải giả
+        thuyết: ``_tokenize_match_words`` có tên trong ``FOLDERS`` và trong
+        ``DELETES_D`` từ đầu, nhưng vắng ở ``ALPHABETS``, nên 7 chỗ so / 15
+        lượt kim của nó chưa từng bị luật nào rờ tới. Cùng lỗ ấy giấu thêm
+        ``_flow_agent_error_match_text`` (17 chỗ, 21 kim) và bậc nền
+        ``_strip_accents`` (11 chỗ, 42 kim). Cả ba đều **sạch** lúc bị lôi
+        ra — nên cái hỏng là DỤNG CỤ, không phải cây. Đúng bài của
+        erplisting-21: xét phủ sóng theo CÂU LỆNH, đừng xét theo phép so.
+
+        Danh sách hàm gấp ở đây **suy ra** bằng vết loang từ
+        ``self._strip_accents(...)`` tới ``return``, không chép tay — chép
+        tay chính là cái đã đẻ ra lỗ này.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+
+        def folds_accents(function: ast.AST) -> bool:
+            tainted = {"_strip_accents"}
+
+            def dinh(node: ast.AST) -> bool:
+                return any(
+                    (
+                        isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == "_strip_accents"
+                    )
+                    or (isinstance(child, ast.Name) and child.id in tainted)
+                    for child in ast.walk(node)
+                )
+
+            for node in ast.walk(function):
+                if isinstance(node, ast.Assign) and dinh(node.value):
+                    tainted |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+                if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                    for gen in node.generators:
+                        if dinh(gen.iter) and isinstance(gen.target, ast.Name):
+                            tainted.add(gen.target.id)
+            return any(
+                isinstance(node, ast.Return) and node.value is not None and dinh(node.value)
+                for node in ast.walk(function)
+            )
+
+        folding = {
+            function.name
+            for function in ast.walk(tree)
+            if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and folds_accents(function)
+        }
+        self.assertGreaterEqual(len(folding), 7, "vết loang rỗng thì câu này vô nghĩa")
+
+        # Hai bảng chép tay còn lại phải phủ đúng bằng ``ALPHABETS``: thêm
+        # một bộ chuẩn hoá mà quên sàn là nó vào diện luật nhưng ngoài diện
+        # canh-tầm-với — lại một kiểu xanh-vì-không-ai-nhìn.
+        alphabets = set(NormalizedNeedleAlphabetTests.ALPHABETS)
+        self.assertEqual(alphabets, set(self.FLOOR_NEEDLES), "FLOOR_NEEDLES phải phủ đúng ALPHABETS")
+        self.assertEqual(alphabets, set(self.FLOOR_FUNCTIONS), "FLOOR_FUNCTIONS phải phủ đúng ALPHABETS")
+        moc_d = (
+            set(DiacriticFoldBoundaryTests.KEEPS_D)
+            | set(DiacriticFoldBoundaryTests.FOLDS_D)
+            | set(DiacriticFoldBoundaryTests.DELETES_D)
+        )
+        self.assertEqual(set(), alphabets - moc_d, "bộ chuẩn hoá nào cũng phải khai chỗ đứng của ``đ``")
+
+        # HAI câu hỏi, không phải một, vì kim đứng ở hai chỗ khác nhau.
+        #
+        # Câu thứ nhất — kim ở CHỖ GỌI. Bản đầu của test này chỉ hỏi câu thứ
+        # hai, và nó **để lọt đúng cái lỗ đã sinh ra nó**: dựng lại lỗ cũ
+        # (rút ``_tokenize_match_words`` khỏi ba bảng) thì cả bộ vẫn xanh
+        # trơn, vì thân hàm ấy dài 3 dòng và không chứa hằng nào — kim của
+        # nó nằm ở 15 chỗ gọi. Dụng cụ đi soi dụng cụ vẫn mù đúng kiểu mù
+        # nó đang soi; phải đo mới biết.
+        for name in sorted(folding - alphabets):
+            with self.subTest(folding=name):
+                self.assertEqual(
+                    {},
+                    needles_compared_with(name).by_text,
+                    f"{name} gấp mà có kim ở chỗ gọi thì phải vào ALPHABETS, không thì không luật nào nhìn",
+                )
+
+        # Câu thứ hai — kim nằm NGAY TRONG thân hàm, so với một biến gấp tại
+        # chỗ. Ba hàm còn lại trả ``bool`` nên lượt quét trên không thấy gì:
+        # kim của chúng đi lối ``_strip_accents``.
+        covered: dict[str, set[str]] = {}
+        for normalizer in NormalizedNeedleAlphabetTests.ALPHABETS:
+            for needle, wheres in needles_compared_with(normalizer).by_text.items():
+                for where in wheres:
+                    covered.setdefault(where.rsplit(":", 1)[0], set()).add(needle)
+
+        residue = []
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if function.name not in folding or function.name in alphabets:
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Compare):
+                    continue
+                for part in [node.left, *node.comparators]:
+                    for element in ast.walk(part):
+                        if not (isinstance(element, ast.Constant) and isinstance(element.value, str)):
+                            continue
+                        if not element.value.strip():
+                            continue
+                        if element.value in covered.get(function.name, set()):
+                            continue
+                        residue.append((function.name, element.value))
+
+        # Ca duy nhất được tha, và tha có lý do đọc được: ``"skill"`` ở đây
+        # so với ``path.lower()`` — hạ chữ suông, KHÔNG phải một lượt gấp
+        # dấu — nên nó không thuộc phạm vi bảng chữ cái nào cả.
+        self.assertEqual(
+            [("_looks_like_skill_text", "skill")],
+            sorted(set(residue)),
+            "hằng nào ở hàm gấp mà không bộ chuẩn hoá nào quét thì phải giải trình",
+        )
 
     def test_every_folding_function_is_either_swept_or_explained(self) -> None:
         """Phân hoạch: hàm nào gấp mà lượt quét không thấy cây kim nào?
@@ -1919,7 +2195,14 @@ class DiacriticFoldBoundaryTests(unittest.TestCase):
     # BA hành vi, không phải hai. Gộp KEEPS vào "không gấp" là để người đọc
     # sau lướt thành "chỉ mất dấu thôi" — trong khi DELETES là mất hẳn con chữ.
     KEEPS_D = ("_strip_accents",)
-    FOLDS_D = ("_normalize_skill_token", "_normalize_prompt_source_header", "_normalize_policy_text")
+    FOLDS_D = (
+        "_normalize_skill_token",
+        "_normalize_prompt_source_header",
+        "_normalize_policy_text",
+        # Gấp bằng ``.replace("đ", "d")`` chứ không nhờ `_strip_accents`, nên
+        # nó vắng mặt ở đây suốt — cùng một lỗ với bảng ``ALPHABETS``.
+        "_flow_agent_error_match_text",
+    )
     DELETES_D = ("_compact_match_text", "_tokenize_match_words")
 
     def test_the_boundary_is_where_it_is_recorded_to_be(self) -> None:
@@ -2655,10 +2938,15 @@ class UnderscoreTwinTests(unittest.TestCase):
         "chưa với tới" chứ không phải "không thể" — khác hẳn vế ``"_" not in
         needle`` của :func:`missing_twins`, cái đó không đầu vào nào chạm
         được. Bằng chứng nó đổi được kết quả: bịt mắt ``box_name`` thì
-        carrier tụt **57 → 54** và giỏ mất-tên lên **0 → 3**: luật (d) mất
+        carrier tụt **65 → 62** và giỏ mất-tên lên **0 → 3**: luật (d) mất
         ba chỗ trong khi cây vẫn y nguyên. Giả định đầu của tôi là "mất
-        sạch 56" — số đo bác bỏ, vì 54 carrier còn lại đi lối ``loop-var``
+        sạch" — số đo bác bỏ, vì 62 carrier còn lại đi lối ``loop-var``
         và ``mapping.get-named`` chứ không qua ``box_name``.
+
+        Ngày 2026-08-21 ``ALPHABETS`` nhận thêm ba bộ chuẩn hoá, tổng carrier
+        57 → 65. Hai con số KHÔNG đổi: ``box_name`` vẫn 39 lượt và phần mất
+        khi bịt mắt vẫn đúng **3**. Đó mới là điều câu này ghim — quan hệ
+        nhân quả, không phải cái tổng.
         """
         for ma in ('RULES["x"]', "self.a.b", "diem.attr"):
             part = ast.parse(ma, mode="eval").body
@@ -2684,7 +2972,7 @@ class UnderscoreTwinTests(unittest.TestCase):
         finally:
             globals()["box_name"] = goc
         self.assertEqual(
-            54, sum(len(v) for s in mu for v in s.carriers_at.values()),
+            62, sum(len(v) for s in mu for v in s.carriers_at.values()),
             "bịt mắt thì luật (d) mất đúng phần carrier đi qua box_name",
         )
         self.assertEqual(
