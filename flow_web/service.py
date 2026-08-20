@@ -4038,12 +4038,38 @@ class FlowWebService:
         )
 
     def _auto_erp_should_stop_on_child_error(self, detail: str) -> bool:
-        # Dùng `_flow_agent_error_match_text` chứ không `_strip_accents`: hàm kia
-        # đã biết gấp ``đ``, và danh sách tín hiệu dưới đây là bản sao của danh
-        # sách trong `_is_flow_agent_source_attachment_error` vốn đi qua nó. Bản
-        # sao ở đây trước dùng `_strip_accents` nên sáu trong chín tín hiệu chết:
-        # "được" ra ``uoc``, "đúng" ra ``ung``, "đã" ra ``a`` — thẻ hỏng vì
-        # không kéo được ảnh nguồn vẫn chạy tiếp cả loạt thay vì dừng.
+        # Dùng `_flow_agent_error_match_text` chứ không `_strip_accents`: chỉ hàm
+        # kia mới gấp ``đ``. Chỗ này trước dùng `_strip_accents`, mà "được" khi ấy
+        # ra ``uoc`` chứ không ra ``duoc`` — ``đ`` là chữ cái riêng (U+0111) nên
+        # NFD không tách nó ra khỏi dấu.
+        #
+        # Đo bằng chính hai bản hàm, trên năm câu raise thật đi tới đây (đừng
+        # đếm số cây kim: kim chết mà không ai sinh ra câu khớp nó thì không hại
+        # ai, còn một câu có thể trúng nhiều kim):
+        #
+        #   trước  sau
+        #   False  True   "Auto AI ERP chưa kéo/upload được ảnh ERP..."
+        #   False  True   "Fallback UI Flow: chưa kéo được ảnh nguồn..."
+        #   False  True   "Fallback UI Flow: chưa upload được ảnh ERP..."
+        #   True   True   "App đã dừng trước khi bấm tạo..."   ← "dừng"/"dùng" là
+        #                 ``d`` thường nên hai kim ấy vẫn sống, đây là câu duy
+        #                 nhất tự cứu được
+        #   False  True   "...chỉ gửi prompt mà không có ảnh nguồn"  ← cây kim
+        #                 mới bên dưới, không phải nhờ gấp ``đ``
+        #
+        # Tức bốn trong năm câu vốn KHÔNG dừng: thẻ hỏng vì không kéo được ảnh
+        # nguồn vẫn kéo cả loạt chạy tiếp. Bảng này khoá trong
+        # `AutoErpStopSignalTests`.
+        #
+        # Ba cây kim "chua xac minh duoc anh nguon", "khong thay attachment moi",
+        # "request khong co anh goc" hiện KHÔNG có câu nào sinh ra ở repo này —
+        # giữ vì nửa listing có thể sinh, nhưng đừng tính chúng vào thiệt hại.
+        #
+        # Danh sách này KHÔNG phải bản sao của danh sách trong
+        # `_is_flow_agent_source_attachment_error` (18707): hai bên trả lời hai
+        # câu hỏi khác nhau — bên kia hỏi "đổi Chrome profile khác thử lại
+        # không?", bên này hỏi "dừng cả loạt không?" — nên chúng chỉ giao nhau
+        # bốn kim, mỗi bên còn kim riêng. Sửa một bên không tự kéo theo bên kia.
         normalized = self._flow_agent_error_match_text(detail)
         stop_signals = (
             "chua keo/upload duoc anh erp",
@@ -4056,9 +4082,8 @@ class FlowWebService:
             "dung truoc khi bam tao",
             # Câu này KHÔNG phải ca chữ ``đ``: thẻ báo "chỉ gửi prompt mà không
             # CÓ ảnh nguồn", còn cây kim bên trên viết "không DÙNG ảnh nguồn" —
-            # lệch một từ nên chưa từng khớp, kể cả sau khi gấp ``đ``. Đo trên
-            # bốn câu raise thật đi tới hàm này: ba câu kia đã dừng đúng nhờ
-            # cây kim khác che, riêng câu này không cây kim nào nhận. Panel Tác
+            # lệch một từ nên chưa từng khớp, kể cả sau khi gấp ``đ`` — xem
+            # bảng đo bên trên, đây là câu bản vá ``đ`` không cứu được. Panel Tác
             # nhân không mở được thì thẻ sau cũng hỏng y hệt, đúng loại lỗi hệ
             # thống mà danh sách này sinh ra để chặn. Lấy đoạn "chi gui prompt"
             # cho hẹp: câu "không có ảnh nguồn mới để làm reference" ở

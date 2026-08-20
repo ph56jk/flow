@@ -73,13 +73,39 @@ class SkillTokenIntentTests(unittest.TestCase):
 
 
 class AutoErpStopSignalTests(unittest.TestCase):
-    """Sáu trong chín tín hiệu dừng của Auto ERP có ``đ``.
+    """Bốn trong năm câu raise thật của Auto ERP không dừng được cả loạt.
 
-    Danh sách này là bản sao của danh sách trong
-    ``_is_flow_agent_source_attachment_error``, vốn đi qua một bộ chuẩn hoá
-    đã biết gấp ``đ``. Bản sao ở đây từng dùng bộ khác và chết lặng: thẻ
-    hỏng vì không kéo được ảnh nguồn vẫn chạy tiếp cả loạt.
+    Đếm câu raise thật, không đếm cây kim: một cây kim chết mà không ai sinh
+    ra câu khớp nó thì không hại ai, còn một câu có thể trúng nhiều kim. Ba
+    kim ở đây (``chua xac minh duoc anh nguon``, ``khong thay attachment
+    moi``, ``request khong co anh goc``) hiện không có chỗ sinh nào trong
+    repo này; ``tat ca chrome profile flow da het quota`` cũng vậy — giữ vì
+    nửa listing sinh ra nó, nhưng không tính vào thiệt hại.
+
+    Lý do chết: hàm này từng dùng ``_strip_accents``, mà ``đ`` là chữ cái
+    riêng (U+0111) nên NFD không tách nó khỏi dấu — "được" ra ``uoc`` chứ
+    không ra ``duoc``. Không lỗi nào được ném ra; thẻ hỏng vì không kéo được
+    ảnh nguồn chỉ lặng lẽ kéo cả loạt chạy tiếp.
     """
+
+    # Chép nguyên văn từ chỗ raise trong ``service.py`` — pin câu người/máy
+    # thật sự sinh ra, không pin câu tự nghĩ ra cho khớp cây kim. Bốn câu đầu
+    # trả False trước bản vá.
+    REAL_RAISES = (
+        "Auto AI ERP chưa kéo/upload được ảnh ERP vào Tác nhân Flow.",
+        "Fallback UI Flow: chưa kéo được ảnh nguồn vào khung Tác nhân (drag_detail).",
+        "Fallback UI Flow: chưa upload được ảnh ERP vào khung Tác nhân (attach_detail).",
+        "App đã dừng trước khi bấm tạo để tránh tạo ảnh không dùng ảnh nguồn. Chi tiết: x",
+        "Auto AI ERP cần mở panel Tác nhân Flow trước khi kéo ảnh vào AI. "
+        "App đã dừng để tránh chỉ gửi prompt mà không có ảnh nguồn.",
+    )
+
+    def test_every_real_raise_stops_the_batch(self) -> None:
+        svc = service()
+
+        for detail in self.REAL_RAISES:
+            with self.subTest(detail=detail[:60]):
+                self.assertTrue(svc._auto_erp_should_stop_on_child_error(detail))
 
     def test_it_stops_when_the_source_image_never_arrived(self) -> None:
         self.assertTrue(service()._auto_erp_should_stop_on_child_error("Chưa kéo/upload được ảnh ERP cho thẻ này"))
