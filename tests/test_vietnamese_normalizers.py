@@ -16,6 +16,7 @@ import ast
 import re
 import sys
 import unittest
+from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple
 
@@ -50,7 +51,29 @@ FOLDING_HELPERS = ("_user_assistant_erp_query_groups",)
 
 
 def literal_bindings_of(function: ast.AST) -> dict[str, object]:
-    """Tên → giá trị hằng gán cho nó ngay trong hàm."""
+    """Tên → giá trị hằng gán cho nó ngay trong hàm.
+
+    Chỉ nhận tên được ghi **đúng một lần**. Tên bị gán lại — hoặc còn làm
+    biến chạy của một vòng lặp khác — thì lúc đem so không biết nó đang
+    mang giá trị nào, mà đoán bừa chính là cách vụ ``token`` sinh ra 14 lỗi
+    bảng chữ cái ma.
+    """
+    written: dict[str, int] = {}
+    for node in ast.walk(function):
+        written_targets: list[ast.expr] = []
+        if isinstance(node, ast.Assign):
+            written_targets = list(node.targets)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+            written_targets = [node.target]
+        elif isinstance(node, (ast.For, ast.AsyncFor)):
+            written_targets = [node.target]
+        elif isinstance(node, ast.comprehension):
+            written_targets = [node.target]
+        for target in written_targets:
+            for child in ast.walk(target):
+                if isinstance(child, ast.Name):
+                    written[child.id] = written.get(child.id, 0) + 1
+
     bindings: dict[str, object] = {}
     for node in ast.walk(function):
         targets: list[ast.expr] = []
@@ -59,6 +82,8 @@ def literal_bindings_of(function: ast.AST) -> dict[str, object]:
         elif isinstance(node, ast.AnnAssign) and node.value is not None:
             targets = [node.target]
         if len(targets) == 1 and isinstance(targets[0], ast.Name):
+            if written.get(targets[0].id, 0) != 1:
+                continue
             try:
                 bindings[targets[0].id] = ast.literal_eval(node.value)
             except Exception:
@@ -215,6 +240,38 @@ def both_sides_folded_functions() -> list[ast.FunctionDef]:
     return family
 
 
+@lru_cache(maxsize=1)
+def outer_literal_boxes() -> dict[str, tuple[str, ...]]:
+    """Bảng hằng chuỗi khai ở mức module hoặc mức lớp của ``service.py``."""
+    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+    tree = ast.parse(source.read_text(encoding="utf-8"))
+    boxes: dict[str, tuple[str, ...]] = {}
+    holders: list[ast.AST] = [tree, *[n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]]
+    for holder in holders:
+        for statement in holder.body:
+            if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1):
+                continue
+            target = statement.targets[0]
+            if not isinstance(target, ast.Name):
+                continue
+            try:
+                value = ast.literal_eval(statement.value)
+            except Exception:
+                continue
+            if isinstance(value, (set, frozenset, list, tuple, dict)) and value:
+                items = tuple(value)
+                if all(isinstance(item, str) for item in items):
+                    boxes[target.id] = items
+    return boxes
+
+
+def box_name(part: ast.AST) -> str:
+    """Tên bảng hằng mà một vế của phép so đang trỏ tới (``self.X`` hoặc ``X``)."""
+    if isinstance(part, ast.Attribute) and isinstance(part.value, ast.Name):
+        return part.attr if part.value.id == "self" else ""
+    return part.id if isinstance(part, ast.Name) else ""
+
+
 class SweptNeedles(NamedTuple):
     """Kết quả quét: cây kim ASCII, kèm nơi tìm thấy, kèm các hàm đã quét."""
 
@@ -275,18 +332,7 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
         # Gỡ tuple theo CỘT chứ đừng dàn phẳng: cùng bảng ấy, cột 0 là kim
         # đem so, cột 1 là bí danh trả về — dàn phẳng thì ``"tap de"`` ở cột
         # 1 bị báo oan là sai bảng chữ cái.
-        literal_bindings: dict[str, object] = {}
-        for node in ast.walk(function):
-            targets: list[ast.expr] = []
-            if isinstance(node, ast.Assign) and len(node.targets) == 1:
-                targets = [node.targets[0]]
-            elif isinstance(node, ast.AnnAssign) and node.value is not None:
-                targets = [node.target]
-            if len(targets) == 1 and isinstance(targets[0], ast.Name):
-                try:
-                    literal_bindings[targets[0].id] = ast.literal_eval(node.value)
-                except Exception:
-                    pass
+        literal_bindings = literal_bindings_of(function)
 
         def iterable_values(expr: ast.AST, scope: dict[str, list]) -> list:
             if isinstance(expr, (ast.Set, ast.List, ast.Tuple)):
@@ -377,6 +423,22 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
             if isinstance(value, str) and value:
                 found.setdefault(value, set()).add(f"{function.name}:{why}")
 
+        def named_set_strings(node: ast.AST) -> list[str]:
+            """Hình dạng kim thứ SÁU: ``normalized in generic_exact``.
+
+            Bốn hình dạng đầu chỉ nhìn thấy tập hằng viết THẲNG tại chỗ.
+            Tập gán vào biến trước rồi mới đem so thì lọt lưới, mà "0 cây
+            kim" đọc y hệt "sạch". Repo này thủng đúng chỗ ấy: 25 cây kim ở
+            ``_sanitize_user_assistant_product_filter`` và
+            ``_erp_auto_search_query`` chưa từng bị lượt quét nhìn thấy.
+            """
+            if not isinstance(node, ast.Name):
+                return []
+            bound = literal_bindings.get(node.id)
+            if not isinstance(bound, (set, frozenset, list, tuple)):
+                return []
+            return [item for item in bound if isinstance(item, str)]
+
         for statement in function.body:
             scan(statement, {})
 
@@ -392,6 +454,8 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
                         for element in elements(part):
                             if isinstance(element, ast.Constant):
                                 keep(element.value, "compare")
+                        for value in named_set_strings(part):
+                            keep(value, "named-set")
             if isinstance(node, (ast.GeneratorExp, ast.ListComp, ast.SetComp)) and isinstance(
                 node.elt, ast.Compare
             ):
@@ -1172,3 +1236,257 @@ class ProductRuleBothSidesNormalizedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SweepReachTests(unittest.TestCase):
+    """Ghim TẦM VỚI của chính lượt quét, không chỉ kết quả nó trả về.
+
+    Mọi test bảng chữ cái ở trên đều đọc "0 vi phạm" là xanh. Nhưng lượt
+    quét hỏng cũng trả về 0 vi phạm — y hệt. Đó không phải giả thuyết: hình
+    dạng kim thứ SÁU (``normalized in generic_exact``, tập hằng gán vào biến
+    rồi mới đem so) đã giấu 25 cây kim ở hai hàm suốt thời gian bảng chữ cái
+    báo sạch, và trồng một cây kim sai bảng chữ vào đúng hai tập ấy thì cả
+    bộ test vẫn xanh trơn. Nên phải đo được rằng lượt quét CÓ nhìn thấy
+    những chỗ nó tự nhận là đã nhìn.
+    """
+
+    # Sàn đo ngày 2026-08-20. Là SÀN chứ không phải con số chính xác: thêm
+    # cây kim mới vào service.py là chuyện thường, mất cây kim thì không.
+    FLOOR_NEEDLES = {
+        "_normalize_skill_token": 284,
+        "_normalize_prompt_source_header": 18,
+        "_compact_match_text": 42,
+    }
+    FLOOR_FUNCTIONS = {
+        "_normalize_skill_token": 33,
+        "_normalize_prompt_source_header": 4,
+        "_compact_match_text": 20,
+    }
+    # (bộ chuẩn hoá, hình dạng) → số ĐIỂM kim tối thiểu. Chia theo hình dạng
+    # mới bắt được ca "hình dạng A chết trong khi hình dạng B mọc thêm", vì
+    # tổng vẫn tăng.
+    FLOOR_SHAPES = {
+        ("_normalize_skill_token", "comprehension"): 263,
+        ("_normalize_skill_token", "loop-var"): 305,
+        ("_normalize_skill_token", "compare"): 32,
+        ("_normalize_skill_token", "mapping.get"): 58,
+        ("_normalize_skill_token", "named-set"): 25,
+        ("_normalize_prompt_source_header", "compare"): 26,
+        ("_compact_match_text", "compare"): 7,
+        ("_compact_match_text", "loop-var"): 40,
+        ("_compact_match_text", "comprehension"): 20,
+    }
+    # Hình dạng lượt quét biết đọc nhưng repo này KHÔNG có chỗ nào dùng. Ghi
+    # thẳng ra thay vì để nó lẫn vào phần "đã phủ": đo được 0 chỗ gọi
+    # ``.startswith``/``.endswith`` trên giá trị đã gấp, trên cả sáu bộ
+    # chuẩn hoá. "0 cây kim" ở đây nghĩa là "chưa có chỗ nào như thế", không
+    # phải "hình dạng này chạy tốt".
+    SHAPES_WITH_NO_SITE_HERE = {"startswith"}
+
+    @staticmethod
+    def _shape_counts(normalizer: str) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for wheres in needles_compared_with(normalizer).by_text.values():
+            for where in wheres:
+                counts[where.rsplit(":", 1)[1]] = counts.get(where.rsplit(":", 1)[1], 0) + 1
+        return counts
+
+    def test_the_sweep_still_reaches_as_far_as_it_did(self) -> None:
+        for normalizer, floor in self.FLOOR_NEEDLES.items():
+            with self.subTest(normalizer=normalizer):
+                swept = needles_compared_with(normalizer)
+                self.assertGreaterEqual(len(swept.by_text), floor)
+                self.assertGreaterEqual(
+                    len(swept.functions), self.FLOOR_FUNCTIONS[normalizer]
+                )
+
+    def test_no_needle_shape_quietly_stops_firing(self) -> None:
+        for (normalizer, shape), floor in self.FLOOR_SHAPES.items():
+            with self.subTest(normalizer=normalizer, shape=shape):
+                self.assertGreaterEqual(self._shape_counts(normalizer).get(shape, 0), floor)
+
+    def test_a_shape_with_no_site_here_is_recorded_as_such(self) -> None:
+        """Ghim đúng cái mình KHÔNG đo được, để lần sau khỏi tưởng đã đo."""
+        fired = set()
+        for normalizer in self.FLOOR_NEEDLES:
+            fired |= set(self._shape_counts(normalizer))
+        self.assertEqual(set(), fired & self.SHAPES_WITH_NO_SITE_HERE)
+
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        sites = []
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            holders = folded_names(function)
+            for node in ast.walk(function):
+                if not (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"startswith", "endswith"}
+                ):
+                    continue
+                receiver = node.func.value
+                if isinstance(receiver, ast.Name) and receiver.id in holders:
+                    sites.append(f"{function.name}:{node.lineno}")
+                elif (
+                    isinstance(receiver, ast.Call)
+                    and isinstance(receiver.func, ast.Attribute)
+                    and receiver.func.attr in FOLDERS
+                ):
+                    sites.append(f"{function.name}:{node.lineno}")
+        self.assertEqual([], sites, "có chỗ dùng rồi thì phải bỏ khỏi danh sách 'chưa có chỗ'")
+
+    def test_every_folding_function_is_either_swept_or_explained(self) -> None:
+        """Phân hoạch: hàm nào gấp mà lượt quét không thấy cây kim nào?
+
+        Ba khả năng, và chỉ một là lành: (1) hàm thuộc họ gấp-cả-hai-vế nên
+        kim của nó là biến chứ không phải hằng; (2) hàm chỉ so hai giá trị
+        đã gấp với nhau, không có hằng nào để mà quét; (3) lượt quét thủng.
+        Không có test này thì (3) đội lốt (2) và không ai biết.
+        """
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        family = {function.name for function in both_sides_folded_functions()}
+
+        swept: set[str] = set()
+        for normalizer in self.FLOOR_NEEDLES:
+            for wheres in needles_compared_with(normalizer).by_text.values():
+                swept |= {where.rsplit(":", 1)[0] for where in wheres}
+
+        blind = []
+        for function in ast.walk(tree):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            folds = [
+                node
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in FOLDERS
+            ]
+            if len(folds) < 2 or function.name in family or function.name in swept:
+                continue
+            # Lý do (2) phải TỰ kiểm chứ không phải danh sách miễn trừ chép
+            # tay: hàm được tha đúng khi trong nó không có hằng chuỗi nào
+            # nằm ở một phép so. Ai thêm cây kim vào đó thì mất quyền tha.
+            literals = [
+                element.value
+                for node in ast.walk(function)
+                if isinstance(node, ast.Compare)
+                for part in [node.left, *node.comparators]
+                for element in ast.walk(part)
+                if isinstance(element, ast.Constant) and isinstance(element.value, str)
+            ]
+            # …và bảng hằng nằm NGOÀI hàm cũng tính là cây kim. Đo được 0
+            # chỗ như thế hôm nay, nhưng repo có sẵn 90 bảng hằng mức lớp:
+            # để nguyên thì hình dạng thứ BẢY chỉ cần một dòng mới là lọt,
+            # và nó sẽ lọt dưới danh nghĩa "hàm này không có hằng nào".
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Compare):
+                    continue
+                parts = [node.left, *node.comparators]
+                if not any(
+                    isinstance(part, ast.Name) and part.id in folded_names(function)
+                    for part in parts
+                ):
+                    continue
+                for part in parts:
+                    box = outer_literal_boxes().get(box_name(part))
+                    if box:
+                        literals.extend(sorted(box)[:5])
+            if literals:
+                blind.append(f"{function.name} -> {sorted(set(literals))[:5]}")
+        self.assertEqual([], blind)
+
+
+class DiacriticFoldBoundaryTests(unittest.TestCase):
+    """Sáu bộ chuẩn hoá KHÔNG xử lý chữ ``đ`` giống nhau, và đó là cố ý.
+
+    Ba bộ gấp ``đ`` → ``d``. Hai bộ **XOÁ HẲN** nó: ``_compact_match_text``
+    và ``_tokenize_match_words`` biến ``"đầm"`` thành ``"am"``, ``"đồ"``
+    thành ``"o"``. Không phải "chưa gấp" mà là mất chữ.
+
+    Vì sao test bảng chữ cái ở trên không bao giờ thấy: cây kim ``"dam"``
+    hợp lệ hoàn hảo với ``[a-z0-9]``. Nó chỉ chết lúc chạy, khi đem so với
+    ``"am"``. Đây là họ lỗi khác — sai NGỮ NGHĨA chứ không sai lớp ký tự —
+    nên phải đo riêng.
+
+    **Đo trên tập đóng của repo này** (không chép kết luận của nửa listing):
+    4768 hằng chuỗi trong ``service.py``, 654 hằng có chữ ``đ``, đối chiếu
+    với 42 cây kim so bằng `_compact_match_text` → **21 cặp đổi kết quả**
+    nếu bắt `_compact_match_text` gấp ``đ``. Cả 21 đều là **đụng chuỗi con
+    trong văn xuôi** — các hằng ấy là câu thông báo cho người dùng, không
+    phải cây kim sản phẩm. Không cây kim sản phẩm nào đổi phân loại.
+
+    **Nên KHÔNG đổi hành vi, chỉ ghim.** Đổi để "cho nhất quán" là đánh đổi
+    một khác biệt vô hại lấy rủi ro trên đường chạy thật.
+    """
+
+    FOLDS_D = ("_normalize_skill_token", "_normalize_prompt_source_header", "_normalize_policy_text")
+    DELETES_D = ("_compact_match_text", "_tokenize_match_words")
+
+    def test_the_boundary_is_where_it_is_recorded_to_be(self) -> None:
+        svc = service()
+        for name in self.FOLDS_D:
+            with self.subTest(normalizer=name, side="gấp"):
+                self.assertEqual("d", getattr(svc, name)("đ"))
+        for name in self.DELETES_D:
+            with self.subTest(normalizer=name, side="xoá"):
+                result = getattr(svc, name)("đ")
+                self.assertEqual([] if isinstance(result, list) else "", result)
+
+    def test_a_d_word_reaches_the_two_alphabets_differently(self) -> None:
+        """Cùng một từ, hai chính tả cây kim. Viết nhầm là kim chết câm."""
+        svc = service()
+        for typed, skill_form, compact_form in (
+            ("đầm", "dam", "am"),
+            ("đồ", "do", "o"),
+            ("đá", "da", "a"),
+            ("đèn", "den", "en"),
+        ):
+            with self.subTest(word=typed):
+                self.assertEqual(skill_form, svc._normalize_skill_token(typed))
+                self.assertEqual(compact_form, svc._compact_match_text(typed))
+                # Đây mới là câu quan trọng: viết "dam" rồi đem so với
+                # `_compact_match_text` thì KHÔNG BAO GIỜ khớp "đầm".
+                self.assertNotIn(skill_form, svc._compact_match_text(typed))
+
+    def test_the_live_d_needle_is_not_affected(self) -> None:
+        """Nhóm đối chứng: ``tạp dề`` có chữ ``d`` THƯỜNG, không phải ``đ``.
+
+        Không có nó thì test trên đọc như "mọi cây kim có chữ d đều nguy",
+        và người sửa sau sẽ đi xoá ``tapde`` — một cây kim đang sống.
+        """
+        svc = service()
+        self.assertNotIn("đ", "tạp dề")
+        self.assertEqual("tapde", svc._compact_match_text("tạp dề"))
+        self.assertEqual("tap_de", svc._normalize_skill_token("tạp dề"))
+
+    def test_no_product_needle_would_change_if_compact_folded_d(self) -> None:
+        """Đo lại tập đóng mỗi lần chạy, đừng tin con số 21 đã chép."""
+        svc = service()
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        tree = ast.parse(source.read_text(encoding="utf-8"))
+        constants = {
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.strip()
+        }
+        needles = set(needles_compared_with("_compact_match_text").by_text)
+
+        product_needle_changed = []
+        for text in sorted(constant for constant in constants if "đ" in constant.lower()):
+            now = svc._compact_match_text(text)
+            folded = svc._compact_match_text(text.replace("đ", "d").replace("Đ", "D"))
+            if now == folded:
+                continue
+            for needle in needles:
+                if (needle in now) == (needle in folded):
+                    continue
+                # Phân biệt máy móc: hằng có dấu cách là câu văn xuôi, đụng
+                # chuỗi con ở đó không định tuyến gì cả. Hằng là một token
+                # trơn mà đổi phân loại thì mới là cây kim sản phẩm.
+                if " " not in text.strip():
+                    product_needle_changed.append(f"{needle!r} <- {text!r}")
+        self.assertEqual([], product_needle_changed)
