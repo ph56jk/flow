@@ -382,6 +382,8 @@ POST /api/erp/idea-batch/auto
 
 Mục **Agent Bot** trên ERP (Vault) phát cho mỗi bot một token riêng. **Thêm bot vào một dự án là toàn bộ phần cấu hình** — không phải gắn vào từng thẻ: bot tự tìm mọi **thẻ Idea** của dự án đó (thẻ còn mở và có thẻ con, hoặc là thẻ nhóm), tự xếp job tạo ảnh, và tự dọn ảnh theo phiếu 👍/👎.
 
+**Cột nào là lời giao việc.** `ERP_AGENT_SOURCE_STATUS` giới hạn phạm vi `board` vào đúng những cột được kể tên; bỏ trống thì mọi cột chưa đóng đều tính, như trước. PROJ-0013 đặt `Working`: cột `Open` là chỗ thẻ còn đang gõ dở — cũng là chỗ gõ `action_1: listing` vào **trước** khi ảnh xong — nên bot để yên, và kéo thẻ sang `Working` chính là nút "chạy đi". Tên cột được nén dấu trước khi so, nên board đặt tên tiếng Việt vẫn khớp. Gõ sai tên cột thì lượt quét ghi log kể đúng những cột đang có: hàng rào này bỏ cả board trong im lặng, mà im lặng ấy đọc y hệt một board đã làm xong. Hàng rào **chỉ** chặn phạm vi `board` — thẻ gắn đích danh bot vẫn chạy dù ở cột nào, vì đó là lối cứu duy nhất cho thẻ lỡ gắn `action_1: listing` muộn. Đừng lẫn với `ERP_STATUS_ID`: dòng kia nói app ghi thẻ vào cột nào, dòng này nói bot nhặt thẻ từ cột nào.
+
 Muốn chỉ chạy đúng một thẻ thì **gắn bot vào thẻ đó**: hễ trong dự án có thẻ gắn đích danh bot, dự án ấy thu về đúng những thẻ đó. Nói rõ thắng suy đoán. Đặt `ERP_AGENT_SCOPE=card` nếu muốn bot **chỉ** làm việc khi được gắn vào thẻ.
 
 **Gắn vào thẻ cha là gắn cho cả cụm.** Chọn agent ở ô *Người phụ trách* của thẻ cha thì mọi thẻ con của nó cũng được gắn theo — thẻ con đã có sẵn được bot khâu lại ở lượt quét kế, còn thẻ con do phần nhận ảnh vừa sinh ra thì mang agent ngay từ lúc tạo. Chỉ lan **xuống**, không bao giờ lan lên: gắn vào một thẻ con là cố ý chỉ đúng thẻ ấy, tự tiện gắn ngược lên thẻ cha sẽ kéo theo cả những thẻ con khác không ai chọn. Thẻ con đã mang agent thì lượt quét vẫn chỉ chạy thẻ cha — cây của thẻ cha đã chứa sẵn bình luận của con, để con chen vào thì trần `ERP_AGENT_MAX_CARDS_PER_SCAN` bị chính đám con ăn hết.
@@ -399,6 +401,7 @@ ERP_AGENT_TOKEN=...                 # bắt buộc; bỏ trống là tắt hẳn
 ERP_AGENT_BOT_USER=agent-<tên>@bots.hvg.internal
 # ERP_AGENT_PROJECTS=PROJ-0013      # bỏ trống = mọi dự án bot nhìn thấy
 ERP_AGENT_SCOPE=                    # bỏ trống = board; "card" = chỉ thẻ được gắn
+ERP_AGENT_SOURCE_STATUS=Working     # cột nào là lời giao việc; bỏ trống = mọi cột chưa đóng
 ERP_AGENT_MAX_CARDS_PER_SCAN=3
 ERP_AGENT_POLL_SECONDS=120
 ERP_AGENT_AUTORUN=1

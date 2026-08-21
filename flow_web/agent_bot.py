@@ -148,6 +148,12 @@ class AgentBotConfig:
     # có thẻ gắn bot thì dự án đó thu về đúng những thẻ ấy — nói rõ vẫn thắng suy
     # đoán, và đó là cách chỉ định "chỉ chạy thẻ này thôi".
     scope: str = SCOPE_BOARD
+    # Cột nguồn của phạm vi ``board``: bỏ trống = mọi cột chưa đóng, đúng như
+    # trước. Điền vào thì kéo thẻ sang cột ấy mới là lời giao việc, còn cột
+    # nháp bên trái vẫn là chỗ gõ dở mà bot không đụng vào. Chỉ chặn phạm vi
+    # ``board``: thẻ đã gắn đích danh bot vẫn chạy dù nằm ở cột nào, vì gắn bot
+    # là cách duy nhất cứu một thẻ lỡ nhịp — chặn cả chỗ đó thì mất lối cứu.
+    source_statuses: Tuple[str, ...] = ()
     max_cards_per_scan: int = DEFAULT_MAX_CARDS_PER_SCAN
     # Chạy khô: ghi log quyết định nhưng không xoá gì. Dùng khi mới cắm bot
     # vào một dự án lạ và chưa tin phạm vi của nó.
@@ -174,6 +180,18 @@ class AgentBotConfig:
         if names and home and home not in names:
             names.append(home)
         projects = tuple(names)
+        raw_source = os.getenv("ERP_AGENT_SOURCE_STATUS", "").replace(";", ",")
+        source_statuses = tuple(item.strip() for item in raw_source.split(",") if item.strip())
+        for wanted in source_statuses:
+            if compact_status(wanted) in CLOSED_STATUSES:
+                # Đặt cột nguồn vào một cột đã đóng là hỏng câm: ``is_idea_card``
+                # loại thẻ ở cột đóng trước cả bước này, nên bot sẽ quét mãi mà
+                # không bao giờ nhận việc, và không có lỗi nào để mà đọc.
+                log.warning(
+                    "ERP_AGENT_SOURCE_STATUS=%r trỏ vào một cột đã đóng — bot sẽ "
+                    "không bao giờ nhận được thẻ nào từ phạm vi board.",
+                    wanted,
+                )
         configured_base = (
             str(base_url or "").strip()
             or os.getenv("ERP_BASE_URL", "").strip()
@@ -193,6 +211,7 @@ class AgentBotConfig:
             scope=SCOPE_CARD
             if os.getenv("ERP_AGENT_SCOPE", "").strip().lower() == SCOPE_CARD
             else SCOPE_BOARD,
+            source_statuses=source_statuses,
             max_cards_per_scan=_positive_int(
                 os.getenv("ERP_AGENT_MAX_CARDS_PER_SCAN", ""), DEFAULT_MAX_CARDS_PER_SCAN
             ),
@@ -647,6 +666,21 @@ def is_idea_card(task: Dict[str, Any], board_row: Dict[str, Any] | None = None) 
     return compact_status(task.get("status")) not in CLOSED_STATUSES
 
 
+def card_is_in_source_column(task: Dict[str, Any], wanted: Sequence[str]) -> bool:
+    """Thẻ có đang nằm ở cột nguồn không. ``wanted`` rỗng = mọi cột đều tính.
+
+    So bằng ``compact_status`` ở *cả hai* đầu, nên ``Working`` trong file cấu
+    hình khớp cả ``working`` lẫn ``WORKING``, và một board đặt tên cột bằng
+    tiếng Việt vẫn khớp được. So nguyên văn thì người ta gõ đúng tên cột mình
+    đang nhìn thấy mà bot vẫn đứng im — đúng kiểu hỏng không ai đọc ra.
+    """
+    keys = {compact_status(name) for name in wanted}
+    keys.discard("")
+    if not keys:
+        return True
+    return compact_status(task.get("status")) in keys
+
+
 def is_listing_card(task_node: Dict[str, Any]) -> bool:
     """Thẻ này có tự nhận mình là việc listing Etsy không.
 
@@ -933,7 +967,24 @@ class AgentBot:
                 continue
             if self.config.scope != SCOPE_BOARD:
                 continue
-            found.extend(task for task in tasks if is_idea_card(task))
+            wanted = self.config.source_statuses
+            open_cards = [task for task in tasks if is_idea_card(task)]
+            picked = [task for task in open_cards if card_is_in_source_column(task, wanted)]
+            if wanted and open_cards and not picked:
+                # Gõ sai tên cột thì bot im lặng bỏ cả board, và im lặng ấy đọc
+                # y hệt một board đã làm xong. Kể tên các cột đang thật sự có
+                # để người đọc log sửa được ngay mà không phải mở ERP ra dò.
+                log.warning(
+                    "Cột nguồn %s không khớp thẻ đang mở nào của %s; đang có: %s.",
+                    ", ".join(wanted),
+                    project,
+                    ", ".join(
+                        sorted(
+                            {str(task.get("status") or "").strip() or "(trống)" for task in open_cards}
+                        )
+                    ),
+                )
+            found.extend(picked)
         return found
 
     def resolve_bot_user(self, trees: Sequence[Dict[str, Any]] = ()) -> str:
@@ -1360,9 +1411,15 @@ class AgentBot:
         # khi bot thật sự làm gì; im lặng khi không có việc là đúng, nhưng im
         # lặng ngay từ lúc khởi động thì không phân biệt được với chết hẳn.
         log.info(
-            "Agent bot bật: quét mỗi %ss, phạm vi %s, tự chạy %s%s.",
+            "Agent bot bật: quét mỗi %ss, phạm vi %s%s, tự chạy %s%s.",
             interval,
             self.config.scope,
+            # Cột nguồn là thứ dễ làm bot trông như chết nhất: gõ sai một chữ
+            # là không thẻ nào lọt. Nói ngay ở dòng khởi động thì người đọc log
+            # đối chiếu được với board mà không phải mở file cấu hình ra.
+            f" (cột nguồn: {', '.join(self.config.source_statuses)})"
+            if self.config.source_statuses
+            else "",
             "bật" if self.config.autorun else "tắt",
             " (chạy khô)" if self.config.dry_run else "",
         )

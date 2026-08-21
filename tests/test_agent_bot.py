@@ -20,6 +20,7 @@ from flow_web.agent_bot import (
     _RateLimiter,
     count_card_images,
     compact_status,
+    card_is_in_source_column,
     is_idea_card,
     is_review_post,
     iter_review_posts,
@@ -493,6 +494,109 @@ class BoardScopeTests(unittest.TestCase):
         self.assertEqual(2, len(self.calls))
         # Nhưng phiếu 👍/👎 thì vẫn được đọc trên toàn bộ thẻ.
         self.assertEqual(5, len(summary["tasks"]))
+
+
+class SourceColumnTests(unittest.TestCase):
+    """Cột nào là lời giao việc — và cột nào chỉ là chỗ gõ dở.
+
+    Không có hàng rào này thì mọi thẻ chưa đóng đều bị nhặt, kể cả thẻ vừa tạo
+    mà người ta còn đang gõ ``action_1: listing`` vào. Có nó thì thao tác kéo
+    thẻ sang cột làm việc mới là nút "chạy đi".
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.calls: List[str] = []
+
+    async def _hook(self, task_id: str) -> Dict[str, Any]:
+        self.calls.append(task_id)
+        return {"queued": []}
+
+    def _run(self, board: List[Dict[str, Any]], **overrides) -> Dict[str, Any]:
+        # Dùng lại đúng bộ đồ chơi của BoardScopeTests: hai lớp này hỏi về cùng
+        # một bước lọc, chỉ khác chỗ đứng.
+        bot = build_bot(BoardScopeTests._client(self, board), self.tmp, **overrides)
+        bot.autorun_hook = self._hook
+        return asyncio.run(bot.run_once())
+
+    def test_an_empty_setting_still_means_every_open_column(self) -> None:
+        # Câu này canh chỗ nguy nhất: thêm hàng rào mà lỡ bật sẵn thì mọi máy
+        # đang chạy đứng im, và đứng im đọc y hệt "board đã làm xong".
+        board = [
+            {"name": "TASK-1", "child_total": 2, "status": "Open"},
+            {"name": "TASK-2", "child_total": 2, "status": "Working"},
+        ]
+        self.assertEqual(["TASK-1", "TASK-2"], sorted(self._run(board)["tasks"]))
+        self.assertEqual(["TASK-1", "TASK-2"], sorted(self.calls))
+
+    def test_only_the_named_column_is_taken_as_work(self) -> None:
+        board = [
+            {"name": "TASK-1", "child_total": 2, "status": "Open"},
+            {"name": "TASK-2", "child_total": 2, "status": "Working"},
+        ]
+        summary = self._run(board, source_statuses=("Working",))
+        self.assertEqual(["TASK-2"], summary["tasks"])
+        self.assertEqual(["TASK-2"], self.calls)
+
+    def test_more_than_one_column_can_be_named(self) -> None:
+        board = [
+            {"name": "TASK-1", "child_total": 2, "status": "Open"},
+            {"name": "TASK-2", "child_total": 2, "status": "Working"},
+            {"name": "TASK-3", "child_total": 2, "status": "Pending Review"},
+        ]
+        summary = self._run(board, source_statuses=("Open", "Working"))
+        self.assertEqual(["TASK-1", "TASK-2"], sorted(summary["tasks"]))
+
+    def test_a_card_the_bot_was_attached_to_runs_from_any_column(self) -> None:
+        # Gắn bot vào thẻ là lối cứu duy nhất cho thẻ lỡ nhịp (``action_1:
+        # listing`` gõ muộn). Bắt nó qua hàng rào cột nữa là bịt luôn lối ấy.
+        board = [
+            {"name": "TASK-1", "child_total": 2, "status": "Working"},
+            {
+                "name": "TASK-2",
+                "child_total": 2,
+                "status": "Open",
+                "agents": [{"bot_user": BOT}],
+            },
+        ]
+        summary = self._run(board, source_statuses=("Working",))
+        self.assertEqual(["TASK-2"], summary["tasks"])
+
+    def test_the_column_name_is_matched_the_way_every_other_column_name_is(self) -> None:
+        # ``compact_status`` cả hai đầu: người ta gõ tên cột mình đang nhìn
+        # thấy, không phải gõ đúng kiểu chữ mà mã nguồn muốn.
+        self.assertTrue(card_is_in_source_column({"status": "Working"}, ("  working ",)))
+        self.assertTrue(card_is_in_source_column({"status": "WORKING"}, ("Working",)))
+        self.assertTrue(card_is_in_source_column({"status": "Đang làm"}, ("dang lam",)))
+        self.assertFalse(card_is_in_source_column({"status": "Open"}, ("Working",)))
+        # Bảng rỗng nghĩa là không hỏi gì, chứ không phải cấm tất.
+        self.assertTrue(card_is_in_source_column({"status": "Open"}, ()))
+        self.assertTrue(card_is_in_source_column({"status": "Open"}, ("", "   ")))
+
+    def test_a_column_name_that_matches_nothing_says_so_out_loud(self) -> None:
+        # Gõ sai một chữ thì cả board biến mất. Log phải kể tên các cột đang
+        # thật sự có, nếu không người đọc chỉ thấy bot "không có việc".
+        board = [
+            {"name": "TASK-1", "child_total": 2, "status": "Open"},
+            {"name": "TASK-2", "child_total": 2, "status": "Pending Review"},
+        ]
+        with self.assertLogs("flow_web.agent_bot", level="WARNING") as caught:
+            summary = self._run(board, source_statuses=("Workign",))
+        self.assertEqual([], summary["tasks"])
+        noise = "\n".join(caught.output)
+        self.assertIn("Workign", noise)
+        self.assertIn("Open", noise)
+        self.assertIn("Pending Review", noise)
+
+    def test_a_board_with_nothing_open_is_not_reported_as_a_typo(self) -> None:
+        # Board đã làm xong hết thì im lặng là đúng — cảnh báo ở đây sẽ kêu mỗi
+        # hai phút cho tới khi có người gõ thẻ mới, và cảnh báo kêu mãi thì
+        # chẳng ai đọc cảnh báo nào nữa.
+        board = [{"name": "TASK-1", "child_total": 2, "status": "Completed"}]
+        with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
+            self.assertEqual([], self._run(board, source_statuses=("Working",))["tasks"])
 
 
 class ListingCardTests(unittest.TestCase):
@@ -1119,6 +1223,30 @@ class ConfigTests(unittest.TestCase):
         # Một giá trị gõ sai không được âm thầm tắt bot khỏi cả board.
         with patch.dict(os.environ, {"ERP_AGENT_TOKEN": "t", "ERP_AGENT_SCOPE": "cards"}):
             self.assertEqual("board", AgentBotConfig.from_env().scope)
+
+    def test_the_source_column_accepts_commas_semicolons_and_stray_spaces(self) -> None:
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"ERP_AGENT_TOKEN": "t", "ERP_AGENT_SOURCE_STATUS": ""}):
+            self.assertEqual((), AgentBotConfig.from_env().source_statuses)
+        with patch.dict(
+            os.environ, {"ERP_AGENT_TOKEN": "t", "ERP_AGENT_SOURCE_STATUS": " Working ; Open,"}
+        ):
+            self.assertEqual(("Working", "Open"), AgentBotConfig.from_env().source_statuses)
+
+    def test_pointing_the_source_column_at_a_closed_column_is_said_out_loud(self) -> None:
+        # ``is_idea_card`` loại thẻ ở cột đã đóng *trước* hàng rào cột nguồn,
+        # nên cấu hình này làm bot không bao giờ nhận việc mà không có lỗi nào
+        # để đọc. Giá trị vẫn được giữ nguyên: cảnh báo, không sửa lưng người.
+        import os
+        from unittest.mock import patch
+
+        with patch.dict(os.environ, {"ERP_AGENT_TOKEN": "t", "ERP_AGENT_SOURCE_STATUS": "Đã hoàn thành"}):
+            with self.assertLogs("flow_web.agent_bot", level="WARNING") as caught:
+                config = AgentBotConfig.from_env()
+        self.assertEqual(("Đã hoàn thành",), config.source_statuses)
+        self.assertIn("Đã hoàn thành", "\n".join(caught.output))
 
     def test_an_empty_token_leaves_the_bot_off(self) -> None:
         import os
