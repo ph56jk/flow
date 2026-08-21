@@ -168,6 +168,13 @@ class ListingBridge:
             # Không có job thật ở đây; chuỗi này chỉ để đầu kia gắn nhãn.
             "source_job_id": f"erp-{task_id}",
             "erp_enabled": True,
+            # Đầu kia để ``telegram_enabled`` **mặc định True**, nên không gửi
+            # gì tức là đã đồng ý gửi. Ảnh đã được duyệt 👍 ngay trên thẻ ERP
+            # rồi; bắt người ta duyệt lại lần nữa qua Telegram là hỏi một câu
+            # đã có câu trả lời. Nói thẳng ra ở đây để ý định nằm trong payload,
+            # chứ không nằm ở chỗ "may mà đường enqueue bên kia không đọc tới
+            # trường này" — cái may ấy tan ngay khi bên kia sửa mã.
+            "telegram_enabled": False,
             "erp_project_id": self.config.project_id,
             "erp_status_id": self.config.status_id,
             "erp_task_id": task_id,

@@ -129,6 +129,7 @@ class PayloadTests(unittest.TestCase):
                 "title": "Khăn tay hoa cúc",
                 "source_job_id": "erp-TASK-2026-00700",
                 "erp_enabled": True,
+                "telegram_enabled": False,
                 "erp_project_id": "PROJ-0013",
                 "erp_status_id": "",
                 "erp_task_id": "TASK-2026-00700",
@@ -150,6 +151,14 @@ class PayloadTests(unittest.TestCase):
         payload = bridge().payload("TASK-1", LISTING_CARD)
         for asked_to_generate in ("prompt", "count", "aspect", "automation_graph"):
             self.assertNotIn(asked_to_generate, payload)
+
+    def test_a_flag_that_defaults_to_on_is_turned_off_out_loud(self) -> None:
+        # ``telegram_enabled`` bên bản Listing mặc định True: im lặng ở đây là
+        # đồng ý, không phải là trung lập. Ca này giữ cho ý định nằm trong
+        # payload thay vì nằm ở chỗ đường enqueue bên kia tình cờ không đọc tới.
+        payload = bridge().payload("TASK-1", LISTING_CARD)
+        self.assertIn("telegram_enabled", payload)
+        self.assertFalse(payload["telegram_enabled"])
 
     def test_the_trial_only_ever_builds_a_draft(self) -> None:
         self.assertFalse(bridge().payload("TASK-1", LISTING_CARD)["etsy_publish"])
