@@ -708,8 +708,16 @@ class SweptNeedles(NamedTuple):
     nameless_at: set[str] = set()
 
 
-def needles_compared_with(normalizer: str) -> SweptNeedles:
+def needles_compared_with(normalizer: str, fake_source: str | None = None) -> SweptNeedles:
     """Mọi hằng chuỗi được đem so với đầu ra của ``normalizer``.
+
+    ``fake_source`` tồn tại vì đúng một lý do: **ghim những nhánh mà cây
+    thật chưa có ca nào chạm tới**. Sàn kiểm kê chỉ canh được thứ nó đang
+    đếm; nhánh chưa ai chạm thì rơi ra ngoài mọi con số và hỏng lặng lẽ.
+    Đo theo câu lệnh trên cây thật: nhánh ``startswith``/``endswith`` của
+    lượt quét này **chưa chạy lần nào** — nó chỉ được ``SHAPES_WITH_NO_SITE_HERE``
+    *ghi nhận là không có ca*, mà ghi nhận không phải là kiểm. (Bài của
+    erplisting-21, 2026-08-21.)
 
     Quét theo BIẾN chứ không theo hàm: chỉ nhận hằng nào thật sự so với
     chính biến giữ kết quả chuẩn hoá. Quét theo hàm — lấy mọi hằng trong
@@ -724,8 +732,10 @@ def needles_compared_with(normalizer: str) -> SweptNeedles:
     đầu chính là thứ đã giấu mất họ lỗi "cây kim viết sai bảng chữ cái":
     nó vứt đúng những cây kim hỏng trước khi có ai kịp nhìn thấy chúng.
     """
-    source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
-    tree = ast.parse(source.read_text(encoding="utf-8"))
+    if fake_source is None:
+        source = Path(__file__).resolve().parents[1] / "flow_web" / "service.py"
+        fake_source = source.read_text(encoding="utf-8")
+    tree = ast.parse(fake_source)
 
     def is_call(node: ast.AST) -> bool:
         return (
@@ -2061,7 +2071,11 @@ class SweepReachTests(unittest.TestCase):
         # trơn, vì thân hàm ấy dài 3 dòng và không chứa hằng nào — kim của
         # nó nằm ở 15 chỗ gọi. Dụng cụ đi soi dụng cụ vẫn mù đúng kiểu mù
         # nó đang soi; phải đo mới biết.
-        for name in sorted(folding - alphabets):
+        ngoai_bang = sorted(folding - alphabets)
+        # Vòng rỗng đọc y hệt vòng sạch (erplisting-21): nếu hiệu tập rỗng
+        # thì cả khối dưới không kiểm gì mà ca vẫn xanh.
+        self.assertTrue(ngoai_bang, "hiệu tập rỗng thì vòng dưới chẳng hỏi gì")
+        for name in ngoai_bang:
             with self.subTest(folding=name):
                 self.assertEqual(
                     {},
@@ -2105,6 +2119,47 @@ class SweepReachTests(unittest.TestCase):
             sorted(set(residue)),
             "hằng nào ở hàm gấp mà không bộ chuẩn hoá nào quét thì phải giải trình",
         )
+
+    def test_the_shape_with_no_site_here_is_kept_working_by_fake_source(self) -> None:
+        """``SHAPES_WITH_NO_SITE_HERE`` GHI NHẬN, nó không KIỂM.
+
+        Đo lượt chạy theo câu lệnh: nhánh ``startswith``/``endswith`` trong
+        :func:`needles_compared_with` **chưa chạy lần nào** — repo này chưa
+        có chỗ nào gọi ``.startswith`` trên một giá trị đã gấp. Sàn kiểm kê
+        chỉ canh được thứ nó đang đếm, nên nhánh ấy hôm nay rơi ra ngoài
+        mọi con số: bẻ gãy nó thì không ca nào đỏ, mà nửa listing của
+        erplisting-21 lại có 2 chỗ dùng thật.
+
+        Cách ghim: cho lượt quét một NGUỒN GIẢ. Câu này và ``fake_source``
+        sinh ra cùng nhau, không có lý do nào khác.
+        """
+        gia = (
+            "class S:\n"
+            "    def _normalize_skill_token(self, x):\n"
+            "        return x\n"
+            "\n"
+            "    def dat_ten(self, x):\n"
+            "        token = self._normalize_skill_token(x)\n"
+            "        if token.startswith(\"auto_erp_etsy\"):\n"
+            "            return 1\n"
+            "        if token.endswith((\"_hoop\", \"_pillow\")):\n"
+            "            return 2\n"
+            "        return 0\n"
+        )
+        swept = needles_compared_with("_normalize_skill_token", gia)
+        self.assertEqual(
+            {"auto_erp_etsy", "_hoop", "_pillow"},
+            set(swept.by_text),
+            "cả startswith lẫn endswith, cả đối số đơn lẫn tuple",
+        )
+        self.assertEqual(
+            {"startswith"},
+            {where.rsplit(":", 1)[1] for wheres in swept.by_text.values() for where in wheres},
+        )
+        self.assertEqual({"dat_ten:7", "dat_ten:9"}, set(swept.by_site))
+
+        # Và nguồn giả KHÔNG được rò vào lượt quét cây thật.
+        self.assertNotIn("auto_erp_etsy", needles_compared_with("_normalize_skill_token").by_text)
 
     def test_every_folding_function_is_either_swept_or_explained(self) -> None:
         """Phân hoạch: hàm nào gấp mà lượt quét không thấy cây kim nào?
@@ -2923,6 +2978,17 @@ class UnderscoreTwinTests(unittest.TestCase):
             rieng += len(set(swept.carriers_at) - set(swept.by_site))
         self.assertEqual(0, rieng, "khoá carriers nằm ngoài by_site thì không ai gánh hộ")
 
+        # Nhánh thứ BA của luật ấy — số dòng hợp lệ nhưng dòng KHÔNG mang
+        # dấu hiệu của một phép so. Hai nhánh trên đã ghim từ vòng trước,
+        # nhánh này thì chưa chạy lần nào trên cây thật.
+        self.assertEqual(
+            [], sites_pointing_nowhere({"f:1": {"shirt"}}, ["if x in y:"]),
+            "dòng có dấu hiệu phép so thì im",
+        )
+        bao = sites_pointing_nowhere({"f:2": {"shirt"}}, ["if x in y:", "    ten = 1"])
+        self.assertEqual(1, len(bao))
+        self.assertIn("ten = 1", bao[0], "phải in ra chính dòng nó trỏ nhầm vào")
+
     def test_a_table_whose_name_cannot_be_read_is_reported_not_dropped(self) -> None:
         """Họ lỗ thứ HAI: mặc-định-lặng, không phải bỏ-qua-lặng.
 
@@ -3037,6 +3103,16 @@ class UnderscoreTwinTests(unittest.TestCase):
         ):
             node = ast.parse(ma, mode="eval").body
             self.assertIsNone(table_from_comprehension(node, {"B": ("a",)}), canh)
+
+        # Nhánh "phần tử không phải chuỗi" là nhánh cây thật CHƯA chạm tới —
+        # đo theo câu lệnh thì nó chưa chạy lần nào, nên không con số nào
+        # trong bản kiểm kê canh nó. Ghim riêng bằng bảng bịa.
+        so = ast.parse("{i for i in B}", mode="eval").body
+        self.assertEqual(("a",), table_from_comprehension(so, {"B": ("a",)}))
+        self.assertIsNone(
+            table_from_comprehension(so, {"B": ("a", 7)}),
+            "bảng lẫn phần tử không phải chuỗi thì chịu, đừng đọc bừa nửa bảng",
+        )
 
     def test_a_widened_ruler_kills_g_but_leaves_e_speaking(self) -> None:
         """Vì sao giữ (e) dù (g) chặt hơn: hai luật hỏng theo hai kiểu.
