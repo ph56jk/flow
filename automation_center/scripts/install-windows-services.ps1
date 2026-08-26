@@ -1,4 +1,5 @@
-# Đăng ký Flow v2 và Content Image Runner thành Scheduled Task trên host Windows.
+# Đăng ký Flow v2, Content Image Runner và Agent điều phối thành Scheduled Task
+# trên host Windows.
 #
 #   - Tự khởi động khi người dùng đăng nhập (Flow cần phiên GUI để chạy Chrome).
 #   - Tự khởi động lại khi crash.
@@ -6,6 +7,17 @@
 #
 # Chạy bằng PowerShell của chính tài khoản sẽ host runner:
 #   powershell -NoProfile -ExecutionPolicy Bypass -File install-windows-services.ps1
+#
+# Thêm một task vào máy đang chạy thì đừng đăng ký lại cả ba: mỗi lần đăng ký
+# là một lần Unregister rồi Register, tức là dừng thật một dịch vụ đang phục
+# vụ để đổi lấy đúng một dòng cấu hình y hệt cũ.  Dùng -Only:
+#
+#   ... -File install-windows-services.ps1 -Only 'HaviGroup Orchestrator Runner'
+
+param(
+    # Rỗng = đăng ký tất cả.  Tên phải khớp nguyên văn tên task bên dưới.
+    [string[]] $Only = @()
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -24,6 +36,11 @@ function Register-HvgTask {
         [Parameter(Mandatory)][string] $ScriptPath,
         [Parameter(Mandatory)][string] $LogName
     )
+
+    if ($Only.Count -gt 0 -and $Only -notcontains $TaskName) {
+        Write-Host "Bỏ qua (không có trong -Only): $TaskName"
+        return
+    }
 
     if (-not (Test-Path $ScriptPath)) { throw "Thiếu script: $ScriptPath" }
 
@@ -85,9 +102,19 @@ Register-HvgTask -TaskName 'HaviGroup Flow v2' `
 Register-HvgTask -TaskName 'HaviGroup Content Image Runner' `
     -ScriptPath (Join-Path $RunnerDir 'run-content-image-runner.ps1') -LogName 'content-image-runner.log'
 
+# Agent điều phối: cùng một khuôn S4U / boot + logon / lặp 5 phút như hai task
+# kia.  Nó không mở trình duyệt nên không vướng chuyện Session 0.  Bản repo mà
+# nó sửa code KHÔNG phải bản này — đó là $env:AGENT_REPO_DIR trong
+# orchestrator.env, và run-orchestrator-runner.ps1 từ chối chạy nếu hai đường
+# dẫn trùng nhau.
+Register-HvgTask -TaskName 'HaviGroup Orchestrator Runner' `
+    -ScriptPath (Join-Path $RunnerDir 'run-orchestrator-runner.ps1') -LogName 'orchestrator-runner.log'
+
 Write-Host ''
 Write-Host 'Khởi động ngay:'
 Write-Host '  Start-ScheduledTask -TaskName "HaviGroup Flow v2"'
 Write-Host '  Start-ScheduledTask -TaskName "HaviGroup Content Image Runner"'
+Write-Host '  Start-ScheduledTask -TaskName "HaviGroup Orchestrator Runner"'
 Write-Host ''
 Write-Host 'Runner sẽ thoát với mã 78 cho tới khi runner\.env có đủ secret.'
+Write-Host 'Agent điều phối cần thêm OPENAI_API_KEY và AGENT_REPO_DIR trong orchestrator.env.'
