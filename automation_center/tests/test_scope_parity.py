@@ -152,6 +152,19 @@ class ScopeParity(unittest.TestCase):
             with self.subTest(raw=raw):
                 self.assertEqual(runner.normalise_path(raw), expected)
 
+    def test_tran_diff_hai_ben_bang_nhau(self):
+        # Runner cắt diff rồi gửi kèm cờ "đã cắt"; Worker cắt lần nữa và tự bật
+        # cờ khi chính nó là bên cắt.  Hai trần lệch nhau thì cờ nói dối theo
+        # đúng một trong hai chiều — hoặc bỏ sót diff bị cắt, hoặc dựng cảnh
+        # báo đỏ trên diff còn nguyên.  Cả hai đều làm hỏng bước duyệt.
+        script = f"""
+        import {{ CONTROL_LIMITS }} from {json.dumps(str(WORKER))};
+        console.log(JSON.stringify(CONTROL_LIMITS.DIFF_TEXT_MAX));
+        """
+        out = subprocess.run(["node", "--input-type=module", "--eval", script],
+                             capture_output=True, text=True, check=True, cwd=CENTER)
+        self.assertEqual(runner.DIFF_LIMIT, json.loads(out.stdout))
+
     def test_file_bi_mat_that_su_bi_chan_o_ca_hai_ben(self):
         # Không chỉ "giống nhau" — phải giống nhau ở phía chặn.  Hai bên cùng
         # sai theo một kiểu vẫn là parity, nên neo lại vài trường hợp tuyệt đối.
@@ -163,10 +176,6 @@ class ScopeParity(unittest.TestCase):
         for path in ["flow_web/service.py", "automation_center/public/app.js"]:
             with self.subTest(path=path):
                 self.assertFalse(runner.is_protected(path))
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class KhungQuyChieuDuongDan(unittest.TestCase):
@@ -266,6 +275,23 @@ class KhungQuyChieuDuongDan(unittest.TestCase):
         self.assertTrue(runner.is_protected(paths[0]),
                         "đường dẫn trả ra phải là thứ `is_protected` nhận ra")
 
+    def test_staged_stats_tra_diff_day_du_chu_khong_tu_cat(self):
+        # Đây là chỗ **duy nhất** còn nhìn thấy diff đầy đủ.  Cắt ngay tại đây
+        # là vứt mất thông tin "đã cắt" trước khi có ai kịp ghi nó lại: thứ gửi
+        # lên Center sẽ luôn vừa khít trần, nên bên kia đo bao nhiêu cũng kết
+        # luận "còn nguyên" — người duyệt đọc nửa diff mà màn hình báo là đủ.
+        # Cắt là việc của `handle_request`, sau khi đã đặt cờ.
+        with tempfile.TemporaryDirectory() as raw:
+            work = self._repo(Path(raw), nested=False)
+            (work / "flow_web" / "service.py").write_text(
+                "".join(f"dong so {i}\n" for i in range(8000)))
+            subprocess.run(["git", "add", "-A"], cwd=work, check=True, capture_output=True)
+            with mock.patch.object(runner, "REPO_DIR", work):
+                _, _, diff = runner.staged_stats()
+        self.assertGreater(
+            len(diff), runner.DIFF_LIMIT,
+            "staged_stats đã cắt diff — cờ diff_truncated sẽ không bao giờ bật")
+
     def test_repo_dir_la_goc_thi_staged_stats_noi_bang_khung_repo(self):
         with tempfile.TemporaryDirectory() as raw:
             work = self._repo(Path(raw), nested=False)
@@ -277,3 +303,10 @@ class KhungQuyChieuDuongDan(unittest.TestCase):
             self.assertEqual(paths, ["automation_center/src/worker.js"])
             self.assertTrue(runner.is_protected(paths[0]))
             self.assertEqual(lines, 1)
+
+
+# Đặt cuối file, không đặt giữa: unittest.main() chạy đúng những lớp đã được
+# nạp tới thời điểm nó chạy.  Nằm trước một lớp test là bỏ sót lớp đó mà vẫn
+# in "OK" — đúng cái kiểu hỏng mà một file test không được phép có.
+if __name__ == "__main__":
+    unittest.main()

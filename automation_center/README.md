@@ -73,10 +73,16 @@ Người gửi không tự duyệt yêu cầu của mình (trừ Owner). Mỗi y
 Ranh giới này được khoá bằng hai bộ test:
 
 ```bash
-node --test tests/permissions.test.mjs          # ranh giới quyền phía Worker
-python3 tests/test_scope_parity.py              # Worker và runner phải cho cùng kết quả
-python3 tests/test_orchestrator_bot.py          # điều khiển bot không rò tên bot, không chạm git
+node --test --experimental-sqlite tests/*.test.mjs   # quyền, cửa chat, migration, cờ diff
+python3 tests/test_scope_parity.py                   # Worker và runner phải cho cùng kết quả
+python3 tests/test_orchestrator_bot.py               # điều khiển bot, cờ diff, dọn nhánh
+python3 tests/test_docs_commands.py                  # lệnh in trong tài liệu chạy được thật
 ```
+
+`--experimental-sqlite` là bắt buộc trên Node 22, không phải tuỳ chọn: bốn file
+test dựng lại schema thật bằng `node:sqlite`, và thiếu cờ thì chúng **chết** với
+`ERR_UNKNOWN_BUILTIN_MODULE` chứ không phải chạy rồi báo đỏ — chạy thiếu cờ mà
+chỉ nhìn dòng cuối thì tưởng là môi trường hỏng, không phải test hỏng.
 
 Bộ thứ hai tồn tại vì hai lớp kiểm phạm vi được cài đặt hai lần bằng hai ngôn ngữ. Trùng lặp là cố ý, nhưng trùng lặp sẽ trôi — và một chỗ trôi ở đây nghĩa là một file lẽ ra được bảo vệ lại đi lọt. Khi thêm mẫu vào danh sách bảo vệ, phải sửa **cả hai** nơi: `src/worker.js` và `runner/orchestrator_runner.py`.
 

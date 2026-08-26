@@ -274,6 +274,95 @@ class JanitorTests(unittest.TestCase):
         self.assertEqual([("TASK-2", "c2")], client.deleted)
 
 
+class DeleteBranchIsDormantTests(unittest.TestCase):
+    """"👎 là xoá" chưa chạy được lần nào, và điều đó phải nói ra thành tiếng.
+
+    ERP chỉ cho xoá bình luận của chính mình, nên bot chỉ dọn được ảnh do
+    **chính bot** đăng (``mine == 1``). Nhưng ảnh hôm nay do ``service.py`` đăng
+    dưới danh tính người thật, còn ``AgentBotClient.publish_image`` — hàm đăng
+    ảnh dưới danh tính bot — chưa được nối vào đâu cả. Kết quả: mỗi lượt quét
+    đi qua một thẻ đầy ảnh bị 👎 và không làm gì, im như thể chẳng có việc gì.
+
+    Giữ nguyên trạng ấy là một lựa chọn có chủ ý. Nhưng nó phải *lộ ra*: một
+    nhánh chết lặng lẽ trông y hệt một nhánh không có việc.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _foreign(self, name: str, **kwargs: Any) -> Dict[str, Any]:
+        return comment(name, mine=0, owner="phong.hothanh@havigroup.llc", **kwargs)
+
+    def test_anh_cua_nguoi_khac_bi_ghet_thi_bot_keu_len_chu_khong_im(self) -> None:
+        client = FakeClient([], {}, {})
+        bot = build_bot(client, self.tmp)
+        tree = {"root": task_node("TASK-1", agents=[BOT],
+                                  comments=[self._foreign("c1", dislike=3),
+                                            self._foreign("c2", dislike=2)])}
+        with self.assertLogs("flow_web.agent_bot", level="WARNING") as ghi:
+            applied = bot.janitor_pass(tree)
+
+        self.assertEqual([], applied)
+        self.assertEqual([], client.deleted, "bot không có quyền xoá bình luận của người khác")
+        loi = "\n".join(ghi.output)
+        self.assertIn("TASK-1", loi)
+        self.assertIn("2", loi, "phải nói rõ có bao nhiêu ảnh đang mắc kẹt")
+        self.assertIn("publish_image", loi, "phải chỉ ra chỗ còn thiếu, không chỉ than là không làm được")
+
+    def test_the_khong_co_anh_la_thi_khong_canh_bao_gi(self) -> None:
+        # Cảnh báo nào cũng kêu thì không còn là cảnh báo. Ảnh của chính bot,
+        # kể cả chưa ai bỏ phiếu, không được chạm vào dòng log này.
+        client = FakeClient([], {}, {})
+        bot = build_bot(client, self.tmp)
+        tree = {"root": task_node("TASK-1", agents=[BOT],
+                                  comments=[comment("c1"), comment("c2", like=1)])}
+        with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
+            bot.janitor_pass(tree)
+
+    def test_anh_cua_nguoi_khac_chua_ai_bo_phieu_thi_chua_phai_viec_mac_ket(self) -> None:
+        client = FakeClient([], {}, {})
+        bot = build_bot(client, self.tmp)
+        tree = {"root": task_node("TASK-1", agents=[BOT], comments=[self._foreign("c1")])}
+        with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
+            bot.janitor_pass(tree)
+
+    def test_anh_cua_nguoi_khac_duoc_giu_lai_thi_khong_co_gi_de_keu(self) -> None:
+        # 👍 nghĩa là giữ, mà giữ thì bot chẳng phải làm gì — ảnh của người
+        # khác được duyệt giữ **không** phải việc mắc kẹt. Kêu ở đây là kêu vô
+        # cớ, và vì thẻ ấy nằm lại mãi nên nó kêu mỗi lượt quét cho tới hết
+        # đời thẻ. Đúng cách dạy người đọc bỏ qua dòng cảnh báo này.
+        client = FakeClient([], {}, {})
+        bot = build_bot(client, self.tmp)
+        tree = {"root": task_node("TASK-1", agents=[BOT],
+                                  comments=[self._foreign("c1", like=4),
+                                            self._foreign("c2", like=1)])}
+        with self.assertNoLogs("flow_web.agent_bot", level="WARNING"):
+            bot.janitor_pass(tree)
+
+    def test_publish_image_van_chua_duoc_noi_va_tai_lieu_van_noi_dung_the(self) -> None:
+        # Khoá đúng điều kiện làm nhánh xoá nằm im. Ngày ai đó nối
+        # ``publish_image`` vào luồng đăng ảnh, test này đỏ — và việc phải làm
+        # kèm là sửa lại README cùng dòng cảnh báo ở trên, chứ không phải xoá
+        # test này đi.
+        root = Path(__file__).resolve().parents[1]
+        goi = []
+        for path in sorted(root.glob("flow_web/*.py")) + sorted(root.glob("scripts/*.py")):
+            if path.name == "agent_bot.py":
+                continue
+            if "publish_image" in path.read_text(encoding="utf-8"):
+                goi.append(str(path.relative_to(root)))
+        self.assertEqual(
+            [], goi,
+            "publish_image đã được nối — hãy cập nhật README mục 4.1e và bỏ dòng "
+            "cảnh báo 'chưa nối' trong janitor_pass cho khớp thực tế")
+
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn("publish_image", readme,
+                      "README phải nói rõ nhánh '👎 là xoá' hiện chưa chạy được và vì sao")
+
+
 class ScopeTests(unittest.TestCase):
     """The ERP decides the scope, not the config file."""
 

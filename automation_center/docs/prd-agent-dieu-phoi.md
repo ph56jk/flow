@@ -152,7 +152,7 @@ Worker kiểm lại file/dòng ◄── runner báo diff + log test ───�
 | FR-17 | Mọi chuyển trạng thái đáng kể ghi audit log theo dashboard; secret không xuất hiện trong audit. | `addAudit` tại các điểm chuyển trạng thái |
 | FR-18 | Trạng thái runner (online/last_seen/last_error) và danh sách file bảo vệ hiển thị cho người dùng trong màn hình Agent điều phối. | `agentOverview` trả `runner` + `protected_globs`; UI `public/app.js` |
 | FR-19 | Chưa cấu hình `AGENT_TEST_COMMAND` → mọi thay đổi coi là "chưa có test xanh", không bao giờ auto-apply. | `run_tests` trả `(False, …)` |
-| FR-20 | Ranh giới quyền (vai trò, glob, danh sách bảo vệ, chuẩn hoá đường dẫn, audit file) phải kiểm được ngoài môi trường Worker bằng `node --test tests/permissions.test.mjs`. | export cuối `worker.js`; toàn bộ `permissions.test.mjs` |
+| FR-20 | Ranh giới quyền (vai trò, glob, danh sách bảo vệ, chuẩn hoá đường dẫn, audit file) phải kiểm được ngoài môi trường Worker bằng `node --test --experimental-sqlite tests/permissions.test.mjs`. | export cuối `worker.js`; toàn bộ `permissions.test.mjs` |
 
 ## 6. Mô hình phân quyền — ba lớp giới hạn
 
@@ -253,7 +253,7 @@ ghi file bí mật — file bảo vệ không bao giờ được gửi nội dun
 
 Checklist kiểm được, gắn với test/endpoint thật:
 
-- [ ] `node --test tests/permissions.test.mjs` xanh toàn bộ (capability theo
+- [ ] `node --test --experimental-sqlite tests/permissions.test.mjs` xanh toàn bộ (capability theo
       vai trò, vai trò lạ, chuẩn hoá đường dẫn, ngữ nghĩa glob, danh sách bảo
       vệ, audit file ngoài phạm vi, phạm vi trống).
 - [ ] `python3 tests/test_scope_parity.py` xanh: Worker và runner cho cùng

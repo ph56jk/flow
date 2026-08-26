@@ -468,6 +468,13 @@ class AgentBotClient:
 
         Đây là điểm mấu chốt của cả module: chỉ khi bình luận thuộc về bot thì
         ``deleteTaskComment`` mới xoá được nó lúc bị 👎.
+
+        **Chưa có ai gọi hàm này.** Ảnh hiện do ``flow_web/service.py`` đăng
+        bằng ``ERP_API_KEY``/``ERP_API_SECRET``, tức dưới danh tính người thật,
+        nên ``mine`` của chúng là 0 và nhánh "👎 là xoá" của bot không chạm tới
+        được — xem dòng cảnh báo trong ``janitor_pass``. Nối hàm này vào luồng
+        đăng ảnh là việc còn lại để nhánh ấy sống; ``tests/test_agent_bot.py``
+        khoá đúng điều kiện đó lại.
         """
         uploaded = self.upload_file(task, file_name, content, purpose="comment")
         file_url = str(uploaded.get("file_url") or "")
@@ -557,6 +564,34 @@ def iter_tree_nodes(root: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
     for child in root.get("subtasks") or []:
         if isinstance(child, dict):
             yield from iter_tree_nodes(child)
+
+
+def is_foreign_review_post(node: Dict[str, Any]) -> bool:
+    """Ảnh chờ duyệt nhưng **không** phải của bot, nên bot không dọn được.
+
+    Cùng hình dạng với ``is_review_post``, khác đúng một điều kiện: tác giả.
+    Tách ra để cái nhánh nằm im có tên gọi và đếm được — nếu không, "không có
+    việc nào" và "có việc mà không làm nổi" trông giống hệt nhau trong log.
+    """
+    if int(node.get("mine") or 0) == 1:
+        return False
+    if is_bot_note(node):
+        return False
+    if node.get("attachments"):
+        return True
+    return REVIEW_PREFIX in node_markers(node)
+
+
+def iter_foreign_review_posts(task_node: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+    """Như ``iter_review_posts`` nhưng cho phía bot không với tới được."""
+    for comment in task_node.get("comments") or []:
+        if not isinstance(comment, dict):
+            continue
+        if is_foreign_review_post(comment):
+            yield comment
+        for reply in comment.get("replies") or []:
+            if isinstance(reply, dict) and is_foreign_review_post(reply):
+                yield reply
 
 
 def iter_review_posts(task_node: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
@@ -1060,6 +1095,7 @@ class AgentBot:
             task_id = str(node.get("name") or "").strip()
             if not task_id:
                 continue
+            self._warn_about_foreign_posts(task_id, node)
             for post in iter_review_posts(node):
                 comment_id = str(post.get("name") or "").strip()
                 if not comment_id or self.state.already_handled(comment_id):
@@ -1071,6 +1107,31 @@ class AgentBot:
                 if outcome is not None:
                     applied.append(outcome)
         return applied
+
+    def _warn_about_foreign_posts(self, task_id: str, node: Dict[str, Any]) -> int:
+        """Nói ra khi có việc bot nhìn thấy mà không với tới được.
+
+        Nhánh "👎 là xoá" chỉ chạy trên ảnh do chính bot đăng, mà hôm nay ảnh
+        do ``service.py`` đăng dưới danh tính người thật. Một nhánh chết lặng
+        lẽ trông y hệt một nhánh không có việc, nên chỗ này phải kêu: có bao
+        nhiêu ảnh **đáng lẽ đã bị gỡ** mà vẫn nằm nguyên, và thiếu cái gì.
+
+        Chỉ đếm phiếu 👎. Ảnh được 👍 giữ thì chẳng có việc gì phải làm, kêu
+        lên là kêu vô cớ — mà một cảnh báo lặp lại mỗi lượt quét trên thẻ đã
+        duyệt xong thì chính nó dạy người đọc bỏ qua dòng này.
+        """
+        stuck = [post for post in iter_foreign_review_posts(node)
+                 if vote_decision(post) == DECISION_DELETE]
+        if not stuck:
+            return 0
+        log.warning(
+            "%s: %s ảnh bị 👎 nhưng bot không gỡ được vì không phải "
+            "bot đăng (mine=0). Nhánh “👎 là xoá” còn nằm im cho tới khi ảnh được "
+            "đăng qua AgentBotClient.publish_image.",
+            task_id,
+            len(stuck),
+        )
+        return len(stuck)
 
     def _apply_decision(self, task_id: str, post: Dict[str, Any], decision: str) -> Dict[str, Any] | None:
         comment_id = str(post.get("name") or "")

@@ -10,6 +10,9 @@ trong lifespan). Script này dành cho hai việc mà app không làm được:
   (👍 giữ / 👎 xoá) chỉ cần token ERP nên chạy được ngay, còn phần tạo ảnh
   được chuyển tiếp qua HTTP tới máy có Flow (``--flow-web-url``).
 
+Thẻ ``action_1: listing`` đi sang bản Listing qua ``ERP_LISTING_API_URL`` trong
+``.env.local``; chưa đặt biến đó thì bot nhận diện rồi để yên, không chạy gì.
+
 Ví dụ::
 
     python scripts/run_agent_bot.py --once --dry-run
@@ -34,6 +37,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from flow_web.agent_bot import AgentBotConfig, AgentBotError, build_agent_bot  # noqa: E402
+from flow_web.listing_bridge import (  # noqa: E402
+    ListingBridge,
+    ListingBridgeConfig,
+    build_listing_hook,
+)
 from flow_web.main import load_local_env  # noqa: E402
 
 log = logging.getLogger("agent_bot")
@@ -117,9 +125,17 @@ async def main(argv: list[str] | None = None) -> int:
         log.error("Chưa đặt ERP_AGENT_TOKEN trong .env.local nên không có gì để chạy.")
         return 2
 
+    # Một agent, hai loại thẻ — giống hệt lúc bot chạy trong app (xem
+    # ``FlowService.agent_bot``). Quên nối cầu Listing ở đây thì bot vẫn sống và
+    # vẫn dọn phiếu, chỉ mỗi thẻ ``action_1: listing`` là nhận "chưa cấu hình
+    # ERP_LISTING_API_URL" — kể cả khi biến ấy đã có trong ``.env.local``.
+    # ``build_listing_hook`` trả None khi chưa đặt biến, nên máy chưa dựng bản
+    # Listing vẫn giữ nguyên hành vi cũ.
+    listing = ListingBridge(ListingBridgeConfig.from_env())
     bot = build_agent_bot(
         config,
         autorun_hook=_forward_autorun(args.flow_web_url) if args.flow_web_url else None,
+        listing_hook=build_listing_hook(listing),
     )
     if bot is None:
         log.error("Không dựng được agent bot.")

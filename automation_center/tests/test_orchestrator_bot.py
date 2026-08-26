@@ -122,5 +122,111 @@ class DieuKhienBotKhongChamGit(unittest.TestCase):
         self.assertEqual(self.reported[0][1], "failed")
 
 
+class DiffBiCatThiPhaiNoiRaLaBiCat(unittest.TestCase):
+    """Cờ "diff đã bị cắt" phải do runner gửi, không phải Worker đoán.
+
+    Runner là chỗ **duy nhất** còn nhìn thấy diff đầy đủ.  Thứ gửi lên Center
+    đã cắt sẵn, nên bên kia so độ dài trước/sau lúc nào cũng thấy bằng nhau và
+    kết luận "không bị cắt" — người duyệt đọc nửa diff mà màn hình báo là đủ.
+    """
+
+    def setUp(self):
+        self.reported = []
+        self.saved = {name: getattr(runner, name) for name in (
+            "report", "git", "plan_change", "require_clean_repo",
+            "write_files", "staged_stats", "run_tests", "is_cancelled")}
+        runner.report = lambda request_id, status, **extra: (
+            self.reported.append((request_id, status, extra)) or {})
+        runner.git = lambda *args, **kwargs: (
+            "deadbeefcafe\n" if args[:1] == ("rev-parse",) else "")
+        runner.require_clean_repo = lambda: None
+        runner.write_files = lambda entries, allow_globs, max_files: ["flow_web/x.py"]
+        runner.run_tests = lambda: (True, "test xanh")
+        runner.is_cancelled = lambda request_id: False
+        runner.plan_change = lambda request, scope: {
+            "action": "edit", "summary": "sửa một dòng",
+            "files": [{"path": "flow_web/x.py", "content": "y\n"}]}
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(runner, name, value)
+
+    def _run(self, diff: str):
+        runner.staged_stats = lambda: (["flow_web/x.py"], 3, diff)
+        runner.handle_request({"id": "req-diff", "scope": {
+            "allow_globs": ["flow_web/**"], "max_files": 3, "max_lines": 200}})
+        self.assertEqual(len(self.reported), 1, self.reported)
+        request_id, status, extra = self.reported[0]
+        self.assertEqual(status, "awaiting_approval", extra.get("error"))
+        return extra
+
+    def test_diff_dai_hon_tran_thi_cat_va_bao_da_cat(self):
+        extra = self._run("d" * (runner.DIFF_LIMIT + 4000))
+        self.assertEqual(extra["diff_truncated"], 1)
+        self.assertEqual(len(extra["diff_text"]), runner.DIFF_LIMIT)
+
+    def test_diff_vua_tran_thi_khong_bao_nham_la_da_cat(self):
+        # Báo nhầm cũng hỏng theo kiểu khác: cảnh báo đỏ hiện ở mọi yêu cầu thì
+        # chẳng ai còn đọc nó, và lần bị cắt thật sẽ trôi qua như mọi lần.
+        extra = self._run("d" * runner.DIFF_LIMIT)
+        self.assertEqual(extra["diff_truncated"], 0)
+        self.assertEqual(len(extra["diff_text"]), runner.DIFF_LIMIT)
+
+    def test_diff_ngan_thi_di_nguyen_ven(self):
+        extra = self._run("diff --git a/x b/x\n+một dòng\n")
+        self.assertEqual(extra["diff_truncated"], 0)
+        self.assertEqual(extra["diff_text"], "diff --git a/x b/x\n+một dòng\n")
+
+
+class MergeXongThiDonNhanh(unittest.TestCase):
+    """Nhánh ``agent/<id>`` đã merge phải bị xoá ngay tại chỗ.
+
+    Máy trung tâm chạy hết yêu cầu này tới yêu cầu khác trên cùng một bản làm
+    việc.  Nhánh đã merge không còn nghĩa gì nữa nhưng vẫn nằm lại, nên sau vài
+    chục lượt ``git branch`` là một danh sách rác — và ngày nào tên nhánh trùng
+    lại (12 ký tự đầu của id) thì ``checkout -B`` ghi đè im lặng lên nhánh cũ.
+    """
+
+    def setUp(self):
+        self.reported = []
+        self.git_calls = []
+        self.saved = {name: getattr(runner, name)
+                      for name in ("report", "git", "require_clean_repo")}
+        runner.report = lambda request_id, status, **extra: (
+            self.reported.append((request_id, status, extra)) or {})
+
+        def fake_git(*args, **kwargs):
+            self.git_calls.append(args)
+            return "deadbeefcafe\n" if args[:1] == ("rev-parse",) else ""
+
+        runner.git = fake_git
+        runner.require_clean_repo = lambda: None
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(runner, name, value)
+
+    def test_merge_xong_thi_xoa_nhanh(self):
+        runner.apply_approved({"id": "req-2", "branch": "agent/abc123"})
+        self.assertIn(("branch", "-D", "agent/abc123"), self.git_calls)
+        # Xoá **sau** khi merge, không phải trước: xoá trước là mất luôn thay đổi.
+        self.assertLess(self.git_calls.index(("merge", "--no-edit", "agent/abc123")),
+                        self.git_calls.index(("branch", "-D", "agent/abc123")))
+        self.assertEqual(self.reported[-1][1], "applied")
+
+    def test_merge_hong_thi_giu_nhanh_lai_de_con_xem(self):
+        def fake_git(*args, **kwargs):
+            self.git_calls.append(args)
+            if args[:1] == ("merge",) and "--abort" not in args:
+                raise RuntimeError("xung đột")
+            return ""
+
+        runner.git = fake_git
+        runner.apply_approved({"id": "req-3", "branch": "agent/abc123"})
+        self.assertNotIn(("branch", "-D", "agent/abc123"), self.git_calls)
+        self.assertEqual(self.reported[-1][1], "failed")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

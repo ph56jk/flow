@@ -155,12 +155,27 @@ const slugify = (value) => clean(value, 80)
   .replace(/^-+|-+$/g, "")
   .slice(0, 64);
 
+// Trần độ dài diff lưu lại.  Runner cắt ở đúng con số này trước khi gửi, nên
+// hai bên phải nói cùng một trần: lệch nhau là cờ "đã cắt" hoặc thiếu hoặc thừa.
+const DIFF_TEXT_MAX = 60000;
+
 // Văn bản nhiều dòng (diff, log test, kế hoạch).  cleanText gộp mọi khoảng
 // trắng thành một dấu cách, thứ đó phá nát một unified diff.
-const cleanBlock = (value, max = 60000) => String(value ?? "")
+const cleanBlock = (value, max = DIFF_TEXT_MAX) => String(value ?? "")
   .replace(/\r\n?/g, "\n")
   .replace(/[^\S\n]+$/gm, "")
   .slice(0, max);
+
+// Diff đã bị cắt hay chưa.  Không suy ra được từ những gì Worker nhận: runner
+// cắt ở đúng trần rồi mới gửi, nên thứ đến nơi luôn vừa khít và phép so độ dài
+// "trước/sau khi dọn" chỉ nói lên là cleanBlock đã xoá mấy khoảng trắng cuối
+// dòng — sai cả hai chiều, vừa bỏ sót diff bị cắt thật vừa dựng cảnh báo đỏ
+// trên diff còn nguyên.  Cờ của runner là nguồn đúng; trần ở đây là hàng rào
+// cuối, dành cho runner cũ vẫn gửi diff đầy đủ.
+function resolveDiffTruncated(rawDiff, reportedFlag, max = DIFF_TEXT_MAX) {
+  if (reportedFlag === true || reportedFlag === 1 || reportedFlag === "1" || reportedFlag === "true") return 1;
+  return String(rawDiff ?? "").length > max ? 1 : 0;
+}
 
 // Đếm số dòng thêm/bớt trong một patch unified.  Dòng "+++"/"---" là tiêu đề
 // file, không phải nội dung thay đổi, nên phải loại ra.
@@ -1621,7 +1636,7 @@ async function runnerUpdateCodeRequest(request, env, requestId) {
   // và một runner báo thiếu sẽ lách được trần số dòng.  Lấy số lớn hơn giữa
   // "runner báo" và "đếm được trong chính diff người duyệt sẽ nhìn".
   const diffText = cleanBlock(body.diff_text);
-  const diffTruncated = String(body.diff_text ?? "").length > diffText.length ? 1 : 0;
+  const diffTruncated = resolveDiffTruncated(body.diff_text, body.diff_truncated);
   const linesInDiff = countDiffLines(diffText);
   const linesReported = Math.max(0, Number.parseInt(body.lines_changed, 10) || 0);
   const linesChanged = Math.max(linesReported, linesInDiff);
@@ -2405,6 +2420,9 @@ const CONTROL_LIMITS = {
   ORPHAN_AFTER_MS,
   RUNNER_ONLINE_WITHIN_MS,
   VN_OFFSET_MS,
+  // Trần diff phải khớp ``DIFF_LIMIT`` của orchestrator_runner.py.  Lệch nhau
+  // là cờ "đã cắt" sai, và cảnh báo sai thì tệ hơn không có cảnh báo.
+  DIFF_TEXT_MAX,
 };
 
 // Xuất ra cho ba bộ test trong tests/.  Đây là phần quyết định ai được chạm vào
@@ -2413,6 +2431,7 @@ export {
   ROLE_CAPABILITIES, PROTECTED_GLOBS, OWNER_DEFAULT_SCOPE,
   capability, permissionsFor, normaliseRepoPath, globToRegExp, matchesAnyGlob,
   isProtectedPath, parseGlobList, auditChangedFiles, countDiffLines, cleanBlock,
+  resolveDiffTruncated,
   healthThresholds,
   staleRunners, orphanRuns, accessTokenIncident, describeStaleRunner, alertText,
   runHealthChecks, healthOverview,

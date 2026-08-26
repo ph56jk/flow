@@ -52,6 +52,9 @@ BASE_BRANCH = os.environ.get("AGENT_BASE_BRANCH", "main").strip() or "main"
 PUSH_AFTER_MERGE = os.environ.get("AGENT_PUSH_REMOTE", "").strip().lower() in {"1", "true", "yes"}
 TEST_COMMAND = os.environ.get("AGENT_TEST_COMMAND", "").strip()
 TEST_TIMEOUT = max(30, int(os.environ.get("AGENT_TEST_TIMEOUT_SECONDS", "900")))
+# Trần độ dài diff gửi lên Center.  Phải khớp trần bên Worker: bên đó cắt lần
+# nữa, và nếu bên đó cắt trước thì cờ "đã cắt" runner gửi lên là cờ sai.
+DIFF_LIMIT = 60000
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
@@ -468,7 +471,9 @@ def staged_stats() -> tuple[list[str], int, str]:
         for value in (added, deleted):
             if value.isdigit():
                 lines += int(value)
-    return paths, lines, git("diff", "--cached")[:60000]
+    # Trả diff đầy đủ.  Cắt ở đây là vứt mất thông tin "đã cắt" ngay tại chỗ
+    # duy nhất còn biết điều đó — sau bước này không ai suy ngược ra được nữa.
+    return paths, lines, git("diff", "--cached")
 
 
 def handle_request(request: dict[str, Any]) -> None:
@@ -514,7 +519,7 @@ def handle_request(request: dict[str, Any]) -> None:
     try:
         written = write_files(entries, allow_globs, int(scope.get("max_files") or 1))
         git("add", "--", *written)
-        paths, lines, diff_text = staged_stats()
+        paths, lines, full_diff = staged_stats()
         if not paths:
             git("checkout", BASE_BRANCH)
             report(request_id, "answered", plan_summary=f"{summary}\n\n(Không có gì thay đổi so với bản hiện tại.)")
@@ -525,6 +530,8 @@ def handle_request(request: dict[str, Any]) -> None:
         if is_cancelled(request_id):
             raise RuntimeError("Người gửi đã rút lại yêu cầu trước khi test chạy xong.")
         passed, output = run_tests()
+        diff_text = full_diff[:DIFF_LIMIT]
+        diff_truncated = 1 if len(full_diff) > DIFF_LIMIT else 0
         git("commit", "--no-verify", "-m", f"agent: {summary[:70]}\n\nYêu cầu {request_id} · {request.get('requested_by')}")
         commit = git("rev-parse", "HEAD").strip()
     except Exception as exc:
@@ -543,6 +550,9 @@ def handle_request(request: dict[str, Any]) -> None:
         files=[{"path": path} for path in paths],
         lines_changed=lines,
         diff_text=diff_text,
+        # Cờ đi kèm diff, không để Worker đoán: thứ gửi đi đã cắt sẵn nên bên
+        # kia đo bao nhiêu cũng chỉ thấy một diff vừa khít trần.
+        diff_truncated=diff_truncated,
         test_output=output,
         tests_passed=passed,
         branch=branch,
@@ -572,6 +582,12 @@ def apply_approved(request: dict[str, Any]) -> None:
         git("checkout", BASE_BRANCH, check=False)
         report(request_id, "failed", error=f"Không merge được nhánh {branch}: {exc}"[:2000])
         return
+    # Nhánh đã merge không còn nghĩa gì.  Để lại thì mỗi lượt bồi thêm một
+    # nhánh vào ``git branch`` của máy trung tâm, và ngày nào 12 ký tự đầu của
+    # một id trùng lại thì ``checkout -B`` ở lượt sau ghi đè im lặng lên nhánh
+    # cũ.  ``check=False``: không xoá được cũng không được phép biến một lần
+    # merge đã thành công thành thất bại.
+    git("branch", "-D", branch, check=False)
     report(request_id, "applied", branch=branch, commit_sha=commit)
     print(f"[{request_id}] đã merge {branch} vào {BASE_BRANCH} ({commit[:8]})")
 
