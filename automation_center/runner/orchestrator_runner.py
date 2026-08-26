@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """Agent điều phối — runner sửa code trên máy trung tâm.
 
-Nó nhận yêu cầu từ Automation Center, hỏi ChatGPT cách sửa, ghi file, chạy
+Nó nhận yêu cầu từ Automation Center, hỏi model cách sửa, ghi file, chạy
 test, rồi báo diff ngược lại để người có quyền duyệt.  Máy cá nhân không tham
 gia bước nào.
+
+Model được hỏi qua một trong hai đường: HTTP tới OpenAI bằng ``OPENAI_API_KEY``,
+hoặc Codex CLI đã đăng nhập sẵn trên máy này.  Đường thứ hai là mặc định khi
+không có khoá — nó bỏ được việc phải cất một khoá API trên máy trung tâm.
+Dù đi đường nào, CLI cũng chỉ là **đường truyền chữ**: nó chạy với sandbox
+``read-only`` và thư mục làm việc rỗng, nên thứ duy nhất ghi file vẫn là runner.
 
 Ba thứ giữ cho việc này an toàn, và không thứ nào nằm trong lời nhắc gửi cho
 ChatGPT — một mô hình ngôn ngữ có thể bị thuyết phục, một allowlist thì không:
@@ -25,8 +31,10 @@ import fnmatch
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -60,6 +68,16 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5").strip()
 OPENAI_TIMEOUT = max(30, int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "300")))
+
+# auto = có OPENAI_API_KEY thì đi HTTP, không thì dùng Codex CLI đã đăng nhập.
+# Đặt thẳng "codex" hay "openai" khi muốn hỏng to thay vì âm thầm đổi đường.
+MODEL_PROVIDER = os.environ.get("AGENT_MODEL_PROVIDER", "auto").strip().lower() or "auto"
+# Để trống thì tìm "codex" trong PATH.  Scheduled Task chạy kiểu S4U có PATH
+# hẹp hơn PATH của phiên đăng nhập, nên trỏ tuyệt đối là chắc chắn hơn.
+CODEX_BIN = os.environ.get("CODEX_BIN", "").strip()
+# Để trống thì dùng model mặc định của codex.  Đừng nhét OPENAI_MODEL vào đây:
+# tên model của API và tên model của codex không cùng một bộ.
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "").strip()
 
 RUNNER_VERSION = "1.0.0"
 # Cloudflare WAF chặn User-Agent mặc định của urllib (lỗi 1010).
@@ -334,6 +352,202 @@ def call_chatgpt(messages: list[dict[str, str]]) -> dict[str, Any]:
     return parsed
 
 
+# ─── Hỏi model qua Codex CLI ────────────────────────────────────────────────
+
+# Structured output đòi mọi khoá đều nằm trong "required", nên khoá không dùng
+# tới ở một action được khai nullable thay vì bỏ đi.  Bốn action phải khớp với
+# SYSTEM_PROMPT ở trên: thiếu một cái nghĩa là model không nói ra được nó, và
+# nhánh xử lý tương ứng trong plan_change() thành mã chết mà không ai hay.
+CODEX_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["action", "summary", "paths", "files", "commands"],
+    "properties": {
+        "action": {"type": "string", "enum": ["read", "answer", "edit", "bot"]},
+        "summary": {"type": ["string", "null"]},
+        "paths": {"type": ["array", "null"], "items": {"type": "string"}},
+        "files": {
+            "type": ["array", "null"],
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "content"],
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+        "commands": {
+            "type": ["array", "null"],
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["bot_id", "command", "prompt", "count", "aspect"],
+                "properties": {
+                    "bot_id": {"type": "string"},
+                    "command": {"type": "string", "enum": ["run", "pause", "resume"]},
+                    "prompt": {"type": ["string", "null"]},
+                    "count": {"type": ["integer", "null"]},
+                    "aspect": {"type": ["string", "null"]},
+                },
+            },
+        },
+    },
+}
+
+NHAN_VAI = {"system": "[Hệ thống]", "user": "[Người dùng]", "assistant": "[Bạn đã trả lời]"}
+
+# Codex chạy với sandbox read-only, và trên Windows lệnh shell trong sandbox ấy
+# chết ngay lúc khởi tạo tiến trình (đo 2026-08-26: mã -1073741502).  Model
+# không biết vậy nên sẽ thử, thử lại, và đốt hết timeout — cùng lần đo đó một
+# lượt để nó tự loay hoay chạy quá 5 phút mà không ra gì.  Nói thẳng rẻ hơn.
+NHAC_KHONG_CONG_CU = (
+    "Bạn không có công cụ nào dùng được ở đây: không shell, không đọc file, không mạng. "
+    "Đừng thử chạy lệnh — lệnh sẽ chết và bạn chỉ mất thời gian. "
+    "Mọi thứ cần biết đã nằm trong lời nhắc này; muốn xem thêm file thì trả về "
+    'action "read", phía gọi sẽ đọc hộ và gửi lại ở lượt sau. '
+    "Trả lời bằng đúng một đối tượng JSON theo lược đồ đã cho, không kèm lời dẫn."
+)
+
+
+def tim_codex(duong_dan: str = "") -> str | None:
+    if duong_dan:
+        return duong_dan if Path(duong_dan).exists() else None
+    return shutil.which("codex")
+
+
+def chon_nha_cung_cap(cai_dat: str, api_key: str, codex: str | None) -> str:
+    """Chốt đường gọi model, và hỏng to ngay nếu không có đường nào.
+
+    Chọn bừa ở đây nghĩa là runner khởi động bình thường rồi mới hỏng ở yêu cầu
+    đầu tiên của một người thật.
+    """
+    cai_dat = (cai_dat or "auto").strip().lower() or "auto"
+    if cai_dat == "openai":
+        if not api_key:
+            raise RuntimeError("AGENT_MODEL_PROVIDER=openai nhưng OPENAI_API_KEY trống.")
+        return "openai"
+    if cai_dat == "codex":
+        if not codex:
+            raise RuntimeError(
+                "AGENT_MODEL_PROVIDER=codex nhưng không tìm thấy codex CLI; "
+                "đặt CODEX_BIN trỏ tới đường dẫn tuyệt đối của nó.")
+        return "codex"
+    if cai_dat != "auto":
+        raise RuntimeError(f"AGENT_MODEL_PROVIDER không hiểu được: {cai_dat}")
+    if api_key:
+        return "openai"
+    if codex:
+        return "codex"
+    raise RuntimeError(
+        "Không gọi được model: OPENAI_API_KEY trống và cũng không tìm thấy codex CLI.")
+
+
+def codex_argv(binary: str, *, work_dir: Path, schema_path: Path, out_path: Path,
+               model: str = "") -> list[str]:
+    """Cờ dòng lệnh cho một lượt hỏi codex.
+
+    ``--sandbox read-only`` không phải cho đẹp: nó là thứ giữ cho codex chỉ là
+    đường truyền chữ.  Đổi nó thành ``workspace-write`` — hoặc thêm ``--add-dir``,
+    ``--approve-for-me``, một cờ ``--dangerously-*`` — là đã lặng lẽ cho model một
+    đường ghi file không đi qua ``in_scope()`` và ``is_protected()``.
+    """
+    argv = [
+        binary, "exec",
+        "--sandbox", "read-only",
+        "--cd", str(work_dir),
+        "--skip-git-repo-check",
+        # Không để lại bản sao lời nhắc (có nội dung file của repo) trong ~/.codex.
+        "--ephemeral",
+        # config.toml của người dùng không được đổi sandbox, model hay hook của
+        # một tiến trình chạy không người trông.  Auth vẫn lấy từ CODEX_HOME.
+        "--ignore-user-config",
+        "--color", "never",
+        "--output-schema", str(schema_path),
+        "--output-last-message", str(out_path),
+    ]
+    if model:
+        argv += ["--model", model]
+    # Lời nhắc đọc từ stdin: vòng "read" gửi lại cả lịch sử mỗi lượt, mà dòng
+    # lệnh Windows cắt ở ~32k ký tự và agent sẽ lặng lẽ mất ngữ cảnh.
+    argv.append("-")
+    return argv
+
+
+def gop_loi_nhac(messages: list[dict[str, str]]) -> str:
+    khuc = [
+        f"{NHAN_VAI.get(m.get('role'), m.get('role'))}\n{m.get('content') or ''}"
+        for m in messages
+    ]
+    khuc.append(f"[Hệ thống]\n{NHAC_KHONG_CONG_CU}")
+    return "\n\n".join(khuc)
+
+
+def doc_ket_qua_codex(text: str) -> dict[str, Any]:
+    raw = (text or "").strip()
+    if not raw:
+        raise RuntimeError("Codex không trả về nội dung nào.")
+    ung_vien = [raw]
+    # --output-schema thường chặn được, nhưng model vẫn có lúc bọc JSON trong
+    # ```json … ``` hoặc kẹp nó giữa hai câu dẫn.
+    rao = re.search(r"```(?:json)?\s*(.+?)\s*```", raw, re.DOTALL)
+    if rao:
+        ung_vien.insert(0, rao.group(1))
+    dau, cuoi = raw.find("{"), raw.rfind("}")
+    if dau >= 0 and cuoi > dau:
+        ung_vien.append(raw[dau:cuoi + 1])
+    for manh in ung_vien:
+        try:
+            parsed = json.loads(manh)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    raise RuntimeError(f"Codex trả về thứ không phải JSON: {raw[:300]}")
+
+
+def call_codex(messages: list[dict[str, str]], *, chay=None) -> dict[str, Any]:
+    binary = tim_codex(CODEX_BIN)
+    if not binary:
+        raise RuntimeError("Không tìm thấy codex CLI; đặt CODEX_BIN nếu nó không nằm trong PATH.")
+    chay = chay or subprocess.run
+    # Thư mục làm việc RỖNG, và cố tình không phải AGENT_REPO_DIR: codex chỉ
+    # được thấy những gì runner đã lọc qua is_protected() rồi đưa vào lời nhắc.
+    # Trỏ nó thẳng vào bản repo là mở một đường đọc không ai kiểm.
+    tam = Path(tempfile.mkdtemp(prefix="agent-codex-"))
+    try:
+        schema_path = tam / "luoc-do.json"
+        out_path = tam / "tra-loi.json"
+        schema_path.write_text(json.dumps(CODEX_OUTPUT_SCHEMA), encoding="utf-8")
+        argv = codex_argv(binary, work_dir=tam, schema_path=schema_path,
+                          out_path=out_path, model=CODEX_MODEL)
+        try:
+            ket_qua = chay(
+                argv, input=gop_loi_nhac(messages), capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=OPENAI_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"Codex CLI quá {OPENAI_TIMEOUT}s chưa trả lời (OPENAI_TIMEOUT_SECONDS)."
+            ) from exc
+        if ket_qua.returncode != 0:
+            loi = (ket_qua.stderr or ket_qua.stdout or "").strip()[-1500:]
+            raise RuntimeError(
+                f"Codex CLI thoát với mã {ket_qua.returncode}: {loi or 'không có thông báo'}")
+        if not out_path.exists():
+            raise RuntimeError("Codex CLI chạy xong nhưng không ghi câu trả lời cuối.")
+        return doc_ket_qua_codex(out_path.read_text(encoding="utf-8", errors="replace"))
+    finally:
+        shutil.rmtree(tam, ignore_errors=True)
+
+
+def call_model(messages: list[dict[str, str]]) -> dict[str, Any]:
+    if chon_nha_cung_cap(MODEL_PROVIDER, OPENAI_API_KEY, tim_codex(CODEX_BIN)) == "codex":
+        return call_codex(messages)
+    return call_chatgpt(messages)
+
+
 def build_context(request: dict[str, Any], allow_globs: list[str], scope: dict[str, Any]) -> str:
     tracked = repo_files()
     editable = [path for path in tracked if in_scope(path, allow_globs) and not is_protected(path)]
@@ -378,19 +592,19 @@ def bot_context_lines(request: dict[str, Any]) -> list[str]:
 
 
 def plan_change(request: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any]:
-    """Hỏi ChatGPT tới khi nó chốt "edit", "answer" hay "bot"; tối đa MAX_ROUNDS lượt."""
+    """Hỏi model tới khi nó chốt "edit", "answer" hay "bot"; tối đa MAX_ROUNDS lượt."""
     allow_globs = [glob for glob in (scope.get("allow_globs") or []) if glob]
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": build_context(request, allow_globs, scope)},
     ]
     for _ in range(MAX_ROUNDS):
-        reply = call_chatgpt(messages)
+        reply = call_model(messages)
         action = str(reply.get("action") or "").lower()
         if action in {"answer", "edit", "bot"}:
             return reply
         if action != "read":
-            raise RuntimeError(f"ChatGPT trả về action lạ: {action or '(trống)'}")
+            raise RuntimeError(f"Model trả về action lạ: {action or '(trống)'}")
         wanted = [normalise_path(path) for path in (reply.get("paths") or [])][:12]
         chunks = []
         for path in wanted:
@@ -404,7 +618,7 @@ def plan_change(request: dict[str, Any], scope: dict[str, Any]) -> dict[str, Any
             chunks.append(f"### {path}\n```\n{read_repo_file(path)}\n```")
         messages.append({"role": "assistant", "content": json.dumps(reply, ensure_ascii=False)})
         messages.append({"role": "user", "content": "\n\n".join(chunks) or "(không đọc được file nào)"})
-    raise RuntimeError("ChatGPT chỉ đòi đọc file mà không đưa ra thay đổi nào sau nhiều lượt.")
+    raise RuntimeError("Model chỉ đòi đọc file mà không đưa ra thay đổi nào sau nhiều lượt.")
 
 
 # ─── Thực thi ───────────────────────────────────────────────────────────────
@@ -595,19 +809,22 @@ def apply_approved(request: dict[str, Any]) -> None:
 def main() -> int:
     missing = [name for name, value in (
         ("AUTOMATION_RUNNER_SECRET", RUNNER_SECRET),
-        ("OPENAI_API_KEY", OPENAI_API_KEY),
         ("AGENT_REPO_DIR", str(REPO_DIR)),
     ) if not value]
     if missing:
         print(f"Thiếu {', '.join(missing)}; runner không khởi động.", file=sys.stderr)
         return 2
+    # Chốt đường gọi model ngay lúc khởi động.  Để tới yêu cầu đầu tiên mới
+    # phát hiện là hỏng trước mặt một người đang chờ.
     try:
+        nha = chon_nha_cung_cap(MODEL_PROVIDER, OPENAI_API_KEY, tim_codex(CODEX_BIN))
         require_repo_root()
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 2
 
-    print(f"{RUNNER_LABEL} · repo {REPO_DIR} · nhánh nền {BASE_BRANCH} · model {OPENAI_MODEL}")
+    mo_ta = OPENAI_MODEL if nha == "openai" else (CODEX_MODEL or "mặc định của codex")
+    print(f"{RUNNER_LABEL} · repo {REPO_DIR} · nhánh nền {BASE_BRANCH} · model {mo_ta} qua {nha}")
     print(f"Poll {CENTER_URL} với runner key {RUNNER_KEY}")
     while True:
         try:

@@ -503,7 +503,7 @@ restart 999 lần.
 Bước 2–4 cần người bấm nút trên dashboard: `botAction` đi qua Cloudflare Access
 + Keycloak SSO nên không gọi bằng script được.
 
-### H. Agent điều phối — CHƯA TRIỂN KHAI
+### H. Agent điều phối — ĐÃ CÀI, CHỜ `orchestrator.env`
 
 Runner thứ ba, chạy trên chính máy trung tâm này. Nó không gắn bot: nó nhận yêu
 cầu sửa code từ nhân viên, gọi ChatGPT, ghi file và chạy test. Đây là phần
@@ -511,26 +511,106 @@ cầu sửa code từ nhân viên, gọi ChatGPT, ghi file và chạy test. Đâ
 
 Điều kiện trước: đã áp `0004_orchestrator_agent.sql` lên remote và deploy Worker.
 
-1. **Clone bản repo riêng cho agent.** Không trỏ vào `C:\HaviGroup\flow-v2`:
+Ngày 2026-08-26 đã làm qua ssh: cài git, dựng `AGENT_REPO_DIR`, chép mã runner
+sang máy, đăng ký Scheduled Task. Còn lại đúng hai việc, ghi ở cuối mục.
+
+Ba điều bản runbook cũ nói sai, vì máy đã đổi từ lúc viết:
+
+- **`C:\HaviGroup\flow-v2` không phải git clone.** Nó là bản giải nén (còn
+  nguyên các file `._*` của macOS). `git clone C:\HaviGroup\flow-v2 …` không
+  chạy được.
+- **Máy chưa có git.** `winget install --id Git.Git -e --silent
+  --accept-package-agreements --accept-source-agreements` → 2.55.0.3 tại
+  `C:\Program Files\Git\cmd\git.exe`. Không có git thì runner chết ngay ở
+  `git checkout -B`, mà chết sau khi đã nhận việc.
+- **`AGENT_TEST_COMMAND` không được dùng đường dẫn tương đối.** `run_tests()`
+  chạy với `cwd = AGENT_REPO_DIR`, nên `.venv\Scripts\python.exe` trỏ vào bản
+  sao của agent — chỗ không có venv. Mọi thay đổi sẽ vĩnh viễn "chưa có test
+  xanh". Dùng đường dẫn tuyệt đối tới trình thông dịch của repo service.
+
+1. **Dựng bản repo riêng cho agent.** Không trỏ vào `C:\HaviGroup\flow-v2`:
    agent checkout qua lại giữa các nhánh, trỏ vào bản đang chạy service sẽ làm
    Flow đọc code nửa chừng. `run-orchestrator-runner.ps1` từ chối khởi động nếu
    `AGENT_REPO_DIR` trùng repo service.
 
+   Máy trung tâm không đăng nhập được GitHub, nên đường đi là một git bundle
+   gửi từ máy có repo — một file, không cần credential, không cần mạng ra ngoài:
+
+   ```sh
+   git bundle create /tmp/flow-v2.bundle --all          # ~2 MB
+   scp /tmp/flow-v2.bundle hvg-pc:C:/HaviGroup/flow-v2.bundle
+   ```
+
    ```powershell
-   git clone C:\HaviGroup\flow-v2 C:\HaviGroup\agent-workspace\flow-v2
+   $g = 'C:\Program Files\Git\cmd\git.exe'
+   & $g clone -b codex/publish-flow-automation `
+       'C:\HaviGroup\flow-v2.bundle' 'C:\HaviGroup\agent-workspace\flow-v2'
+   cd 'C:\HaviGroup\agent-workspace\flow-v2'
+   & $g checkout -B main                                 # khớp AGENT_BASE_BRANCH
+   & $g remote set-url origin 'https://github.com/ph56jk/flow-v2.git'
+   & $g config user.name  'HaviGroup Agent dieu phoi'    # thiếu danh tính thì
+   & $g config user.email 'agent@havigroup.llc'          # `git commit` thất bại
+   & $g config core.autocrlf false
+   Remove-Item 'C:\HaviGroup\flow-v2.bundle' -Force
    ```
 
    Kiểm dung lượng trước: ổ C: chỉ còn ~23 GB.
 
-2. **Tạo `runner\orchestrator.env`** từ `orchestrator-runner.env.example`. Đặt
-   ACL giống hai file `.env` kia (`PC\Admin` R/W + SYSTEM, bỏ kế thừa). Dùng lại
-   `RUNNER_SHARED_SECRET` và cặp Access Service Token của
-   `content-image-runner`. `OPENAI_API_KEY` **chỉ** nằm trong file này — không
-   vào D1, `public/`, form của Automation Center, plist, Scheduled Task hay log.
+2. **Tạo `runner\orchestrator.env`.** Đừng chép tay: `AUTOMATION_RUNNER_SECRET`
+   và cặp Access Service Token đã nằm trong `runner\.env` của chính máy này,
+   chép tay nghĩa là cho chúng đi qua màn hình và clipboard.
+   `scripts\make-orchestrator-env.ps1` đọc thẳng file cũ và sao ACL nguyên sang.
+
+   Script **không hỏi gì cả**: agent gọi model qua Codex CLI đã đăng nhập sẵn
+   trên máy, nên không có khoá API nào phải cất ở đâu. Nó tự tìm `codex.exe`
+   và ghi đường dẫn tuyệt đối vào `CODEX_BIN` — Scheduled Task chạy kiểu S4U
+   có PATH hẹp hơn phiên đăng nhập.
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass `
+       -File C:\HaviGroup\flow-v2\automation_center\scripts\make-orchestrator-env.ps1
+   ```
+
+   Vẫn muốn đi đường HTTP của OpenAI thì thêm `-KhoaOpenAI`. Khi ấy
+   `OPENAI_API_KEY` **chỉ** nằm trong file này — không vào D1, `public/`, form
+   của Automation Center, plist, Scheduled Task hay log.
+
+   Codex CLI ở đây chỉ là **đường truyền chữ**, không phải thứ ghi file. Nó
+   chạy với `--sandbox read-only`, và thư mục làm việc là một thư mục tạm
+   **rỗng** chứ không phải `AGENT_REPO_DIR`: model chỉ thấy những gì runner đã
+   lọc qua `is_protected()` rồi đưa vào lời nhắc. Ba lớp an toàn không đổi —
+   phạm vi glob, danh sách bảo vệ, nhánh `agent/<id>` — vì thứ duy nhất ghi
+   file vẫn là runner.
+
+   Đo trên chính máy này ngày 2026-08-26:
+
+   - Lệnh shell do model sinh ra **chết ngay lúc khởi tạo tiến trình** (mã
+     `-1073741502` = `STATUS_DLL_INIT_FAILED`, dấu hiệu AppContainer chặn) và
+     không file nào được ghi. Sandbox có thật trên Windows, không phải lời hứa.
+   - Để model tự loay hoay với công cụ đã chết thì một lượt chạy **quá 5 phút**
+     không ra kết quả. Câu "bạn không có công cụ nào dùng được ở đây" trong
+     lời nhắc đưa nó về **8 giây**. Đừng bỏ câu đó đi.
 
 3. **Đăng ký Scheduled Task** `HaviGroup Orchestrator Runner`, cùng kiểu S4U /
    `RunLevel Highest` / trigger `AtStartup` + `AtLogOn` như hai task kia. Runner
    này không mở trình duyệt nên không vướng vấn đề Session 0.
+
+   Máy đang chạy bốn task rồi, nên **phải** dùng `-Only`: mỗi lần đăng ký là một
+   lần Unregister rồi Register, tức là dừng thật một dịch vụ đang phục vụ.
+
+   Và **phải** gửi lệnh bằng `-EncodedCommand`: qua ssh, chuỗi
+   `-Only 'HaviGroup Orchestrator Runner'` bị lớp vỏ bên kia tách thành ba tham
+   số, script lặng lẽ bỏ qua đúng cái task cần đăng ký rồi thoát với mã 0.
+
+   ```sh
+   CMD=$(python3 -c "
+   import base64
+   ps = (\"& 'C:\\\\HaviGroup\\\\flow-v2\\\\automation_center\\\\scripts\\\\install-windows-services.ps1' \"
+         \"-Only 'HaviGroup Orchestrator Runner'\")
+   print(base64.b64encode(ps.encode('utf-16-le')).decode())
+   ")
+   ssh hvg-pc "powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand $CMD"
+   ```
 
 4. **Kiểm tra**: dashboard → **Agent điều phối** phải hiện runner trực tuyến.
    Khi runner offline, Worker trả 409 và không xếp yêu cầu nào — không có lệnh giả.
@@ -549,6 +629,12 @@ Nghiệm thu tối thiểu, làm theo thứ tự này:
 3. Gửi một yêu cầu chạm file bảo vệ (ví dụ `.env` hay `src/worker.js`) →
    `touches_protected`, chỉ Owner duyệt được, không bao giờ tự áp dụng.
 4. Người gửi tự bấm duyệt yêu cầu của mình → bị từ chối (trừ Owner).
+
+**Còn lại tính tới 2026-08-26:** bước 2 (`orchestrator.env`). Worker đã deploy
+(bản `8d00be8c`). Task đã đăng ký và đang lặp 5 phút, nên nó tự sống dậy ngay
+lần tick đầu sau khi file env có mặt — không phải đăng ký lại. Trước lúc đó log
+chỉ có đúng một dòng `Thiếu file cấu hình runner: …\orchestrator.env`, và đó là
+dấu hiệu đúng.
 
 ---
 
