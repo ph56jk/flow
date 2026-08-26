@@ -1769,7 +1769,14 @@ def folds_that_forget_to_lower(source: str) -> list[str]:
     tree = ast.parse(source)
 
     def ha_chu(node: ast.AST) -> bool:
-        doan = ast.get_source_segment(source, node) or ""
+        # ``ast.get_source_segment`` cắt lại toàn bộ file nguồn mỗi lần gọi:
+        # trên ``service.py`` (1,2 MB) riêng hàm này đã ăn hết ngân sách test.
+        # ``ast.unparse`` đọc theo cây con — cùng câu trả lời, giá bằng subtree.
+        #
+        # Nó còn siết luật lại một nấc: ``unparse`` chuẩn hoá cách viết, nên
+        # ``x . lower ()`` không còn bị báo oan, và chú thích có chữ .lower()
+        # không còn làm luật im.
+        doan = ast.unparse(node)
         return ".lower()" in doan or ".casefold()" in doan
 
     ra: list[str] = []
