@@ -209,6 +209,11 @@ async def flow_project_debug(request: Request) -> Dict[str, Any]:
     return await service(request).get_project_debug()
 
 
+@app.get("/api/flow/agent-ui-debug")
+async def flow_agent_ui_debug(request: Request, probe: str = "", prefill: int = 0, variant: str = "") -> Dict[str, Any]:
+    return await service(request).get_flow_agent_ui_debug(probe, prefill, variant)
+
+
 @app.get("/api/models")
 async def models(request: Request) -> Dict[str, Any]:
     return await service(request).get_model_config()

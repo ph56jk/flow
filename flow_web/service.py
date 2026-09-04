@@ -1991,6 +1991,487 @@ class FlowWebService:
 
         return await self._with_client(_go)
 
+    def _flow_agent_debug_sample_image(self) -> Path:
+        try:
+            candidates = sorted(UPLOADS_DIR.glob("trello-*.jp*g"), key=lambda item: item.stat().st_mtime, reverse=True)
+        except Exception:
+            candidates = []
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and candidate.stat().st_size > 1024:
+                    return candidate
+            except OSError:
+                continue
+        from PIL import Image
+
+        ensure_app_dirs()
+        sample = DATA_DIR / "agent-ui-debug-sample.png"
+        Image.new("RGB", (512, 512), (200, 120, 60)).save(sample)
+        return sample
+
+    async def get_flow_agent_ui_debug(self, probe: str = "", prefill: int = 0, variant: str = "") -> Dict[str, Any]:
+        probe = str(probe or "").strip().lower()
+        try:
+            prefill_level = int(prefill or 0)
+        except (TypeError, ValueError):
+            prefill_level = 1 if prefill else 0
+        prefill_real = prefill_level >= 2
+        prefill = prefill_level > 0
+        variant = str(variant or "").strip().lower()
+
+        async def _go(client: Any) -> Dict[str, Any]:
+            project_url = self._project_url(client.project_id)
+            page, page_detail = await self._acquire_isolated_flow_agent_page(client, project_url)
+            payload: Dict[str, Any] = {"page_detail": str(page_detail)[:200]}
+            try:
+                try:
+                    await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
+                except Exception:
+                    pass
+                await asyncio.sleep(2.5)
+                app_ready, app_ready_detail = await self._wait_for_flow_app_ready(page, timeout_s=45.0)
+                payload["app_ready"] = {"ok": app_ready, "detail": str(app_ready_detail)[:200]}
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.4)
+                except Exception:
+                    pass
+                agent_opened, agent_detail = await self._enable_flow_agent_mode(page)
+                payload["agent_mode"] = {"opened": agent_opened, "detail": str(agent_detail)[:200]}
+                panel_opened, panel_detail = await self._open_flow_agent_panel(page)
+                payload["agent_panel"] = {"opened": panel_opened, "detail": str(panel_detail)[:200]}
+                fresh_ok, fresh_detail = await self._ensure_fresh_flow_agent_panel(page)
+                payload["fresh_panel"] = {"ok": fresh_ok, "detail": str(fresh_detail)[:220]}
+                payload["attachment_snapshot"] = await self._flow_agent_panel_attachment_snapshot(page)
+                dump_js = """
+                    () => {
+                      const deepQuery = (selector, root = document, seen = new Set()) => {
+                        const found = [];
+                        const visit = (node) => {
+                          if (!node || seen.has(node)) return;
+                          seen.add(node);
+                          try {
+                            found.push(...node.querySelectorAll(selector));
+                            for (const el of node.querySelectorAll('*')) {
+                              if (el.shadowRoot) visit(el.shadowRoot);
+                            }
+                          } catch (_) {}
+                        };
+                        visit(root);
+                        return found;
+                      };
+                      const rectOf = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        return {
+                          x: Math.round(rect.left),
+                          y: Math.round(rect.top),
+                          w: Math.round(rect.width),
+                          h: Math.round(rect.height),
+                        };
+                      };
+                      const isVisible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 1 || rect.height < 1) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                      };
+                      const labelFor = (el) => [
+                        (el.textContent || '').slice(0, 60),
+                        el.getAttribute('placeholder') || '',
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-testid') || '',
+                      ].join(' | ').replace(/\\s+/g, ' ').trim();
+                      const inShadow = (el) => el.getRootNode() instanceof ShadowRoot;
+                      const textboxes = deepQuery('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')
+                        .map((el) => ({
+                          tag: el.tagName.toLowerCase(),
+                          label: labelFor(el).slice(0, 160),
+                          rect: rectOf(el),
+                          visible: isVisible(el),
+                          shadow: inShadow(el),
+                        }));
+                      const fileInputs = deepQuery('input[type="file"]')
+                        .map((el) => ({
+                          accept: el.getAttribute('accept') || '',
+                          rect: rectOf(el),
+                          visible: isVisible(el),
+                          shadow: inShadow(el),
+                          multiple: el.hasAttribute('multiple'),
+                          outer: (el.outerHTML || '').slice(0, 220),
+                        }));
+                      const buttons = deepQuery('button, [role="button"], label')
+                        .filter(isVisible)
+                        .map((el) => ({
+                          tag: el.tagName.toLowerCase(),
+                          label: labelFor(el).slice(0, 140),
+                          rect: rectOf(el),
+                          shadow: inShadow(el),
+                        }))
+                        .filter((item) => item.rect.y >= window.innerHeight * 0.4 || item.rect.x >= window.innerWidth * 0.4)
+                        .slice(0, 120);
+                      const iframes = [...document.querySelectorAll('iframe')].map((el) => ({
+                        src: (el.src || '').slice(0, 200),
+                        rect: rectOf(el),
+                        visible: isVisible(el),
+                      }));
+                      return {
+                        viewport: { w: window.innerWidth, h: window.innerHeight },
+                        url: location.href.slice(0, 200),
+                        textboxes,
+                        fileInputs,
+                        buttons,
+                        iframes,
+                      };
+                    }
+                    """
+                payload["dom"] = await page.evaluate(dump_js)
+                frames_info = []
+                for frame in list(getattr(page, "frames", []) or []):
+                    try:
+                        count = await frame.locator('input[type="file"]').count()
+                    except Exception:
+                        count = -1
+                    frames_info.append({"url": str(getattr(frame, "url", "") or "")[:200], "file_inputs": count})
+                payload["frames"] = frames_info
+                if prefill and probe == "prefill":
+                    dummy_prompt = (
+                        "Use Google Flow Agent as the prompt writer and image-generation operator. "
+                        "This is a diagnostic dry run: do not generate anything. "
+                    ) * 48
+                    steps: List[str] = []
+
+                    async def _check(tag: str) -> bool:
+                        try:
+                            hit = await page.evaluate(
+                                "() => { const t = (document.body.innerText || ''); return t.includes('found several images') || t.includes('Image Editing Request'); }"
+                            )
+                        except Exception:
+                            hit = False
+                        steps.append(f"{tag}={'SENT' if hit else 'ok'}")
+                        return bool(hit)
+
+                    loc = await page.evaluate(self.FLOW_AGENT_ADD_CONTROL_JS)
+                    composer = (loc or {}).get("composer") if isinstance(loc, dict) else None
+                    if composer and variant in ("clickwait", "short", "lorem", "long"):
+                        await page.mouse.click(float(composer.get("x")), float(composer.get("y")))
+                        await asyncio.sleep(0.6)
+                        await _check("click")
+                        if variant == "short":
+                            await page.keyboard.insert_text(dummy_prompt[:300])
+                        elif variant == "lorem":
+                            await page.keyboard.insert_text(("lorem ipsum dolor sit amet consectetur " * 160)[:6240])
+                        elif variant == "long":
+                            await page.keyboard.insert_text(dummy_prompt)
+                        for wait_index in range(4):
+                            await asyncio.sleep(2.0)
+                            if await _check(f"{variant}+{(wait_index + 1) * 2}s"):
+                                break
+                    elif composer:
+                        await page.mouse.click(float(composer.get("x")), float(composer.get("y")))
+                        await asyncio.sleep(0.6)
+                        sent = await _check("click")
+                        if not sent:
+                            await page.keyboard.press("Meta+a")
+                            await asyncio.sleep(0.6)
+                            sent = await _check("meta-a")
+                        if not sent:
+                            await page.keyboard.press("Control+a")
+                            await asyncio.sleep(0.6)
+                            sent = await _check("ctrl-a")
+                        if not sent:
+                            await page.keyboard.press("Backspace")
+                            await asyncio.sleep(0.6)
+                            sent = await _check("backspace")
+                        if not sent:
+                            await page.keyboard.insert_text(dummy_prompt[:300])
+                            await asyncio.sleep(1.0)
+                            sent = await _check("insert-300")
+                        if not sent:
+                            await page.keyboard.insert_text(dummy_prompt[300:])
+                            await asyncio.sleep(2.0)
+                            sent = await _check("insert-rest")
+                        if not sent:
+                            await asyncio.sleep(4.0)
+                            await _check("wait-4s")
+                    payload["prefill"] = {"steps": steps, "composer": composer}
+                elif prefill and probe:
+                    dummy_prompt = (
+                        "Use Google Flow Agent as the prompt writer and image-generation operator. "
+                        "This is a diagnostic dry run: do not generate anything. "
+                    ) * 48
+                    if prefill_real:
+                        for job in self.store.snapshot().jobs:
+                            job_input = job.input if isinstance(job.input, dict) else {}
+                            real_prompt = str(job_input.get("prompt") or "").strip()
+                            if job.type == "image" and job_input.get("flow_agent_enabled") and len(real_prompt) > 400:
+                                dummy_prompt = real_prompt
+                                break
+                    filled, fill_detail = await self._fill_flow_agent_panel_instruction(page, dummy_prompt.strip())
+                    payload["prefill"] = {"ok": filled, "detail": str(fill_detail)[:160], "chars": len(dummy_prompt), "real": bool(prefill_real)}
+                if probe == "prefill":
+                    await asyncio.sleep(6.0)
+                    payload["probe"] = {
+                        "panel_text": await self._flow_agent_panel_text(page, 300),
+                        "screenshot": await self._capture_flow_agent_debug_screenshot(page, "prefill-only"),
+                    }
+                all_controls_js = """
+                    () => {
+                      const deepQuery = (selector, root = document, seen = new Set()) => {
+                        const found = [];
+                        const visit = (node) => {
+                          if (!node || seen.has(node)) return;
+                          seen.add(node);
+                          try {
+                            found.push(...node.querySelectorAll(selector));
+                            for (const el of node.querySelectorAll('*')) {
+                              if (el.shadowRoot) visit(el.shadowRoot);
+                            }
+                          } catch (_) {}
+                        };
+                        visit(root);
+                        return found;
+                      };
+                      const isVisible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 1 || rect.height < 1) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                      };
+                      const labelFor = (el) => [
+                        (el.textContent || '').slice(0, 60),
+                        el.getAttribute('aria-label') || '',
+                        el.getAttribute('title') || '',
+                        el.getAttribute('data-testid') || '',
+                      ].join(' | ').replace(/\\s+/g, ' ').trim();
+                      return deepQuery('button, [role="button"], [role="menuitem"], [role="option"], label, a, input[type="file"], img')
+                        .filter(isVisible)
+                        .map((el) => {
+                          const rect = el.getBoundingClientRect();
+                          return {
+                            tag: el.tagName.toLowerCase(),
+                            role: el.getAttribute('role') || '',
+                            label: labelFor(el).slice(0, 140),
+                            rect: { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) },
+                            attrs: ['aria-selected', 'aria-checked', 'aria-pressed', 'alt', 'src'].map((name) => `${name}=${(el.getAttribute(name) || '').slice(0, 60)}`).filter((item) => !item.endsWith('=')).join(' '),
+                            cls: (typeof el.className === 'string' ? el.className : '').slice(0, 80),
+                          };
+                        })
+                        .filter((item) => item.tag !== 'img' || (item.rect.w >= 24 && item.rect.h >= 24))
+                        .slice(0, 200);
+                    }
+                """
+                if probe == "attach":
+                    from flow._ui_interceptor import UIInterceptor
+
+                    sample = self._flow_agent_debug_sample_image()
+                    interceptor = UIInterceptor()
+                    interceptor.attach(page)
+                    interceptor.clear()
+                    seen_requests: List[str] = []
+
+                    def _on_request(request: Any) -> None:
+                        try:
+                            url = str(getattr(request, "url", "") or "")
+                            if re.search(r"\.(js|css|png|jpe?g|webp|svg|woff2?|ico|map)(\?|$)", url, flags=re.I):
+                                return
+                            if "google" not in url and "gstatic" not in url:
+                                return
+                            seen_requests.append(f"{getattr(request, 'method', '')} {url[:180]}")
+                        except Exception:
+                            pass
+
+                    try:
+                        page.on("request", _on_request)
+                    except Exception:
+                        pass
+                    before = await self._flow_agent_panel_attachment_snapshot(page)
+                    ensure_app_dirs()
+                    shot_before = DATA_DIR / "agent-ui-debug-before.png"
+                    shot_after = DATA_DIR / "agent-ui-debug-after.png"
+                    try:
+                        await page.screenshot(path=str(shot_before))
+                    except Exception:
+                        pass
+                    self._flow_agent_debug_steps = True
+                    try:
+                        attached, attach_detail = await self._attach_flow_agent_source_file(page, str(sample), before_snapshot=before)
+                    finally:
+                        self._flow_agent_debug_steps = False
+                    try:
+                        await page.screenshot(path=str(shot_after))
+                    except Exception:
+                        pass
+                    upload_ok, upload_detail = False, "skipped"
+                    verify_ok, verify_detail = False, "skipped"
+                    if attached:
+                        upload_ok, upload_detail = await self._wait_for_flow_agent_upload_ready(interceptor, 0, timeout_s=40.0)
+                        verify_ok, verify_detail = await self._wait_for_flow_agent_source_attachment(
+                            page,
+                            before,
+                            timeout_s=15.0,
+                            accept_stable_ready_after_attach=True,
+                            source_file_name=sample.name,
+                        )
+                    payload["probe"] = {
+                        "sample": str(sample),
+                        "attached": attached,
+                        "attach_detail": attach_detail,
+                        "upload": {"ok": upload_ok, "detail": upload_detail},
+                        "verify": {"ok": verify_ok, "detail": verify_detail},
+                        "captured_calls": [str(tail) for tail in interceptor.all_tails()][:30],
+                        "seen_requests": seen_requests[:80],
+                        "screenshots": {"before": str(shot_before), "after": str(shot_after)},
+                        "panel_text": await page.evaluate(
+                            """
+                            () => {
+                              const nodes = [...document.querySelectorAll('aside, section, div')]
+                                .filter((el) => {
+                                  const rect = el.getBoundingClientRect();
+                                  const style = window.getComputedStyle(el);
+                                  return rect.left >= window.innerWidth * 0.6 && rect.width >= 240 && rect.height >= 300
+                                    && style.display !== 'none' && style.visibility !== 'hidden';
+                                })
+                                .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height));
+                              const panel = nodes[0];
+                              return panel ? (panel.innerText || '').replace(/\\s+/g, ' ').slice(0, 800) : '';
+                            }
+                            """
+                        ),
+                        "before_snapshot": before,
+                        "after_snapshot": await self._flow_agent_panel_attachment_snapshot(page),
+                        "after_controls": await page.evaluate(all_controls_js),
+                    }
+                elif probe and probe != "prefill":
+                    probe_payload: Dict[str, Any] = {}
+                    target = await page.evaluate(
+                        """
+                        () => {
+                          const deepQuery = (selector, root = document, seen = new Set()) => {
+                            const found = [];
+                            const visit = (node) => {
+                              if (!node || seen.has(node)) return;
+                              seen.add(node);
+                              try {
+                                found.push(...node.querySelectorAll(selector));
+                                for (const el of node.querySelectorAll('*')) {
+                                  if (el.shadowRoot) visit(el.shadowRoot);
+                                }
+                              } catch (_) {}
+                            };
+                            visit(root);
+                            return found;
+                          };
+                          const labelFor = (el) => [
+                            el.textContent || '',
+                            el.getAttribute('aria-label') || '',
+                            el.getAttribute('title') || '',
+                            el.getAttribute('data-testid') || '',
+                          ].join(' ').replace(/\\s+/g, ' ').trim();
+                          const candidates = deepQuery('button, [role="button"]')
+                            .filter((el) => {
+                              const rect = el.getBoundingClientRect();
+                              if (rect.width < 12 || rect.height < 12) return false;
+                              const style = window.getComputedStyle(el);
+                              if (style.visibility === 'hidden' || style.display === 'none') return false;
+                              return /add\\s*ingredient|ingredient|đính\\s*kèm|dinh\\s*kem|thêm\\s*ảnh|them\\s*anh|add\\s*media|upload/i.test(labelFor(el))
+                                || (/(^|\\s)add(\\s|$)/i.test(labelFor(el)) && rect.top >= window.innerHeight * 0.5);
+                            })
+                            .map((el) => {
+                              const rect = el.getBoundingClientRect();
+                              return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2, label: labelFor(el).slice(0, 120), top: rect.top };
+                            })
+                            .sort((a, b) => b.top - a.top);
+                          const target = candidates[0];
+                          if (!target) return { ok: false, detail: 'no add-ingredient control' };
+                          return { ok: true, x: target.x, y: target.y, detail: target.label };
+                        }
+                        """
+                    )
+                    probe_payload["add_control"] = target
+                    if isinstance(target, dict) and target.get("ok"):
+                        chooser_seen = False
+                        chooser_detail = ""
+                        try:
+                            async with page.expect_file_chooser(timeout=3000) as chooser_info:
+                                await page.mouse.click(float(target.get("x")), float(target.get("y")))
+                            chooser = await chooser_info.value
+                            chooser_seen = True
+                            chooser_detail = "file chooser opened directly"
+                        except Exception as exc:
+                            chooser_detail = humanize_flow_error(str(exc))[:160]
+                        probe_payload["file_chooser"] = {"seen": chooser_seen, "detail": chooser_detail}
+                        await asyncio.sleep(1.2)
+                        probe_payload["after_click_dom"] = await page.evaluate(dump_js)
+                        probe_payload["after_click_controls"] = await page.evaluate(all_controls_js)
+                        probe_payload["after_click_overlays"] = await page.evaluate(
+                            """
+                            () => {
+                              const deepQuery = (selector, root = document, seen = new Set()) => {
+                                const found = [];
+                                const visit = (node) => {
+                                  if (!node || seen.has(node)) return;
+                                  seen.add(node);
+                                  try {
+                                    found.push(...node.querySelectorAll(selector));
+                                    for (const el of node.querySelectorAll('*')) {
+                                      if (el.shadowRoot) visit(el.shadowRoot);
+                                    }
+                                  } catch (_) {}
+                                };
+                                visit(root);
+                                return found;
+                              };
+                              const rectOf = (el) => {
+                                const rect = el.getBoundingClientRect();
+                                return { x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) };
+                              };
+                              const isVisible = (el) => {
+                                const rect = el.getBoundingClientRect();
+                                if (rect.width < 1 || rect.height < 1) return false;
+                                const style = window.getComputedStyle(el);
+                                return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                              };
+                              const labelFor = (el) => [
+                                (el.textContent || '').slice(0, 80),
+                                el.getAttribute('aria-label') || '',
+                                el.getAttribute('data-testid') || '',
+                              ].join(' | ').replace(/\\s+/g, ' ').trim();
+                              const roles = deepQuery('[role]')
+                                .filter(isVisible)
+                                .map((el) => ({ role: el.getAttribute('role'), label: labelFor(el).slice(0, 140), rect: rectOf(el) }))
+                                .filter((item) => !['presentation', 'none', 'img'].includes(item.role))
+                                .slice(0, 100);
+                              const popovers = deepQuery('div, ul, section')
+                                .filter(isVisible)
+                                .filter((el) => {
+                                  const style = window.getComputedStyle(el);
+                                  const z = parseInt(style.zIndex || '0', 10) || 0;
+                                  return (style.position === 'fixed' || style.position === 'absolute') && z >= 5;
+                                })
+                                .map((el) => ({ rect: rectOf(el), z: window.getComputedStyle(el).zIndex, text: (el.textContent || '').replace(/\\s+/g, ' ').slice(0, 240) }))
+                                .slice(0, 25);
+                              return { roles, popovers };
+                            }
+                            """
+                        )
+                        await asyncio.sleep(5.0)
+                        probe_payload["panel_text_after_wait"] = await self._flow_agent_panel_text(page, 300)
+                        probe_payload["screenshot_after_wait"] = await self._capture_flow_agent_debug_screenshot(page, "menu-after-wait")
+                        try:
+                            await page.keyboard.press("Escape")
+                        except Exception:
+                            pass
+                    payload["probe"] = probe_payload
+            finally:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+            return payload
+
+        return await self._with_client(_go)
+
     def _project_debug_payload(self, project_data: Dict[str, Any]) -> Dict[str, Any]:
         project_contents = project_data.get("projectContents", {}) if isinstance(project_data, dict) else {}
         workflows = project_contents.get("workflows", []) if isinstance(project_contents, dict) else []
@@ -10865,6 +11346,33 @@ exit 1
                 "context": ("bouquet", "bridal bouquet", "wedding", "stitched lettering", "embroidered message", "draped"),
                 "exclude": ("book", "pillow", "cushion", "banner", "dress"),
             },
+            "christmas_sash": {
+                "main": (
+                    "christmas sash",
+                    "christmas wreath sash",
+                    "christmas linen sash",
+                    "embroidered christmas sash",
+                    "noel sash",
+                    "xmas sash",
+                    "linen wreath sash",
+                    "two-tail sash",
+                ),
+                "context": (
+                    "christmas",
+                    "noel",
+                    "xmas",
+                    "evergreen wreath",
+                    "christmas wreath",
+                    "two pointed tails",
+                    "embroidered motif",
+                    "embroidered text",
+                    "linen weave",
+                    "red berries",
+                    "dried orange",
+                    "christmas baubles",
+                ),
+                "exclude": ("halloween", "pumpkin", "ghost", "bouquet", "hair bow", "book", "pillow", "bag", "banner"),
+            },
             "family_halloween_sash": {
                 "main": (
                     "family halloween sash",
@@ -10948,6 +11456,49 @@ exit 1
                 ),
                 "exclude": ("bouquet", "bridal bouquet", "dress", "headband", "bow tie", "pouch", "bag", "scarf", "ribbon strip", "pillow", "cushion", "banner", "book", "passport"),
             },
+            "jewelry_box": {
+                "main": (
+                    "jewelry box",
+                    "jewery box",
+                    "jewellery box",
+                    "jewelry case",
+                    "jewellery case",
+                    "travel jewelry box",
+                    "embroidered jewelry box",
+                    "linen jewelry box",
+                    "silver framed jewelry box",
+                    "hop dung trang suc",
+                    "hop trang suc",
+                ),
+                "context": (
+                    "small rounded rectangle box",
+                    "rounded rectangular case",
+                    "silver metal frame",
+                    "metal rim",
+                    "front clasp",
+                    "hinged lid",
+                    "white linen lid",
+                    "linen covered lid",
+                    "hand embroidered lid",
+                    "personalized name",
+                    "two compartments",
+                    "jewelry organizer",
+                    "rings and earrings",
+                    "bridesmaid gift",
+                ),
+                "exclude": (
+                    "drawstring",
+                    "pouch",
+                    "bag",
+                    "book",
+                    "album",
+                    "passport",
+                    "pillow",
+                    "banner",
+                    "stocking",
+                    "wooden jewelry chest",
+                ),
+            },
             "passport_cover": {
                 "main": (
                     "passport cover",
@@ -11025,6 +11576,44 @@ exit 1
                     "album",
                     "dress",
                     "plush",
+                ),
+            },
+            "pn_ornament": {
+                "main": (
+                    "pn ornament",
+                    "punch needle ornament",
+                    "punch needle christmas ornament",
+                    "christmas punch needle ornament",
+                    "punch needle linen ornament",
+                    "pn christmas ornament",
+                    "ornament punch needle",
+                ),
+                "context": (
+                    "christmas",
+                    "noel",
+                    "xmas",
+                    "small ornament",
+                    "wooden hoop",
+                    "wooden frame",
+                    "metal clasp",
+                    "hanging cord",
+                    "linen",
+                    "punch needle",
+                    "raised wool loops",
+                    "loop pile",
+                    "thick yarn fibers",
+                    "handmade wool motif",
+                ),
+                "exclude": (
+                    "stocking",
+                    "sock",
+                    "pillow",
+                    "cushion",
+                    "bag",
+                    "banner",
+                    "book",
+                    "dress",
+                    "printed",
                 ),
             },
             "ornament_round": {
@@ -11120,6 +11709,33 @@ exit 1
                 ),
                 "exclude": ("book", "album", "pillow", "cushion", "banner", "hoop", "dress", "shirt", "crown", "cross", "plush"),
             },
+            "christmas_banner": {
+                "main": (
+                    "christmas banner",
+                    "christmas fabric banner",
+                    "christmas linen banner",
+                    "christmas wall hanging",
+                    "christmas pennant",
+                    "noel banner",
+                    "xmas banner",
+                    "holiday banner",
+                ),
+                "context": (
+                    "christmas",
+                    "noel",
+                    "xmas",
+                    "holiday",
+                    "dowel",
+                    "wooden rod",
+                    "cord hanger",
+                    "rope hanger",
+                    "hand embroidered",
+                    "evergreen",
+                    "christmas tree",
+                    "merry christmas",
+                ),
+                "exclude": ("pillow", "cushion", "book", "album", "hoop", "dress", "stocking"),
+            },
             "banner": {
                 "main": ("banner", "pennant", "flag", "wall hanging", "fabric panel", "hanging panel"),
                 "context": ("dowel", "rod", "cord hanger", "rope hanger", "pointed v", "v bottom", "triangular", "nursery wall"),
@@ -11134,6 +11750,32 @@ exit 1
                 "main": ("crown", "fabric crown", "linen crown", "birthday crown", "party crown", "baby crown", "wearable crown", "crown headband", "crown hat", "pom-pom crown", "pompom crown"),
                 "context": ("birthday", "party", "cake", "pom-pom", "pompom", "felt ball", "pointed", "points", "wearing", "head", "child", "baby", "linen", "embroidered"),
                 "exclude": ("cross", "crucifix", "banner", "pennant", "wall hanging", "dowel", "rod", "pillow", "cushion", "book", "dress", "hoop"),
+            },
+            "christmas_fabric_cross": {
+                "main": (
+                    "christmas fabric cross",
+                    "christmas linen cross",
+                    "christmas embroidered cross",
+                    "christmas cross keepsake",
+                    "christmas soft cross",
+                    "noel fabric cross",
+                    "xmas fabric cross",
+                    "holiday fabric cross",
+                ),
+                "context": (
+                    "christmas",
+                    "noel",
+                    "xmas",
+                    "holiday",
+                    "fabric",
+                    "linen",
+                    "hand embroidered",
+                    "embroidered name",
+                    "hanging loop",
+                    "tree ornament",
+                    "pine",
+                ),
+                "exclude": ("pillow", "cushion", "book", "banner", "hoop", "crown", "pom-pom", "pompom"),
             },
             "fabric_cross": {
                 "main": ("cross", "religious cross", "crucifix", "soft cross", "cross keepsake"),
@@ -11504,7 +12146,7 @@ exit 1
         card.update(metadata)
 
     def _flow_operator_banner_wall_hook_rule_for_shot(self, product_key: str, *parts: str) -> str:
-        if str(product_key or "").strip() != "banner":
+        if str(product_key or "").strip() not in {"banner", "halloween_banner", "christmas_banner"}:
             return ""
         text = " ".join(str(part or "").lower() for part in parts)
         non_wall_terms = (
@@ -11595,7 +12237,7 @@ exit 1
                     "pine",
                     "evergreen",
                 ),
-                "product_keys": ("ornament_round", "pc_stocks"),
+                "product_keys": ("ornament_round", "pc_stocks", "christmas_banner"),
                 "decor": (
                     "use bright premium Christmas props such as evergreen sprigs, pine cones, white or red ribbon, matte ornaments, tiny stockings, wrapped gifts, neutral snowflake accents, or gingerbread details while keeping whites clean and not warm/yellow"
                 ),
@@ -16823,13 +17465,82 @@ exit 1
             )
         )
 
+    FLOW_APP_HOSTS = ("labs.google", "flow.google.com")
+
+    def _is_flow_project_page_url(self, url: str, project_url: str) -> bool:
+        current_url = str(url or "").strip()
+        target_url = str(project_url or "").strip()
+        if not current_url or not target_url:
+            return False
+        if self._looks_like_placeholder_project_url(current_url):
+            return False
+        if current_url.startswith(target_url):
+            return True
+        project_id = self._normalize_project_id(target_url)
+        if not project_id:
+            return False
+        parsed = urlparse(current_url)
+        host = str(parsed.netloc or "").lower()
+        if not any(host == known or host.endswith("." + known) for known in self.FLOW_APP_HOSTS):
+            return False
+        path = str(parsed.path or "")
+        return f"/project/{project_id}" in path or f"/project/{quote(project_id, safe='')}" in path
+
+    async def _wait_for_flow_app_ready(self, page: Any, timeout_s: float = 40.0) -> tuple[bool, str]:
+        deadline = asyncio.get_running_loop().time() + max(3.0, float(timeout_s or 40.0))
+        last_detail = "flow app not rendered"
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                info = await page.evaluate(
+                    """
+                    () => {
+                      const deepQuery = (selector, root = document, seen = new Set()) => {
+                        const found = [];
+                        const visit = (node) => {
+                          if (!node || seen.has(node)) return;
+                          seen.add(node);
+                          try {
+                            found.push(...node.querySelectorAll(selector));
+                            for (const el of node.querySelectorAll('*')) {
+                              if (el.shadowRoot) visit(el.shadowRoot);
+                            }
+                          } catch (_) {}
+                        };
+                        visit(root);
+                        return found;
+                      };
+                      const visible = (el) => {
+                        const rect = el.getBoundingClientRect();
+                        if (rect.width < 12 || rect.height < 12) return false;
+                        const style = window.getComputedStyle(el);
+                        return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+                      };
+                      const buttons = deepQuery('button, [role="button"]').filter(visible).length;
+                      const textboxes = deepQuery('textarea, [contenteditable="true"], [role="textbox"]').filter(visible).length;
+                      return { buttons, textboxes, url: location.href.slice(0, 160) };
+                    }
+                    """
+                )
+            except Exception as exc:
+                info = {"error": humanize_flow_error(str(exc))[:120]}
+            info = info if isinstance(info, dict) else {}
+            try:
+                buttons = int(info.get("buttons") or 0)
+            except Exception:
+                buttons = 0
+            if buttons >= 3:
+                return True, f"flow app rendered ({buttons} controls) at {str(info.get('url') or '')[:120]}"
+            last_detail = f"controls={buttons} url={str(info.get('url') or '')[:120]} {str(info.get('error') or '')}".strip()
+            await asyncio.sleep(0.75)
+        return False, last_detail
+
     async def _ensure_valid_flow_project_page(self, page: Any, project_url: str) -> None:
         target_url = str(project_url or "").strip()
         if not target_url:
             return
 
         current_url = str(getattr(page, "url", "") or "").strip()
-        if current_url.startswith(target_url) and not self._looks_like_placeholder_project_url(current_url):
+        if self._is_flow_project_page_url(current_url, target_url):
             return
 
         if self._looks_like_placeholder_project_url(current_url):
@@ -16873,7 +17584,7 @@ exit 1
 
         for candidate in pages:
             current_url = str(getattr(candidate, "url", "") or "").strip()
-            if current_url.startswith(target_url) and not self._looks_like_placeholder_project_url(current_url):
+            if self._is_flow_project_page_url(current_url, target_url):
                 try:
                     browser._page = candidate
                 except Exception:
@@ -20105,8 +20816,17 @@ exit 1
             except Exception:
                 await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
         await asyncio.sleep(2.5)
+        app_ready, app_ready_detail = await self._wait_for_flow_app_ready(page, timeout_s=45.0)
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: tab hiện tại {str(getattr(page, 'url', '') or '')[:160]}.")
+            await self.store.append_log(
+                job_id,
+                (
+                    f"Fallback UI Flow: trang Flow đã render ({app_ready_detail[:140]})."
+                    if app_ready
+                    else f"Fallback UI Flow: trang Flow chưa render xong sau khi chờ ({app_ready_detail[:140]})."
+                ),
+            )
 
         interceptor = UIInterceptor()
         interceptor.attach(page)
@@ -20247,24 +20967,33 @@ exit 1
         if flow_agent_enabled and (not attached_agent_source or not source_attachment_verified) and safe_reference_image_path:
             fallback_before = await self._flow_agent_panel_attachment_snapshot(page)
             upload_call_start = len(getattr(interceptor, "_calls", []) or [])
-            attached_local_source, attach_detail = await self._attach_flow_agent_source_file(page, safe_reference_image_path)
+            attached_local_source, attach_detail = await self._attach_flow_agent_source_file(
+                page,
+                safe_reference_image_path,
+                before_snapshot=fallback_before,
+            )
             if attached_local_source:
                 attached_agent_source = True
+                source_file_name = Path(safe_reference_image_path).name
+                source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
+                    page,
+                    fallback_before,
+                    timeout_s=25.0,
+                    source_file_name=source_file_name,
+                )
                 upload_ready, upload_ready_detail = await self._wait_for_flow_agent_upload_ready(
                     interceptor,
                     upload_call_start,
-                    timeout_s=min(60.0, max(20.0, ui_timeout_s / 5)),
+                    timeout_s=5.0 if source_attachment_verified else min(60.0, max(20.0, ui_timeout_s / 5)),
                 )
-                if upload_ready:
+                if not source_attachment_verified and upload_ready:
                     source_attachment_verified, source_verify_detail = await self._wait_for_flow_agent_source_attachment(
                         page,
                         fallback_before,
                         accept_stable_ready_after_attach=True,
+                        source_file_name=source_file_name,
                     )
-                    source_verify_detail = f"{upload_ready_detail}; {source_verify_detail}"
-                else:
-                    source_attachment_verified = False
-                    source_verify_detail = upload_ready_detail
+                source_verify_detail = f"{upload_ready_detail}; {source_verify_detail}"
             if job_id:
                 await self.store.append_log(
                     job_id,
@@ -20423,7 +21152,7 @@ exit 1
                             known_media_before_submit,
                             prompt=prompt,
                             target_count=target_count,
-                            timeout_s=min(120.0, max(20.0, ui_timeout_s / 2)),
+                            timeout_s=min(ui_timeout_s, max(120.0, ui_timeout_s * 0.8)),
                             fallback_workflow_id=resolved_workflow_id,
                             allow_visible_fallback=True,
                         )
@@ -20661,20 +21390,39 @@ exit 1
         except Exception as exc:
             return f"could not close stale cached Flow Agent tab: {humanize_flow_error(str(exc))[:120]}"
 
+    async def _wait_flow_agent_prior_context(self, page: Any, settle_s: float = 4.0) -> Dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + max(0.5, float(settle_s or 4.0))
+        state: Dict[str, Any] = {}
+        while True:
+            state = await self._flow_agent_panel_context_state(page)
+            if state.get("has_prior_context"):
+                return state
+            if asyncio.get_running_loop().time() >= deadline:
+                return state
+            await asyncio.sleep(0.75)
+
     async def _ensure_fresh_flow_agent_panel(self, page: Any) -> tuple[bool, str]:
-        state = await self._flow_agent_panel_context_state(page)
-        if not state.get("has_prior_context"):
-            return True, str(state.get("detail") or "agent panel has no prior context")
-
-        reset_ok, reset_detail = await self._reset_flow_agent_panel_context(page)
-        if not reset_ok:
-            return False, f"old context visible; reset unavailable: {reset_detail}"
-
-        await asyncio.sleep(1.0)
-        state_after = await self._flow_agent_panel_context_state(page)
-        if state_after.get("has_prior_context"):
-            return False, f"old context still visible after reset: {state_after.get('detail') or reset_detail}"
-        return True, f"reset old Agent context: {reset_detail}"
+        # flow.google.com restores the previous Agent session a few seconds after the
+        # panel opens, so an immediate check can pass on a panel that is about to fill
+        # with old context. Settle first, then start a new session whenever the UI offers one.
+        parts: List[str] = []
+        state = await self._wait_flow_agent_prior_context(page, settle_s=4.0)
+        if state.get("has_prior_context"):
+            parts.append("old context visible after settle")
+        new_session_ok, new_session_detail = await self._click_flow_agent_new_session_button(page)
+        if new_session_ok:
+            parts.append(new_session_detail)
+            state = await self._wait_flow_agent_prior_context(page, settle_s=3.0)
+        if state.get("has_prior_context"):
+            reset_ok, reset_detail = await self._reset_flow_agent_panel_context(page)
+            if not reset_ok:
+                return False, f"old context visible; reset unavailable: {reset_detail}"
+            parts.append(f"reset old Agent context: {reset_detail}")
+            state = await self._wait_flow_agent_prior_context(page, settle_s=3.0)
+            if state.get("has_prior_context"):
+                return False, f"old context still visible after reset: {state.get('detail') or reset_detail}"
+        parts.append(str(state.get("detail") or "agent panel has no prior context"))
+        return True, "; ".join(part for part in parts if part)
 
     async def _flow_agent_panel_context_state(self, page: Any) -> Dict[str, Any]:
         try:
@@ -20713,8 +21461,11 @@ exit 1
                     .sort((a, b) => b.score - a.score);
                   const panel = panels[0];
                   if (!panel) return { visible: false, has_prior_context: false, detail: 'agent panel not detected' };
-                  const text = panel.text || '';
-                  const hasPrior = /I['’]?ve\\s+generated|generated\\s+the\\s+final|Design\\s+Analysis|Shot\\s+Brief|Credit\\s+Spend\\s+Approval|source\\s+product\\s+image\\s+as\\s+the\\s+reference|Sheep\\s+pillow|Pillow\\s+with\\s+sheep|Teddy\\s+Swims/i.test(text);
+                  const ariaText = [...panel.el.querySelectorAll('[aria-label]')]
+                    .map((el) => el.getAttribute('aria-label') || '')
+                    .join(' ');
+                  const text = `${panel.text || ''} ${ariaText}`;
+                  const hasPrior = /I['’]?ve\\s+generated|generated\\s+the\\s+final|Design\\s+Analysis|Shot\\s+Brief|Credit\\s+Spend\\s+Approval|source\\s+product\\s+image\\s+as\\s+the\\s+reference|Sheep\\s+pillow|Pillow\\s+with\\s+sheep|Teddy\\s+Swims|Good\\s+response|Bad\\s+response|Flag\\s+output|Open\\s+image\\s+in\\s+editor|I['’]?ve\\s+found\\s+several|Which\\s+one\\s+would\\s+you\\s+like/i.test(text);
                   return {
                     visible: true,
                     has_prior_context: hasPrior,
@@ -20728,6 +21479,9 @@ exit 1
         return result if isinstance(result, dict) else {"visible": False, "has_prior_context": False, "detail": "agent context check unavailable"}
 
     async def _reset_flow_agent_panel_context(self, page: Any) -> tuple[bool, str]:
+        direct_ok, direct_detail = await self._click_flow_agent_new_session_button(page)
+        if direct_ok:
+            return True, direct_detail
         try:
             menu_result = await page.evaluate(
                 """
@@ -21244,7 +21998,7 @@ exit 1
                 await page.keyboard.insert_text(prompt)
             except Exception:
                 await page.keyboard.type(prompt, delay=10)
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(1.0)
             return True, str(result.get("detail") or "agent panel textbox")
         except Exception as exc:
             return False, humanize_flow_error(str(exc))
@@ -21474,16 +22228,16 @@ exit 1
                       const isNegativeLabel = (label) => {
                         const plain = plainText(label);
                         return (
-                          /Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|Xoá|Xóa|Xoa|Delete|delete_forever|Cài\\s*đặt|Cai\\s*dat|Settings|tune|không\\s*cho\\s*phép|khong\\s*cho\\s*phep/i.test(label)
-                          || /\\b(tu\\s*choi|reject|cancel|huy|close|stop|dung|xoa|delete|settings|cai\\s*dat|khong\\s*cho\\s*phep)\\b/i.test(plain)
+                          /Từ\\s*chối|Tu\\s*choi|Reject|Cancel|Hủy|Huy|Đóng|Close|Stop|Dừng|Dung|Xoá|Xóa|Xoa|Delete|delete_forever|Cài\\s*đặt|Cai\\s*dat|Settings|tune|không\\s*cho\\s*phép|khong\\s*cho\\s*phep|new\\s*session|phiên\\s*mới|phien\\s*moi|edit_square|session\\s*history|history|instruction|article_spark|start\\s*generation|arrow_forward|ingredient|add\\s*media|upload|menu|more_vert|filter|help|account|thumb_up|thumb_down|content_copy|flag|open\\s*image|editor|collections?|storyboard|moodboard/i.test(label)
+                          || /\\b(tu\\s*choi|reject|cancel|huy|close|stop|dung|xoa|delete|settings|cai\\s*dat|khong\\s*cho\\s*phep|new\\s*session|phien\\s*moi)\\b/i.test(plain)
                         ) && !/không\\s*hỏi\\s*lại|khong\\s*hoi\\s*lai|don.?t\\s+ask/i.test(label);
                       };
                       const isApproveLabel = (label) => {
                         const plain = plainText(label);
                         return (
-                          /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Tiếp\\s*tục|Tiep\\s*tuc|Chấp\\s*thuận|Chap\\s*thuan|Continue|Run|Start/i.test(label)
-                          || /\\b(phe\\s*duyet|approve|allow|confirm|cho\\s*phep|dong\\s*y|tiep\\s*tuc|chap\\s*thuan|continue|run|start)\\b/i.test(plain)
-                        ) && !isNegativeLabel(label);
+                          /Phê\\s*duyệt|Phe\\s*duyet|Approve|Allow|Confirm|Cho\\s*phép|Cho\\s*phep|Đồng\\s*ý|Dong\\s*y|Tiếp\\s*tục|Tiep\\s*tuc|Chấp\\s*thuận|Chap\\s*thuan|Continue|\\bRun\\b|\\bStart\\b(?!\\s*(new|generation))/i.test(label)
+                          || /\\b(phe\\s*duyet|approve|allow|confirm|cho\\s*phep|dong\\s*y|tiep\\s*tuc|chap\\s*thuan|continue|run|start)\\b(?!\\s*(new|generation|ing))/i.test(plain)
+                        ) && !isNegativeLabel(label) && !/starting\\s+generation/i.test(label);
                       };
                       const isApprovalActionLabel = (label) => {
                         const plain = plainText(label);
@@ -21921,23 +22675,135 @@ exit 1
                 "composer_ready_labels": [],
                 "detail": humanize_flow_error(str(exc)),
             }
-        if isinstance(result, dict):
-            return result
-        return {
-            "visible": False,
-            "count": 0,
-            "ready_count": 0,
-            "busy_count": 0,
-            "composer_ready_count": 0,
-            "composer_busy_count": 0,
-            "media_count": 0,
-            "chip_count": 0,
-            "file_input_count": 0,
-            "card_count": 0,
-            "ready_labels": [],
-            "composer_ready_labels": [],
-            "detail": "attachment snapshot unavailable",
+        if not isinstance(result, dict):
+            result = {
+                "visible": False,
+                "count": 0,
+                "ready_count": 0,
+                "busy_count": 0,
+                "composer_ready_count": 0,
+                "composer_busy_count": 0,
+                "media_count": 0,
+                "chip_count": 0,
+                "file_input_count": 0,
+                "card_count": 0,
+                "ready_labels": [],
+                "composer_ready_labels": [],
+                "detail": "attachment snapshot unavailable",
+            }
+        try:
+            chip_state = await page.evaluate(self.FLOW_AGENT_COMPOSER_CHIP_JS)
+        except Exception as exc:
+            chip_state = {"composer_chip_count": 0, "composer_chip_labels": [], "composer_chip_detail": humanize_flow_error(str(exc))[:80]}
+        chip_state = chip_state if isinstance(chip_state, dict) else {}
+        try:
+            result["composer_chip_count"] = max(0, int(chip_state.get("composer_chip_count") or 0))
+        except Exception:
+            result["composer_chip_count"] = 0
+        result["composer_chip_labels"] = [str(label) for label in (chip_state.get("composer_chip_labels") or []) if label][:8]
+        result["composer_chip_detail"] = str(chip_state.get("composer_chip_detail") or "")[:120]
+        result["detail"] = f"{result.get('detail') or ''} {result['composer_chip_detail']}".strip()
+        return result
+
+    FLOW_AGENT_COMPOSER_CHIP_JS = """
+        /* composer-chip-probe */
+        () => {
+          const deepQuery = (selector, root = document, seen = new Set()) => {
+            const found = [];
+            const visit = (node) => {
+              if (!node || seen.has(node)) return;
+              seen.add(node);
+              try {
+                found.push(...node.querySelectorAll(selector));
+                for (const el of node.querySelectorAll('*')) {
+                  if (el.shadowRoot) visit(el.shadowRoot);
+                }
+              } catch (_) {}
+            };
+            visit(root);
+            return found;
+          };
+          const visible = (el, minW = 20, minH = 20) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < minW || rect.height < minH) return false;
+            const style = window.getComputedStyle(el);
+            return style.visibility !== 'hidden'
+              && style.display !== 'none'
+              && style.opacity !== '0'
+              && rect.bottom > 0
+              && rect.top < window.innerHeight;
+          };
+          const labelFor = (el) => [
+            el.textContent || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.getAttribute('alt') || '',
+            el.getAttribute('data-testid') || '',
+          ].join(' ').replace(/\\s+/g, ' ').trim();
+          const textboxes = deepQuery('textarea, [contenteditable="true"], [role="textbox"]')
+            .filter((el) => visible(el, 120, 12))
+            .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+            .filter((item) => item.rect.left >= window.innerWidth * 0.35)
+            .sort((a, b) => b.rect.bottom - a.rect.bottom);
+          const ingredientChips = deepQuery('button, [role="button"]')
+            .filter((el) => visible(el, 20, 20))
+            .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+            .filter((item) => item.rect.left >= window.innerWidth * 0.35)
+            .filter((item) => /ingredient|nguyên\\s*liệu|nguyen\\s*lieu/i.test(item.label)
+              && /cancel|close|remove|xóa|xoa|delete|bỏ|huỷ|huy/i.test(item.label)
+              && !/add\\s*ingredient|thêm|them\\b/i.test(item.label));
+          const box = textboxes[0];
+          if (!box) {
+            return {
+              composer_chip_count: ingredientChips.length,
+              composer_chip_labels: ingredientChips.map((item) => item.label.slice(0, 80)),
+              composer_chip_detail: `composerChips=${ingredientChips.length} (no composer textbox)`,
+            };
+          }
+          let container = box.el.parentElement;
+          let found = null;
+          for (let depth = 0; container && depth < 12; depth += 1, container = container.parentElement) {
+            const rect = container.getBoundingClientRect();
+            if (rect.height > window.innerHeight * 0.96 || rect.width < 160 || rect.width > window.innerWidth * 0.6) break;
+            const hasToolbar = [...container.querySelectorAll('button, [role="button"]')]
+              .some((btn) => /ingredient|start\\s*generation|arrow_forward|send|gửi|tune|settings/i.test(labelFor(btn)));
+            if (hasToolbar) {
+              found = container;
+              break;
+            }
+          }
+          if (!found) {
+            return {
+              composer_chip_count: ingredientChips.length,
+              composer_chip_labels: ingredientChips.map((item) => item.label.slice(0, 80)),
+              composer_chip_detail: `composerChips=${ingredientChips.length} (no composer container)`,
+            };
+          }
+          const containerRect = found.getBoundingClientRect();
+          const nodes = [...found.querySelectorAll('*')]
+            .filter((el) => el !== box.el && !box.el.contains(el))
+            .filter((el) => visible(el, 20, 20))
+            .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+            .filter((item) => item.rect.bottom <= box.rect.top + 6 && item.rect.top >= containerRect.top - 4)
+            .filter((item) => item.rect.width <= 360 && item.rect.height <= 220);
+          const nodeSet = new Set(nodes.map((item) => item.el));
+          const topLevel = nodes.filter((item) => !nodeSet.has(item.el.parentElement));
+          const removeButtons = nodes.filter((item) => /close|remove|xóa|xoa|delete|clear|bỏ|huỷ|huy|cancel/i.test(item.label) && item.el.closest('button, [role="button"]'));
+          const media = nodes.filter((item) => item.el.matches('img, canvas, video, [style*="background-image"]') || /(^|\\s)image(\\s|$)/i.test(item.label));
+          const labels = [...topLevel.map((item) => item.label.slice(0, 80)), ...ingredientChips.map((item) => item.label.slice(0, 80))]
+            .filter((label, index, arr) => label && arr.indexOf(label) === index)
+            .slice(0, 8);
+          const chipCount = Math.max(topLevel.length, ingredientChips.length);
+          return {
+            composer_chip_count: chipCount,
+            composer_chip_remove_count: removeButtons.length,
+            composer_chip_media_count: media.length,
+            composer_chip_labels: labels,
+            composer_chip_detail: `composerChips=${chipCount} chipRemove=${removeButtons.length} chipMedia=${media.length} ingredientChips=${ingredientChips.length}`,
+          };
         }
+    """
 
     def _flow_agent_attachment_ready_count(self, snapshot: Dict[str, Any]) -> int:
         if not isinstance(snapshot, dict):
@@ -21988,8 +22854,14 @@ exit 1
         *,
         timeout_s: float = 20.0,
         accept_stable_ready_after_attach: bool = False,
+        source_file_name: str = "",
     ) -> tuple[bool, str]:
         before = before if isinstance(before, dict) else {}
+        name_tokens = self._flow_agent_source_name_tokens(source_file_name)
+        try:
+            before_chips = max(0, int(before.get("composer_chip_count") or 0))
+        except Exception:
+            before_chips = 0
         before_count = self._flow_agent_attachment_ready_count(before)
         before_labels = self._flow_agent_attachment_label_signature(before)
         before_composer_count = self._flow_agent_attachment_composer_ready_count(before)
@@ -22010,6 +22882,16 @@ exit 1
                 composer_busy_count = int(last_snapshot.get("composer_busy_count") or 0)
             except Exception:
                 composer_busy_count = 0
+            try:
+                current_chips = max(0, int(last_snapshot.get("composer_chip_count") or 0))
+            except Exception:
+                current_chips = 0
+            if current_chips > before_chips and busy_count <= 0 and composer_busy_count <= 0:
+                return True, f"composer chip added {before_chips}->{current_chips}; {last_snapshot.get('detail') or ''}"
+            if name_tokens and busy_count <= 0 and composer_busy_count <= 0:
+                matched_label = self._flow_agent_snapshot_label_matching(last_snapshot, name_tokens)
+                if matched_label:
+                    return True, f"source file visible in agent panel ({matched_label[:60]}); {last_snapshot.get('detail') or ''}"
             if last_snapshot.get("visible") and current_composer_count > 0 and composer_busy_count <= 0:
                 if current_composer_count > before_composer_count:
                     return True, f"composer attachment ready {before_composer_count}->{current_composer_count}; {last_snapshot.get('detail') or ''}"
@@ -22057,104 +22939,715 @@ exit 1
             await asyncio.sleep(0.25)
         return False, f"{last_detail}; no completed uploadImage response in {int(timeout_s)}s"
 
-    async def _attach_flow_agent_source_file(self, page: Any, image_path: str) -> tuple[bool, str]:
-        source = Path(str(image_path or "")).expanduser()
-        if not source.is_file():
-            return False, f"source file missing: {source}"
+    FLOW_AGENT_ADD_CONTROL_JS = """
+        () => {
+          const deepQuery = (selector, root = document, seen = new Set()) => {
+            const found = [];
+            const visit = (node) => {
+              if (!node || seen.has(node)) return;
+              seen.add(node);
+              try {
+                found.push(...node.querySelectorAll(selector));
+                for (const el of node.querySelectorAll('*')) {
+                  if (el.shadowRoot) visit(el.shadowRoot);
+                }
+              } catch (_) {}
+            };
+            visit(root);
+            return found;
+          };
+          const visible = (el, minW = 14, minH = 14) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < minW || rect.height < minH) return false;
+            const style = window.getComputedStyle(el);
+            return style.visibility !== 'hidden'
+              && style.display !== 'none'
+              && style.opacity !== '0'
+              && rect.bottom > 0
+              && rect.top < window.innerHeight
+              && rect.right > 0
+              && rect.left < window.innerWidth;
+          };
+          const labelFor = (el) => [
+            el.textContent || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.getAttribute('data-testid') || '',
+            el.getAttribute('placeholder') || '',
+          ].join(' ').replace(/\\s+/g, ' ').trim();
+          const textboxes = deepQuery('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')
+            .filter((el) => visible(el, 120, 12))
+            .map((el) => {
+              const rect = el.getBoundingClientRect();
+              const label = labelFor(el);
+              const rightPanel = rect.left >= window.innerWidth * 0.35;
+              const agentish = /What\\s+do\\s+you\\s+want|Bạn\\s*muốn|Ban\\s*muon|prompt|create|tạo/i.test(label);
+              const searchish = /search|tìm\\s*kiếm|tim\\s*kiem|editable\\s*text/i.test(label);
+              const score = (rightPanel ? 1000 : 0) + (agentish ? 600 : 0) - (searchish ? 1500 : 0) + rect.bottom / 10;
+              return { el, rect, label, score };
+            })
+            .sort((a, b) => b.score - a.score);
+          const box = textboxes[0] || null;
+          const boxRect = box
+            ? box.rect
+            : { left: window.innerWidth * 0.5, top: window.innerHeight * 0.6, right: window.innerWidth, bottom: window.innerHeight, width: window.innerWidth * 0.5 };
+          // A long prompt makes the editor tens of thousands of px tall; only its visible slice matters.
+          const visTop = Math.max(0, boxRect.top);
+          const visBottom = Math.min(window.innerHeight, boxRect.bottom);
+          const boxMidY = (visTop + visBottom) / 2;
+          const toolbarish = /ingredient|start\\s*generation|arrow_forward|send|gửi|tune|settings/i;
+          let container = null;
+          if (box) {
+            let node = box.el.parentElement;
+            for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
+              const rect = node.getBoundingClientRect();
+              if (rect.height > window.innerHeight * 0.96 || rect.width < 160 || rect.width > window.innerWidth * 0.6) break;
+              const hasToolbar = [...node.querySelectorAll('button, [role="button"]')].some((btn) => toolbarish.test(labelFor(btn)));
+              if (hasToolbar) {
+                container = node;
+                break;
+              }
+            }
+          }
+          const excluded = /send|arrow_forward|arrow_upward|start\\s*generation|gửi|gui\\b|settings|tune|close|history|instruction|article_spark|new\\s*session|edit_square|filter|help|more_vert|account|cancel|delete|remove|xóa|xoa\\b|đóng|dong\\b|clear\\s*prompt/i;
+          const suggestionish = /edit\\s+an?\\s+image|create\\s+a\\s+few|versions?\\s+of|moodboard|storyboard|organi[sz]e|learn\\s+about|brainstorm|develop|show\\s+me|keyboard|shortcut|omni|collections?|generation\\s+costs?/i;
+          const strong = /ingredient|add\\s*media|upload|tải\\s*lên|tai\\s*len|đính\\s*kèm|dinh\\s*kem|thêm\\s*ảnh|them\\s*anh|attach|add_photo|photo_library|hình\\s*ảnh|hinh\\s*anh|nguyên\\s*liệu|nguyen\\s*lieu/i;
+          const iconAdd = /(^|\\s)(\\+|add|add_2|add_circle|add_box|attach_file|attachment|upload|upload_file|photo|image|media)(\\s|$)/i;
+          const candidates = deepQuery('button, [role="button"], label')
+            .filter((el) => visible(el, 14, 14))
+            .map((el) => {
+              const rect = el.getBoundingClientRect();
+              const label = labelFor(el);
+              const midY = (rect.top + rect.bottom) / 2;
+              const compact = rect.width <= 96 && rect.height <= 96;
+              const inContainer = container ? container.contains(el) : rect.top >= window.innerHeight * 0.3;
+              const nearBox = rect.bottom >= visTop - 140
+                && rect.top <= visBottom + 140
+                && rect.right >= boxRect.left - 200
+                && rect.left <= boxRect.right + 60;
+              const leftish = rect.left <= boxRect.left + Math.max(200, boxRect.width * 0.4);
+              const relevant = strong.test(label) || iconAdd.test(label);
+              const distance = Math.min(Math.abs(midY - boxMidY), Math.abs(midY - visBottom), Math.abs(midY - visTop));
+              const score = (inContainer ? 1500 : -1500)
+                + (nearBox ? 1000 : 0)
+                + (strong.test(label) ? 900 : 0)
+                + (iconAdd.test(label) ? 400 : 0)
+                + (leftish ? 150 : 0)
+                - distance / 2
+                - (excluded.test(label) ? 5000 : 0)
+                - (suggestionish.test(label) ? 5000 : 0)
+                - (compact ? 0 : 5000)
+                - (relevant ? 0 : 5000)
+                - (label.length > 140 ? 800 : 0);
+              return { rect, label, score };
+            })
+            .filter((item) => item.score > 500)
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 4)
+            .map((item) => ({
+              x: item.rect.left + item.rect.width / 2,
+              y: item.rect.top + item.rect.height / 2,
+              label: item.label.slice(0, 120),
+              score: Math.round(item.score),
+            }));
+          return {
+            ok: candidates.length > 0,
+            candidates,
+            composer: box ? { x: boxRect.left + boxRect.width / 2, y: boxMidY, label: box.label.slice(0, 80) } : null,
+            detail: candidates.length
+              ? `add control: ${candidates[0].label}`
+              : (box ? `no agent add/upload control near ${box.label.slice(0, 60)}` : 'no agent add/upload control (no composer)'),
+          };
+        }
+    """
 
-        async def _set_any_file_input() -> tuple[bool, str]:
-            for selector in ('input[type="file"][accept*="image"]', 'input[type="file"]'):
-                try:
-                    locator = page.locator(selector)
-                    count = await locator.count()
-                except Exception:
-                    count = 0
-                for index in range(count):
-                    try:
-                        await locator.nth(index).set_input_files(str(source))
-                        await asyncio.sleep(2.0)
-                        return True, f"{selector} #{index + 1}"
-                    except Exception:
-                        continue
-            return False, "no usable file input"
+    FLOW_AGENT_UPLOAD_MENU_JS = """
+        () => {
+          const deepQuery = (selector, root = document, seen = new Set()) => {
+            const found = [];
+            const visit = (node) => {
+              if (!node || seen.has(node)) return;
+              seen.add(node);
+              try {
+                found.push(...node.querySelectorAll(selector));
+                for (const el of node.querySelectorAll('*')) {
+                  if (el.shadowRoot) visit(el.shadowRoot);
+                }
+              } catch (_) {}
+            };
+            visit(root);
+            return found;
+          };
+          const visible = (el, minW = 24, minH = 16) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < minW || rect.height < minH) return false;
+            const style = window.getComputedStyle(el);
+            return style.visibility !== 'hidden'
+              && style.display !== 'none'
+              && style.opacity !== '0'
+              && rect.bottom > 0
+              && rect.top < window.innerHeight;
+          };
+          const labelFor = (el) => [
+            el.textContent || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.getAttribute('data-testid') || '',
+          ].join(' ').replace(/\\s+/g, ' ').trim();
+          const uploadish = /upload|tải\\s*lên|tai\\s*len|từ\\s*máy|tu\\s*may|computer|device|thiết\\s*bị|thiet\\s*bi|browse|choose\\s*file|chọn\\s*tệp|chon\\s*tep|local|file|drive|photos|ảnh|anh\\b|image|media/i;
+          const preferred = /upload|tải\\s*lên|tai\\s*len|computer|device|máy\\s*tính|may\\s*tinh|browse|choose|chọn|chon\\b|local|file/i;
+          const excluded = /close|cancel|đóng|dong\\b|hủy|huy\\b|send|arrow_forward|settings|tune|history|instruction|search|tìm|tim\\s*kiem|edit\\s+an?\\s+image|create\\s+a\\s+few|versions?\\s+of|moodboard|storyboard|organi[sz]e|learn\\s+about|brainstorm|develop|show\\s+me|keyboard|shortcut|omni|collections?|generation\\s+costs?|open\\s+image|editor|add\\s*media\\s*menu/i;
+          const seenKeys = new Set();
+          const items = deepQuery('[role="menuitem"], [role="option"], [role="menu"] button, [role="menu"] [role="button"], [role="listbox"] [role="option"], [role="dialog"] button, li, button, [role="button"], label, a')
+            .filter((el) => visible(el))
+            .map((el) => {
+              const rect = el.getBoundingClientRect();
+              return { rect, label: labelFor(el), role: el.getAttribute('role') || el.tagName.toLowerCase() };
+            })
+            .filter((item) => item.label.length > 0 && item.label.length <= 160)
+            .filter((item) => uploadish.test(item.label) && preferred.test(item.label) && !excluded.test(item.label))
+            .filter((item) => /menuitem|option/.test(item.role) || (item.rect.width <= 240 && item.rect.height <= 64))
+            .filter((item) => /menuitem|option/.test(item.role) || item.rect.top >= window.innerHeight * 0.12)
+            .map((item) => ({
+              ...item,
+              score: (preferred.test(item.label) ? 500 : 0)
+                + (/menuitem|option/.test(item.role) ? 300 : 0)
+                - (item.rect.width > window.innerWidth * 0.6 ? 900 : 0),
+            }))
+            .filter((item) => {
+              const key = `${item.label}|${Math.round(item.rect.left)}|${Math.round(item.rect.top)}`;
+              if (seenKeys.has(key)) return false;
+              seenKeys.add(key);
+              return true;
+            })
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5)
+            .map((item) => ({
+              x: item.rect.left + item.rect.width / 2,
+              y: item.rect.top + item.rect.height / 2,
+              label: item.label.slice(0, 120),
+              role: item.role,
+            }));
+          return { items };
+        }
+    """
 
+    FLOW_AGENT_DROP_FILE_JS = """
+        ({ b64, name, mime, x, y }) => {
+          const deepQuery = (selector, root = document, seen = new Set()) => {
+            const found = [];
+            const visit = (node) => {
+              if (!node || seen.has(node)) return;
+              seen.add(node);
+              try {
+                found.push(...node.querySelectorAll(selector));
+                for (const el of node.querySelectorAll('*')) {
+                  if (el.shadowRoot) visit(el.shadowRoot);
+                }
+              } catch (_) {}
+            };
+            visit(root);
+            return found;
+          };
+          const visible = (el) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 120 || rect.height < 12) return false;
+            const style = window.getComputedStyle(el);
+            return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+          };
+          let target = null;
+          if (x > 0 && y > 0) target = document.elementFromPoint(x, y);
+          if (!target) {
+            const boxes = deepQuery('textarea, [contenteditable="true"], [role="textbox"]')
+              .filter(visible)
+              .sort((a, b) => b.getBoundingClientRect().bottom - a.getBoundingClientRect().bottom);
+            target = boxes[0] || null;
+          }
+          if (!target) return { ok: false, detail: 'no composer for drop' };
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+          const file = new File([bytes], name, { type: mime });
+          const dt = new DataTransfer();
+          dt.items.add(file);
+          const rect = target.getBoundingClientRect();
+          const opts = {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            dataTransfer: dt,
+            clientX: rect.left + rect.width / 2,
+            clientY: rect.top + rect.height / 2,
+          };
+          for (const type of ['dragenter', 'dragover', 'drop']) {
+            target.dispatchEvent(new DragEvent(type, opts));
+          }
+          const label = (target.getAttribute('aria-label') || target.textContent || '').replace(/\\s+/g, ' ').trim();
+          return { ok: true, detail: `${target.tagName.toLowerCase()} ${label.slice(0, 40)}`.trim() };
+        }
+    """
+
+    async def _flow_agent_label_at_point(self, page: Any, x: Any, y: Any) -> str:
+        try:
+            label = await page.evaluate(
+                """
+                ({ x, y }) => {
+                  const el = document.elementFromPoint(x, y);
+                  if (!el) return '';
+                  const control = el.closest('button, [role="button"], [role="option"], [role="menuitem"], a, label') || el;
+                  return [
+                    control.textContent || '',
+                    control.getAttribute('aria-label') || '',
+                    control.getAttribute('title') || '',
+                  ].join(' ').replace(/\\s+/g, ' ').trim().slice(0, 160);
+                }
+                """,
+                {"x": float(x), "y": float(y)},
+            )
+            return str(label or "")
+        except Exception:
+            return ""
+
+    async def _click_flow_agent_point_if(self, page: Any, x: Any, y: Any, pattern: str, what: str) -> tuple[bool, str]:
+        try:
+            px, py = float(x), float(y)
+        except (TypeError, ValueError):
+            return False, f"{what}: invalid point"
+        label = await self._flow_agent_label_at_point(page, px, py)
+        if not re.search(pattern, label or "", flags=re.IGNORECASE):
+            return False, f"{what} moved (found '{label[:50]}' at {int(px)},{int(py)})"
+        try:
+            await page.mouse.click(px, py)
+        except Exception as exc:
+            return False, f"{what} click failed: {humanize_flow_error(str(exc))[:60]}"
+        return True, f"{what} '{label[:50]}'@{int(px)},{int(py)}"
+
+    async def _click_flow_agent_new_session_button(self, page: Any) -> tuple[bool, str]:
         try:
             result = await page.evaluate(
                 """
                 () => {
+                  const deepQuery = (selector, root = document, seen = new Set()) => {
+                    const found = [];
+                    const visit = (node) => {
+                      if (!node || seen.has(node)) return;
+                      seen.add(node);
+                      try {
+                        found.push(...node.querySelectorAll(selector));
+                        for (const el of node.querySelectorAll('*')) {
+                          if (el.shadowRoot) visit(el.shadowRoot);
+                        }
+                      } catch (_) {}
+                    };
+                    visit(root);
+                    return found;
+                  };
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
                     const rect = el.getBoundingClientRect();
-                    if (rect.width < 18 || rect.height < 18) return false;
+                    if (rect.width < 16 || rect.height < 16) return false;
                     const style = window.getComputedStyle(el);
-                    return style.visibility !== 'hidden'
-                      && style.display !== 'none'
-                      && style.opacity !== '0'
-                      && rect.bottom > 0
-                      && rect.top < window.innerHeight;
+                    return style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0' && !el.disabled
+                      && rect.bottom > 0 && rect.top < window.innerHeight;
                   };
                   const labelFor = (el) => [
                     el.textContent || '',
                     el.getAttribute('aria-label') || '',
                     el.getAttribute('title') || '',
-                    el.getAttribute('data-testid') || '',
                   ].join(' ').replace(/\\s+/g, ' ').trim();
-                  const textboxes = [...document.querySelectorAll('textarea, input[type="text"], [contenteditable="true"], [role="textbox"]')]
+                  const target = deepQuery('button, [role="button"]')
                     .filter(visible)
-                    .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
-                    .sort((a, b) => b.rect.bottom - a.rect.bottom);
-                  const box = textboxes.find((item) => /Bạn\\s*muốn|Ban\\s*muon|What\\s+do\\s+you|thay đổi|thay doi|prompt|create/i.test(item.label))
-                    || textboxes[0];
-                  const boxRect = box?.rect || { left: 0, top: window.innerHeight * 0.55, right: window.innerWidth, bottom: window.innerHeight };
-                  const controls = [...document.querySelectorAll('button, [role="button"], label, [aria-label], [data-testid]')]
-                    .filter(visible)
-                    .map((el) => {
-                      const rect = el.getBoundingClientRect();
-                      const label = labelFor(el);
-                      const nearBox = rect.bottom >= boxRect.top - 96 && rect.top <= boxRect.bottom + 96;
-                      const addish = /\\+|add|upload|image|media|ảnh|anh|hình|hinh|thêm|them|add_2|attach|file/i.test(label);
-                      const leftish = rect.right <= boxRect.left + Math.max(180, boxRect.width * 0.32);
-                      const score = (nearBox ? 1000 : 0) + (addish ? 500 : 0) + (leftish ? 120 : 0) - Math.abs((rect.top + rect.bottom) / 2 - (boxRect.top + boxRect.bottom) / 2);
-                      return { el, rect, label, score };
-                    })
-                    .filter((item) => item.score > 400)
-                    .sort((a, b) => b.score - a.score);
-                  const target = controls[0];
-                  if (!target) return { ok: false, detail: 'no agent add/upload control' };
-                  target.el.scrollIntoView({ block: 'center', inline: 'center' });
-                  const rect = target.el.getBoundingClientRect();
+                    .map((el) => ({ rect: el.getBoundingClientRect(), label: labelFor(el) }))
+                    .filter((item) => item.rect.left >= window.innerWidth * 0.35 && item.rect.width <= 96 && item.rect.height <= 96)
+                    .find((item) => /start\\s*new\\s*session|new\\s*session|edit_square|phiên\\s*mới|phien\\s*moi|cuộc\\s*trò\\s*chuyện\\s*mới|cuoc\\s*tro\\s*chuyen\\s*moi/i.test(item.label));
+                  if (!target) return { ok: false, detail: 'no start-new-session button' };
                   return {
                     ok: true,
-                    x: rect.left + rect.width / 2,
-                    y: rect.top + rect.height / 2,
-                    detail: target.label || target.el.outerHTML?.slice(0, 120) || target.el.tagName,
+                    x: target.rect.left + target.rect.width / 2,
+                    y: target.rect.top + target.rect.height / 2,
+                    label: target.label.slice(0, 80),
                   };
                 }
                 """
             )
-        except Exception:
-            result = {}
+        except Exception as exc:
+            return False, humanize_flow_error(str(exc))[:120]
+        if not isinstance(result, dict) or not result.get("ok"):
+            detail = str(result.get("detail") or "") if isinstance(result, dict) else ""
+            return False, detail or "no start-new-session button"
+        clicked, click_detail = await self._click_flow_agent_point_if(
+            page,
+            result.get("x"),
+            result.get("y"),
+            r"new\s*session|edit_square|phiên\s*mới|phien\s*moi|trò\s*chuyện\s*mới|tro\s*chuyen\s*moi",
+            "start-new-session",
+        )
+        if not clicked:
+            return False, click_detail
+        await asyncio.sleep(1.2)
+        return True, click_detail
 
+    def _flow_agent_source_name_tokens(self, source_file_name: str) -> tuple[str, ...]:
+        name = Path(str(source_file_name or "").strip()).name.lower()
+        if not name:
+            return ()
+        tokens = [name]
+        stem = Path(name).stem
+        if len(stem) >= 6 and stem not in tokens:
+            tokens.append(stem)
+        return tuple(tokens)
+
+    FLOW_AGENT_INGREDIENT_PICKER_JS = """
+        ({ tokens }) => {
+          const deepQuery = (selector, root = document, seen = new Set()) => {
+            const found = [];
+            const visit = (node) => {
+              if (!node || seen.has(node)) return;
+              seen.add(node);
+              try {
+                found.push(...node.querySelectorAll(selector));
+                for (const el of node.querySelectorAll('*')) {
+                  if (el.shadowRoot) visit(el.shadowRoot);
+                }
+              } catch (_) {}
+            };
+            visit(root);
+            return found;
+          };
+          const visible = (el, minW = 24, minH = 16) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < minW || rect.height < minH) return false;
+            const style = window.getComputedStyle(el);
+            return style.visibility !== 'hidden'
+              && style.display !== 'none'
+              && style.opacity !== '0'
+              && rect.bottom > 0
+              && rect.top < window.innerHeight;
+          };
+          const labelFor = (el) => [
+            el.textContent || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            ...[...el.querySelectorAll('img')].map((img) => img.getAttribute('alt') || ''),
+          ].join(' ').replace(/\\s+/g, ' ').trim();
+          const selectedState = (el) => {
+            for (const attr of ['aria-selected', 'aria-checked', 'aria-pressed']) {
+              const value = el.getAttribute(attr);
+              if (value === 'true') return true;
+              if (value === 'false') return false;
+            }
+            const inner = el.querySelector('[aria-selected], [aria-checked], [aria-pressed], input[type="checkbox"]');
+            if (inner) {
+              if (inner instanceof HTMLInputElement) return Boolean(inner.checked);
+              for (const attr of ['aria-selected', 'aria-checked', 'aria-pressed']) {
+                const value = inner.getAttribute(attr);
+                if (value === 'true') return true;
+                if (value === 'false') return false;
+              }
+            }
+            const cls = typeof el.className === 'string' ? el.className : '';
+            if (/selected|checked|active/i.test(cls)) return true;
+            return null;
+          };
+          const lowerTokens = (tokens || []).map((token) => String(token || '').toLowerCase()).filter(Boolean);
+          const options = deepQuery('[role="option"], [role="listbox"] button, [role="listbox"] [role="button"], [role="checkbox"], li, button')
+            .filter((el) => visible(el, 60, 24))
+            .map((el) => {
+              const rect = el.getBoundingClientRect();
+              return { el, rect, label: labelFor(el), selected: selectedState(el) };
+            })
+            .filter((item) => item.label.length > 0 && item.label.length <= 240)
+            .filter((item) => lowerTokens.some((token) => item.label.toLowerCase().includes(token)))
+            .filter((item) => !/upload\\s*media|add\\s*to\\s*prompt/i.test(item.label))
+            .sort((a, b) => a.rect.top - b.rect.top);
+          const target = options[0] || null;
+          const addToPrompt = deepQuery('button, [role="button"]')
+            .filter((el) => visible(el, 40, 20))
+            .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+            .find((item) => /add\\s*to\\s*prompt|thêm\\s*vào\\s*(prompt|lệnh|câu)|them\\s*vao|use\\s*in\\s*prompt|insert\\s*into\\s*prompt/i.test(item.label));
+          const center = (rect) => ({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 });
+          const uploading = target ? /uploading|đang\\s*tải|dang\\s*tai|processing|đang\\s*xử|dang\\s*xu/i.test(target.label) : false;
+          const rawState = target
+            ? ['aria-selected', 'aria-checked', 'aria-pressed'].map((attr) => `${attr}=${target.el.getAttribute(attr) || ''}`).join(' ')
+              + ` class=${(typeof target.el.className === 'string' ? target.el.className : '').slice(0, 80)}`
+            : '';
+          return {
+            option: target ? { ...center(target.rect), label: target.label.slice(0, 120), selected: target.selected, uploading, raw_state: rawState } : null,
+            option_count: options.length,
+            add_to_prompt: addToPrompt ? { ...center(addToPrompt.rect), label: addToPrompt.label.slice(0, 80) } : null,
+          };
+        }
+    """
+
+    async def _flow_agent_panel_text(self, page: Any, limit: int = 160) -> str:
+        try:
+            text = await page.evaluate(
+                """
+                () => {
+                  const nodes = [...document.querySelectorAll('aside, section, div')]
+                    .filter((el) => {
+                      const rect = el.getBoundingClientRect();
+                      const style = window.getComputedStyle(el);
+                      return rect.left >= window.innerWidth * 0.6 && rect.width >= 240 && rect.height >= 300
+                        && style.display !== 'none' && style.visibility !== 'hidden';
+                    })
+                    .sort((a, b) => (a.getBoundingClientRect().width * a.getBoundingClientRect().height) - (b.getBoundingClientRect().width * b.getBoundingClientRect().height));
+                  const panel = nodes[0];
+                  return panel ? (panel.innerText || '').replace(/\\s+/g, ' ').slice(0, 400) : '';
+                }
+                """
+            )
+            return str(text or "")[:limit]
+        except Exception:
+            return ""
+
+    async def _flow_agent_debug_step(self, page: Any, tag: str) -> str:
+        if not getattr(self, "_flow_agent_debug_steps", False):
+            return ""
+        shot = await self._capture_flow_agent_debug_screenshot(page, f"step-{tag}")
+        text = await self._flow_agent_panel_text(page, 90)
+        return f"[{tag}: {shot}; panel='{text}']"
+
+    async def _confirm_flow_agent_ingredient_picker(self, page: Any, file_name: str, timeout_s: float = 30.0) -> str:
+        tokens = list(self._flow_agent_source_name_tokens(file_name))
+        if not tokens:
+            return "no file name for ingredient picker"
+        deadline = asyncio.get_running_loop().time() + max(3.0, float(timeout_s or 30.0))
+        state: Dict[str, Any] = {}
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                state = await page.evaluate(self.FLOW_AGENT_INGREDIENT_PICKER_JS, {"tokens": tokens})
+            except Exception as exc:
+                state = {"error": humanize_flow_error(str(exc))[:120]}
+            state = state if isinstance(state, dict) else {}
+            option_state = state.get("option") if isinstance(state.get("option"), dict) else None
+            if option_state and not option_state.get("uploading"):
+                break
+            await asyncio.sleep(0.75)
+        option = state.get("option") if isinstance(state.get("option"), dict) else None
+        add_button = state.get("add_to_prompt") if isinstance(state.get("add_to_prompt"), dict) else None
+        if not option and not add_button:
+            return f"no ingredient picker ({str(state.get('error') or 'no option/add-to-prompt visible')[:80]})"
+        parts: List[str] = []
+        if option:
+            option_label = str(option.get("label") or "uploaded item")[:60]
+            if option.get("uploading"):
+                parts.append(f"still uploading after {int(timeout_s)}s: {option_label}")
+            parts.append(f"state[{str(option.get('raw_state') or '')[:90]}]")
+            if option.get("selected") is True:
+                parts.append(f"already selected {option_label}")
+            else:
+                token_pattern = "|".join(re.escape(token) for token in tokens)
+                _, select_detail = await self._click_flow_agent_point_if(
+                    page,
+                    option.get("x"),
+                    option.get("y"),
+                    token_pattern,
+                    "select option",
+                )
+                parts.append(select_detail)
+                await asyncio.sleep(0.8)
+                parts.append(await self._flow_agent_debug_step(page, "after-select"))
+                add_button = None
+                try:
+                    state = await page.evaluate(self.FLOW_AGENT_INGREDIENT_PICKER_JS, {"tokens": tokens})
+                    state = state if isinstance(state, dict) else {}
+                    add_button = state.get("add_to_prompt") if isinstance(state.get("add_to_prompt"), dict) else None
+                except Exception:
+                    add_button = None
+        else:
+            parts.append("uploaded item not listed in picker")
+        if add_button:
+            _, add_detail = await self._click_flow_agent_point_if(
+                page,
+                add_button.get("x"),
+                add_button.get("y"),
+                r"add\s*to\s*prompt|thêm\s*vào|them\s*vao|use\s*in\s*prompt|insert\s*into\s*prompt",
+                "add-to-prompt",
+            )
+            parts.append(add_detail)
+            await asyncio.sleep(1.2)
+            parts.append(await self._flow_agent_debug_step(page, "after-add-to-prompt"))
+        else:
+            parts.append("no add-to-prompt button (picker closed?)")
+        return "; ".join(part for part in parts if part)
+
+    def _flow_agent_snapshot_label_matching(self, snapshot: Dict[str, Any], tokens: tuple[str, ...]) -> str:
+        if not isinstance(snapshot, dict) or not tokens:
+            return ""
+        for key in ("composer_chip_labels", "composer_ready_labels", "ready_labels"):
+            for label in snapshot.get(key) or []:
+                text = str(label or "").lower()
+                if any(token in text for token in tokens):
+                    return str(label)
+        return ""
+
+    async def _drop_file_on_flow_agent_composer(
+        self,
+        page: Any,
+        source: Path,
+        composer: Dict[str, Any] | None,
+    ) -> tuple[bool, str]:
+        try:
+            payload = base64.b64encode(source.read_bytes()).decode("ascii")
+        except Exception as exc:
+            return False, f"drop skipped: {humanize_flow_error(str(exc))[:80]}"
+        mime = mimetypes.guess_type(source.name)[0] or "image/jpeg"
+        try:
+            x = float((composer or {}).get("x") or 0.0)
+            y = float((composer or {}).get("y") or 0.0)
+        except Exception:
+            x, y = 0.0, 0.0
+        try:
+            result = await page.evaluate(
+                self.FLOW_AGENT_DROP_FILE_JS,
+                {"b64": payload, "name": source.name, "mime": mime, "x": x, "y": y},
+            )
+        except Exception as exc:
+            return False, f"drop failed: {humanize_flow_error(str(exc))[:100]}"
         if isinstance(result, dict) and result.get("ok"):
-            detail = str(result.get("detail") or "agent add/upload control")
+            await asyncio.sleep(2.0)
+            return True, f"synthetic drop on {str(result.get('detail') or 'composer')[:60]}"
+        detail = str(result.get("detail") if isinstance(result, dict) else result or "")
+        return False, f"drop failed: {detail[:100]}"
+
+    async def _attach_flow_agent_source_file(
+        self,
+        page: Any,
+        image_path: str,
+        before_snapshot: Dict[str, Any] | None = None,
+    ) -> tuple[bool, str]:
+        source = Path(str(image_path or "")).expanduser()
+        if not source.is_file():
+            return False, f"source file missing: {source}"
+        attempts: List[str] = []
+
+        async def _set_any_file_input() -> tuple[bool, str]:
+            try:
+                scopes: List[Any] = list(getattr(page, "frames", []) or [])
+            except Exception:
+                scopes = []
+            if not scopes:
+                scopes = [page]
+            for scope in scopes:
+                for selector in ('input[type="file"][accept*="image"]', 'input[type="file"]'):
+                    try:
+                        locator = scope.locator(selector)
+                        count = await locator.count()
+                    except Exception:
+                        count = 0
+                    for index in range(count):
+                        try:
+                            await locator.nth(index).set_input_files(str(source))
+                            await asyncio.sleep(2.0)
+                            attempts.append(await self._flow_agent_debug_step(page, "after-set-input"))
+                            return True, f"{selector} #{index + 1}"
+                        except Exception:
+                            continue
+            return False, "no usable file input"
+
+        async def _click_for_file_chooser(x: Any, y: Any, expected_label: str = "") -> bool:
+            expected = str(expected_label or "").strip()
+            if expected:
+                probe_token = re.escape(expected[:14])
+                actual = await self._flow_agent_label_at_point(page, x, y)
+                if not re.search(probe_token, actual or "", flags=re.IGNORECASE):
+                    attempts.append(f"{expected[:40]} moved (found '{actual[:40]}')")
+                    return False
             try:
                 async with page.expect_file_chooser(timeout=3500) as chooser_info:
-                    await page.mouse.click(float(result.get("x")), float(result.get("y")))
+                    await page.mouse.click(float(x), float(y))
                 chooser = await chooser_info.value
                 await chooser.set_files(str(source))
                 await asyncio.sleep(2.0)
-                return True, f"file chooser via {detail}"
+                attempts.append(await self._flow_agent_debug_step(page, f"chooser-{re.sub(r'[^a-z0-9]+', '-', expected[:16].lower())}"))
+                return True
+            except Exception:
+                attempts.append(await self._flow_agent_debug_step(page, f"nochooser-{re.sub(r'[^a-z0-9]+', '-', expected[:16].lower())}"))
+                return False
+
+        async def _finish(detail: str) -> tuple[bool, str]:
+            step_detail = await self._flow_agent_debug_step(page, "after-upload")
+            picker_detail = await self._confirm_flow_agent_ingredient_picker(page, source.name)
+            tried = f" (earlier clicks: {' | '.join(item for item in attempts[:8] if item)})" if attempts else ""
+            return True, f"{detail}; {step_detail} {picker_detail}{tried}"[:1600]
+
+        # The composer toolbar re-renders for a moment after a long prompt is inserted,
+        # so poll for the add control instead of trusting a single snapshot.
+        lookup_deadline = asyncio.get_running_loop().time() + 10.0
+        result: Dict[str, Any] = {}
+        while True:
+            try:
+                result = await page.evaluate(self.FLOW_AGENT_ADD_CONTROL_JS)
             except Exception as exc:
-                input_ok, input_detail = await _set_any_file_input()
-                if input_ok:
-                    return True, f"{input_detail} after {detail}"
-                return False, f"{detail}: {humanize_flow_error(str(exc))}"
+                result = {"ok": False, "detail": humanize_flow_error(str(exc))[:120]}
+            result = result if isinstance(result, dict) else {}
+            if result.get("candidates") or asyncio.get_running_loop().time() >= lookup_deadline:
+                break
+            await asyncio.sleep(0.75)
+        candidates = [item for item in (result.get("candidates") or []) if isinstance(item, dict)]
+        composer = result.get("composer") if isinstance(result.get("composer"), dict) else None
+
+        for candidate in candidates[:3]:
+            label = str(candidate.get("label") or "add control")[:80]
+            if await _click_for_file_chooser(candidate.get("x"), candidate.get("y"), label):
+                return await _finish(f"file chooser via {label}")
+            attempts.append(f"{label}: no chooser")
+            await asyncio.sleep(0.6)
+            try:
+                menu = await page.evaluate(self.FLOW_AGENT_UPLOAD_MENU_JS)
+            except Exception:
+                menu = {}
+            menu_items = [item for item in ((menu or {}).get("items") or []) if isinstance(item, dict)] if isinstance(menu, dict) else []
+            for item in menu_items[:3]:
+                item_label = str(item.get("label") or "menu item")[:80]
+                if await _click_for_file_chooser(item.get("x"), item.get("y"), item_label):
+                    return await _finish(f"file chooser via {label} > {item_label}")
+                attempts.append(f"menu {item_label}: no chooser")
+            input_ok, input_detail = await _set_any_file_input()
+            if input_ok:
+                return await _finish(f"{input_detail} after {label}")
+            try:
+                await page.keyboard.press("Escape")
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
 
         input_ok, input_detail = await _set_any_file_input()
         if input_ok:
-            return True, input_detail
-        detail = str((result or {}).get("detail") or input_detail) if isinstance(result, dict) else input_detail
-        return False, detail
+            return await _finish(input_detail)
+
+        drop_ok, drop_detail = await self._drop_file_on_flow_agent_composer(page, source, composer)
+        if drop_ok:
+            verified, verify_detail = await self._wait_for_flow_agent_source_attachment(
+                page,
+                before_snapshot or {},
+                timeout_s=8.0,
+                source_file_name=source.name,
+            )
+            if verified:
+                return True, f"{drop_detail}; {verify_detail}"[:400]
+            attempts.append(f"{drop_detail}: no chip after drop")
+            drop_detail = ""
+
+        shot_detail = await self._capture_flow_agent_debug_screenshot(page, "attach-fail")
+        summary = str(result.get("detail") or "no agent add/upload control")
+        parts = [summary, *attempts[:5], input_detail, drop_detail, shot_detail]
+        return False, "; ".join(part for part in parts if part)[:600]
+
+    async def _capture_flow_agent_debug_screenshot(self, page: Any, tag: str) -> str:
+        try:
+            ensure_app_dirs()
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            path = DATA_DIR / f"agent-ui-{tag}-{stamp}.png"
+            await page.screenshot(path=str(path))
+            return f"screenshot={path.name}"
+        except Exception as exc:
+            return f"screenshot failed: {humanize_flow_error(str(exc))[:60]}"
 
     async def _select_flow_edit_target_image(
         self,

@@ -27,20 +27,26 @@ PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('ring_bearer_pillow',
  'notebook',
  'guest_book',
  'bouquet_ribbon',
+ 'christmas_sash',
  'family_halloween_sash',
  'halloween_wreath_sash',
  'wreath_sash',
  'hair_bow',
  'passport_cover',
  'pc_stocks',
+ 'pn_ornament',
  'ornament_round',
+ 'jewelry_box',
  'napkin_set',
+ 'advent_calendar',
  'halloween_bag',
  'drawstring_bag',
+ 'christmas_banner',
  'halloween_banner',
  'banner',
  'birthday_hat',
  'crown',
+ 'christmas_fabric_cross',
  'fabric_cross',
  'christmas_dress_baby',
  'halloween_dress_baby',
@@ -159,6 +165,76 @@ def _halloween_banner_brief(scene: str) -> str:
     )
 
 
+_CHRISTMAS_BANNER_LOCK = (
+    "Keep the original handmade Christmas linen fabric banner 100% unchanged: same small wall-banner silhouette, "
+    "same fabric cut and lower edge shape, same wooden hanging rod, same hanging cord or tie construction, same linen "
+    "material and exact base color, same seams, embroidery motif, readable personalized name or lettering when present, "
+    "embroidery placement, embroidery scale, thread colors, raised hand-stitch texture, linen weave, natural wrinkles, "
+    "proportions, and premium handmade identity. The source image is authoritative for every design detail. Never "
+    "redesign, redraw, simplify, move, resize, recolor, replace, or cover the embroidery; never change the rod, cord, "
+    "fabric, product shape, or physical construction; and never turn the banner into a bag, pillow, book, flag set, "
+    "garment, framed print, machine-embroidered item, or another product. Keep the banner realistically small relative "
+    "to doors, wardrobes, cribs, mantles, shelves, adults, and children. If a personalized name is visible in the source, "
+    "preserve it exactly in every single-product shot; only an explicitly planned colorway shot may use different "
+    "plausible names in the exact same lettering position, scale, stitch style, and thread treatment."
+)
+
+_CHRISTMAS_BANNER_STYLE = (
+    "Overall style for every output: realistic premium Etsy handmade Christmas product photography, true square 1:1 "
+    "composition, bright clear airy white daylight, clean white-balanced natural light, soft natural shadows, tasteful "
+    "refined Christmas and Noel decor, uncluttered styling, sharp product focus, visible linen weave, and unmistakable "
+    "raised hand-embroidered thread with individual stitch direction and fibers. Never use yellow, amber, dark, tungsten, "
+    "or harsh studio lighting; no Halloween props, pumpkins, ghosts, bats, spiders, nylon or plastic-looking fabric, "
+    "machine-flat embroidery, distorted hands, extra fingers, AI defects, random text, logo, or watermark. The only "
+    "permitted added wording is the explicitly requested decor wording Merry Christmas or Happy Christmas in the "
+    "specified shots; never add text onto the product itself."
+)
+
+
+def _christmas_banner_brief(scene: str) -> str:
+    return (
+        "Use the uploaded Christmas Banner reference image as the exact product. Create one separate square 1:1 "
+        f"high-end handmade Etsy Christmas product photo: {scene} {_CHRISTMAS_BANNER_LOCK} "
+        f"{_CHRISTMAS_BANNER_STYLE}"
+    )
+
+
+_CHRISTMAS_SASH_LOCK = (
+    "Keep the original handmade Christmas linen sash 100% unchanged in every image: same two-tail construction, "
+    "same total length, tail width, pointed tail ends, knot size, linen material and source base color, weave, seams, "
+    "edge finish, natural wrinkles, soft drape, embroidery motif, readable source lettering when present, embroidery "
+    "placement and scale, thread colors, raised individual hand stitches, and premium handmade identity. Preserve the "
+    "source left-tail and right-tail layout exactly; never swap the motif and lettering between tails. Never redesign, "
+    "redraw, simplify, move, resize, recolor, replace, cover, print, or machine-embroider the source design. Never turn "
+    "the sash into a bow, scarf, banner, stocking, ribbon roll, bag, pillow, or another product. In every tied scene, use "
+    "one physically plausible soft simple knot, never a decorative bow, and keep both embroidered tails flat, untwisted, "
+    "fully visible, correctly scaled, and unobstructed. Keep the sash realistically small and never enlarge or lengthen "
+    "it relative to a door, wreath, book stack, basket, banister, adult, or child. Only the explicit color-comparison "
+    "images 7 and 11 may vary the linen base color within subtle neutral source-compatible shades; even there, preserve "
+    "the exact source embroidery design, lettering, thread colors, stitch placement, dimensions, and knot construction. "
+    "When tied to a wreath, the sash must be tied at the bottom center "
+    "at the 6 o'clock position, with the knot on the lower rim and both tails hanging completely below the wreath."
+)
+
+_CHRISTMAS_SASH_STYLE = (
+    "Overall style for every output: one separate true square 1:1 realistic premium Etsy handmade Christmas product "
+    "photograph, professional composition, crisp product focus, visible linen weave, and unmistakable raised hand-"
+    "embroidery with individual thread fibers and stitch direction. Follow the requested lighting for each numbered "
+    "scene exactly: bright scenes use clean balanced white daylight or even white studio light, while explicitly warm "
+    "afternoon or evening scenes may use refined warm natural light without muddying the source fabric or thread colors. "
+    "Keep Christmas props tasteful, secondary, and clear of both embroidered tails. No distorted fabric, twisted tails, "
+    "hidden embroidery, printed or machine-flat stitches, malformed hands, extra fingers, AI defects, random text, text "
+    "overlay, logo, or watermark. Only image 6 may be a four-panel 2x2 collage; every other image is one standalone scene."
+)
+
+
+def _christmas_sash_brief(scene: str) -> str:
+    return (
+        "Use the uploaded Christmas Sash reference image as the exact product. Create one separate square 1:1 high-end "
+        f"handmade Etsy Christmas product photo: {scene} {_CHRISTMAS_SASH_LOCK} {_CHRISTMAS_SASH_STYLE}"
+    )
+
+
 _HALLOWEEN_DRESS_BABY_LOCK = (
     "Keep the original handmade baby or toddler dress 100% unchanged: same garment silhouette, neckline, bodice, "
     "sleeves or shoulder ruffles, gathers, skirt volume, hem, pleats, ties if present, seams, stitching, exact linen or "
@@ -249,6 +325,37 @@ def _ornament_round_brief(scene: str) -> str:
     return (
         "Use the uploaded Ornament_Round reference image as the exact product. Create one separate square 1:1 "
         f"high-end handmade Etsy Christmas product photo: {scene} {_ORNAMENT_ROUND_LOCK} {_ORNAMENT_ROUND_STYLE}"
+    )
+
+
+_PN_ORNAMENT_LOCK = (
+    "Keep the original handmade Punch Needle Christmas ornament 100% unchanged: same small ornament silhouette and "
+    "proportions, same wooden hoop or frame and metal clasp or fastener when visible, same linen material and exact base "
+    "color, same hanging cord or ribbon, same natural fabric tension and wrinkles, and the exact source motif. Preserve "
+    "every motif element, readable personalized name when present, placement, scale, spacing, outline, wool-yarn color, "
+    "and thick raised punch-needle loop-pile texture. The embroidery must visibly consist of dense tactile handmade wool "
+    "loops and fibers, never flat floss stitches, machine embroidery, print, paint, applique, or tufted carpet. Never "
+    "redesign, redraw, simplify, move, resize, recolor, replace, mirror, or cover the motif; never alter the frame, clasp, "
+    "hanging construction, linen, or product scale; and never turn the ornament into a large wall hoop, pillow, bag, "
+    "banner, coaster, plaque, stocking, plush, or another product."
+)
+
+_PN_ORNAMENT_STYLE = (
+    "Overall style for every output: one separate true square 1:1 realistic premium Etsy handmade Christmas photograph, "
+    "bright clear airy white-balanced natural daylight, clean whites, soft natural shadows, refined sparse Christmas "
+    "decor, sharp product focus, visible linen weave, and unmistakable thick raised handmade punch-needle wool loops with "
+    "individual yarn fibers. Keep the ornament realistically small. No yellow or dark cast, harsh studio glare, clutter, "
+    "flat embroidery floss, printed or machine-made motif, distorted hands, extra fingers, impossible needle position, "
+    "misspelled names, random text, text overlay, logo, watermark, or AI defects. Only images 8 and 14 may be four-panel "
+    "collages; every other output must be one standalone scene. The only permitted added prop wording is Merry "
+    "Christmas on the separate greeting card in image 5; never add wording to the ornament itself."
+)
+
+
+def _pn_ornament_brief(scene: str) -> str:
+    return (
+        "Use the uploaded PN Ornament reference image as the exact product. Create one separate square 1:1 high-end "
+        f"handmade Etsy Christmas product photo: {scene} {_PN_ORNAMENT_LOCK} {_PN_ORNAMENT_STYLE}"
     )
 
 
@@ -359,6 +466,51 @@ def _christmas_album_brief(scene: str) -> str:
     )
 
 
+_JEWELRY_BOX_COLLECTION_LOCK = (
+    "Treat every jewelry box visible in the uploaded reference as one member of a fixed collection. Every output must "
+    "show the complete source collection together, preserving each box's identity and its one-to-one association with "
+    "its own embroidery design. Keep every box 100% unchanged: same small rounded-rectangle proportions, thickness, "
+    "silver metal frame, hinge and front clasp positions, white linen cover, woven texture, edge finish, and exact "
+    "hand-embroidered design. Preserve every source flower, leaf, mushroom, stem, berry, letter, name, shape, count, "
+    "orientation, spacing, stitch direction, raised thread texture, placement, scale, and thread color. Never mix parts "
+    "between boxes, omit a source design, make every box use one repeated motif, invent a similar motif, redraw, simplify, "
+    "mirror, move, resize, recolor, print, machine-embroider, or cover the source designs. A foreground box may receive "
+    "extra emphasis, but all remaining source designs must still be identifiable in the same frame. Only the explicit "
+    "nine-name personalization shot may duplicate complete unmodified source motifs when more boxes are needed; it must "
+    "still include every distinct source design at least once. In that shot use exactly Anita, Mom, Alice, Maria, Chloe, "
+    "Jessie, Crystal, Eloise, and Jenna, one correctly spelled hand-embroidered name per box, changing only the name in "
+    "the source lettering position and never shifting or shrinking the decorative motif."
+)
+
+_JEWELRY_BOX_TWO_COMPARTMENT_LOCK = (
+    "Whenever any product box is open, its base must have exactly two shallow side-by-side rectangular compartments and "
+    "nothing else: one single straight divider running continuously from the front wall to the back wall, producing one "
+    "left compartment and one right compartment of nearly equal size. Each compartment is one uninterrupted open space "
+    "lined in light cream or pale beige fabric. The inside lid is one plain flat clean fabric-lined surface. Never add a "
+    "third or fourth compartment, cross divider, subdivision, drawer, tier, removable tray, ring roll, ring pillow, ring "
+    "slot, necklace hook, lid pocket, retaining strap, mirror, or interior embroidery. Jewelry rests loose and naturally "
+    "inside the two open compartments. Frame the scene so the single divider and both complete compartments are clearly "
+    "visible."
+)
+
+_JEWELRY_BOX_STYLE = (
+    "Overall style for every output: one separate true square 1:1 realistic premium Etsy handmade product photograph, "
+    "professional composition, bright clear airy white-balanced natural daylight, clean whites, soft natural shadows, "
+    "accurate silver metal and thread colors, visible linen weave, and unmistakable raised hand stitches. Keep wedding, "
+    "vanity, gift, and craft props refined, sparse, and secondary. No yellow or amber cast, dark scene, harsh studio glare, "
+    "clutter, oversized boxes, gold frames, plastic-looking linen, flat machine embroidery, malformed hands, extra "
+    "fingers, misspelled names, digital text, random text, logo, watermark, or AI artifacts."
+)
+
+
+def _jewelry_box_brief(scene: str) -> str:
+    return (
+        "Use the uploaded personalized hand-embroidered linen Jewelry Box collection as the exact product reference. "
+        f"Create one separate square 1:1 high-end handmade Etsy product photo: {scene} "
+        f"{_JEWELRY_BOX_COLLECTION_LOCK} {_JEWELRY_BOX_TWO_COMPARTMENT_LOCK} {_JEWELRY_BOX_STYLE}"
+    )
+
+
 _NAPKIN_SET_LOCK = (
     "Keep the original set of exactly six handmade white linen dinner napkins 100% unchanged: same square napkin "
     "dimensions and proportions, white natural linen color, woven linen texture, thickness, hems, edge stitching, "
@@ -383,6 +535,72 @@ def _napkin_set_brief(scene: str) -> str:
     return (
         "Use the uploaded Napkin Set reference image as the exact product. Create one separate square 1:1 high-end "
         f"handmade Etsy autumn product photo: {scene} {_NAPKIN_SET_LOCK} {_NAPKIN_SET_STYLE}"
+    )
+
+
+_ADVENT_CALENDAR_LOCK = (
+    "Keep the original handmade linen Christmas wall-hanging advent countdown calendar 100% unchanged: same tall "
+    "rectangular silhouette and proportions, exact fabric color and linen weave, thickness, seams, hems, natural "
+    "wrinkles, top wooden dowel, dowel length, hanging cord, knots, and attachment construction. Preserve the exact "
+    "source pocket count, row count, column count, pocket dimensions, spacing, borders, stitching, and placement. "
+    "Preserve every visible pocket number in its exact source order and position with no missing, duplicated, swapped, "
+    "invented, or reordered number. Preserve any personalized name, phrase, lettering style, Christmas motif, icon, "
+    "thread color, stitch direction, raised hand-stitch texture, placement, scale, and spacing exactly as the source. "
+    "Do not combine designs from other reference calendars. The selected source image is the only authoritative design. "
+    "Small gifts may protrude slightly from pockets only when the shot requires them, but they must never cover a number "
+    "or embroidery. Never turn the product into a generic banner, printed poster, paper calendar, organizer, or bag."
+)
+
+_ADVENT_CALENDAR_STYLE = (
+    "Overall style for every output: one separate true square 1:1 realistic premium Etsy handmade Christmas product "
+    "photograph, professionally composed in bright clear airy white-balanced natural daylight with clean whites, soft "
+    "natural shadows, accurate fabric and thread colors, visible linen weave, crisp pocket seams, and unmistakable "
+    "raised hand embroidery rather than print or machine-flat stitching. Fit the complete tall calendar inside the square "
+    "frame with breathing room; never crop the cord, dowel, fabric edges, or final pocket row, and never stretch, widen, "
+    "shorten, distort, or enlarge it unnaturally. Christmas props remain sparse and secondary. No yellow or amber cast, "
+    "dark scene, harsh studio glare, clutter, plastic-looking fabric, malformed hands, extra fingers, misspelled text, "
+    "random text, logo, watermark, UI, or AI artifacts. Only the explicitly requested four-panel detail image may be a "
+    "collage; every other output is one standalone scene. Only image 6 may be a four-panel collage; images 1-5 and "
+    "7-12 must each remain one standalone photograph."
+)
+
+
+def _advent_calendar_brief(scene: str) -> str:
+    return (
+        "Use the uploaded Advent Calendar reference image as the exact and only product reference. Create one separate "
+        f"square 1:1 high-end handmade Etsy Christmas product photo: {scene} "
+        f"{_ADVENT_CALENDAR_LOCK} {_ADVENT_CALENDAR_STYLE}"
+    )
+
+
+_CHRISTMAS_FABRIC_CROSS_LOCK = (
+    "Keep the original soft handmade Christmas fabric cross 100% unchanged: same exact cross silhouette, arm width, "
+    "height-to-width ratio, thickness, soft volume, size, proportions, fabric material and base color, linen weave, "
+    "edge seams, natural wrinkles, embroidery motif, personalized text if present, thread colors, stitch direction, "
+    "raised hand-stitch texture, embroidery placement and scale, hanging cord or ribbon material, loop length, and loop "
+    "attachment position. Never redraw, simplify, mirror, recolor, move, enlarge, hide, print, or machine-embroider the "
+    "source design, and never turn the cross into a pillow, plush toy, ornament of another shape, wooden cross, metal "
+    "cross, wreath, banner, or mass-produced object. Only the surrounding scene and explicitly requested fabric-color "
+    "variants may change."
+)
+
+_CHRISTMAS_FABRIC_CROSS_STYLE = (
+    "Overall style for every output: one separate true square 1:1 premium Etsy handmade Christmas product photograph, "
+    "professional editorial composition, clear airy bright white-balanced natural daylight, clean whites, soft natural "
+    "shadows, accurate fabric and thread colors, visible linen fibers, crisp seams, and tack-sharp raised hand embroidery. "
+    "Use refined restrained Christmas props that remain secondary and never obscure the cross. No yellow, amber, orange, "
+    "golden-hour, tungsten, sepia, beige, or warm color cast; no harsh studio glare, dark scene, clutter, plastic-looking "
+    "fabric, altered embroidery, mass-produced appearance, malformed hands or bodies, extra fingers, random text, logo, "
+    "watermark, UI, blur, or AI artifacts. Only image 7 may be one four-panel 2x2 process collage; images 1-6 and 8-12 "
+    "must each remain one standalone photograph."
+)
+
+
+def _christmas_fabric_cross_brief(scene: str) -> str:
+    return (
+        "Use the uploaded Christmas Fabric Cross reference image as the exact and only product reference. Create one "
+        f"separate square 1:1 high-end handmade Etsy Christmas product photo: {scene} "
+        f"{_CHRISTMAS_FABRIC_CROSS_LOCK} {_CHRISTMAS_FABRIC_CROSS_STYLE}"
     )
 
 
@@ -6514,6 +6732,166 @@ PRODUCT_SHOT_RULES["notebook"] = {
 }
 
 
+PRODUCT_SHOT_RULES["christmas_sash"] = {
+    "display_name": "Christmas Sash",
+    "aliases": (
+        "Christmas Sash",
+        "christmas sash",
+        "Christmas Wreath Sash",
+        "christmas wreath sash",
+        "Christmas Linen Sash",
+        "christmas linen sash",
+        "Embroidered Christmas Sash",
+        "embroidered christmas sash",
+        "Noel Sash",
+        "noel sash",
+        "Xmas Sash",
+        "xmas sash",
+    ),
+    "target_count": 12,
+    "lock": _CHRISTMAS_SASH_LOCK,
+    "shots": (
+        (
+            "Wreath close-up",
+            "Close front view of sash tied below evergreen wreath",
+            _christmas_sash_brief(
+                "tie the exact sash at the bottom center, exactly at 6 o'clock, of a fresh green evergreen wreath "
+                "decorated with red berries and dried orange slices. Preserve the source orientation with the motif tail "
+                "on the left and the lettering tail on the right, and keep both complete tails hanging below the wreath. "
+                "Hide a few small bronze baubles within the greenery without letting them touch the sash. Shoot a tight "
+                "straight-on close-up in refined warm afternoon sunlight, with tack-sharp focus on the raised embroidery."
+            ),
+        ),
+        (
+            "Gift presentation",
+            "Sash folded in open cream gift box",
+            _christmas_sash_brief(
+                "fold the exact sash neatly inside an open cream gift box lined with white tissue paper, placing both "
+                "embroidered tails side by side and face-up so the complete motif and source lettering are clearly "
+                "readable. Curl a loose red tartan ribbon around the box and add one small evergreen sprig plus one "
+                "cinnamon stick at a corner. Shoot an overhead unboxing composition on a light neutral surface in soft "
+                "bright daylight, conveying a premium handmade Christmas gift."
+            ),
+        ),
+        (
+            "Staircase lifestyle",
+            "Sash tied around dark wooden banister",
+            _christmas_sash_brief(
+                "tie the exact sash in a soft simple knot around a dark wooden staircase banister post, with both full "
+                "embroidered tails draping naturally down along the railing. Shoot from a slight angle looking along the "
+                "staircase with deep background blur. Decorate the railing with an evergreen garland, red baubles, and "
+                "restrained warm string lights. Use a cozy warm indoor late-afternoon atmosphere while keeping the knot, "
+                "linen color, and raised embroidery sharply focused."
+            ),
+        ),
+        (
+            "Front door lifestyle",
+            "Christmas wreath sash on decorated front door",
+            _christmas_sash_brief(
+                "create a wide straight-on winter front-door scene with one very small evergreen wreath mounted flat at "
+                "the center of the entrance door using a hidden hook. Tie the exact small sash at the wreath's bottom "
+                "center at 6 o'clock, with both tails hanging flat against the door and fully visible below the wreath. "
+                "The sash must remain short, narrow, and realistically small, never oversized or overlong. Style the steps with stacked "
+                "kraft-paper gifts, one small wooden sled, a candle lantern, and two mini potted evergreens. Use crisp "
+                "clear winter daylight, keep the sash as the visual center, and prevent every prop from covering either "
+                "embroidered tail."
+            ),
+        ),
+        (
+            "Handmade flat lay",
+            "Knotted sash lying on light wooden table",
+            _christmas_sash_brief(
+                "tie the exact sash in the same soft simple knot shown by the source and lay it flat at the center of a "
+                "light wooden table, with both complete embroidered tails face-up, untwisted, and fully readable. Shoot "
+                "top-down at exactly 90 degrees in bright even white studio light. Balance the edges with one evergreen "
+                "sprig, a few small baubles, and restrained Christmas decorations without covering either embroidered tail."
+            ),
+        ),
+        (
+            "Detail grid",
+            "Four-panel embroidery linen hem and wreath-knot details",
+            _christmas_sash_brief(
+                "create one square 2x2 macro collage containing exactly four panels: panels one and two show two different "
+                "close sections of the exact raised hand-embroidery stitches on the white linen, including individual "
+                "thread fibers, stitch direction, original colors, and exact motif details; panel three shows the pointed "
+                "sash-tail hem and edge stitching; panel four shows the realistic fabric knot "
+                "wrapped around the bottom rim of an evergreen wreath. Use soft natural light and ultra-high sharpness "
+                "to emphasize authentic hand craftsmanship. This is the only collage in the set."
+            ),
+        ),
+        (
+            "Three-color comparison",
+            "Three neutral linen sash colorways in flat lay",
+            _christmas_sash_brief(
+                "arrange exactly three identical sashes diagonally across a neutral-toned wooden table, each made in a "
+                "different subtle neutral linen base color while preserving the same exact physical construction, knot "
+                "style, embroidery design, source lettering, embroidery placement, thread colors, pointed ends, and "
+                "dimensions. Shoot top-down as one flat-lay scene in bright even white studio light. Scatter a few pine "
+                "cones, red berries, and restrained Christmas decorations around the edges without covering any tail."
+            ),
+        ),
+        (
+            "Book stack lifestyle",
+            "Sash draped over vintage books by winter window",
+            _christmas_sash_brief(
+                "drape the exact sash diagonally over a stack of three vintage hardback books in brown and deep green "
+                "beside a window, with both embroidered tails flowing toward the foreground. Place a steaming cup of "
+                "cocoa softly blurred behind it, thin-frame reading glasses, and one candy cane on the books. Shoot from "
+                "45 degrees overhead with shallow depth of field toward the window in clear warm slanting winter morning "
+                "sunlight. Steam must remain subtle and never obscure the sash; the embroidery is the sharpest detail."
+            ),
+        ),
+        (
+            "Door-handle lifestyle",
+            "Sash tied to antique brass door handle",
+            _christmas_sash_brief(
+                "tie the exact sash in a soft simple knot around an antique brass handle on a dark moss-green painted "
+                "wooden door. Keep both embroidered tails flat, untwisted, and hanging straight against the door along "
+                "the right third of the composition. Tuck one small mistletoe sprig above the knot without covering it. "
+                "Shoot at eye level, nearly straight-on with a slight 15-degree angle, in gentle indoor daylight with a "
+                "subtle highlight on the brass and crisp focus on both embroidered tails."
+            ),
+        ),
+        (
+            "Gift basket lifestyle",
+            "Small sash tied to gift basket beside child",
+            _christmas_sash_brief(
+                "tie the exact small sash in a simple knot around the handle of a Christmas gift basket placed on the "
+                "floor, with both embroidered tails hanging fully visible down the basket side. Show a child seated "
+                "beside the basket naturally reaching one hand toward it without touching or covering the sash. Place a "
+                "warm-lit Christmas tree softly blurred in the background of a festive room. Shoot straight-on in clean "
+                "white studio-balanced light across the full image, with natural anatomy and sharp sash embroidery."
+            ),
+        ),
+        (
+            "Two-color comparison",
+            "Two neutral linen sash colorways on wooden table",
+            _christmas_sash_brief(
+                "place exactly two identical sashes diagonally on a wooden table using two different neutral linen base "
+                "colors drawn from the source palette. Preserve the same exact design, source lettering, thread colors, "
+                "embroidery placement, construction, proportions, pointed ends, and simple knot style on both. Shoot "
+                "from a 45-degree overhead angle in bright even white studio light. Scatter pine cones, red berries, and "
+                "small Christmas decorations around the edges without covering either embroidered tail."
+            ),
+        ),
+        (
+            "Hand embroidery process",
+            "Artisan hand-stitching exact Christmas sash motif",
+            _christmas_sash_brief(
+                "show a close 45-degree over-the-shoulder view of an artisan's anatomically natural hands hand-stitching "
+                "the exact source Christmas motif onto matching sash linen stretched in a round wooden embroidery hoop. "
+                "One hand supports the hoop and the other holds a realistic sewing needle at the true stitch position; "
+                "the needle eye is visibly threaded and the thread color exactly matches the motif section being worked. "
+                "Every completed portion must match the source motif, placement, scale, stitch direction, and original "
+                "thread colors. Arrange red, evergreen-green, and bronze-gold thread spools, small embroidery scissors, "
+                "and spare linen on the wooden table. Use clean white studio light and shallow depth of field while keeping "
+                "the hand embroidery and needle contact point sharply focused."
+            ),
+        ),
+    ),
+}
+
+
 PRODUCT_SHOT_RULES["family_halloween_sash"] = {
     "display_name": "Family Halloween Sash",
     "aliases": (
@@ -6925,6 +7303,531 @@ PRODUCT_SHOT_RULES["wreath_sash"] = {
 }
 
 
+PRODUCT_SHOT_RULES["christmas_banner"] = {
+    "display_name": "Christmas Banner",
+    "aliases": (
+        "Christmas Banner",
+        "christmas banner",
+        "Christmas Fabric Banner",
+        "christmas fabric banner",
+        "Christmas Babric Banner",
+        "christmas babric banner",
+        "Christmas Linen Banner",
+        "christmas linen banner",
+        "Christmas Embroidered Banner",
+        "christmas embroidered banner",
+        "Christmas Wall Banner",
+        "christmas wall banner",
+        "Christmas Wall Hanging",
+        "christmas wall hanging",
+        "Christmas Pennant",
+        "christmas pennant",
+        "Noel Banner",
+        "noel banner",
+        "Xmas Banner",
+        "xmas banner",
+        "banner christmas",
+        "fabric banner christmas",
+        "linen banner christmas",
+    ),
+    "target_count": 13,
+    "allow_planned_multi_panel_shots": True,
+    "allow_planned_prop_text": True,
+    "lock": (
+        "the main product must remain the exact same small handmade Christmas linen fabric wall banner from the source "
+        "image, with the same banner silhouette, lower edge shape, wooden rod, hanging cord, fabric material and color, "
+        "seams, embroidery motif and readable source lettering, embroidery placement and scale, thread colors, raised "
+        "hand-stitch texture, linen weave, natural wrinkles, proportions, and premium handmade identity; never redesign "
+        "the embroidery, change its physical construction, enlarge it unnaturally, or turn it into another product"
+    ),
+    "shots": (
+        (
+            "Door hook lifestyle",
+            "Small banner hanging from child-room door hook",
+            _christmas_banner_brief(
+                "hang the exact banner naturally from a clearly visible hook on a child-room door. Frame the complete "
+                "product and part of the door from a 20-30 degree angle, close enough to prioritize the product. Use soft "
+                "clean white daylight with no yellow cast. Hang one tasteful Merry Christmas garland above it; inside the "
+                "room show a small fresh Christmas tree and a few wrapped gifts softly blurred. Keep the banner "
+                "realistically small relative to the door and preserve its complete rod, cord, shape, source embroidery, "
+                "readable source lettering, and handmade linen texture."
+            ),
+        ),
+        (
+            "Nursery crib wall",
+            "Small banner centered above Christmas-decorated crib",
+            _christmas_banner_brief(
+                "hang the exact banner from a small visible wooden wall hook at the center above a baby crib. Photograph "
+                "straight-on or from a 30-degree front angle with close product-focused framing and bright even natural "
+                "white light across the banner and crib bedding. Add a restrained Merry Christmas garland above the "
+                "banner, one small reindeer cushion, one cute gnome, and refined nursery Christmas decor. The banner must "
+                "look very small relative to the crib and must never be enlarged."
+            ),
+        ),
+        (
+            "Entryway lifestyle",
+            "Small banner above white or gray wood console",
+            _christmas_banner_brief(
+                "hang the exact small banner from a visible wall hook in a home entryway above a compact white or gray "
+                "wood-grain console. Shoot from a 45-60 degree angle, close enough to prioritize the banner while showing "
+                "realistic use. Use clean natural white light without yellow cast. Style the console with one vase of "
+                "fresh evergreen branches or one tiny fresh Christmas tree, one white candle, and a few small gnomes. "
+                "Keep the banner realistically small relative to the entryway."
+            ),
+        ),
+        (
+            "Christmas mantle",
+            "Small banner above or on bright fireplace mantle",
+            _christmas_banner_brief(
+                "hang the exact banner from a visible hook above or on the front of a fireplace mantle as the clear main "
+                "subject. Shoot straight-on or from a gentle three-quarter angle in bright white-balanced daylight with "
+                "no yellow cast. Add a thin evergreen garland, a Merry Christmas bunting, a few miniature Christmas "
+                "stockings, and several pine cones in a balanced uncluttered arrangement. Keep the banner physically "
+                "small, close enough to inspect, fully visible, and never enlarged."
+            ),
+        ),
+        (
+            "Colorway flat lay",
+            "Three or four personalized Christmas banner colorways",
+            _christmas_banner_brief(
+                "create a 90-degree flat lay of three or four banners of the exact same source style arranged in a clean "
+                "row or fan. If personalized names are visibly part of the source design, use different plausible names "
+                "while preserving the exact lettering position, scale, stitch style, motif, thread colors, rod, cord, "
+                "seams, and shape. Only the linen base color may differ. Use even white daylight and add fresh evergreen "
+                "sprigs with small pine cones and a few dried orange slices only around the frame edges."
+            ),
+        ),
+        (
+            "Detail collage",
+            "Four-panel embroidery rod and hanging-cord details",
+            _christmas_banner_brief(
+                "create one square 2x2 collage containing exactly four macro photographs of the same source banner: one "
+                "close detail of the raised hand embroidery, a second close detail of another embroidered section or "
+                "readable source lettering, a close detail of the wooden hanging rod and top seam, and a close detail of "
+                "the hanging-cord attachment. Match the source exactly and clearly show genuine hand-stitched thread "
+                "relief, individual stitch direction, and linen fibers, never printing or machine-flat embroidery."
+            ),
+        ),
+        (
+            "Christmas tabletop",
+            "Banner flat on white wood with card evergreen and gnome",
+            _christmas_banner_brief(
+                "lay the exact banner flat on a white wood-grain table with the complete rod and hanging cord neatly "
+                "visible. Shoot top-down at 90 degrees in bright clean white daylight with no yellow cast. Add two fresh "
+                "evergreen sprigs with pine cones, one elegant Merry Christmas card, and one small cute gnome, leaving "
+                "generous negative space and never covering the source embroidery or lettering."
+            ),
+        ),
+        (
+            "Bright shelf mantle",
+            "Banner above light shelf with evergreen vase plush Santa and candy",
+            _christmas_banner_brief(
+                "hang the exact banner from a visible hook above a light wooden shelf or mini mantle while keeping it at "
+                "the center of the composition. Shoot straight-on or at a slight 15-degree angle in bright white light "
+                "that also illuminates the decor below. Style the shelf with one vase of fresh evergreen branches, one "
+                "small plush Santa Claus figure, and one plate of colorful Christmas candy. Keep every prop secondary, "
+                "use Christmas decor only with no pumpkins or ghosts, and preserve crisp raised hand stitches and the "
+                "exact source design."
+            ),
+        ),
+        (
+            "Hand-held display",
+            "Two hands holding banner before elegant Christmas tree",
+            _christmas_banner_brief(
+                "show two anatomically natural adult hands holding the hanging cord so the exact banner floats naturally "
+                "in a Christmas-decorated room. Use a straight-on close-medium composition and soft white light with no "
+                "yellow cast. Behind it place an elegant fresh Christmas tree and softly blurred wrapped gifts. Keep the "
+                "banner sharply prominent; hands must not cover the rod, product shape, embroidery, or source lettering."
+            ),
+        ),
+        (
+            "Gift presentation",
+            "Banner beside open gift box and Happy Christmas tag",
+            _christmas_banner_brief(
+                "place the exact banner beside an open premium gift box or Christmas-patterned wrapping paper with the "
+                "personalized name and embroidery facing the camera. Shoot from 45 degrees overhead in bright high-key "
+                "white light. Add one thin deep-red or forest-green ribbon, one small tag bearing the exact words Happy "
+                "Christmas, and one evergreen sprig. Do not add any other readable text, and keep the complete banner, "
+                "rod, cord, source lettering, and embroidery unobstructed."
+            ),
+        ),
+        (
+            "Hand embroidery process",
+            "Woman hand-stitching the exact banner motif",
+            _christmas_banner_brief(
+                "show a woman seated at a clean handmade craft table, one natural hand holding a round embroidery hoop "
+                "and the other carefully hand-stitching the exact source motif onto linen matching the banner fabric "
+                "color. Use a realistically threaded needle contacting the correct stitch position. Place small scissors, "
+                "matching thread skeins, folded linen, and the completed source banner nearby. Use beautiful white window "
+                "light and restrained Christmas workshop decor; hands and needle placement must be anatomically correct."
+            ),
+        ),
+        (
+            "Baby lifestyle",
+            "Baby seated on floor holding small Christmas banner",
+            _christmas_banner_brief(
+                "preserve the banner design exactly and show a baby seated naturally on the floor holding the exact small "
+                "banner with its embroidered front facing the camera. Shoot straight-on in a close-medium composition "
+                "with soft white light and no yellow cast in a beautifully decorated Christmas room. The banner must "
+                "remain small relative to the baby, must not cover the child, and must retain its rod, cord, source "
+                "lettering, exact motif, proportions, and clearly raised hand-embroidered texture."
+            ),
+        ),
+        (
+            "Wardrobe or room door",
+            "Small banner below a miniature Christmas wreath",
+            _christmas_banner_brief(
+                "hang the exact banner naturally from a visible hook on a wardrobe door or room door, directly below a "
+                "small Christmas wreath. Shoot nearly straight-on in even clean white daylight. Add elegant eye-catching "
+                "Christmas decor around the doorway without clutter or yellow light. Keep the complete cord, wooden rod, "
+                "product shape, embroidery, and source lettering unobstructed, and keep the banner realistically small "
+                "relative to the door or wardrobe."
+            ),
+        ),
+    ),
+}
+
+
+PRODUCT_SHOT_RULES["pn_ornament"] = {
+    "display_name": "PN Ornament",
+    "aliases": (
+        "PN Ornament",
+        "PN Ornaments",
+        "Punch Needle Ornament",
+        "Punch Needle Ornaments",
+        "Punch Needle Christmas Ornament",
+        "Christmas Punch Needle Ornament",
+        "Punch Needle Linen Ornament",
+        "Embroidered Punch Needle Ornament",
+        "PN Christmas Ornament",
+        "PN Xmas Ornament",
+        "ornament punch needle",
+        "ornament pn",
+        "do treo punch needle",
+    ),
+    "target_count": 14,
+    "lock": (
+        "the main product must remain the exact same small handmade Christmas linen Punch Needle ornament from the "
+        "source, preserving its silhouette, frame, metal clasp, hanging cord, linen, motif, colors, placement, scale, "
+        "and visibly thick raised handmade wool loop-pile texture; never substitute ordinary flat hand embroidery, "
+        "machine embroidery, print, paint, or a different ornament construction"
+    ),
+    "shots": (
+        (
+            "White wood flat lay",
+            "Punch Needle ornament on white wood table with pine branch",
+            _pn_ornament_brief(
+                "lay the exact ornament flat at the center of a white wood-grain tabletop, with its hanging cord curving "
+                "naturally to one side. Shoot top-down at exactly 90 degrees in even white overhead daylight. Place one "
+                "small evergreen branch in the lower-left or lower-right corner, several white wooden snowflakes, and a "
+                "restrained strand of softly blurred warm fairy lights. Keep the composition airy and make the thick "
+                "raised punch-needle wool loops and individual yarn fibers unmistakable."
+            ),
+        ),
+        (
+            "Christmas tree branch",
+            "Punch Needle ornament hanging at center of evergreen branch",
+            _pn_ornament_brief(
+                "hang the exact ornament at the center of a fresh Christmas tree branch, clearly separated from the pine "
+                "needles. Shoot at ornament height from a 30-45 degree angle in soft white-balanced daylight. Add a few "
+                "baubles and softly blurred fairy lights behind it without yellowing the linen or hiding the hanging cord, "
+                "frame, clasp, motif, or tactile punch-needle loops."
+            ),
+        ),
+        (
+            "Gift box",
+            "Punch Needle ornament in open Christmas gift box",
+            _pn_ornament_brief(
+                "place the exact ornament inside one open Christmas-toned gift box lined with clean tissue paper. Shoot "
+                "from 35-45 degrees in bright clean luxurious white daylight. Add deep red or champagne ribbon, small pine "
+                "sprigs, dried orange slices, cinnamon, and softly blurred gift boxes behind. Keep the complete frame, "
+                "clasp, cord, linen face, and raised punch-needle motif uncovered."
+            ),
+        ),
+        (
+            "Minimal Christmas table",
+            "Punch Needle ornament with low candles and pastel baubles",
+            _pn_ornament_brief(
+                "place the exact ornament lying flat or standing securely at the center of a minimal Christmas tabletop. "
+                "Shoot from a frontal 45-degree angle in soft even white light, never candle-yellow. Style with two low "
+                "neutral candles, a few small pinecones, pastel matte baubles, and one evergreen sprig. Keep every prop "
+                "secondary and the thick handmade punch-needle loop texture crisp."
+            ),
+        ),
+        (
+            "Christmas card flat lay",
+            "Punch Needle ornament beside neutral Merry Christmas card",
+            _pn_ornament_brief(
+                "place the exact ornament as the focal point beside one neutral greeting card whose only readable prop "
+                "text is Merry Christmas, on a white wood-grain tabletop. Shoot top-down from 75-90 degrees in clean even "
+                "white daylight. Add a thin ribbon, one small gnome, and one small evergreen branch in the upper-left "
+                "corner. Keep the card separate and never cover the ornament or add other wording."
+            ),
+        ),
+        (
+            "Baby clothing shelf",
+            "Punch Needle ornament beside folded baby outfits near window",
+            _pn_ornament_brief(
+                "place the exact ornament on a white wood-grain shelf or tabletop beside several neatly folded baby "
+                "outfits near a bright window. Shoot top-down or at 45 degrees in soft clear white daylight. Use a softly "
+                "blurred Christmas background with one small gnome teddy, a Christmas stocking, and a tiny reindeer figure. "
+                "Keep the ornament small relative to the clothes and preserve its tactile punch-needle motif."
+            ),
+        ),
+        (
+            "Punch Needle process",
+            "Woman punch-needling exact ornament motif in round hoop",
+            _pn_ornament_brief(
+                "show a woman seated at a clean handmade craft table, carefully creating the exact source motif on linen "
+                "matching the ornament color inside a round wooden embroidery hoop. One anatomically natural hand supports "
+                "the hoop and the other holds a realistic large wooden-handled punch needle at the true stitch position, "
+                "with matching wool yarn correctly threaded through the tool and trailing from its rear. Place the finished "
+                "source ornament, matching yarn, scissors, and folded linen nearby. Focus on the hands, hoop, fibers, and "
+                "dense raised punch-needle loops in soft white window daylight."
+            ),
+        ),
+        (
+            "Four-panel making process",
+            "Fabric selection sketch Punch Needle stitching and finished ornament",
+            _pn_ornament_brief(
+                "create one square 1:1 four-panel process collage. Panel 1: a hand selects linen matching the exact source "
+                "color from several fabric rolls. Panel 2: the exact motif is lightly sketched but not stitched on a larger "
+                "linen piece. Panel 3: the motif is being built in color with a correctly threaded punch needle inside a "
+                "round hoop, one hand holding the hoop and the other working at a realistic contact point, with matching "
+                "wool yarn nearby. Panel 4: the completed ornament matches the exact source silhouette, frame, clasp, cord, "
+                "linen, motif, placement, scale, colors, and thick loop-pile texture. Use soft clean light and Christmas mood."
+            ),
+        ),
+        (
+            "Personalized group",
+            "Three to five Punch Needle ornaments in row or fan",
+            _pn_ornament_brief(
+                "arrange three to five ornaments of the exact same physical style in a horizontal row or gentle fan on a "
+                "white wood-grain tabletop. If the source visibly contains a personalized name, use a different plausible "
+                "name on each while preserving the exact lettering position, scale, punch-needle treatment, motif, frame, "
+                "clasp, cord, and colors; if the source has no name, invent no wording. Shoot top-down at 90 degrees or from "
+                "a light 60-degree angle in very even white daylight. Add one thin pine sprig, dried orange slices, holly, "
+                "and a softly blurred Christmas background."
+            ),
+        ),
+        (
+            "Gift wrapping",
+            "Punch Needle ornament beside neat Noel wrapping setup",
+            _pn_ornament_brief(
+                "place the exact ornament beside a neat Noel gift-wrapping setup. Shoot top-down from 60-75 degrees or at "
+                "a slight angle in crisp white daylight. Include tasteful Christmas wrapping paper, scissors, ribbon, and "
+                "one plain textless gift tag. Keep the ornament embroidery, frame, clasp, linen weave, and hanging cord "
+                "fully visible and sharply detailed."
+            ),
+        ),
+        (
+            "Mini tree lifestyle",
+            "Punch Needle ornament foreground with fresh mini tree",
+            _pn_ornament_brief(
+                "place the exact ornament prominently in the foreground with a fresh mini Christmas tree in the left or "
+                "right background. Shoot straight-on or from a 30-degree angle in bright white daylight. Add two or three "
+                "small bells, red berries, and a restrained amount of softly blurred fairy light. Keep the small ornament "
+                "as the sharper subject and reveal the thick punch-needle wool loops clearly."
+            ),
+        ),
+        (
+            "Baby Christmas lifestyle",
+            "One-year-old baby holding small Punch Needle ornament",
+            _pn_ornament_brief(
+                "show a roughly one-year-old baby wearing a Christmas outfit and Santa hat, seated beside a decorated tree "
+                "and smiling naturally while holding the exact ornament. Use soft white-balanced daylight. Keep the ornament "
+                "genuinely small relative to the baby's hand and body, never enlarged, with its embroidered face turned "
+                "toward the camera and unobstructed. Keep hands anatomically natural and the raised wool loops sharp."
+            ),
+        ),
+        (
+            "Books lifestyle",
+            "Punch Needle ornament resting on pale hardcover books",
+            _pn_ornament_brief(
+                "rest the exact ornament against one or two white or pale neutral hardcover books for a refined Christmas "
+                "lifestyle scene. Shoot from 30-45 degrees in soft clean white daylight reflecting from the paper. Add one "
+                "frosted glass bauble, one evergreen sprig, dried orange slices, and cinnamon. Keep the ornament dominant, "
+                "sharp, correctly scaled, and free of beige or yellow color grading."
+            ),
+        ),
+        (
+            "Four-panel macro proof",
+            "Punch Needle loops linen frame and metal clasp close-ups",
+            _pn_ornament_brief(
+                "create one square 1:1 collage containing exactly four macro close-up photographs of the same source "
+                "ornament: panel 1 shows dense raised punch-needle wool loops and individual fibers; panel 2 shows linen "
+                "weave and the transition between loop pile and fabric; panel 3 shows the wooden hoop or frame material and "
+                "edge finish; panel 4 shows the metal clasp or fastener and hanging-cord attachment. Every panel must match "
+                "the original product exactly and prove genuine handmade Punch Needle work."
+            ),
+        ),
+    ),
+}
+
+
+PRODUCT_SHOT_RULES["jewelry_box"] = {
+    "display_name": "Jewelry Box",
+    "aliases": (
+        "Jewelry Box",
+        "Jewery Box",
+        "Jewellery Box",
+        "jewelry boxes",
+        "jewery boxes",
+        "jewellery boxes",
+        "linen jewelry box",
+        "linen jewellery box",
+        "embroidered jewelry box",
+        "embroidered jewellery box",
+        "hand embroidered jewelry box",
+        "personalized jewelry box",
+        "personalised jewellery box",
+        "wedding jewelry box",
+        "bridesmaid jewelry box",
+        "travel jewelry box",
+        "jewelry case",
+        "jewellery case",
+        "jewelry organizer box",
+        "hop dung trang suc",
+        "hop trang suc",
+    ),
+    "target_count": 12,
+    "lock": (
+        "the complete source collection of small rounded-rectangle silver-framed white linen jewelry boxes must appear "
+        "together in every image, with each exact original hand-embroidered motif kept on its corresponding box; every "
+        "open product box must have exactly two shallow side-by-side rectangular compartments separated by one straight "
+        "front-to-back divider, with a plain flat inner lid and no other interior structures"
+    ),
+    "shots": (
+        (
+            "Collection hero",
+            "Complete embroidered jewelry-box collection in two balanced rows",
+            _jewelry_box_brief(
+                "arrange the complete source collection in two balanced rows on a white or light-wood tabletop. Keep "
+                "every box closed with every embroidered lid facing the camera, and show every distinct source design, "
+                "silver frame, and front clasp clearly. Shoot nearly straight-on with a subtle 15-degree angle. Add only "
+                "one restrained white flower sprig and a few tiny jewelry pieces at the outer edges."
+            ),
+        ),
+        (
+            "Complete flat lay",
+            "All original box designs in a clean overhead grid or fan",
+            _jewelry_box_brief(
+                "arrange the complete source collection in a clean grid or gentle fan on a white wood-grain surface. "
+                "Shoot top-down at 90 degrees. Keep every box fully visible and separated so no lid overlaps another "
+                "box's embroidery. Show all original motifs together, sharp and unobstructed."
+            ),
+        ),
+        (
+            "Nine personalized boxes",
+            "Nine exact source-design boxes personalized with the requested names",
+            _jewelry_box_brief(
+                "create exactly nine boxes arranged in a precise 3x3 grid on a bright neutral surface. Use the exact "
+                "names Anita, Mom, Alice, Maria, Chloe, Jessie, Crystal, Eloise, and Jenna, one name per box and no other "
+                "names. Preserve and distribute only exact complete motifs from the source collection, including every "
+                "distinct source motif at least once; repeat a complete unchanged source motif only if needed to reach "
+                "nine boxes. Shoot top-down at 90 degrees with every embroidered name and motif legible."
+            ),
+        ),
+        (
+            "Two-compartment function",
+            "Two open boxes with exactly two compartments among the complete collection",
+            _jewelry_box_brief(
+                "style the complete collection on a bright dressing table. Open exactly two foreground product boxes "
+                "to about 100-110 degrees. In each open box show exactly one straight front-to-back center divider and "
+                "exactly two side-by-side rectangular compartments: place one ring and one pair of earrings loose in the "
+                "left compartment, and one neatly coiled fine necklace loose in the right compartment. Keep both inner "
+                "lids plain and flat. Arrange every remaining source box closed behind them with all embroidered designs "
+                "facing the camera. Shoot from 45 degrees overhead so both complete two-compartment interiors are obvious."
+            ),
+        ),
+        (
+            "Close collection detail",
+            "Macro foreground designs with the full source collection behind",
+            _jewelry_box_brief(
+                "layer the complete source collection on a clean tabletop. Place three closed boxes in the foreground for "
+                "a close product view of raised embroidery, linen weave, personalized stitching, silver rim, and clasp. "
+                "Arrange all remaining source boxes behind them so every original design remains identifiable. Shoot from "
+                "a low 25-35 degree angle with enough depth of field to retain the whole collection."
+            ),
+        ),
+        (
+            "Hand embroidery process",
+            "Artisan stitching one exact source motif beside all completed boxes",
+            _jewelry_box_brief(
+                "show a woman hand-embroidering one exact motif from the source collection onto matching white linen in "
+                "a round wooden hoop. One natural hand supports the hoop while the other holds a realistically threaded "
+                "needle contacting the correct stitch position; the thread color matches that exact source detail. Place "
+                "the complete set of finished source boxes together on the same table with all embroidered lids visible, "
+                "plus neatly arranged matching floss and small embroidery scissors."
+            ),
+        ),
+        (
+            "Two-compartment assembly",
+            "Artisan fitting embroidered lid beside exact two-compartment insert",
+            _jewelry_box_brief(
+                "show an artisan fitting an already embroidered white linen panel into one silver metal lid. Beside it, "
+                "show the matching box base during assembly with exactly one straight front-to-back divider creating "
+                "exactly two open rectangular compartments, left and right, and no other interior structure. Arrange the "
+                "complete collection of finished source boxes in a visible row on the same clean craft table. Add only "
+                "small scissors, matching thread, and tidy hand tools in bright white window daylight."
+            ),
+        ),
+        (
+            "Bridesmaid gift collection",
+            "Complete personalized collection on a bright wedding preparation table",
+            _jewelry_box_brief(
+                "arrange the complete personalized collection in balanced rows on a bright wedding preparation table. "
+                "Keep each exact original motif paired with its box and each embroidered name clear. Add restrained silk "
+                "ribbon and white wedding flowers, with pastel bridesmaid dresses softly blurred in the background. Shoot "
+                "from a professional 35-45 degree angle without covering any name or embroidery."
+            ),
+        ),
+        (
+            "Bride giving bridesmaid gift",
+            "Bride presents one box while the complete collection remains visible",
+            _jewelry_box_brief(
+                "show a bride handing one closed personalized box to a bridesmaid, with the embroidered lid and name "
+                "facing the camera in the foreground. Arrange the complete remaining source collection together on a gift "
+                "table behind them so every other distinct design remains visible. Frame natural hands and partial attire "
+                "rather than faces, using clean white daylight and a refined wedding setting."
+            ),
+        ),
+        (
+            "Daily two-compartment use",
+            "Woman selecting earrings from exact two-compartment boxes",
+            _jewelry_box_brief(
+                "arrange the complete collection on a bright dressing table and open exactly two foreground boxes. Each "
+                "open base has exactly one straight front-to-back divider and exactly two uninterrupted side-by-side "
+                "rectangular compartments. Place rings and earrings loose in the left compartments and a fine necklace "
+                "or slim bracelet loose in the right compartments. Show a woman's natural hand taking earrings directly "
+                "from one left compartment. Keep both inner lids plain and every remaining box closed with its exact source "
+                "embroidery facing outward. Shoot from 45-60 degrees overhead so the two-compartment geometry is explicit."
+            ),
+        ),
+        (
+            "Gift packaging collection",
+            "All closed boxes in open cream presentation gift boxes",
+            _jewelry_box_brief(
+                "place every closed jewelry box from the source collection inside its own open cream presentation gift "
+                "box lined with white tissue paper, then arrange all gift boxes together on one bright tabletop. Face every "
+                "embroidered product lid and personalized name upward. Add restrained satin ribbon, baby's breath flowers, "
+                "and blank white cards with no readable text. Shoot overhead from 75-90 degrees."
+            ),
+        ),
+        (
+            "Wedding flat lay",
+            "Complete closed collection with wedding jewelry and veil",
+            _jewelry_box_brief(
+                "arrange the complete closed source collection in a premium wedding flat lay on a clean white surface. "
+                "Show every different embroidered lid fully and preserve the exact box-to-design mapping. Place wedding "
+                "rings, a white veil, white flowers, and pale silk ribbon only around the outer edges, never over a box. "
+                "Shoot top-down at 90 degrees in bright white natural daylight."
+            ),
+        ),
+    ),
+}
+
+
 PRODUCT_SHOT_RULES["napkin_set"] = {
     "display_name": "Napkin Set",
     "aliases": (
@@ -7065,6 +7968,340 @@ PRODUCT_SHOT_RULES["napkin_set"] = {
                 "different original motifs. Add only two mini pumpkins, a few acorns, and one olive branch at the frame "
                 "edges. Shoot from 70-80 degrees above with even white daylight and a spacious premium Etsy catalog "
                 "composition."
+            ),
+        ),
+    ),
+}
+
+
+PRODUCT_SHOT_RULES["advent_calendar"] = {
+    "display_name": "Advent Calendar",
+    "aliases": (
+        "Advent Calendar",
+        "advent_calendar",
+        "Christmas Advent Calendar",
+        "Christmas Countdown Calendar",
+        "Christmas Countdown Wall Hanging",
+        "Embroidered Advent Calendar",
+        "Hand Embroidered Advent Calendar",
+        "Linen Advent Calendar",
+        "Personalized Advent Calendar",
+        "Personalised Advent Calendar",
+        "Fabric Advent Calendar",
+        "Wall Hanging Advent Calendar",
+        "Pocket Advent Calendar",
+        "Christmas Pocket Calendar",
+        "advent countdown",
+        "christmas countdown",
+        "lich dem nguoc giang sinh",
+        "lich giang sinh treo tuong",
+        "lich advent vai linen",
+        "lich advent theu tay",
+    ),
+    "target_count": 12,
+    "allow_planned_multi_panel_shots": True,
+    "lock": (
+        "the main product must remain the exact same tall handmade linen Christmas wall-hanging advent countdown "
+        "calendar from the source, preserving its exact pocket count and grid, every number in the exact source order, "
+        "personalized wording and motifs, fabric and thread colors, raised hand embroidery, wooden dowel, hanging cord, "
+        "knots, seams, dimensions, and construction; never mix designs from another calendar or convert it into a banner"
+    ),
+    "shots": (
+        (
+            "Front hero",
+            "Complete advent calendar centered on bright Christmas wall",
+            _advent_calendar_brief(
+                "hang the complete exact calendar on a bright white wall in a refined Christmas living room. Shoot "
+                "straight-on at product height and show the full hanging cord, wooden dowel, fabric body, every pocket, "
+                "and the final row. Let the calendar fill about 65-75 percent of the square frame. Add restrained evergreen "
+                "branches, softly blurred white fairy lights, and a few gift boxes below, while keeping every source "
+                "number, personalized word, and embroidered motif clear and unobstructed."
+            ),
+        ),
+        (
+            "Tree lifestyle",
+            "Advent calendar beside decorated fresh Christmas tree",
+            _advent_calendar_brief(
+                "hang the complete exact calendar flat against a light wall beside a real decorated Christmas tree. Shoot "
+                "from a subtle 20-30 degree angle that reveals the lifestyle setting without changing the calendar's "
+                "rectangular geometry. Keep the tree and gifts softly blurred in the background, use bright white window "
+                "daylight, and make the calendar, pocket grid, numbers, lettering, and embroidery the sharpest subject."
+            ),
+        ),
+        (
+            "Mantel scene",
+            "Advent calendar above a light Christmas mantel",
+            _advent_calendar_brief(
+                "hang the exact calendar flat on the wall above or immediately beside a pale fireplace mantel. Style the "
+                "mantel with a thin evergreen garland, a few red or champagne baubles, small Christmas stockings, and low "
+                "white candles that do not cast yellow light. Shoot straight-on or at a very light three-quarter angle, "
+                "close enough to read the original pocket numbers and embroidery, with no prop covering the product."
+            ),
+        ),
+        (
+            "Children's room",
+            "Advent calendar in bright Christmas children's room",
+            _advent_calendar_brief(
+                "hang the exact calendar securely on a clearly visible wall hook in a bright children's room, near a low "
+                "wood shelf or chair. Add one small plush reindeer, one gnome, a mini tree, and a few gift boxes as secondary "
+                "Christmas decor. Keep the calendar realistically scaled relative to the furniture and shoot straight-on "
+                "or slightly angled in clean white daylight, with the complete calendar visible and sharp."
+            ),
+        ),
+        (
+            "Complete flat lay",
+            "Full advent calendar flat on white wood surface",
+            _advent_calendar_brief(
+                "lay the complete calendar flat on a large white wood-grain surface without detaching its wooden dowel or "
+                "hanging cord. Arrange the cord naturally above the product. Shoot top-down at exactly 90 degrees and fit "
+                "the entire calendar inside the square frame, including every pocket and edge. Add one evergreen sprig, a "
+                "few pinecones, dried orange slices, one candy cane, and a thin ribbon only around the outer margins, never "
+                "over the original numbers, wording, pockets, or embroidery."
+            ),
+        ),
+        (
+            "Four-panel detail proof",
+            "Embroidery pockets linen dowel and cord macro collage",
+            _advent_calendar_brief(
+                "create one square 1:1 collage divided into exactly four clean macro panels of this same source calendar. "
+                "Panel 1 shows the exact upper embroidery, personalized name, or source phrase with raised hand stitches. "
+                "Panel 2 shows the linen weave, individual thread fibers, and stitch direction. Panel 3 shows a small group "
+                "of original numbered pockets with their exact numbers, borders, seams, and spacing. Panel 4 shows the "
+                "wooden dowel, top fabric channel, cord, and tied knot construction. Do not invent or replace any detail."
+            ),
+        ),
+        (
+            "Hand embroidery process",
+            "Artisan stitching exact advent calendar motif in round hoop",
+            _advent_calendar_brief(
+                "show a woman at a clean bright craft table hand-embroidering one exact motif or lettering fragment from "
+                "the source calendar onto matching linen stretched in a round wooden hoop. One anatomically natural hand "
+                "supports the hoop and the other holds a realistically threaded needle at the true stitch contact point; "
+                "the thread color matches that exact source detail. Place the completed source calendar, matching floss, "
+                "small scissors, a fabric ruler, and linen pieces nearby. Shoot close at 45 degrees in soft white window "
+                "daylight, proving genuine hand stitching rather than print or machine embroidery."
+            ),
+        ),
+        (
+            "Filling a pocket",
+            "Adult hand placing small Christmas gift into one pocket",
+            _advent_calendar_brief(
+                "capture a close lifestyle view of one natural adult hand gently placing one very small wrapped Christmas "
+                "gift into a single pocket while the exact calendar hangs flat against the wall. Let the gift protrude only "
+                "slightly and never cover that pocket's number or embroidery. Do not open, distort, or alter any other "
+                "pocket. Focus sharply on the hand, exact number, seam, linen weave, and hand stitches while keeping enough "
+                "of the full source design visible for clear product recognition."
+            ),
+        ),
+        (
+            "Child countdown",
+            "Young child taking a surprise from advent pocket",
+            _advent_calendar_brief(
+                "show a young child naturally reaching for one small surprise in one pocket of the exact calendar, mounted "
+                "at a safe realistic height in a bright Christmas room. Keep the child's body and hand from covering most "
+                "of the product, and preserve the complete grid, every source number, lettering, and motif. Use clean white "
+                "daylight with a tree and gifts softly blurred behind, keeping the calendar visually dominant."
+            ),
+        ),
+        (
+            "Family countdown",
+            "Mother and child pointing to one advent pocket",
+            _advent_calendar_brief(
+                "create a realistic Etsy lifestyle scene of a mother seated beside her child as they point together at one "
+                "pocket on the exact wall-mounted calendar. Frame their faces and bodies as secondary context and prevent "
+                "their hands from obscuring the upper embroidery, personalized wording, or pocket rows. Use bright airy "
+                "white-balanced natural daylight and restrained Christmas room decor."
+            ),
+        ),
+        (
+            "Gift-ready presentation",
+            "Advent calendar carefully folded in open premium gift box",
+            _advent_calendar_brief(
+                "present the exact calendar carefully and realistically folded or loosely rolled inside an open cream or "
+                "kraft gift box lined with white tissue, while revealing a substantial recognizable section of its exact "
+                "upper embroidery and numbered pockets. Keep the wooden dowel attached unless the source construction "
+                "visibly permits removal; if attached, fit it naturally beside the folded fabric inside the box. Add a deep "
+                "red ribbon, one evergreen sprig, and one blank textless card. Shoot from 45 degrees above in bright white "
+                "daylight for a premium handmade gift presentation."
+            ),
+        ),
+        (
+            "Entryway scene",
+            "Advent calendar above bright Christmas console table",
+            _advent_calendar_brief(
+                "hang the complete exact calendar flat against a light entryway wall above a pale console table. Style the "
+                "table with a mini fresh tree, a small bowl of Christmas ornaments, restrained evergreen garland, and a few "
+                "gift boxes. Shoot a moderately wide professional view close enough to preserve readable source numbers, "
+                "lettering, embroidery, linen texture, dowel, and cord. Use crisp winter-white daylight and keep the calendar "
+                "as the centered focal point."
+            ),
+        ),
+    ),
+}
+
+
+PRODUCT_SHOT_RULES["christmas_fabric_cross"] = {
+    "display_name": "Christmas Fabric Cross",
+    "aliases": (
+        "Christmas Fabric Cross",
+        "Christmas Fabric Crosses",
+        "christmas_fabric_cross",
+        "Christmas Linen Cross",
+        "Christmas Embroidered Cross",
+        "Christmas Cross Keepsake",
+        "Christmas Soft Cross",
+        "Christmas Hanging Fabric Cross",
+        "Christmas Cross Ornament",
+        "Noel Fabric Cross",
+        "Xmas Fabric Cross",
+        "Holiday Fabric Cross",
+        "fabric cross christmas",
+        "embroidered cross christmas",
+        "thanh gia vai giang sinh",
+        "thanh gia linen giang sinh",
+        "thanh gia theu tay giang sinh",
+    ),
+    "target_count": 12,
+    "allow_planned_multi_panel_shots": True,
+    "lock": (
+        "the main product must remain the exact same soft handmade Christmas fabric cross from the source, preserving "
+        "its exact cross silhouette, proportions, fabric, soft volume, seams, embroidery or personalized wording, "
+        "thread colors, raised hand stitches, hanging loop material, length, attachment position, and handmade identity"
+    ),
+    "shots": (
+        (
+            "Baby holding cross",
+            "Baby gently holding exact fabric cross in Christmas nursery",
+            _christmas_fabric_cross_brief(
+                "show a baby relaxing in a bright neutral nursery or softly decorated home space with subtle Christmas "
+                "touches, gently holding the exact cross with both hands. Keep the cross fully recognizable and facing the "
+                "camera, with fingers positioned naturally around its edges rather than covering the embroidery, wording, "
+                "or hanging loop. Use soft blankets, pale knitwear, delicate decor, clean white window daylight, and shallow "
+                "depth of field so the cross is the emotional and visual focal point."
+            ),
+        ),
+        (
+            "Teddy nursery display",
+            "Fabric cross upright against teddy bear with Christmas accents",
+            _christmas_fabric_cross_brief(
+                "position the exact cross upright, leaning gently against a soft neutral teddy bear on a cream wool blanket "
+                "inside a bright Christmas nursery. Add only a few small matte ornaments, one evergreen sprig, and delicate "
+                "botanical accents. Shoot close at a subtle 30-degree angle in clear airy white daylight with soft bokeh. "
+                "Keep the teddy and props secondary and reveal the complete cross, loop, embroidery, seams, and texture."
+            ),
+        ),
+        (
+            "Crib mobile",
+            "Fabric cross hanging from natural wood mobile above Christmas crib",
+            _christmas_fabric_cross_brief(
+                "hang the exact cross naturally from its original loop on a simple natural-wood mobile above a cozy neutral "
+                "crib with cream bedding and a soft pastel throw. Decorate the bright nursery with sparse dried grass, a tiny "
+                "evergreen accent, and restrained Christmas ornaments. Shoot at cross height in clean white side daylight, "
+                "keeping the cross sharp and safely separated from the softly blurred crib background. Preserve realistic "
+                "crib, mobile, loop, and product scale."
+            ),
+        ),
+        (
+            "Wreath doorway",
+            "Fabric cross centered on Christmas wreath at light oak doorway",
+            _christmas_fabric_cross_brief(
+                "hang the exact cross by its original loop from one small nail or hidden hook at the center of a refined "
+                "evergreen Christmas wreath mounted flat on a light oak door. Shoot straight-on and fairly close in bright "
+                "white natural daylight with a softly blurred doorway background. Keep pine needles and ornaments behind "
+                "the cross rather than covering its arms, lower stem, embroidery, personalized text, seams, or loop."
+            ),
+        ),
+        (
+            "Two-cross textile display",
+            "Two exact fabric crosses on woven blanket with Christmas ornaments",
+            _christmas_fabric_cross_brief(
+                "arrange exactly two copies of the exact source cross side by side on a textured woven wool blanket layered "
+                "with soft linen. Both crosses retain the same source fabric color, embroidery, thread colors, loop, and "
+                "construction unless the source itself visibly shows two variants. Add a few matte Christmas ornaments and "
+                "one pine sprig around the outer edges. Shoot from 60-75 degrees above in clear airy white daylight with "
+                "soft natural shadows and neither cross overlapping the other."
+            ),
+        ),
+        (
+            "Church lifestyle",
+            "Three-year-old girl holding fabric cross beside small pine tree",
+            _christmas_fabric_cross_brief(
+                "capture a candid three-year-old girl in a light-colored dress standing in a bright church, holding the "
+                "exact cross naturally in one hand while her other hand steadies a small artificial pine tree. Crop or turn "
+                "her face so it is not clearly identifiable. Shoot in serene white window daylight with shallow depth of "
+                "field. Keep the cross front-facing, sharply focused, correctly scaled, and free of fingers covering its "
+                "embroidery, personalized text, seams, shape, or hanging loop."
+            ),
+        ),
+        (
+            "Four-panel making process",
+            "Sketch threading hand embroidery and finished cross process",
+            _christmas_fabric_cross_brief(
+                "create one square 1:1 collage divided into exactly four clean process panels. Panel 1 shows the exact cross "
+                "outline and exact embroidery motif lightly sketched in pencil on linen matching the source color. Panel 2 "
+                "shows matching embroidery floss being threaded through the eye of a real needle by anatomically natural "
+                "hands. Panel 3 shows the exact motif being hand embroidered on matching linen stretched in a round wooden "
+                "hoop, with the needle at a realistic stitch contact point and the correct thread color. Panel 4 shows the "
+                "completed exact cross hanging from its original soft loop above a clean surface with restrained dried reeds "
+                "and one evergreen sprig. Use clear airy white daylight and no captions or panel labels."
+            ),
+        ),
+        (
+            "Christmas table display",
+            "Fabric cross upright on wood table with festive blocks and pine",
+            _christmas_fabric_cross_brief(
+                "stand the exact cross upright and securely supported on a rustic light-wood table as the dominant subject. "
+                "Surround it sparsely with textless wooden blocks or blocks turned so no letters are readable, one small pine "
+                "tree, a ball of natural yarn, and a soft woven basket. Shoot at table height from a slight 20-degree angle "
+                "in clear white side daylight, with a softly blurred festive background and the complete cross, loop, seams, "
+                "linen weave, and raised embroidery sharply visible."
+            ),
+        ),
+        (
+            "Embroidery macro",
+            "Close-up proof of raised hand embroidery and stitching",
+            _christmas_fabric_cross_brief(
+                "take one close macro photograph of the exact source cross, filling most of the square frame while retaining "
+                "enough outer edge to prove its cross shape. Focus on the original embroidered motif or personalized text, "
+                "individual thread fibers, stitch direction, raised needlework depth, linen weave, edge seam, and one portion "
+                "of the hanging-loop attachment. Use soft white side daylight and shallow background blur, with no redesign, "
+                "enhancement, replacement, or invented stitch."
+            ),
+        ),
+        (
+            "Sleeping baby keepsake",
+            "Adult hands cradling fabric cross beside sleeping baby",
+            _christmas_fabric_cross_brief(
+                "show anatomically natural adult hands gently cradling the exact cross in the foreground beside a peacefully "
+                "sleeping baby in a bright Christmas nursery. Keep the baby safely positioned and softly blurred in the crib "
+                "background. Shoot in clean white window daylight with the cross as the sharp focal point. Hands may support "
+                "only the outer edges and must not cover the source embroidery, personalized text, cross silhouette, seams, "
+                "or hanging loop."
+            ),
+        ),
+        (
+            "Christmas tree ornament",
+            "Fabric cross hanging naturally on decorated Christmas tree",
+            _christmas_fabric_cross_brief(
+                "hang the exact cross naturally from its original loop on a fresh Christmas-tree branch like a standard "
+                "keepsake ornament. Shoot head-on at product height in soft white-balanced light. Place a few matte baubles "
+                "and restrained cool-white LED string lights in the softly blurred background. Keep needles and ornaments "
+                "from touching or covering the cross, and make its source hand embroidery, seams, fabric texture, loop, and "
+                "complete silhouette tack-sharp."
+            ),
+        ),
+        (
+            "Three color options",
+            "Three neutral fabric-color crosses in pine-lined wicker basket",
+            _christmas_fabric_cross_brief(
+                "display exactly three copies of the same cross construction prominently in a natural wicker basket lined "
+                "with pine sprigs. Use three distinct tasteful neutral linen base colors, while preserving the exact source "
+                "cross silhouette, dimensions, soft volume, embroidery motif, embroidery placement, thread colors, stitch "
+                "style, seams, and hanging-loop construction on all three. If the source contains personalized text, use a "
+                "different plausible correctly stitched name on each cross in the exact source position and lettering style; "
+                "if the source has no text, invent none. Place the basket on a pale table with soft greenery, moss, and small "
+                "Christmas accents. Shoot outdoors in open shade or beside a bright window with clean white daylight and no "
+                "yellow cast, keeping all three crosses fully visible and dominant."
             ),
         ),
     ),

@@ -1328,6 +1328,55 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("exactly four macro photographs", item["prompt"])
         self.assertIn("hand-stitched thread relief and linen fibers", item["prompt"])
 
+    def test_auto_trello_uses_christmas_banner_shot_rules_before_other_banner_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=13)
+        cards = [
+            {
+                "id": "card-christmas-banner",
+                "shortLink": "christmas-banner",
+                "idList": "ready",
+                "name": "Christmas Banner (13).jpeg",
+                "url": "https://trello.example/c/christmas-banner",
+                "_image_attachments": [
+                    {"id": "att-banner", "name": "hand_embroidered_christmas_linen_banner.jpeg", "mimeType": "image/jpeg"}
+                ],
+                "_selected_attachment_ids": ["att-banner"],
+            }
+        ]
+
+        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("christmas_banner")
+
+        self.assertEqual("christmas_banner", self.service._flow_operator_product_rule_key_from_text("Christmas Banner"))
+        self.assertEqual(
+            "christmas_banner",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Banner (13).jpeg"),
+        )
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(13, len(shots))
+        self.assertEqual(13, item["flow_agent_image_count"])
+        self.assertIn("Christmas Banner category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Christmas Banner", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Halloween Banner", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Banner uses", item["prompt"])
+        self.assertEqual(
+            "Christmas Banner image 1 Small banner hanging from child-room door hook",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Christmas Banner image 13 Small banner below a miniature Christmas wreath",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("realistically small relative to doors, wardrobes, cribs", item["prompt"])
+        self.assertIn("exactly four macro photographs", item["prompt"])
+        self.assertIn("Happy Christmas", item["prompt"])
+        self.assertIn("one vase of fresh evergreen branches", item["prompt"])
+        self.assertIn("one small plush Santa Claus figure", item["prompt"])
+        self.assertIn("one plate of colorful Christmas candy", item["prompt"])
+        self.assertIn("no pumpkins or ghosts", item["prompt"])
+        self.assertIn("clearly visible wall hook", item["prompt"])
+
     def test_auto_trello_uses_ornament_round_christmas_shot_rules(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=14)
         cards = [
@@ -1360,6 +1409,151 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("raised hand-stitch texture", item["prompt"])
         self.assertIn("four-panel process collage", item["prompt"])
         self.assertNotIn("Wedding Hoop category", item["design_analysis"])
+
+    def test_auto_trello_uses_pn_ornament_shot_rules(self) -> None:
+        self.assertEqual(
+            "pn_ornament",
+            self.service._flow_operator_card_name_product_rule_key("PN Ornament"),
+        )
+        self.assertEqual(
+            "pn_ornament",
+            self.service._flow_operator_card_name_product_rule_key("Punch Needle Christmas Ornament (7).jpeg"),
+        )
+        self.assertEqual(
+            "ornament_round",
+            self.service._flow_operator_card_name_product_rule_key("Ornament_Round"),
+        )
+
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=14)
+        card = {
+            "id": "card-pn-ornament",
+            "shortLink": "pn-ornament",
+            "idList": "ready",
+            "name": "PN Ornament (5).jpeg",
+            "url": "https://trello.example/c/pn-ornament",
+            "_image_attachments": [
+                {"id": "att-pn-ornament", "name": "punch_needle_christmas_ornament.jpeg", "mimeType": "image/jpeg"}
+            ],
+            "_selected_attachment_ids": ["att-pn-ornament"],
+        }
+
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("pn_ornament")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(14, len(shots))
+        self.assertEqual(14, item["flow_agent_image_count"])
+        self.assertIn("PN Ornament category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: PN Ornament", item["prompt"])
+        self.assertEqual(
+            "PN Ornament image 1 Punch Needle ornament on white wood table with pine branch",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "PN Ornament image 14 Punch Needle loops linen frame and metal clasp close-ups",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("thick raised punch-needle loop-pile texture", item["prompt"])
+        self.assertIn("large wooden-handled punch needle", item["prompt"])
+        self.assertIn("Only images 8 and 14 may be four-panel collages", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Ornament Round", item["prompt"])
+
+    def test_auto_trello_uses_advent_calendar_shot_rules(self) -> None:
+        self.assertEqual(
+            "advent_calendar",
+            self.service._flow_operator_card_name_product_rule_key("advent_calendar"),
+        )
+        self.assertEqual(
+            "advent_calendar",
+            self.service._flow_operator_card_name_product_rule_key(
+                "Embroidered Christmas countdown calendar (8).jpeg"
+            ),
+        )
+
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-advent-calendar",
+            "shortLink": "advent-calendar",
+            "idList": "ready",
+            "name": "advent_calendar (8).jpeg",
+            "url": "https://trello.example/c/advent-calendar",
+            "_image_attachments": [
+                {"id": "att-advent", "name": "embroidered_advent_calendar.jpeg", "mimeType": "image/jpeg"}
+            ],
+            "_selected_attachment_ids": ["att-advent"],
+        }
+
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("advent_calendar")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Advent Calendar category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Advent Calendar", item["prompt"])
+        self.assertEqual(
+            "Advent Calendar image 1 Complete advent calendar centered on bright Christmas wall",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Advent Calendar image 12 Advent calendar above bright Christmas console table",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("exact pocket count and grid", item["prompt"])
+        self.assertIn("no missing, duplicated, swapped", item["prompt"])
+        self.assertIn("Only image 6 may be a four-panel collage", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Banner", item["prompt"])
+
+    def test_auto_trello_uses_christmas_fabric_cross_before_generic_fabric_cross(self) -> None:
+        self.assertEqual(
+            "christmas_fabric_cross",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Fabric Cross"),
+        )
+        self.assertEqual(
+            "christmas_fabric_cross",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Fabric Cross (4).jpeg"),
+        )
+        self.assertEqual(
+            "fabric_cross",
+            self.service._flow_operator_card_name_product_rule_key("Fabric Cross"),
+        )
+
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-christmas-fabric-cross",
+            "shortLink": "christmas-fabric-cross",
+            "idList": "ready",
+            "name": "Christmas Fabric Cross (4).jpeg",
+            "url": "https://trello.example/c/christmas-fabric-cross",
+            "_image_attachments": [
+                {"id": "att-cross", "name": "christmas_fabric_cross.jpeg", "mimeType": "image/jpeg"}
+            ],
+            "_selected_attachment_ids": ["att-cross"],
+        }
+
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("christmas_fabric_cross")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Christmas Fabric Cross category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Christmas Fabric Cross", item["prompt"])
+        self.assertEqual(
+            "Christmas Fabric Cross image 1 Baby gently holding exact fabric cross in Christmas nursery",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Christmas Fabric Cross image 12 Three neutral fabric-color crosses in pine-lined wicker basket",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("same exact cross silhouette", item["prompt"])
+        self.assertIn("Only image 7 may be one four-panel 2x2 process collage", item["prompt"])
+        self.assertIn("No yellow", item["prompt"])
+        self.assertNotIn("HAVI product shot rule lock: Fabric Cross\n", item["prompt"])
 
     def test_auto_trello_birthday_hat_text_overrides_crown_visual_fallback(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
@@ -1732,6 +1926,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
     def test_auto_trello_recognizes_wreath_sash_rule(self) -> None:
         self.assertEqual(
+            "christmas_sash",
+            self.service._flow_operator_card_name_product_rule_key("Christmas Sash"),
+        )
+        self.assertEqual(
             "family_halloween_sash",
             self.service._flow_operator_card_name_product_rule_key("Family Halloween Sash"),
         )
@@ -1743,6 +1941,93 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "wreath_sash",
             self.service._flow_operator_card_name_product_rule_key("Autumn wreath sash"),
         )
+
+    def test_auto_trello_uses_christmas_sash_shot_rules(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-christmas-sash",
+            "shortLink": "christmas-sash",
+            "idList": "ready",
+            "name": "Christmas Sash (4).jpeg",
+            "url": "https://trello.example/c/christmas-sash",
+            "_image_attachments": [
+                {"id": "att-sash", "name": "christmas_wreath_sash.jpeg", "mimeType": "image/jpeg"}
+            ],
+            "_selected_attachment_ids": ["att-sash"],
+        }
+
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("christmas_sash")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Christmas Sash category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Christmas Sash", item["prompt"])
+        self.assertEqual(
+            "Christmas Sash image 1 Close front view of sash tied below evergreen wreath",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Christmas Sash image 12 Artisan hand-stitching exact Christmas sash motif",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("motif tail on the left and the lettering tail on the right", item["prompt"])
+        self.assertIn("exactly at 6 o'clock", item["prompt"])
+        self.assertIn("never a decorative bow", item["prompt"])
+        self.assertIn("Only image 6 may be a four-panel 2x2 collage", item["prompt"])
+        self.assertIn("realistically small and never enlarge or lengthen", item["prompt"])
+        self.assertIn("panels one and two show two different close sections", item["prompt"])
+        self.assertIn("needle eye is visibly threaded", item["prompt"])
+        self.assertIn("red, evergreen-green, and bronze-gold thread spools", item["prompt"])
+        self.assertIn("images 7 and 11 may vary the linen base color", item["prompt"])
+        self.assertNotIn("Halloween Wreath Sash category", item["design_analysis"])
+
+    def test_auto_trello_uses_jewelry_box_shot_rules(self) -> None:
+        self.assertEqual(
+            "jewelry_box",
+            self.service._flow_operator_card_name_product_rule_key("Jewery Box"),
+        )
+        self.assertEqual(
+            "jewelry_box",
+            self.service._flow_operator_card_name_product_rule_key("Personalized Jewellery Box"),
+        )
+
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-jewelry-box",
+            "shortLink": "jewelry-box",
+            "idList": "ready",
+            "name": "Jewery Box (4).jpeg",
+            "url": "https://trello.example/c/jewelry-box",
+            "_image_attachments": [
+                {"id": "att-box", "name": "white_linen_embroidered_jewelry_boxes.jpeg", "mimeType": "image/jpeg"}
+            ],
+            "_selected_attachment_ids": ["att-box"],
+        }
+
+        items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        shots = self.service._flow_operator_product_rule_shot_suite("jewelry_box")
+
+        self.assertEqual(1, len(items))
+        item = items[0]
+        self.assertEqual(12, len(shots))
+        self.assertEqual(12, item["flow_agent_image_count"])
+        self.assertIn("Jewelry Box category", item["design_analysis"])
+        self.assertIn("HAVI product shot rule lock: Jewelry Box", item["prompt"])
+        self.assertEqual(
+            "Jewelry Box image 1 Complete embroidered jewelry-box collection in two balanced rows",
+            item["shot_labels"][0],
+        )
+        self.assertEqual(
+            "Jewelry Box image 12 Complete closed collection with wedding jewelry and veil",
+            item["shot_labels"][-1],
+        )
+        self.assertIn("exactly two shallow side-by-side rectangular compartments", item["prompt"])
+        self.assertIn("one single straight divider", item["prompt"])
+        self.assertIn("Anita, Mom, Alice, Maria, Chloe, Jessie, Crystal, Eloise, and Jenna", item["prompt"])
+        self.assertIn("show the complete source collection together", item["prompt"])
 
     def test_auto_trello_uses_halloween_wreath_sash_shot_rules(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
@@ -2192,20 +2477,26 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "notebook": "hand embroidered linen fabric covered notebook with bound paper pages and a stitched cover motif",
             "guest_book": "fabric covered embroidered guest book for wedding guests to sign",
             "bouquet_ribbon": "long fabric strip tied to a bridal bouquet with stitched lettering",
+            "christmas_sash": "handmade Christmas wreath sash with two pointed linen tails, raised embroidery and text tied below an evergreen wreath with red berries",
             "family_halloween_sash": "family Halloween wreath sash with two pointed white linen tails, embroidered ghost motif and text tied to a maple leaf wreath",
             "halloween_wreath_sash": "handmade Halloween wreath sash with two long pointed linen tails and raised pumpkin embroidery tied at the bottom center of a dark twig wreath",
             "wreath_sash": "two long pointed linen wreath sash tails tied around a green wreath with floral embroidery and an initial",
             "hair_bow": "cotton linen embroidered hair bow scrunchie with center knot and long tails for a ponytail",
             "passport_cover": "cotton linen passport cover holder with hand embroidered travel motif beside a boarding pass",
             "pc_stocks": "compact hanging Christmas stocking with white cuff, heel, toe, hanging loop, and thick raised punch needle wool yarn motif",
+            "pn_ornament": "small Christmas linen ornament in a wooden hoop with metal clasp, hanging cord, and thick raised punch needle wool loop pile motif",
             "ornament_round": "small round Christmas tree ornament with linen in a wooden mini hoop, metal clasp, hanging cord, and raised hand embroidery",
+            "jewelry_box": "collection of small rounded rectangular silver framed jewelry boxes with white linen hand embroidered lids, front clasps, and exactly two interior compartments",
             "napkin_set": "set of six white linen dinner napkins with six distinct hand embroidered autumn flowers leaves and acorns",
+            "advent_calendar": "tall linen Christmas advent countdown wall hanging with numbered pockets, a wooden dowel, hanging cord, and hand embroidery",
             "halloween_bag": "small linen Halloween trick-or-treat candy bag with one handle and hand embroidered pumpkin motif",
             "drawstring_bag": "cotton linen drawstring pouch with rope cords, gathered top, and hand embroidered lavender motif",
+            "christmas_banner": "small Christmas linen wall banner with wooden hanging rod, cord hanger, raised hand embroidery, and Noel decor",
             "halloween_banner": "small Halloween linen wall banner with wooden hanging rod, cord, and raised hand embroidery",
             "banner": "flat triangular nursery wall hanging with top wooden dowel cord hanger and pointed V bottom",
             "birthday_hat": "hand embroidered linen birthday hat with tie strings, pom-pom details, ruffle trim, and birthday party styling",
             "crown": "soft fabric birthday crown made of linen with pom-pom tips and embroidered details for a baby party",
+            "christmas_fabric_cross": "soft sewn Christmas fabric cross keepsake made of linen with raised hand embroidery, a hanging loop, and pine decor",
             "fabric_cross": "soft sewn religious cross keepsake made of linen with embroidered name",
             "christmas_dress_baby": "Christmas baby linen dress with a white collar, ruffled shoulders, hand embroidery, and two wooden back buttons",
             "halloween_dress_baby": "Halloween baby linen dress with ruffled shoulders, hand embroidery, and two wooden back buttons",
@@ -5612,10 +5903,17 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
     async def test_flow_agent_attachment_snapshot_scans_shadow_dom_and_file_inputs(self) -> None:
         class FakePage:
-            script = ""
+            def __init__(self) -> None:
+                self.scripts: list[str] = []
+
+            @property
+            def script(self) -> str:
+                return "\n".join(self.scripts)
 
             async def evaluate(self, script: str) -> dict:
-                self.script = script
+                self.scripts.append(script)
+                if "composer-chip-probe" in script:
+                    return {"composer_chip_count": 0, "composer_chip_labels": [], "composer_chip_detail": "composerChips=0 chipRemove=0 chipMedia=0"}
                 return {
                     "visible": True,
                     "count": 1,
@@ -5643,6 +5941,36 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("composerReady", page.script)
         self.assertIn("inCurrentComposer", page.script)
         self.assertIn("allMedia", page.script)
+        self.assertIn("composer-chip-probe", page.script)
+        self.assertEqual(0, snapshot["composer_chip_count"])
+        self.assertIn("composerChips=0", snapshot["detail"])
+
+    async def test_flow_agent_source_attachment_accepts_new_composer_chip(self) -> None:
+        class FakePage:
+            async def evaluate(self, script: str, *_args: object) -> dict:
+                if "composer-chip-probe" in script:
+                    return {"composer_chip_count": 1, "composer_chip_labels": ["cancel close"], "composer_chip_detail": "composerChips=1 chipRemove=1 chipMedia=1"}
+                return {
+                    "visible": True,
+                    "count": 0,
+                    "ready_count": 0,
+                    "busy_count": 0,
+                    "composer_ready_count": 0,
+                    "composer_busy_count": 0,
+                    "ready_labels": [],
+                    "composer_ready_labels": [],
+                    "detail": "attachments=0 ready=0 media=0 chips=0 files=0 cards=0 allMedia=0",
+                }
+
+        ok, detail = await self.service._wait_for_flow_agent_source_attachment(
+            FakePage(),
+            {"visible": True, "count": 0, "ready_count": 0, "composer_chip_count": 0, "detail": "attachments=0"},
+            timeout_s=2,
+            source_file_name="trello-abc12345-1.jpeg",
+        )
+
+        self.assertTrue(ok)
+        self.assertIn("composer chip added 0->1", detail)
 
     async def test_acquire_isolated_flow_agent_page_opens_fresh_agent_tab_each_time(self) -> None:
         class FakePage:
@@ -10101,7 +10429,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         class FakePage:
             context_checks = 0
 
-            async def evaluate(self, script: str) -> dict:
+            async def evaluate(self, script: str, *_args: object) -> dict:
                 if "has_prior_context" in script:
                     self.context_checks += 1
                     events.append(f"context-{self.context_checks}")
@@ -10110,6 +10438,8 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                         "has_prior_context": self.context_checks == 1,
                         "detail": "old Flow Agent conversation text is visible" if self.context_checks == 1 else "agent panel looks fresh",
                     }
+                if "no start-new-session button" in script:
+                    return {"ok": False, "detail": "no start-new-session button"}
                 if "agent panel not found for reset" in script:
                     events.append("menu")
                     return {"ok": True, "detail": "agent menu button"}
@@ -10120,16 +10450,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         self.assertTrue(ok)
         self.assertIn("reset old Agent context", detail)
-        self.assertEqual(["context-1", "menu", "new-chat", "context-2"], events)
+        self.assertEqual(["context-1", "menu", "new-chat", "context-2"], events[:4])
+        self.assertTrue(all(event.startswith("context-") for event in events[4:]))
 
     async def test_ensure_fresh_flow_agent_panel_blocks_when_old_context_cannot_reset(self) -> None:
         events: list[str] = []
 
         class FakePage:
-            async def evaluate(self, script: str) -> dict:
+            async def evaluate(self, script: str, *_args: object) -> dict:
                 if "has_prior_context" in script:
                     events.append("context")
                     return {"visible": True, "has_prior_context": True, "detail": "old Flow Agent conversation text is visible"}
+                if "no start-new-session button" in script:
+                    return {"ok": False, "detail": "no start-new-session button"}
                 events.append("reset")
                 return {"ok": False, "detail": "no new chat/session item"}
 
@@ -10138,6 +10471,35 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(ok)
         self.assertIn("old context visible", detail)
         self.assertEqual(["context", "reset"], events)
+
+    async def test_ensure_fresh_flow_agent_panel_starts_new_session_when_button_exists(self) -> None:
+        events: list[str] = []
+
+        class FakeMouse:
+            async def click(self, x: float, y: float) -> None:
+                events.append(f"click-{int(x)}-{int(y)}")
+
+        class FakePage:
+            mouse = FakeMouse()
+
+            async def evaluate(self, script: str, *_args: object) -> object:
+                if "has_prior_context" in script:
+                    events.append("context")
+                    return {"visible": True, "has_prior_context": False, "detail": "agent panel looks fresh"}
+                if "no start-new-session button" in script:
+                    events.append("new-session-lookup")
+                    return {"ok": True, "x": 1361.0, "y": 100.0, "label": "edit_square Start new session"}
+                if "elementFromPoint" in script:
+                    return "edit_square Start new session"
+                raise AssertionError(f"unexpected script: {script[:60]}")
+
+        ok, detail = await self.service._ensure_fresh_flow_agent_panel(FakePage())
+
+        self.assertTrue(ok)
+        self.assertIn("start-new-session", detail)
+        self.assertIn("click-1361-100", events)
+        self.assertEqual("context", events[0])
+        self.assertIn("new-session-lookup", events)
 
     async def test_acquire_isolated_flow_agent_page_opens_new_project_tab(self) -> None:
         events: list[str] = []
