@@ -3625,8 +3625,17 @@ class FlowWebService:
 
     @staticmethod
     def _is_gemini_parse_error(detail: str) -> bool:
+        """Errors worth retrying with a smaller image batch: broken/truncated JSON or a slow response."""
         lowered = str(detail or "").lower()
-        return "json" in lowered or "nội dung" in lowered or "noi dung" in lowered or "max_tokens" in lowered
+        return (
+            "json" in lowered
+            or "nội dung" in lowered
+            or "noi dung" in lowered
+            or "max_tokens" in lowered
+            or "timed out" in lowered
+            or "timeout" in lowered
+            or "time out" in lowered
+        )
 
     def _auto_trello_is_design_qa_rejection(self, detail: str) -> bool:
         """Gemini compared the outputs and rejected the design: worth regenerating."""
@@ -9608,7 +9617,12 @@ exit 1
             },
             method="POST",
         )
-        body = self._gemini_post_json(request_obj, context="kiểm tra ảnh trước khi upload Trello")
+        # A 13-image comparison with thinking regularly needs more than the default 30 s.
+        body = self._gemini_post_json(
+            request_obj,
+            context="kiểm tra ảnh trước khi upload Trello",
+            timeout_s=max(120.0, float(self.GEMINI_TIMEOUT_S)),
+        )
 
         text = self._extract_gemini_text(body)
         try:
@@ -12318,7 +12332,11 @@ exit 1
             },
             method="POST",
         )
-        body = self._gemini_post_json(request_obj, context="the source design inventory")
+        body = self._gemini_post_json(
+            request_obj,
+            context="the source design inventory",
+            timeout_s=max(90.0, float(self.GEMINI_TIMEOUT_S)),
+        )
 
         text = self._extract_gemini_text(body)
         parsed = self._parse_json_candidate(text, context="design inventory")
