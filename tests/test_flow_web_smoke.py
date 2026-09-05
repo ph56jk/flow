@@ -40,6 +40,12 @@ from flow_web.shot_rules import PRODUCT_SHOT_RULES
 from flow_web.store import StateStore
 
 
+def _model_dump_for_test(model: Any) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return model.model_dump(mode="json")
+    return model.dict()
+
+
 class TempAppPathsMixin:
     def start_temp_paths(self) -> None:
         self._tempdir = tempfile.TemporaryDirectory()
@@ -501,6 +507,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Design inventory of the source product", qa_prompt)
         self.assertIn("Merry Rex-mas", qa_prompt)
         self.assertIn("is a REJECT", qa_prompt)
+        # Colorway lineup shots may carry different names per variant (matches the prompt's colorway rule).
+        self.assertIn("multi-product lineup shot", qa_prompt)
+        self.assertIn("is NOT a defect", qa_prompt)
 
     def test_design_inventory_is_cached_per_source_attachment(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
@@ -1896,7 +1905,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "Halloween Dress Baby image 12 Three-year-old wearing dress at bright Halloween party",
             item["shot_labels"][-1],
         )
-        self.assertIn("exactly two small natural wooden buttons", item["prompt"])
+        self.assertIn("never add or remove a button", item["prompt"])
+        self.assertNotIn("exactly two small natural wooden buttons", item["prompt"])
         self.assertIn("exactly eight distinct process panels", item["prompt"])
         self.assertIn("Vietnamese seamstress", item["prompt"])
         self.assertIn("exactly four high-resolution close-up photographs", item["prompt"])
@@ -1947,7 +1957,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             item["shot_labels"][-1],
         )
         self.assertIn("collar must remain clean white in every colorway", item["prompt"])
-        self.assertIn("exactly two small natural wooden buttons", item["prompt"])
+        self.assertIn("never add or remove a button", item["prompt"])
+        self.assertNotIn("exactly two small natural wooden buttons", item["prompt"])
         self.assertIn("exactly eight distinct process panels", item["prompt"])
         self.assertIn("Vietnamese seamstress", item["prompt"])
         self.assertIn("exactly four high-resolution close-up photographs", item["prompt"])
@@ -6224,6 +6235,150 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         messages = [entry.message for entry in saved.logs]
         self.assertTrue(any("không upload Trello khi chưa kiểm tra được thiết kế" in message for message in messages))
         self.assertFalse(any("vẫn upload" in message for message in messages))
+
+    def _trello_source_request(self, source: Path) -> CreateJobRequest:
+        return CreateJobRequest(
+            type="image",
+            prompt="cat",
+            trello_enabled=True,
+            trello_card_id="source-card",
+            reference_image_paths=[str(source)],
+            automation_graph={
+                "modules": [
+                    {"id": "trello_source", "type": "trello_source", "enabled": True},
+                    {"id": "flow", "type": "flow", "enabled": True},
+                    {"id": "trello", "type": "trello", "enabled": True},
+                ]
+            },
+        )
+
+    async def test_trello_source_validation_splits_into_smaller_chunks_on_bad_json(self) -> None:
+        source = self.uploads_dir / "source.jpg"
+        source.write_bytes(b"source")
+        artifacts = []
+        for index in range(8):
+            path = self.downloads_dir / f"out-{index}.jpg"
+            path.write_bytes(b"generated")
+            artifacts.append(JobArtifact(label=f"Ảnh {index + 1}", media_name=f"media-{index}", local_path=str(path), mime_type="image/jpeg"))
+        request = self._trello_source_request(source)
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        calls: list[int] = []
+
+        def _validate(_request: Any, _source: str, chunk: list[Any]) -> dict[str, Any]:
+            calls.append(len(chunk))
+            if len(chunk) > 4:
+                raise RuntimeError("Gemini cắt phản hồi kiểm tra ảnh vì MAX_TOKENS nên JSON không hợp lệ.")
+            return {"ok": True, "reason": "", "bad_indexes": [], "confidence": 0.9}
+
+        with patch.object(
+            self.service,
+            "_artifact_validation_image_bytes",
+            new=AsyncMock(return_value=(b"generated", "image/jpeg")),
+        ), patch.object(self.service, "_gemini_validate_trello_source_artifacts", side_effect=_validate):
+            await self.service._validate_trello_source_artifacts_before_upload(job.id, request, artifacts)
+
+        # 8 images: full-set call fails twice, then two 4-image chunks succeed.
+        self.assertEqual([8, 8, 4, 4], calls)
+        messages = [entry.message for entry in self.store.get_job(job.id).logs]
+        self.assertTrue(any("chia nhỏ 4 ảnh/lần" in message for message in messages))
+        self.assertTrue(any("đã xác nhận ảnh generated khớp thiết kế" in message for message in messages))
+
+    async def test_trello_source_validation_merges_rejections_across_chunks(self) -> None:
+        source = self.uploads_dir / "source.jpg"
+        source.write_bytes(b"source")
+        artifacts = []
+        for index in range(8):
+            path = self.downloads_dir / f"out-{index}.jpg"
+            path.write_bytes(b"generated")
+            artifacts.append(JobArtifact(label=f"Ảnh {index + 1}", media_name=f"media-{index}", local_path=str(path), mime_type="image/jpeg"))
+        request = self._trello_source_request(source)
+        job = JobRecord(type="image", status="running", title="test")
+        await self.store.add_job(job)
+
+        def _validate(_request: Any, _source: str, chunk: list[Any]) -> dict[str, Any]:
+            if len(chunk) > 4:
+                raise RuntimeError("Gemini không trả về JSON kiểm tra ảnh hợp lệ.")
+            first_index = chunk[0][0]
+            if first_index == 4:
+                return {"ok": False, "reason": "Index 5 has an invented wooden tag", "bad_indexes": [5], "confidence": 0.9}
+            return {"ok": True, "reason": "", "bad_indexes": [], "confidence": 0.9}
+
+        with patch.object(
+            self.service,
+            "_artifact_validation_image_bytes",
+            new=AsyncMock(return_value=(b"generated", "image/jpeg")),
+        ), patch.object(self.service, "_gemini_validate_trello_source_artifacts", side_effect=_validate):
+            with self.assertRaises(RuntimeError) as ctx:
+                await self.service._validate_trello_source_artifacts_before_upload(job.id, request, artifacts)
+
+        self.assertIn("ảnh lỗi: 6", str(ctx.exception))
+        self.assertIn("invented wooden tag", str(ctx.exception))
+        self.assertTrue(self.service._auto_trello_is_design_qa_rejection(str(ctx.exception)))
+
+    async def test_retry_trello_upload_refetches_images_from_flow_urls(self) -> None:
+        source = self.uploads_dir / "source.jpg"
+        source.write_bytes(b"source")
+        stale = self.downloads_dir / "visible-flow-1.jpg.jpg"
+        stale.write_bytes(b"another-jobs-image")
+        request = self._trello_source_request(source)
+        job = JobRecord(
+            type="image",
+            status="failed",
+            title="held",
+            input=_model_dump_for_test(request),
+            error="Gemini QA không chạy được nên app chưa upload Trello",
+            artifacts=[
+                JobArtifact(label="Ảnh 1", media_name="m1", url="https://flow-content.example/1", local_path=str(stale), mime_type="image/jpeg"),
+                JobArtifact(label="Ảnh 2", media_name="m2", url="https://flow-content.example/2", local_path=str(stale), mime_type="image/jpeg"),
+            ],
+        )
+        await self.store.add_job(job)
+
+        archived: dict[str, Any] = {}
+
+        async def _archive(job_id: str, _request: CreateJobRequest, artifacts: list[JobArtifact]) -> dict[str, Any]:
+            archived["paths"] = [artifact.local_path for artifact in artifacts]
+            archived["bytes"] = [Path(artifact.local_path).read_bytes() for artifact in artifacts]
+            return {"configured": True, "sent": len(artifacts), "failed": 0, "card_id": "source-card"}
+
+        with patch.object(self.service, "_read_remote_file", return_value=(b"fresh-image", "image/jpeg")) as fetch, patch.object(
+            self.service,
+            "_validate_trello_source_artifacts_before_upload",
+            new=AsyncMock(return_value=None),
+        ) as validate, patch.object(self.service, "_archive_trello_artifacts", side_effect=_archive):
+            payload = await self.service.retry_trello_upload(job.id)
+
+        self.assertEqual("completed", payload["status"])
+        self.assertEqual(2, payload["sent"])
+        self.assertEqual(2, fetch.call_count)
+        validate.assert_awaited_once()
+        self.assertTrue(all(f"retry-{job.id[:8]}-" in path for path in archived["paths"]))
+        self.assertEqual([b"fresh-image", b"fresh-image"], archived["bytes"])
+        saved = self.store.get_job(job.id)
+        self.assertEqual("completed", saved.status)
+        self.assertEqual("", saved.error)
+        self.assertTrue(saved.result.get("trello_retry_upload"))
+        self.assertEqual(b"another-jobs-image", stale.read_bytes())
+
+    async def test_retry_trello_upload_rejects_running_jobs_and_missing_urls(self) -> None:
+        source = self.uploads_dir / "source.jpg"
+        source.write_bytes(b"source")
+        request = self._trello_source_request(source)
+        running = JobRecord(type="image", status="running", title="busy", input=_model_dump_for_test(request), artifacts=[JobArtifact(label="Ảnh 1", url="https://x/1")])
+        await self.store.add_job(running)
+        with self.assertRaises(HTTPException) as ctx:
+            await self.service.retry_trello_upload(running.id)
+        self.assertEqual(409, ctx.exception.status_code)
+
+        no_url = JobRecord(type="image", status="failed", title="no-url", input=_model_dump_for_test(request), artifacts=[JobArtifact(label="Ảnh 1", local_path="C:/missing.jpg")])
+        await self.store.add_job(no_url)
+        with self.assertRaises(HTTPException) as ctx:
+            await self.service.retry_trello_upload(no_url.id)
+        self.assertEqual(400, ctx.exception.status_code)
+        self.assertIn("không còn URL Flow", ctx.exception.detail)
+        self.assertEqual("failed", self.store.get_job(no_url.id).status)
 
     async def test_plan_storyboard_returns_local_scenes_when_gemini_is_not_configured(self) -> None:
         with patch.object(self.service, "ensure_media_skill_library", AsyncMock(return_value={})), patch.object(

@@ -236,6 +236,11 @@ async def create_prompt_batch(request: Request, payload: PromptBatchRequest) -> 
     return {"job": job}
 
 
+@app.post("/api/jobs/{job_id}/retry-trello-upload")
+async def retry_trello_upload(request: Request, job_id: str) -> Dict[str, Any]:
+    return await service(request).retry_trello_upload(job_id)
+
+
 @app.post("/api/jobs/{job_id}/stop")
 async def stop_job(request: Request, job_id: str) -> Dict[str, Any]:
     job = await service(request).request_stop_prompt_batch(job_id)

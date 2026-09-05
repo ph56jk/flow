@@ -3617,9 +3617,16 @@ class FlowWebService:
 
     AUTO_TRELLO_DESIGN_QA_MAX_RETRIES = 2
 
+    TRELLO_SOURCE_QA_FALLBACK_CHUNK = 4
+
     def _trello_source_qa_strict(self) -> bool:
         raw = os.getenv("FLOW_TRELLO_QA_STRICT", "").strip().lower()
         return raw not in {"0", "false", "off", "no"}
+
+    @staticmethod
+    def _is_gemini_parse_error(detail: str) -> bool:
+        lowered = str(detail or "").lower()
+        return "json" in lowered or "nội dung" in lowered or "noi dung" in lowered or "max_tokens" in lowered
 
     def _auto_trello_is_design_qa_rejection(self, detail: str) -> bool:
         """Gemini compared the outputs and rejected the design: worth regenerating."""
@@ -9549,7 +9556,9 @@ exit 1
                 "A product that merely shares the theme of the source (for example a different dinosaur design on the same kind of calendar, or a different flower on the same kind of dress) is a REJECT, even if it looks high quality.",
                 "Reject if the output appears to come from another Trello card or another product.",
                 "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",
-                "Reject invented readable names/text unless the same text is visible on SOURCE_IMAGE or the Trello card instructions explicitly requested alternate personalized names.",
+                "Personalized name rule: a single-product output must show exactly the source name/text (same letters, lettering style, and placement) or no text when the source has none. "
+                "The only exception is a multi-product lineup shot that shows two or more copies of the same product side by side in different fabric colors: when the source carries a personalized name, each color variant in that lineup may carry a different plausible name in the same lettering style and placement, and that is NOT a defect. "
+                "Reject invented readable text anywhere else, and reject any lineup variant whose motif, lettering style, collar, trims, construction, or placement differs from the source.",
                 "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
                 "Close-up, detail, process, or partial-view outputs are acceptable only when every visible design element matches the source exactly.",
                 "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
@@ -9585,7 +9594,7 @@ exit 1
             "contents": [{"parts": parts}],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 2048,
+                "maxOutputTokens": 8192,
                 "responseMimeType": "application/json",
             },
         }
@@ -9602,6 +9611,12 @@ exit 1
         body = self._gemini_post_json(request_obj, context="kiểm tra ảnh trước khi upload Trello")
 
         text = self._extract_gemini_text(body)
+        try:
+            finish_reason = str(((body.get("candidates") or [{}])[0] or {}).get("finishReason") or "").upper()
+        except Exception:
+            finish_reason = ""
+        if finish_reason == "MAX_TOKENS" and not text.strip().endswith("}"):
+            raise RuntimeError("Gemini cắt phản hồi kiểm tra ảnh vì MAX_TOKENS nên JSON không hợp lệ.")
         parsed = self._parse_json_candidate(text, context="kiểm tra ảnh")
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
@@ -9626,12 +9641,8 @@ exit 1
             image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
             generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
 
-        # One Gemini call per output set keeps the free-tier daily request budget usable.
-        chunk_size = max(1, int(self.FLOW_AGENT_MAX_OUTPUT_COUNT))
-        for chunk_start in range(0, len(generated_items), chunk_size):
-            chunk = generated_items[chunk_start : chunk_start + chunk_size]
-            result: Dict[str, Any] | None = None
-            last_validation_error: Exception | None = None
+        async def _validate_chunk(chunk: List[tuple[int, bytes, str]]) -> tuple[Dict[str, Any] | None, Exception | None]:
+            last_error: Exception | None = None
             for attempt in range(2):
                 try:
                     result = await asyncio.to_thread(
@@ -9640,12 +9651,11 @@ exit 1
                         source_path,
                         chunk,
                     )
-                    break
+                    return result, None
                 except Exception as exc:
-                    last_validation_error = exc
+                    last_error = exc
                     detail = humanize_flow_error(str(exc))
-                    retryable_parse_error = "json" in detail.lower() or "nội dung" in detail.lower() or "noi dung" in detail.lower()
-                    if attempt == 0 and retryable_parse_error:
+                    if attempt == 0 and self._is_gemini_parse_error(detail):
                         await self.store.append_log(
                             job_id,
                             f"Gemini chưa trả JSON kiểm tra ảnh ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}, app thử lại lần 2: {detail[:180]}",
@@ -9653,45 +9663,156 @@ exit 1
                         await asyncio.sleep(2.0)
                         continue
                     break
-            if result is None:
-                warning = humanize_flow_error(str(last_validation_error or "")) or "Gemini không trả về kết quả kiểm tra ảnh hợp lệ."
-                if not self._trello_source_qa_strict():
-                    await self.store.append_log(
-                        job_id,
-                        (
-                            f"Gemini QA không chạy được cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
-                            "FLOW_TRELLO_QA_STRICT=0 nên app vẫn upload để duyệt tay trên Trello. "
-                            f"Chi tiết: {warning[:180]}"
-                        ),
-                    )
-                    continue
+            return None, last_error
+
+        # First try the whole set in one call (cheapest); when Gemini cannot return valid JSON for
+        # that many images (thinking tokens eat the output budget) fall back to smaller chunks.
+        full_chunk = max(1, int(self.FLOW_AGENT_MAX_OUTPUT_COUNT))
+        chunk_plan = [full_chunk] + ([self.TRELLO_SOURCE_QA_FALLBACK_CHUNK] if len(generated_items) > self.TRELLO_SOURCE_QA_FALLBACK_CHUNK else [])
+        verdicts: List[Dict[str, Any]] = []
+        qa_unavailable_warning = ""
+        for plan_index, chunk_size in enumerate(chunk_plan):
+            verdicts = []
+            failed_range: tuple[int, int] | None = None
+            failed_error: Exception | None = None
+            for chunk_start in range(0, len(generated_items), chunk_size):
+                chunk = generated_items[chunk_start : chunk_start + chunk_size]
+                result, error = await _validate_chunk(chunk)
+                if result is None:
+                    failed_range = (chunk[0][0] + 1, chunk[-1][0] + 1)
+                    failed_error = error
+                    break
+                verdicts.append(result)
+            if failed_range is None:
+                break
+            warning = humanize_flow_error(str(failed_error or "")) or "Gemini không trả về kết quả kiểm tra ảnh hợp lệ."
+            if plan_index < len(chunk_plan) - 1 and self._is_gemini_parse_error(warning):
                 await self.store.append_log(
                     job_id,
                     (
-                        f"Gemini QA không chạy được cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
-                        "app giữ bộ ảnh lại, không upload Trello khi chưa kiểm tra được thiết kế. "
+                        f"Gemini QA chưa trả JSON hợp lệ cho ảnh {failed_range[0]}-{failed_range[1]}; "
+                        f"app chia nhỏ {chunk_plan[plan_index + 1]} ảnh/lần và kiểm tra lại."
+                    ),
+                )
+                continue
+            qa_unavailable_warning = warning
+            if not self._trello_source_qa_strict():
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Gemini QA không chạy được cho ảnh {failed_range[0]}-{failed_range[1]}; "
+                        "FLOW_TRELLO_QA_STRICT=0 nên app vẫn upload để duyệt tay trên Trello. "
                         f"Chi tiết: {warning[:180]}"
                     ),
                 )
-                raise RuntimeError(
-                    "Gemini QA không chạy được nên app chưa upload Trello (giữ lại để kiểm tra thiết kế; card sẽ chạy lại ở phiên Auto sau khi Gemini có quota). "
-                    f"Chi tiết: {warning}"
-                )
+                return
+            await self.store.append_log(
+                job_id,
+                (
+                    f"Gemini QA không chạy được cho ảnh {failed_range[0]}-{failed_range[1]}; "
+                    "app giữ bộ ảnh lại, không upload Trello khi chưa kiểm tra được thiết kế. "
+                    f"Chi tiết: {warning[:180]}"
+                ),
+            )
+            raise RuntimeError(
+                "Gemini QA không chạy được nên app chưa upload Trello (giữ lại để kiểm tra thiết kế; "
+                "dùng nút/endpoint upload lại hoặc chờ phiên Auto sau). "
+                f"Chi tiết: {warning}"
+            )
 
+        bad_indexes: List[int] = []
+        reasons: List[str] = []
+        rejected = False
+        for result in verdicts:
             ok = bool(result.get("ok"))
             raw_bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
-            bad_indexes = [
+            chunk_bad = [
                 int(item)
                 for item in raw_bad_indexes
                 if isinstance(item, (int, float)) and 0 <= int(item) < self.FLOW_AGENT_MAX_OUTPUT_COUNT
             ]
-            reason = str(result.get("reason") or "").strip() or "Ảnh generated không khớp ảnh nguồn Trello."
-            if not ok or bad_indexes:
-                display_indexes = ", ".join(str(index + 1) for index in bad_indexes) or "không rõ"
-                raise RuntimeError(
-                    f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
-                )
+            if not ok or chunk_bad:
+                rejected = True
+                bad_indexes.extend(index for index in chunk_bad if index not in bad_indexes)
+                reason = str(result.get("reason") or "").strip()
+                if reason and reason not in reasons:
+                    reasons.append(reason)
+        if rejected:
+            display_indexes = ", ".join(str(index + 1) for index in sorted(bad_indexes)) or "không rõ"
+            reason_text = "; ".join(reasons) or "Ảnh generated không khớp ảnh nguồn Trello."
+            raise RuntimeError(
+                f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason_text}; ảnh lỗi: {display_indexes})."
+            )
         await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp thiết kế ảnh nguồn Trello; tiếp tục upload.")
+
+    async def retry_trello_upload(self, job_id: str) -> Dict[str, Any]:
+        """Re-run design QA + Trello upload from the images a finished job already generated.
+
+        Generated files share local names across jobs, so the images are re-fetched from their
+        Flow URLs into job-specific files before anything is compared or uploaded.
+        """
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Không tìm thấy job.")
+        if job.status in {"running", "queued"}:
+            raise HTTPException(status_code=409, detail="Job đang chạy, chưa thể upload lại.")
+        if job.type != "image" or not job.artifacts:
+            raise HTTPException(status_code=400, detail="Job không có ảnh generated để upload lại.")
+        try:
+            request = CreateJobRequest(**dict(job.input or {}))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Input của job không hợp lệ: {exc}") from exc
+        if not request.trello_enabled:
+            raise HTTPException(status_code=400, detail="Job không bật Trello Archive nên không có chỗ để upload lại.")
+
+        download_root = self._download_root()
+        download_root.mkdir(parents=True, exist_ok=True)
+        await self.store.patch_job(job_id, status="running", error="")
+        await self.store.append_log(job_id, f"Upload lại Trello từ {len(job.artifacts)} ảnh đã tạo (không tạo ảnh mới).")
+        refreshed: List[JobArtifact] = []
+        try:
+            for index, artifact in enumerate(job.artifacts):
+                source_url = str(artifact.url or "").strip()
+                if not source_url:
+                    raise RuntimeError(f"Ảnh {index + 1} không còn URL Flow để tải lại; cần tạo lại card này.")
+                image_bytes, content_type = await asyncio.to_thread(self._read_remote_file, source_url)
+                if not image_bytes:
+                    raise RuntimeError(f"Ảnh {index + 1} tải về rỗng từ Flow; URL có thể đã hết hạn.")
+                mime = str(content_type or artifact.mime_type or "image/jpeg").strip() or "image/jpeg"
+                suffix = ".png" if "png" in mime else ".jpg"
+                destination = download_root / f"retry-{job_id[:8]}-{index + 1}{suffix}"
+                destination.write_bytes(image_bytes)
+                payload = _model_dump(artifact)
+                payload.update(
+                    {
+                        "local_path": str(destination),
+                        "public_url": self._public_download_url(str(destination)),
+                        "mime_type": mime,
+                    }
+                )
+                refreshed.append(JobArtifact(**payload))
+            await self.store.replace_artifacts(job_id, refreshed)
+            await self.store.append_log(job_id, f"Đã tải lại {len(refreshed)} ảnh từ Flow vào file riêng của job để kiểm tra và upload.")
+            await self._validate_trello_source_artifacts_before_upload(job_id, request, refreshed)
+            trello_result = await self._archive_trello_artifacts(job_id, request, refreshed)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            detail = self._flow_error_detail(exc)
+            await self.store.patch_job(job_id, status="failed", error=detail)
+            await self.store.append_log(job_id, f"Upload lại Trello thất bại: {detail}")
+            raise HTTPException(status_code=400, detail=detail) from exc
+
+        trello_result = trello_result if isinstance(trello_result, dict) else {}
+        sent = int(trello_result.get("sent") or 0)
+        result = dict(job.result or {})
+        result["trello"] = trello_result
+        result["trello_retry_upload"] = True
+        status = "completed" if sent > 0 else "failed"
+        error = "" if sent > 0 else str(trello_result.get("error") or "Trello không nhận được ảnh nào khi upload lại.")
+        await self.store.patch_job(job_id, status=status, result=result, error=error)
+        await self.store.append_log(job_id, f"Upload lại Trello xong: {sent} ảnh đã gửi." if sent else f"Upload lại Trello không gửi được ảnh nào: {error}")
+        return {"job_id": job_id, "status": status, "sent": sent, "trello": trello_result}
 
     async def _archive_trello_artifacts(
         self,

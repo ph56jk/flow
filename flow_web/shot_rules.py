@@ -237,12 +237,12 @@ def _christmas_sash_brief(scene: str) -> str:
 
 _HALLOWEEN_DRESS_BABY_LOCK = (
     "Keep the original handmade baby or toddler dress 100% unchanged: same garment silhouette, neckline, bodice, "
-    "sleeves or shoulder ruffles, gathers, skirt volume, hem, pleats, ties if present, seams, stitching, exact linen or "
+    "the exact source sleeve and shoulder construction (shoulder ruffles, wings, or flutter sleeves only if the source has them), gathers, skirt volume, hem, pleats, ties if present, seams, stitching, exact linen or "
     "cotton-linen fabric texture, source fabric color, embroidery motif, readable embroidered name when present, "
     "embroidery placement, embroidery scale, thread colors, raised hand-stitch texture, proportions, and premium "
-    "handmade construction. In every back-facing view, preserve exactly two small natural wooden buttons on the back "
-    "placket, vertically aligned and evenly spaced like the reference, with no third button, extra button row, snaps, "
-    "zipper, or bow closure. Never redesign, redraw, simplify, move, enlarge, recolor, replace, or cover the source "
+    "handmade construction. In every back-facing view, preserve exactly the back closure of the reference: the same number, size, and placement of natural wooden buttons on the back "
+    "placket (never add or remove a button), with no extra button row, snaps, "
+    "zipper, or bow closure. Never add shoulder ruffles, wings, flutter sleeves, bows, or trims that the source does not have. Never redesign, redraw, simplify, move, enlarge, recolor, replace, or cover the source "
     "embroidery; never add a new motif or name; and never turn the dress into a shirt, romper, apron, costume, skirt, "
     "pillow, banner, or mass-produced garment. Colorway collection shots may change only the base fabric color while "
     "keeping the source dress form, construction, embroidery design, thread colors, and proportions identical."
@@ -270,13 +270,13 @@ def _halloween_dress_baby_brief(scene: str) -> str:
 
 _CHRISTMAS_DRESS_BABY_LOCK = (
     "Keep the original handmade baby or toddler dress 100% unchanged: same garment silhouette, neckline, bodice, "
-    "collar if present, sleeves or shoulder ruffles, gathers, skirt volume, hem, pleats, ties if present, seams, "
+    "collar if present, the exact source sleeve and shoulder construction (shoulder ruffles, wings, or flutter sleeves only if the source has them), gathers, skirt volume, hem, pleats, ties if present, seams, "
     "stitching, exact linen or cotton-linen fabric texture, source fabric color, embroidery motif, readable embroidered "
     "name when present, embroidery placement, embroidery scale, thread colors, raised hand-stitch texture, proportions, "
     "and premium handmade construction. If the source dress has a collar, the collar must remain clean white in every "
     "colorway and must never be recolored to match the dress body; if the source has no collar, never invent one. In "
-    "every back-facing view, preserve exactly two small natural wooden buttons on the back placket, vertically aligned "
-    "and evenly spaced like the reference, with no third button, extra button row, snaps, zipper, or bow closure. Never "
+    "every back-facing view, preserve exactly the back closure of the reference: the same number, size, and placement of "
+    "natural wooden buttons (never add or remove a button), with no extra button row, snaps, zipper, or bow closure. Never add shoulder ruffles, wings, flutter sleeves, bows, or trims that the source does not have. Never "
     "redesign, redraw, simplify, move, enlarge, recolor, replace, or cover the source embroidery; never add a new motif "
     "or name; and never turn the dress into a shirt, romper, apron, costume, skirt, pillow, banner, or mass-produced "
     "garment. Colorway collection shots may change only the base dress-body fabric color while keeping the source dress "
@@ -4030,10 +4030,10 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
      'allow_planned_multi_panel_shots': True,
      'lock': (
          'the main product must remain the exact same handmade baby or toddler dress from the source image, with the '
-         'same silhouette, neckline, white collar when present, bodice, sleeves or shoulder ruffles, gathers, skirt, '
+         'same silhouette, neckline, white collar when present, bodice, the exact source sleeve and shoulder construction (shoulder ruffles or wings only if the source has them), gathers, skirt, '
          'hem, pleats, ties, seams, linen or cotton-linen fabric, embroidery motif and readable source name, embroidery '
          'placement and scale, thread colors, proportions, and premium handmade identity; never invent a collar, and '
-         'every back view must retain exactly two vertically aligned natural wooden buttons and no other closure'
+         'every back view must keep exactly the same back closure as the source (same number, size, and placement of natural wooden buttons, never more or fewer) and no other closure; never add shoulder ruffles, wings, bows, or trims the source does not have'
      ),
      'shots': (
          ('Four mannequin colorways',
@@ -4042,7 +4042,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'display exactly four child-size mannequins in a spacious two-by-two arrangement inside a minimalist white '
               'room, each wearing the exact same source dress construction in a different gentle pastel base fabric '
               'color. If the source dress has a collar, every collar must remain white rather than matching the dress '
-              'body; if no collar exists, add none. Preserve the identical silhouette, ruffles, seams, embroidery design, '
+              'body; if no collar exists, add none. Preserve the identical silhouette, source sleeve and shoulder construction, seams, embroidery design, '
               'placement, thread colors, and proportions; only the dress-body fabric color may differ. Add a few refined '
               'Christmas decorations. Use soft above-left window light, ample spacing, and subtle festive bokeh.'
           )),
@@ -4056,19 +4056,19 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'embroidery, seams, scale, and white collar on every colorway when the source has one.'
           )),
          ('Front and back Christmas garden',
-          'Two child mannequins showing dress front and two-button back',
+          'Two child mannequins showing dress front and source back closure',
           _christmas_dress_baby_brief(
               'display two matching dresses on child-size mannequins in a bright garden decorated for Christmas: the '
               'front mannequin clearly shows the exact embroidered front, while the second clearly shows the back. The '
-              'back placket must have exactly two small natural wooden buttons, vertically aligned and evenly spaced, '
+              'back placket must show exactly the same buttons as the source (same count, size, and spacing; never add or remove a button), '
               'with no additional closure. Use clean soft natural daylight and a premium Etsy product composition. '
-              'Preserve all source colors, white collar when present, materials, ruffles, seams, embroidery, and proportions.'
+              'Preserve all source colors, white collar when present, materials, source sleeve and shoulder construction, seams, embroidery, and proportions.'
           )),
          ('Christmas gift box',
           'Dress folded neatly inside bright Christmas gift box',
           _christmas_dress_baby_brief(
-              'place the exact dress neatly folded inside an open premium paper gift box, with its embroidery, ruffled '
-              'shoulder detail, white collar when present, fabric texture, and handmade seams clearly visible. Shoot '
+              'place the exact dress neatly folded inside an open premium paper gift box, with its embroidery, sleeve and '
+              'shoulder detail exactly as in the source, white collar when present, fabric texture, and handmade seams clearly visible. Shoot '
               'top-down with soft natural light from above-left and a lightly blurred bright background. Add restrained '
               'natural Christmas decorations around the box without clutter or obstruction. Keep the product centered, '
               'spacious, realistic, and gift-ready.'
@@ -4077,7 +4077,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
           'Two dresses on wooden hangers with Christmas decor',
           _christmas_dress_baby_brief(
               'hang exactly two dresses of the same source design in two different gentle dress-body colors from wooden '
-              'hangers on a clothesline. Preserve the identical silhouette, material, ruffles, seams, embroidery design, '
+              'hangers on a clothesline. Preserve the identical silhouette, material, source sleeve and shoulder construction, seams, embroidery design, '
               'placement, thread colors, white collar when present, and proportions; only the body fabric color may '
               'differ. Add minimal Christmas decor in a bright airy setting, use soft above-left natural daylight and '
               'subtle background bokeh, and leave ample negative space around both complete garments.'
@@ -4086,7 +4086,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
           'Child wearing dress while decorating tree with friends',
           _christmas_dress_baby_brief(
               'show a child safely wearing the exact source dress while decorating a Christmas tree with friends. Center '
-              'the child wearing the product and keep the complete dress shape, white collar when present, ruffles, '
+              'the child wearing the product and keep the complete dress shape, white collar when present, source sleeve and shoulder construction, '
               'embroidery, seams, material, color, and proportions visible while friends remain secondary. Use soft '
               'above-left natural daylight, an airy minimalist room, restrained tree decorations, and gentle background '
               'bokeh. Children and hands must be anatomically natural.'
@@ -4098,7 +4098,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'game or eating small pieces of fruit in a beautifully but minimally Christmas-decorated room. Capture a '
               'genuine expression and pose. Use bright soft side-window daylight, a slightly blurred background, and '
               'generous spacing. Keep the dress central and preserve its exact form, white collar when present, fabric, '
-              'color, source embroidery, ruffles, seams, and handmade details.'
+              'color, source embroidery, source sleeve and shoulder construction, seams, and handmade details.'
           )),
          ('Embroidery process macro',
           'Macro hand-embroidery detail matching the dress motif',
@@ -4130,17 +4130,17 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'dress while posing naturally with her parents. Place a decorated Christmas tree and wrapped gifts in the '
               'softly blurred background, with the child and dress as the sharp primary subject. Use clear airy '
               'white-balanced natural daylight rather than yellow light. Preserve the exact garment silhouette, white '
-              'collar when present, fabric, color, seams, sleeve folds, ruffles, skirt construction, source embroidery, '
+              'collar when present, fabric, color, seams, sleeve folds, shoulder construction as in the source, skirt construction, source embroidery, '
               'proportions, and handmade softness.'
           )),
          ('Four-panel garment details',
-          'Four close-ups of collar embroidery ruffles seams and hem',
+          'Four close-ups of collar embroidery sleeves seams and hem',
           _christmas_dress_baby_brief(
               'create one clean square 2x2 Etsy detail collage with exactly four high-resolution close-up photographs of '
-              'the same source dress: 1) embroidered neckline and white collar when present; 2) shoulder ruffle '
-              'construction; 3) bodice or skirt seam and stitch quality; 4) pleated or gathered hem finish. Preserve the '
+              'the same source dress: 1) embroidered neckline and white collar when present; 2) sleeve and shoulder '
+              'construction exactly as in the source; 3) bodice or skirt seam and stitch quality; 4) pleated or gathered hem finish. Preserve the '
               'exact source fabric color, dress design, embroidery placement, thread colors, collar construction, '
-              'ruffles, seams, proportions, and handmade appearance. Use soft window light and no text or labels.'
+              'sleeve and shoulder construction as in the source, seams, proportions, and handmade appearance. Use soft window light and no text or labels.'
           )),
          ('Children opening gifts',
           'Two four-year-old children wearing dresses under Christmas tree',
@@ -4149,7 +4149,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'wrapped gifts, each wearing a dress of the exact same source construction in a coordinated gentle '
               'colorway. Keep both dresses clearly visible and product-focused. Preserve the exact silhouette, white '
               'collar when present, material, source embroidery design and placement, thread colors, seams, sleeve folds, '
-              'ruffles, skirt structure, scale, and handmade details. Use bright airy white-balanced natural daylight, '
+              'shoulder construction as in the source, skirt structure, scale, and handmade details. Use bright airy white-balanced natural daylight, '
               'natural child movement, realistic anatomy, shallow depth of field, and refined festive decor.'
           )),
      ),
@@ -4182,10 +4182,10 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
      'allow_planned_multi_panel_shots': True,
      'lock': (
          'the main product must remain the exact same handmade baby or toddler dress from the source image, with the '
-         'same silhouette, neckline, bodice, sleeves or shoulder ruffles, gathers, skirt, hem, pleats, ties, seams, '
+         'same silhouette, neckline, bodice, the exact source sleeve and shoulder construction (shoulder ruffles or wings only if the source has them), gathers, skirt, hem, pleats, ties, seams, '
          'linen or cotton-linen fabric, embroidery motif and readable source name, embroidery placement and scale, '
-         'thread colors, proportions, and premium handmade identity; every back view must retain exactly two vertically '
-         'aligned natural wooden buttons and no other closure'
+         'thread colors, proportions, and premium handmade identity; every back view must keep exactly the same back closure as the source (same number, size, and placement of '
+         'natural wooden buttons, never more or fewer) and no other closure; never add shoulder ruffles, wings, bows, or trims the source does not have'
      ),
      'shots': (
          ('Four mannequin colorways',
@@ -4193,7 +4193,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
           _halloween_dress_baby_brief(
               'display exactly four child-size mannequins in a spacious two-by-two arrangement inside a minimalist white '
               'room, each wearing the exact same source dress construction in a different gentle pastel base fabric '
-              'color. Preserve the identical source silhouette, ruffles, seams, embroidery design, placement, thread '
+              'color. Preserve the identical source silhouette, source sleeve and shoulder construction, seams, embroidery design, placement, thread '
               'colors, and proportions on all four dresses; only the base fabric color may differ. Add a few restrained '
               'Halloween decorations around the room. Use soft natural window light from above-left, ample spacing, a '
               'centered editorial composition, and subtle background bokeh.'
@@ -4208,19 +4208,19 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'texture, source embroidery, seams, scale, and handmade proportions on every dress.'
           )),
          ('Front and back mannequins',
-          'Two child mannequins showing dress front and two-button back',
+          'Two child mannequins showing dress front and source back closure',
           _halloween_dress_baby_brief(
               'display two matching dresses on child-size mannequins in a bright Halloween-decorated garden: the front '
               'mannequin clearly shows the exact embroidered front, while the second mannequin clearly shows the back. '
-              'The back placket must have exactly two small natural wooden buttons, vertically aligned and evenly spaced, '
+              'The back placket must show exactly the same buttons as the source (same count, size, and spacing; never add or remove a button), '
               'with no additional closure. Use clean soft natural daylight and a realistic premium Etsy product '
-              'composition. Preserve all source colors, materials, ruffles, seams, embroidery, and proportions.'
+              'composition. Preserve all source colors, materials, source sleeve and shoulder construction, seams, embroidery, and proportions.'
           )),
          ('Gift box presentation',
           'Dress folded neatly inside bright paper gift box',
           _halloween_dress_baby_brief(
               'place the exact dress neatly folded inside an open premium paper gift box, with the embroidered section, '
-              'ruffled shoulder detail, fabric texture, and handmade seams clearly visible. Shoot top-down with soft '
+              'sleeve and shoulder detail exactly as in the source, fabric texture, and handmade seams clearly visible. Shoot top-down with soft '
               'natural light from above-left and a lightly blurred bright background. Add small pumpkins, a tiny wooden '
               'ghost, miniature bats, and a few refined Halloween objects around the box without clutter or obstruction. '
               'Keep the product centered, spacious, natural, and gift-ready.'
@@ -4229,7 +4229,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
           'Two dresses on wooden hangers along bright clothesline',
           _halloween_dress_baby_brief(
               'hang exactly two dresses of the same source design in two different gentle base fabric colors from wooden '
-              'hangers on a clothesline. Preserve the identical silhouette, material, ruffles, seams, embroidery design, '
+              'hangers on a clothesline. Preserve the identical silhouette, material, source sleeve and shoulder construction, seams, embroidery design, '
               'placement, thread colors, and proportions; only the base fabric color may differ. Add minimal Halloween '
               'decor in a bright airy setting, use soft above-left natural daylight and subtle background bokeh, and leave '
               'ample negative space around both complete garments.'
@@ -4239,7 +4239,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
           _halloween_dress_baby_brief(
               'show a baby safely wearing the exact source dress while seated and playing naturally with friends on an '
               'indoor rug in a bright Halloween-decorated room. Center the child wearing the product, keep the full dress '
-              'shape, ruffles, embroidery, seams, material, color, and proportions visible, and let the friends remain '
+              'shape, source sleeve and shoulder construction, embroidery, seams, material, color, and proportions visible, and let the friends remain '
               'secondary. Use soft above-left natural daylight, airy minimalist styling, and gentle background bokeh. '
               'Children and hands must be anatomically natural.'
           )),
@@ -4250,7 +4250,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'game or eating small pieces of fruit in a beautifully but minimally Halloween-decorated room. Capture a '
               'genuine child expression and pose. Use bright soft side-window daylight, a slightly blurred background, '
               'and generous spacing. Keep the dress central and preserve its exact form, fabric, color, source '
-              'embroidery, ruffles, seams, and handmade details.'
+              'embroidery, source sleeve and shoulder construction, seams, and handmade details.'
           )),
          ('Embroidery process macro',
           'Macro hand-embroidery detail matching the dress motif',
@@ -4282,17 +4282,17 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'create a realistic American Halloween trick-or-treat scene outside a decorated home. The child wearing the '
               'exact source dress stands with friends at the front door while collecting candy, with the dress as the '
               'sharp primary subject. Use bright clear airy daytime shade light rather than yellow evening light. '
-              'Preserve the exact garment silhouette, fabric, color, seams, sleeve folds, ruffles, skirt construction, '
+              'Preserve the exact garment silhouette, fabric, color, seams, sleeve folds, shoulder construction as in the source, skirt construction, '
               'source embroidery, proportions, and handmade softness. Keep friends and porch decor secondary and softly '
               'blurred.'
           )),
          ('Four-panel garment details',
-          'Four close-ups of embroidery ruffles seams and hem',
+          'Four close-ups of embroidery sleeves seams and hem',
           _halloween_dress_baby_brief(
               'create one clean square 2x2 Etsy detail collage with exactly four high-resolution close-up photographs of '
-              'the same source dress: 1) embroidered neckline and linen weave; 2) shoulder ruffle construction; 3) bodice '
+              'the same source dress: 1) embroidered neckline and linen weave; 2) sleeve and shoulder construction exactly as in the source; 3) bodice '
               'or skirt seam and stitch quality; 4) pleated or gathered hem finish. Preserve the exact source fabric color, '
-              'dress design, embroidery placement, thread colors, ruffles, seams, proportions, and handmade appearance. '
+              'dress design, embroidery placement, thread colors, sleeve and shoulder construction as in the source, seams, proportions, and handmade appearance. '
               'Use soft natural window light, a neutral linen background, consistent scale, and no text or labels.'
           )),
          ('Halloween party lifestyle',
@@ -4302,7 +4302,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
               'party. Capture a natural candid pose and gentle movement while keeping the complete garment readable and '
               'sharply prioritized. Use clear airy white-balanced natural daylight, shallow depth of field, and refined '
               'Halloween decorations in the softly blurred background. Preserve the exact dress silhouette, material, '
-              'color, seams, sleeve folds, ruffles, skirt structure, source embroidery, scale, and handmade details.'
+              'color, seams, sleeve folds, shoulder construction as in the source, skirt structure, source embroidery, scale, and handmade details.'
           )),
      ),
  },
@@ -4407,8 +4407,8 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
                            'manocanh 2 mặt',
                            'Use the dress in the reference image as the main product. Create a neat, Etsy-style '
                            "product photo, displaying two dresses on a child's mannequin, one in the front and one in "
-                           'the back. The back-facing dress must show exactly two small natural wooden buttons, '
-                           'vertically aligned and evenly spaced on the back placket; do not add a third button, extra '
+                           'the back. The back-facing dress must show exactly the same back buttons as the reference (same count, size, and placement), '
+                           'on the back placket; do not add or remove a button, extra '
                            'button row, snaps, zipper, bow closure, or decorative back closures. Place the dress in an '
                            'outdoor garden setting with soft, natural flowers and greenery in the background. Ensure '
                            'the dress retains its shape, color, texture, and details as in the reference image. Do not '
@@ -4507,9 +4507,9 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
                            'em bé',
                            'Use the dresses in the reference photos as the main product. Photograph the children '
                            'wearing the dresses against a white background: one child facing forward, one child facing '
-                           'backward. The back-facing dress must show exactly two small natural wooden buttons, '
-                           'vertically aligned and evenly spaced on the back placket, matching the reference detail; '
-                           'do not add a third button, extra button row, snaps, zipper, bow closure, or decorative back '
+                           'backward. The back-facing dress must show exactly the same back buttons as the reference (same count, size, and placement), '
+                           'on the back placket, matching the reference detail; never add or remove a button; '
+                           'do not add an extra button row, snaps, zipper, bow closure, or decorative back '
                            'closures. Do not add any text overlay or caption to the image. Maintain the original shape, '
                            'material, color, and details of each dress. Do not alter, redesign, embroider, or add any '
                            'decorative details. \n'
