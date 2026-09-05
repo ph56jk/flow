@@ -15,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import uuid
@@ -9348,6 +9349,7 @@ exit 1
                 "temperature": 0.1,
                 "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
+                **self._gemini_thinking_config("light"),
             },
         }
         url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
@@ -9499,11 +9501,200 @@ exit 1
         lowered = str(message or "").lower()
         return "per day" in lowered or "requests_per_day" in lowered or "perday" in lowered
 
+    # Thinking tokens are billed as output (~8x the input price), so structured helper calls
+    # run with little or no thinking. Override with GEMINI_QA_THINKING_BUDGET / GEMINI_LIGHT_THINKING_BUDGET
+    # (-1 lets the model decide).
+    GEMINI_QA_THINKING_BUDGET_DEFAULT = 512
+    GEMINI_LIGHT_THINKING_BUDGET_DEFAULT = 0
+    # Approximate list prices in USD per 1M tokens: (input, output incl. thinking).
+    GEMINI_PRICE_PER_MILLION_USD: Dict[str, tuple[float, float]] = {
+        "gemini-2.5-flash-lite": (0.10, 0.40),
+        "gemini-2.5-flash": (0.30, 2.50),
+        "gemini-2.5-pro": (1.25, 10.00),
+        "gemini-flash-lite": (0.10, 0.40),
+    }
+    GEMINI_USAGE_FILE_NAME = "gemini-usage.json"
+    VISUAL_RULE_CACHE_FILE_NAME = "visual-rule-cache.json"
+    _VISUAL_RULE_CACHE_PERSIST_KEYS = (
+        "_visual_product_rule_key",
+        "_visual_product_rule_confidence",
+        "_visual_product_rule_visible_product",
+        "_visual_product_rule_reason",
+        "_visual_product_rule_inferred",
+        "_design_inventory_text",
+    )
+
+    def _gemini_thinking_config(self, kind: str = "light") -> Dict[str, Any]:
+        model = self._gemini_model()
+        if not model.startswith("gemini-2.5"):
+            return {}
+        env_name = "GEMINI_QA_THINKING_BUDGET" if kind == "qa" else "GEMINI_LIGHT_THINKING_BUDGET"
+        default = self.GEMINI_QA_THINKING_BUDGET_DEFAULT if kind == "qa" else self.GEMINI_LIGHT_THINKING_BUDGET_DEFAULT
+        raw = os.getenv(env_name, "").strip()
+        try:
+            budget = int(raw) if raw else int(default)
+        except ValueError:
+            budget = int(default)
+        if budget < 0:
+            return {}
+        if model.startswith("gemini-2.5-pro"):
+            budget = max(128, budget)
+        return {"thinkingConfig": {"thinkingBudget": max(0, min(24576, budget))}}
+
+    @staticmethod
+    def _strip_thinking_config(data: Any) -> Any:
+        try:
+            payload = json.loads(bytes(data).decode("utf-8"))
+            generation = payload.get("generationConfig")
+            if isinstance(generation, dict) and "thinkingConfig" in generation:
+                generation.pop("thinkingConfig", None)
+                return json.dumps(payload).encode("utf-8")
+        except Exception:
+            pass
+        return data
+
+    def _gemini_price(self, model: str) -> tuple[float, float]:
+        name = str(model or "").lower()
+        for key in sorted(self.GEMINI_PRICE_PER_MILLION_USD, key=len, reverse=True):
+            if name.startswith(key):
+                return self.GEMINI_PRICE_PER_MILLION_USD[key]
+        return self.GEMINI_PRICE_PER_MILLION_USD["gemini-2.5-flash"]
+
+    def _gemini_usage_lock(self) -> threading.Lock:
+        lock = getattr(self, "_gemini_usage_lock_obj", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._gemini_usage_lock_obj = lock
+        return lock
+
+    def _gemini_usage_state(self) -> Dict[str, Any]:
+        state = getattr(self, "_gemini_usage", None)
+        if state is None:
+            state = {}
+            try:
+                path = DATA_DIR / self.GEMINI_USAGE_FILE_NAME
+                if path.is_file():
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        state = loaded
+            except Exception:
+                state = {}
+            self._gemini_usage = state
+        return state
+
+    def _record_gemini_usage(self, model: str, context: str, usage: Any) -> Dict[str, Any]:
+        if not isinstance(usage, dict):
+            return {}
+        try:
+            prompt_tokens = int(usage.get("promptTokenCount") or 0)
+            candidate_tokens = int(usage.get("candidatesTokenCount") or 0)
+            thinking_tokens = int(usage.get("thoughtsTokenCount") or 0)
+        except (TypeError, ValueError):
+            return {}
+        output_tokens = candidate_tokens + thinking_tokens
+        in_price, out_price = self._gemini_price(model)
+        cost = prompt_tokens / 1_000_000 * in_price + output_tokens / 1_000_000 * out_price
+        summary = {
+            "model": model,
+            "prompt_tokens": prompt_tokens,
+            "output_tokens": output_tokens,
+            "thinking_tokens": thinking_tokens,
+            "estimated_usd": round(cost, 5),
+        }
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        context_key = re.sub(r"\s+", " ", str(context or "other")).strip()[:48] or "other"
+        with self._gemini_usage_lock():
+            state = self._gemini_usage_state()
+            entry = state.setdefault(
+                day,
+                {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "estimated_usd": 0.0, "by_context": {}},
+            )
+            entry["calls"] = int(entry.get("calls") or 0) + 1
+            entry["prompt_tokens"] = int(entry.get("prompt_tokens") or 0) + prompt_tokens
+            entry["output_tokens"] = int(entry.get("output_tokens") or 0) + output_tokens
+            entry["thinking_tokens"] = int(entry.get("thinking_tokens") or 0) + thinking_tokens
+            entry["estimated_usd"] = round(float(entry.get("estimated_usd") or 0.0) + cost, 6)
+            by_context = entry.setdefault("by_context", {})
+            slot = by_context.setdefault(context_key, {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "estimated_usd": 0.0})
+            slot["calls"] = int(slot.get("calls") or 0) + 1
+            slot["prompt_tokens"] = int(slot.get("prompt_tokens") or 0) + prompt_tokens
+            slot["output_tokens"] = int(slot.get("output_tokens") or 0) + output_tokens
+            slot["estimated_usd"] = round(float(slot.get("estimated_usd") or 0.0) + cost, 6)
+            for old_day in sorted(state)[:-60]:
+                state.pop(old_day, None)
+            try:
+                path = DATA_DIR / self.GEMINI_USAGE_FILE_NAME
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception:
+                pass
+        return summary
+
+    def get_gemini_usage(self) -> Dict[str, Any]:
+        with self._gemini_usage_lock():
+            state = json.loads(json.dumps(self._gemini_usage_state()))
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        return {
+            "today": today,
+            "today_usage": state.get(today) or {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "estimated_usd": 0.0, "by_context": {}},
+            "days": state,
+            "model": self._gemini_model(),
+            "prices_usd_per_million": {key: {"input": value[0], "output": value[1]} for key, value in self.GEMINI_PRICE_PER_MILLION_USD.items()},
+            "thinking_budget": {"qa": self._gemini_thinking_config("qa"), "light": self._gemini_thinking_config("light")},
+            "note": "estimated_usd la uoc tinh theo gia niem yet; so tien thuc te xem tai Google Cloud Billing.",
+        }
+
+    def _visual_rule_file_cache_path(self) -> Path:
+        return DATA_DIR / self.VISUAL_RULE_CACHE_FILE_NAME
+
+    def _visual_rule_file_cache_state(self) -> Dict[str, Any]:
+        state = getattr(self, "_visual_rule_file_cache", None)
+        if state is None:
+            state = {}
+            try:
+                path = self._visual_rule_file_cache_path()
+                if path.is_file():
+                    loaded = json.loads(path.read_text(encoding="utf-8"))
+                    if isinstance(loaded, dict):
+                        state = loaded
+            except Exception:
+                state = {}
+            self._visual_rule_file_cache = state
+        return state
+
+    def _visual_rule_file_cache_get(self, cache_key: str) -> Dict[str, Any] | None:
+        with self._gemini_usage_lock():
+            entry = self._visual_rule_file_cache_state().get(str(cache_key))
+        if not isinstance(entry, dict):
+            return None
+        return {key: value for key, value in entry.items() if key in self._VISUAL_RULE_CACHE_PERSIST_KEYS}
+
+    def _visual_rule_file_cache_set(self, cache_key: str, metadata: Dict[str, Any]) -> None:
+        persisted = {
+            key: metadata.get(key)
+            for key in self._VISUAL_RULE_CACHE_PERSIST_KEYS
+            if metadata.get(key) not in (None, "")
+        }
+        if not persisted.get("_visual_product_rule_key") and not persisted.get("_design_inventory_text"):
+            return
+        with self._gemini_usage_lock():
+            state = self._visual_rule_file_cache_state()
+            state[str(cache_key)] = persisted
+            for old_key in list(state)[:-2000]:
+                state.pop(old_key, None)
+            try:
+                path = self._visual_rule_file_cache_path()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+            except Exception:
+                pass
+
     def _gemini_post_json(self, request_obj: Request, *, context: str, timeout_s: float | None = None) -> Dict[str, Any]:
         """POST to Gemini and return the parsed body.
 
         Per-minute 429/503 limits are waited out a few times; a daily free-tier quota
         exhaustion switches to the fallback models (each has its own daily bucket).
+        Token usage is recorded per day (see get_gemini_usage) and attached as body["_usage"].
         """
         timeout = float(timeout_s or max(20, self.GEMINI_TIMEOUT_S))
         attempts = max(1, int(self.GEMINI_RATE_LIMIT_MAX_ATTEMPTS))
@@ -9516,13 +9707,21 @@ exit 1
         last_message = ""
         for model_index, model in enumerate(models):
             model_url = url.replace(f"/models/{primary_model}:", f"/models/{model}:") if model != primary_model else url
-            current = request_obj if model == primary_model else Request(model_url, data=data, headers=headers, method="POST")
+            if model == primary_model:
+                current = request_obj
+            else:
+                # Fallback models may not accept the 2.5-style thinkingBudget field.
+                model_data = data if model.startswith("gemini-2.5") else self._strip_thinking_config(data)
+                current = Request(model_url, data=model_data, headers=headers, method="POST")
             for attempt in range(attempts):
                 try:
                     with urlopen(current, timeout=timeout) as response:
                         body = json.loads(response.read().decode("utf-8"))
                     if model != primary_model:
                         body["_fallback_model"] = model
+                    usage_summary = self._record_gemini_usage(model, context, body.get("usageMetadata"))
+                    if usage_summary:
+                        body["_usage"] = usage_summary
                     return body
                 except HTTPError as exc:
                     try:
@@ -9605,6 +9804,7 @@ exit 1
                 "temperature": 0.0,
                 "maxOutputTokens": 8192,
                 "responseMimeType": "application/json",
+                **self._gemini_thinking_config("qa"),
             },
         }
         url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
@@ -9634,6 +9834,8 @@ exit 1
         parsed = self._parse_json_candidate(text, context="kiểm tra ảnh")
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini không trả về kết quả kiểm tra ảnh hợp lệ.")
+        if isinstance(body.get("_usage"), dict):
+            parsed["_usage"] = body["_usage"]
         return parsed
 
     async def _validate_trello_source_artifacts_before_upload(
@@ -9732,6 +9934,24 @@ exit 1
                 "Gemini QA không chạy được nên app chưa upload Trello (giữ lại để kiểm tra thiết kế; "
                 "dùng nút/endpoint upload lại hoặc chờ phiên Auto sau). "
                 f"Chi tiết: {warning}"
+            )
+
+        usage_totals = {"calls": 0, "prompt_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "estimated_usd": 0.0}
+        for result in verdicts:
+            usage = result.get("_usage") if isinstance(result, dict) else None
+            if isinstance(usage, dict):
+                usage_totals["calls"] += 1
+                for key in ("prompt_tokens", "output_tokens", "thinking_tokens"):
+                    usage_totals[key] += int(usage.get(key) or 0)
+                usage_totals["estimated_usd"] += float(usage.get("estimated_usd") or 0.0)
+        if usage_totals["calls"]:
+            await self.store.append_log(
+                job_id,
+                (
+                    f"Gemini QA dùng {usage_totals['calls']} lần gọi: {usage_totals['prompt_tokens']} token vào, "
+                    f"{usage_totals['output_tokens']} token ra (thinking {usage_totals['thinking_tokens']}), "
+                    f"ước tính ${usage_totals['estimated_usd']:.4f}."
+                ),
             )
 
         bad_indexes: List[int] = []
@@ -12251,6 +12471,7 @@ exit 1
                 "temperature": 0.0,
                 "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
+                **self._gemini_thinking_config("light"),
             },
         }
         url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
@@ -12320,6 +12541,7 @@ exit 1
                 "temperature": 0.0,
                 "maxOutputTokens": 4096,
                 "responseMimeType": "application/json",
+                **self._gemini_thinking_config("light"),
             },
         }
         url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
@@ -12463,6 +12685,11 @@ exit 1
         )
         cache_key = self._flow_operator_visual_rule_cache_key(card_id, attachment)
         cached = self._trello_visual_product_rule_cache.get(cache_key)
+        if cached is None:
+            # Survive restarts: classification + design inventory are stable per attachment.
+            cached = self._visual_rule_file_cache_get(cache_key)
+            if cached is not None:
+                self._trello_visual_product_rule_cache[cache_key] = cached
         if cached is not None:
             card.update(cached)
             cached_inventory = str(cached.get("_design_inventory_text") or "").strip()
@@ -12579,6 +12806,7 @@ exit 1
             except Exception as exc:
                 metadata["_ai_title_error"] = humanize_flow_error(str(exc)) or str(exc)
         self._trello_visual_product_rule_cache[cache_key] = metadata
+        self._visual_rule_file_cache_set(cache_key, metadata)
         card.update(metadata)
 
     def _flow_operator_banner_wall_hook_rule_for_shot(self, product_key: str, *parts: str) -> str:

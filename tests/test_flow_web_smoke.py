@@ -547,6 +547,68 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Design replication lock", items[0]["prompt"])
         self.assertEqual("", self.service._design_inventory_from_request(CreateJobRequest(type="image", prompt=items[0]["prompt"])))
 
+    def test_gemini_thinking_budget_and_usage_tracking(self) -> None:
+        with patch.dict(os.environ, {"GEMINI_QA_THINKING_BUDGET": "", "GEMINI_LIGHT_THINKING_BUDGET": ""}, clear=False):
+            with patch.object(self.service, "_gemini_model", return_value="gemini-2.5-flash"):
+                self.assertEqual({"thinkingConfig": {"thinkingBudget": 512}}, self.service._gemini_thinking_config("qa"))
+                self.assertEqual({"thinkingConfig": {"thinkingBudget": 0}}, self.service._gemini_thinking_config("light"))
+            with patch.object(self.service, "_gemini_model", return_value="gemini-2.5-pro"):
+                self.assertEqual({"thinkingConfig": {"thinkingBudget": 128}}, self.service._gemini_thinking_config("light"))
+            with patch.object(self.service, "_gemini_model", return_value="gemini-3.8-flash"):
+                self.assertEqual({}, self.service._gemini_thinking_config("qa"))
+        with patch.dict(os.environ, {"GEMINI_QA_THINKING_BUDGET": "-1"}, clear=False), patch.object(
+            self.service, "_gemini_model", return_value="gemini-2.5-flash"
+        ):
+            self.assertEqual({}, self.service._gemini_thinking_config("qa"))
+
+        payload = json.dumps({"generationConfig": {"temperature": 0.0, "thinkingConfig": {"thinkingBudget": 0}}}).encode("utf-8")
+        stripped = json.loads(FlowWebService._strip_thinking_config(payload).decode("utf-8"))
+        self.assertNotIn("thinkingConfig", stripped["generationConfig"])
+
+        summary = self.service._record_gemini_usage(
+            "gemini-2.5-flash",
+            "kiểm tra ảnh trước khi upload Trello",
+            {"promptTokenCount": 14000, "candidatesTokenCount": 300, "thoughtsTokenCount": 500},
+        )
+        self.assertEqual(800, summary["output_tokens"])
+        self.assertAlmostEqual(14000 / 1e6 * 0.30 + 800 / 1e6 * 2.50, summary["estimated_usd"], places=5)
+        self.service._record_gemini_usage("gemini-2.5-flash", "the source design inventory", {"promptTokenCount": 1000, "candidatesTokenCount": 700})
+        usage = self.service.get_gemini_usage()
+        today = usage["today_usage"]
+        self.assertEqual(2, today["calls"])
+        self.assertEqual(15000, today["prompt_tokens"])
+        self.assertEqual(500, today["thinking_tokens"])
+        self.assertIn("the source design inventory", today["by_context"])
+        self.assertTrue((self.data_dir / FlowWebService.GEMINI_USAGE_FILE_NAME).is_file())
+
+    def test_visual_rule_file_cache_survives_new_service_instance(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        describe_payload = {"inventory": "Cream linen calendar with two hatted dinosaurs."}
+        patches = self._design_inventory_patches(describe_payload)
+        with contextlib.ExitStack() as stack:
+            mocks = [stack.enter_context(item) for item in patches]
+            first_card = self._design_inventory_card("card-file-cache")
+            self.service._flow_operator_enrich_card_with_visual_product_rule(request, first_card)
+        self.assertEqual(1, mocks[-1].call_count)
+        self.assertTrue((self.data_dir / FlowWebService.VISUAL_RULE_CACHE_FILE_NAME).is_file())
+
+        fresh_service = FlowWebService(self.store)
+        second_card = self._design_inventory_card("card-file-cache")
+        with patch.object(fresh_service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+            fresh_service, "_trello_credentials", return_value=("trello-key", "trello-token")
+        ), patch.object(fresh_service, "_trello_download_attachment_bytes") as download, patch.object(
+            fresh_service, "_gemini_classify_trello_source_product_rule"
+        ) as classify, patch.object(fresh_service, "_gemini_describe_trello_source_design") as describe, patch.object(
+            fresh_service, "_trello_should_write_ai_title_description", return_value=False
+        ):
+            fresh_service._flow_operator_enrich_card_with_visual_product_rule(request, second_card)
+
+        download.assert_not_called()
+        classify.assert_not_called()
+        describe.assert_not_called()
+        self.assertEqual("advent_calendar", second_card["_visual_product_rule_key"])
+        self.assertIn("two hatted dinosaurs", second_card["_design_inventory_text"])
+
     def test_auto_trello_design_qa_rejection_is_retried_not_stopped(self) -> None:
         detail = "Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn (different dinosaur; ảnh lỗi: 2, 6)."
         self.assertTrue(self.service._auto_trello_is_design_qa_rejection(detail))

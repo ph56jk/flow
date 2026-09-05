@@ -236,6 +236,11 @@ async def create_prompt_batch(request: Request, payload: PromptBatchRequest) -> 
     return {"job": job}
 
 
+@app.get("/api/gemini/usage")
+async def gemini_usage(request: Request) -> Dict[str, Any]:
+    return service(request).get_gemini_usage()
+
+
 @app.post("/api/jobs/{job_id}/retry-trello-upload")
 async def retry_trello_upload(request: Request, job_id: str) -> Dict[str, Any]:
     return await service(request).retry_trello_upload(job_id)
