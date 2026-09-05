@@ -3615,6 +3615,24 @@ class FlowWebService:
         normalized = self._strip_accents(str(detail or "")).lower()
         return "chua tim thay card" in normalized or "khong tim thay card" in normalized
 
+    AUTO_TRELLO_DESIGN_QA_MAX_RETRIES = 2
+
+    def _trello_source_qa_strict(self) -> bool:
+        raw = os.getenv("FLOW_TRELLO_QA_STRICT", "").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _auto_trello_is_design_qa_rejection(self, detail: str) -> bool:
+        """Gemini compared the outputs and rejected the design: worth regenerating."""
+        normalized = self._strip_accents(str(detail or "")).lower().replace("đ", "d")
+        if self._auto_trello_is_design_qa_unavailable(detail):
+            return False
+        return "gemini chan upload trello" in normalized or "khong khop anh nguon" in normalized
+
+    def _auto_trello_is_design_qa_unavailable(self, detail: str) -> bool:
+        """Gemini QA could not run (quota/outage): hold the card instead of burning Flow credits."""
+        normalized = self._strip_accents(str(detail or "")).lower().replace("đ", "d")
+        return "gemini qa khong chay duoc" in normalized
+
     def _auto_trello_should_stop_on_child_error(self, detail: str) -> bool:
         normalized = self._strip_accents(str(detail or "")).lower()
         stop_signals = (
@@ -4051,6 +4069,7 @@ class FlowWebService:
         cycles = 0
         idle_cycles = 0
         seen_card_ids: set[str] = set()
+        design_qa_retry_counts: Dict[str, int] = {}
         await self.store.patch_job(batch_id, status="running")
         await self.store.append_log(
             batch_id,
@@ -4073,6 +4092,16 @@ class FlowWebService:
                     if self._normalize_trello_card_id(str(item or ""))
                 ]
                 seen_card_ids.update(stored_seen_card_ids)
+                stored_retry_counts = existing_result.get("design_qa_retry_counts")
+                if isinstance(stored_retry_counts, dict):
+                    for raw_key, raw_count in stored_retry_counts.items():
+                        retry_key = self._normalize_trello_card_id(str(raw_key or ""))
+                        try:
+                            retry_count = int(raw_count or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if retry_key and retry_count > 0:
+                            design_qa_retry_counts[retry_key] = max(design_qa_retry_counts.get(retry_key, 0), retry_count)
                 existing_result.update(
                     {
                         "continuous": True,
@@ -4263,6 +4292,34 @@ class FlowWebService:
                         failed += 1
                         detail = saved_child.error if saved_child is not None else "Không tìm thấy job con sau khi chạy."
                         await self.store.append_log(batch_id, f"Card {item_index}/{planned_total} bị lỗi: {detail}")
+                        if item_card_id and self._auto_trello_is_design_qa_unavailable(detail):
+                            await self.store.append_log(
+                                batch_id,
+                                (
+                                    f"Card {item_index}/{planned_total} chưa được QA thiết kế vì Gemini không chạy được (quota/outage); "
+                                    "app giữ card lại, không tạo lại ảnh để tránh tốn credit Flow. Card sẽ chạy lại ở phiên Auto tiếp theo."
+                                ),
+                            )
+                        elif item_card_id and self._auto_trello_is_design_qa_rejection(detail):
+                            retry_count = design_qa_retry_counts.get(item_card_id, 0) + 1
+                            design_qa_retry_counts[item_card_id] = retry_count
+                            if retry_count <= self.AUTO_TRELLO_DESIGN_QA_MAX_RETRIES:
+                                seen_card_ids.discard(item_card_id)
+                                await self.store.append_log(
+                                    batch_id,
+                                    (
+                                        f"Card {item_index}/{planned_total} bị QA thiết kế chặn upload; app sẽ tạo lại bộ ảnh mới cho card này "
+                                        f"ở lượt quét tiếp theo (thử lại {retry_count}/{self.AUTO_TRELLO_DESIGN_QA_MAX_RETRIES})."
+                                    ),
+                                )
+                            else:
+                                await self.store.append_log(
+                                    batch_id,
+                                    (
+                                        f"Card {item_index}/{planned_total} đã bị QA thiết kế chặn {retry_count} lần; "
+                                        "app bỏ qua card này trong phiên Auto hiện tại, cần kiểm tra ảnh nguồn/rule."
+                                    ),
+                                )
                         if self._auto_trello_should_stop_on_child_error(detail):
                             current_batch = self.store.get_job(batch_id)
                             current_result = dict(current_batch.result or {}) if current_batch is not None else {}
@@ -4283,7 +4340,10 @@ class FlowWebService:
                         failed=failed,
                         current_index=item_index,
                         current_child_job_id="",
-                        extra={"seen_card_ids": sorted(seen_card_ids)},
+                        extra={
+                            "seen_card_ids": sorted(seen_card_ids),
+                            "design_qa_retry_counts": dict(design_qa_retry_counts),
+                        },
                     )
                     if item_offset < len(items) - 1 and not self._prompt_batch_stop_requested(batch_id):
                         await self._sleep_between_flow_agent_batches(batch_id, completed + failed + 1, planned_total)
@@ -4510,9 +4570,10 @@ class FlowWebService:
                 f"Request exactly {target} separate standalone 1:1 images; never make a collage, contact sheet, grid, or multi-frame canvas. "
             )
         return (
-            "Use the learned product-prompt style: give a compact design analysis, then a numbered shot brief. "
+            "Use the learned product-prompt style: first give a design analysis that restates the exact design inventory of the source product "
+            "(fabric base color, exact wording, every motif with its colors and placement, numbering, trims and hardware), then a numbered shot brief. "
             f"{collage_rule}"
-            "For each shot, state the product placement, background, props, lighting, camera angle, and the source details that must stay unchanged. "
+            "For each shot, state the product placement, background, props, lighting, camera angle, and restate the design inventory literally as the source details that must stay unchanged; never reduce the product to a generic description. "
             "The attached source image is the authority: keep the same product object type, silhouette, construction, proportions, motif/design placement, readable text/name, colors, fabric texture, and handmade irregularities. "
             "Only if the source image visibly contains an embroidered/personalized name and the Required shot plan, Trello description, or colorway/multi-color shot requires variants may a multi-product shot vary the name; otherwise keep text/name exactly as the source or absent. "
             f"{self._flow_agent_colorway_text_variant_rule()} "
@@ -9269,7 +9330,7 @@ exit 1
             ],
             "generationConfig": {
                 "temperature": 0.1,
-                "maxOutputTokens": 1024,
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
             },
         }
@@ -9283,18 +9344,7 @@ exit 1
             },
             method="POST",
         )
-        try:
-            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            try:
-                error_payload = json.loads(exc.read().decode("utf-8"))
-                message = str(error_payload.get("error", {}).get("message", "")).strip()
-            except Exception:
-                message = ""
-            raise RuntimeError(message or f"Gemini API returned HTTP {exc.code}.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Could not call Gemini for AI product title generation: {exc.reason}") from exc
+        body = self._gemini_post_json(request_obj, context="AI product title generation")
 
         text = self._extract_gemini_text(body)
         parsed = self._parse_json_candidate(text, context="AI product title")
@@ -9386,6 +9436,130 @@ exit 1
         artifact_url = str(artifact.url or artifact.public_url or "").strip()
         return await self._trello_artifact_file_bytes(job_id, artifact, index, artifact_url)
 
+    GEMINI_RATE_LIMIT_MAX_ATTEMPTS = 3
+    GEMINI_RATE_LIMIT_MAX_WAIT_S = 90.0
+
+    def _gemini_retry_delay_from_message(self, message: str, fallback: float) -> float:
+        match = re.search(r"retry\s+in\s+([0-9]+(?:\.[0-9]+)?)\s*s", str(message or ""), re.IGNORECASE)
+        if not match:
+            match = re.search(r"retryDelay[\"']?\s*:\s*[\"']?([0-9]+(?:\.[0-9]+)?)s", str(message or ""))
+        try:
+            suggested = float(match.group(1)) if match else fallback
+        except (TypeError, ValueError):
+            suggested = fallback
+        return max(5.0, min(self.GEMINI_RATE_LIMIT_MAX_WAIT_S, suggested + 1.0))
+
+    # Verified on 2026-09-04 against the free-tier key: every model has its own daily request bucket.
+    GEMINI_DEFAULT_FALLBACK_MODELS = (
+        "gemini-3.8-flash",
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemini-3-flash-preview",
+    )
+
+    def _gemini_fallback_models(self, primary_model: str) -> List[str]:
+        raw = os.getenv("GEMINI_FALLBACK_MODELS", "").strip()
+        candidates = [item.strip() for item in raw.split(",")] if raw else list(self.GEMINI_DEFAULT_FALLBACK_MODELS)
+        ordered: List[str] = []
+        for candidate in candidates:
+            model = self._sanitize_gemini_model(candidate) if candidate else ""
+            if model and model != primary_model and model not in ordered:
+                ordered.append(model)
+        return ordered
+
+    @staticmethod
+    def _gemini_error_is_daily_quota(error_payload: Dict[str, Any], message: str) -> bool:
+        try:
+            for detail in error_payload.get("error", {}).get("details", []) or []:
+                for violation in detail.get("violations", []) or []:
+                    quota_id = str(violation.get("quotaId") or "")
+                    if "PerDay" in quota_id or "Daily" in quota_id:
+                        return True
+        except Exception:
+            pass
+        lowered = str(message or "").lower()
+        return "per day" in lowered or "requests_per_day" in lowered or "perday" in lowered
+
+    def _gemini_post_json(self, request_obj: Request, *, context: str, timeout_s: float | None = None) -> Dict[str, Any]:
+        """POST to Gemini and return the parsed body.
+
+        Per-minute 429/503 limits are waited out a few times; a daily free-tier quota
+        exhaustion switches to the fallback models (each has its own daily bucket).
+        """
+        timeout = float(timeout_s or max(20, self.GEMINI_TIMEOUT_S))
+        attempts = max(1, int(self.GEMINI_RATE_LIMIT_MAX_ATTEMPTS))
+        url = str(request_obj.full_url)
+        model_match = re.search(r"/models/([^:/]+):generateContent", url)
+        primary_model = model_match.group(1) if model_match else self._gemini_model()
+        models = [primary_model, *self._gemini_fallback_models(primary_model)]
+        headers = dict(request_obj.header_items())
+        data = request_obj.data
+        last_message = ""
+        for model_index, model in enumerate(models):
+            model_url = url.replace(f"/models/{primary_model}:", f"/models/{model}:") if model != primary_model else url
+            current = request_obj if model == primary_model else Request(model_url, data=data, headers=headers, method="POST")
+            for attempt in range(attempts):
+                try:
+                    with urlopen(current, timeout=timeout) as response:
+                        body = json.loads(response.read().decode("utf-8"))
+                    if model != primary_model:
+                        body["_fallback_model"] = model
+                    return body
+                except HTTPError as exc:
+                    try:
+                        error_payload = json.loads(exc.read().decode("utf-8"))
+                        message = str(error_payload.get("error", {}).get("message", "")).strip()
+                    except Exception:
+                        error_payload, message = {}, ""
+                    last_message = message or f"Gemini API returned HTTP {exc.code}."
+                    has_next_model = model_index < len(models) - 1
+                    if exc.code == 429 and self._gemini_error_is_daily_quota(error_payload, message):
+                        logging.warning("Gemini daily quota exhausted for %s during %s; trying fallback model.", model, context)
+                        break
+                    if exc.code in (429, 503) and has_next_model:
+                        # Another model with its own quota bucket is cheaper than waiting out this one.
+                        logging.warning("Gemini %s rate-limited (%s) during %s; switching model.", model, exc.code, context)
+                        break
+                    if exc.code in (429, 503) and attempt < attempts - 1:
+                        time.sleep(self._gemini_retry_delay_from_message(message, 20.0 * (attempt + 1)))
+                        continue
+                    raise RuntimeError(last_message) from exc
+                except URLError as exc:
+                    raise RuntimeError(f"Could not call Gemini for {context}: {exc.reason}") from exc
+        raise RuntimeError(last_message or f"Gemini API request failed for {context}.")
+
+    def _trello_source_qa_prompt(self, request: CreateJobRequest) -> str:
+        inventory = self._design_inventory_from_request(request)
+        return "\n".join(
+            [
+                "You are a strict ecommerce QA checker before uploading generated images to Trello.",
+                "Compare SOURCE_IMAGE with each OUTPUT_IMAGE element by element. The product in every output must be an exact replica of the source product, as if the same physical item were photographed again in a new scene.",
+                "Accept only changes in scene, background, camera angle, crop, lighting, styling, secondary props, fabric wrinkles, and presentation.",
+                "Reject an output when any of these differ from the source: "
+                "(1) wording, spelling, lettering style, or letter colors; "
+                "(2) motif identity - subject/species/character, pose, accessories such as hats or bows, count, colors, size, or placement; "
+                "(3) numbering or label style and colors; "
+                "(4) fabric base color or material of a single-product output (only a multi-variant colorway lineup showing several products side by side may vary the fabric color, and even then motif, lettering, and construction must stay identical); "
+                "(5) trims, collar, buttons, ties, cords, dowel, clasps, or hardware; "
+                "(6) silhouette, construction, proportions, pocket/panel layout, or product category; "
+                "(7) any added, missing, simplified, restyled, or 'improved' design element, including a motif repeated onto areas that are plain on the source.",
+                "A product that merely shares the theme of the source (for example a different dinosaur design on the same kind of calendar, or a different flower on the same kind of dress) is a REJECT, even if it looks high quality.",
+                "Reject if the output appears to come from another Trello card or another product.",
+                "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",
+                "Reject invented readable names/text unless the same text is visible on SOURCE_IMAGE or the Trello card instructions explicitly requested alternate personalized names.",
+                "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
+                "Close-up, detail, process, or partial-view outputs are acceptable only when every visible design element matches the source exactly.",
+                "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
+                "bad_indexes must contain the zero-based artifact indexes shown in the OUTPUT_IMAGE_INDEX_N labels; in reason, name the first mismatching design element for each bad index.",
+                (f"Design inventory of the source product (authoritative checklist for the comparison): {inventory}" if inventory else ""),
+                f"Source card/product title: {request.prompt_product or request.title or ''}",
+                f"Source card key: {request.prompt_product_key or request.trello_card_id or ''}",
+            ]
+        )
+
     def _gemini_validate_trello_source_artifacts(
         self,
         request: CreateJobRequest,
@@ -9401,23 +9575,7 @@ exit 1
 
         source_bytes = source_file.read_bytes()
         source_mime = mimetypes.guess_type(str(source_file))[0] or "image/jpeg"
-        prompt = "\n".join(
-            [
-                "You are a strict ecommerce QA checker before uploading generated images to Trello.",
-                "Compare SOURCE_IMAGE with each OUTPUT_IMAGE.",
-                "Accept changes in scene, camera angle, styling, props, fabric colorway, and presentation.",
-                "Reject any output whose main product category, silhouette, construction, motif/design, embroidered/printed text, personalized name, material identity, or source product family does not match the source.",
-                "Reject if the output appears to come from another Trello card or another product, even if it is visually high quality.",
-                "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",
-                "Reject if the main product changes form: for example source pillow to shirt/banner/blanket/hoop, source banner to pillow/shirt, source hoop to pillow/banner, or source apparel to pillow/banner.",
-                "Reject invented readable names/text unless the same text is visible on SOURCE_IMAGE or the Trello card instructions explicitly requested alternate personalized names.",
-                "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
-                "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
-                "bad_indexes must contain the zero-based artifact indexes shown in the OUTPUT_IMAGE_INDEX_N labels.",
-                f"Source card/product title: {request.prompt_product or request.title or ''}",
-                f"Source card key: {request.prompt_product_key or request.trello_card_id or ''}",
-            ]
-        )
+        prompt = self._trello_source_qa_prompt(request)
         parts: List[Dict[str, Any]] = [{"text": prompt}, {"text": "SOURCE_IMAGE"}, self._inline_gemini_image_part(source_bytes, source_mime)]
         for index, image_bytes, mime in generated_items[: self.FLOW_AGENT_MAX_OUTPUT_COUNT]:
             parts.append({"text": f"OUTPUT_IMAGE_INDEX_{index}"})
@@ -9427,7 +9585,7 @@ exit 1
             "contents": [{"parts": parts}],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 512,
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
             },
         }
@@ -9441,18 +9599,7 @@ exit 1
             },
             method="POST",
         )
-        try:
-            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            try:
-                error_payload = json.loads(exc.read().decode("utf-8"))
-                message = str(error_payload.get("error", {}).get("message", "")).strip()
-            except Exception:
-                message = ""
-            raise RuntimeError(message or f"Gemini API trả về HTTP {exc.code}.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Không gọi được Gemini để kiểm tra ảnh: {exc.reason}") from exc
+        body = self._gemini_post_json(request_obj, context="kiểm tra ảnh trước khi upload Trello")
 
         text = self._extract_gemini_text(body)
         parsed = self._parse_json_candidate(text, context="kiểm tra ảnh")
@@ -9479,8 +9626,8 @@ exit 1
             image_bytes, mime = await self._artifact_validation_image_bytes(job_id, artifact, index)
             generated_items.append((index, image_bytes, mime or artifact.mime_type or "image/jpeg"))
 
-        chunk_size = 4
-        validation_warnings: List[str] = []
+        # One Gemini call per output set keeps the free-tier daily request budget usable.
+        chunk_size = max(1, int(self.FLOW_AGENT_MAX_OUTPUT_COUNT))
         for chunk_start in range(0, len(generated_items), chunk_size):
             chunk = generated_items[chunk_start : chunk_start + chunk_size]
             result: Dict[str, Any] | None = None
@@ -9508,16 +9655,28 @@ exit 1
                     break
             if result is None:
                 warning = humanize_flow_error(str(last_validation_error or "")) or "Gemini không trả về kết quả kiểm tra ảnh hợp lệ."
-                validation_warnings.append(warning)
+                if not self._trello_source_qa_strict():
+                    await self.store.append_log(
+                        job_id,
+                        (
+                            f"Gemini QA không chạy được cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
+                            "FLOW_TRELLO_QA_STRICT=0 nên app vẫn upload để duyệt tay trên Trello. "
+                            f"Chi tiết: {warning[:180]}"
+                        ),
+                    )
+                    continue
                 await self.store.append_log(
                     job_id,
                     (
-                        f"Gemini QA không ổn định cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
-                        "card nguồn đã khóa đúng nên app vẫn upload để duyệt trực tiếp trên Trello. "
+                        f"Gemini QA không chạy được cho ảnh {chunk[0][0] + 1}-{chunk[-1][0] + 1}; "
+                        "app giữ bộ ảnh lại, không upload Trello khi chưa kiểm tra được thiết kế. "
                         f"Chi tiết: {warning[:180]}"
                     ),
                 )
-                continue
+                raise RuntimeError(
+                    "Gemini QA không chạy được nên app chưa upload Trello (giữ lại để kiểm tra thiết kế; card sẽ chạy lại ở phiên Auto sau khi Gemini có quota). "
+                    f"Chi tiết: {warning}"
+                )
 
             ok = bool(result.get("ok"))
             raw_bad_indexes = result.get("bad_indexes") if isinstance(result.get("bad_indexes"), list) else []
@@ -9532,13 +9691,7 @@ exit 1
                 raise RuntimeError(
                     f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason}; ảnh lỗi: {display_indexes})."
                 )
-        if validation_warnings:
-            await self.store.append_log(
-                job_id,
-                f"Gemini QA có {len(validation_warnings)} cảnh báo kỹ thuật nhưng không báo ảnh sai; tiếp tục upload vào card Trello đã khóa.",
-            )
-        else:
-            await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp ảnh nguồn Trello; tiếp tục upload.")
+        await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp thiết kế ảnh nguồn Trello; tiếp tục upload.")
 
     async def _archive_trello_artifacts(
         self,
@@ -11961,7 +12114,7 @@ exit 1
             ],
             "generationConfig": {
                 "temperature": 0.0,
-                "maxOutputTokens": 512,
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
             },
         }
@@ -11975,24 +12128,145 @@ exit 1
             },
             method="POST",
         )
-        try:
-            with urlopen(request_obj, timeout=max(20, self.GEMINI_TIMEOUT_S)) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except HTTPError as exc:
-            try:
-                error_payload = json.loads(exc.read().decode("utf-8"))
-                message = str(error_payload.get("error", {}).get("message", "")).strip()
-            except Exception:
-                message = ""
-            raise RuntimeError(message or f"Gemini API returned HTTP {exc.code}.") from exc
-        except URLError as exc:
-            raise RuntimeError(f"Could not call Gemini for visual product classification: {exc.reason}") from exc
+        body = self._gemini_post_json(request_obj, context="visual product classification")
 
         text = self._extract_gemini_text(body)
         parsed = self._parse_json_candidate(text, context="visual product classification")
         if not isinstance(parsed, dict):
             raise RuntimeError("Gemini did not return a valid visual classification object.")
         return parsed
+
+    DESIGN_INVENTORY_MAX_CHARS = 1400
+    DESIGN_INVENTORY_MARKER = "EXACT DESIGN INVENTORY of the source product"
+
+    def _design_inventory_enabled(self) -> bool:
+        raw = os.getenv("FLOW_DESIGN_INVENTORY_ENABLED", "").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _gemini_describe_trello_source_design(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        card_name: str,
+        attachment_name: str,
+        card_description: str,
+        product_rule_key: str = "",
+        visible_product: str = "",
+    ) -> Dict[str, Any]:
+        api_key = self._gemini_api_key()
+        if not api_key:
+            raise RuntimeError("Gemini is not configured for the source design inventory.")
+        prompt = "\n".join(
+            [
+                "You are cataloguing a handmade product photo so an image generator can reproduce the SAME design exactly in new scenes.",
+                "Describe only what is visible on the main product in SOURCE_IMAGE. Never invent details, never generalize, never suggest alternatives or improvements.",
+                "Be literal and specific: the exact wording and spelling of any text with its letter colors and lettering style; every motif with its subject/species/character, pose, accessories (hats, bows, scarves), colors, count, size, and position on the product; number/label style and colors; fabric base color and material; trims, collar, buttons, ties, cords, dowel, clasps, and hardware; layout and proportions.",
+                "Return JSON only with this exact shape: {\"inventory\": string, \"base_color\": string, \"material\": string, \"text_elements\": [string], \"motifs\": [string], \"numbers_or_labels\": string, \"trims_hardware\": string, \"layout\": string, \"must_not_change\": [string]}.",
+                f"inventory is one compact English paragraph under {self.DESIGN_INVENTORY_MAX_CHARS} characters that restates all of the above in reproduction order.",
+                f"Card name: {card_name}",
+                f"Attachment name: {attachment_name}",
+                f"Product rule: {product_rule_key or 'unknown'}",
+                f"Visible product: {visible_product or 'unknown'}",
+                f"Card description: {card_description[:800]}",
+            ]
+        )
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": prompt},
+                        {"text": "SOURCE_IMAGE"},
+                        self._inline_gemini_image_part(image_bytes, mime_type or "image/jpeg"),
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 4096,
+                "responseMimeType": "application/json",
+            },
+        }
+        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
+        request_obj = Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        body = self._gemini_post_json(request_obj, context="the source design inventory")
+
+        text = self._extract_gemini_text(body)
+        parsed = self._parse_json_candidate(text, context="design inventory")
+        if not isinstance(parsed, dict):
+            raise RuntimeError("Gemini did not return a valid design inventory object.")
+        return parsed
+
+    def _design_inventory_text_from_payload(self, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+
+        def _clean(value: Any) -> str:
+            if isinstance(value, (list, tuple)):
+                return "; ".join(item for item in (_clean(entry) for entry in value) if item)
+            if isinstance(value, dict):
+                return "; ".join(f"{key}: {_clean(entry)}" for key, entry in value.items() if _clean(entry))
+            return re.sub(r"\s+", " ", str(value or "")).strip()
+
+        parts: List[str] = []
+        inventory = _clean(payload.get("inventory"))
+        if inventory:
+            parts.append(inventory)
+        for label, key in (
+            ("Base color", "base_color"),
+            ("Material", "material"),
+            ("Text", "text_elements"),
+            ("Motifs", "motifs"),
+            ("Numbers/labels", "numbers_or_labels"),
+            ("Trims/hardware", "trims_hardware"),
+            ("Layout", "layout"),
+            ("Must not change", "must_not_change"),
+        ):
+            text = _clean(payload.get(key))
+            if text:
+                parts.append(f"{label}: {text}")
+        combined = " ".join(parts).strip()
+        return combined[: self.DESIGN_INVENTORY_MAX_CHARS * 2].strip()
+
+    def _design_inventory_from_request(self, request: CreateJobRequest) -> str:
+        for candidate in (request.prompt_notes, request.prompt):
+            text = str(candidate or "")
+            marker_pos = text.find(self.DESIGN_INVENTORY_MARKER)
+            if marker_pos < 0:
+                continue
+            tail = text[marker_pos:]
+            colon_pos = tail.find(": ")
+            inventory = tail[colon_pos + 2 :] if colon_pos >= 0 else tail
+            for stop_marker in (" Flow Agent will write the final prompts", " Use the selected Trello attachment"):
+                stop_pos = inventory.find(stop_marker)
+                if stop_pos >= 0:
+                    inventory = inventory[:stop_pos]
+            inventory = re.sub(r"\s+", " ", inventory).strip()
+            if inventory:
+                return inventory[: self.DESIGN_INVENTORY_MAX_CHARS * 2]
+        return ""
+
+    def _flow_agent_design_replication_rule(self) -> str:
+        return (
+            "Design replication lock (highest priority after the source lock): every output must show an exact replica of the attached source product, "
+            "as if the same physical item were photographed again in a new scene. Reproduce the design inventory exactly: the same fabric base color; "
+            "the same wording and lettering with the same letters, spelling, colors, and lettering style; the same motifs with the same subjects/species/characters, "
+            "pose, accessories, colors, count, size, and positions; the same numbering; and the same trims, collar, buttons, ties, cords, dowel, clasps, and hardware. "
+            "Do not add, remove, simplify, enlarge, recolor, restyle, modernize, or 'improve' any design element, and never replace the source artwork with a generic design "
+            "on the same theme (for example, never swap the source's two hatted dinosaurs for a different single dinosaur, and never put a motif on every pocket when the source has motifs on only some). "
+            "A single-product output must keep the source fabric color; only an explicitly numbered colorway lineup shot may vary the fabric color, and even then the motif, lettering, and construction stay identical. "
+            "In every internal image prompt you write, restate the design inventory literally and name the attached source ingredient image as the identity reference; "
+            "never describe the product generically (such as 'a dinosaur advent calendar' or 'an embroidered baby dress'). "
+            "If a scene, angle, or prop would hide or alter the design, change the scene, not the design."
+        )
 
     def _flow_operator_enrich_card_with_visual_product_rule(
         self,
@@ -12004,7 +12278,8 @@ exit 1
         card["_visual_product_rule_checked"] = True
         existing_rule_key = self._flow_operator_card_visual_product_rule_key(card)
         needs_ai_title = self._trello_should_write_ai_title_description(card)
-        if existing_rule_key and not needs_ai_title:
+        needs_design_inventory = self._design_inventory_enabled() and not str(card.get("_design_inventory_text") or "").strip()
+        if existing_rule_key and not needs_ai_title and not needs_design_inventory:
             return
         if not self._gemini_api_key():
             if needs_ai_title:
@@ -12051,8 +12326,11 @@ exit 1
         cached = self._trello_visual_product_rule_cache.get(cache_key)
         if cached is not None:
             card.update(cached)
-            if not needs_ai_title:
+            cached_inventory = str(cached.get("_design_inventory_text") or "").strip()
+            if not needs_ai_title and (not needs_design_inventory or cached_inventory):
                 return
+            if cached_inventory:
+                needs_design_inventory = False
 
         image_bytes: bytes | None = None
         mime = ""
@@ -12108,6 +12386,25 @@ exit 1
                         "_visual_product_rule_error": humanize_flow_error(str(exc)) or str(exc),
                     }
                 )
+        if needs_design_inventory and image_bytes is not None and not str(metadata.get("_design_inventory_text") or "").strip():
+            try:
+                inventory_payload = self._gemini_describe_trello_source_design(
+                    image_bytes=image_bytes,
+                    mime_type=mime,
+                    card_name=str(card.get("name") or ""),
+                    attachment_name=str(attachment.get("name") or ""),
+                    card_description=self._flow_operator_trello_card_description_note(card),
+                    product_rule_key=str(metadata.get("_visual_product_rule_key") or existing_rule_key or text_rule_key or ""),
+                    visible_product=str(metadata.get("_visual_product_rule_visible_product") or ""),
+                )
+                inventory_text = self._design_inventory_text_from_payload(inventory_payload)
+                if inventory_text:
+                    metadata["_design_inventory_text"] = inventory_text
+                    metadata.pop("_design_inventory_error", None)
+                else:
+                    metadata["_design_inventory_error"] = "Gemini returned an empty design inventory."
+            except Exception as exc:
+                metadata["_design_inventory_error"] = humanize_flow_error(str(exc)) or str(exc)
         if needs_ai_title and image_bytes is not None:
             try:
                 resolved_rule_key = str(
@@ -12569,11 +12866,18 @@ exit 1
             if confidence_text:
                 detail += f", confidence {confidence_text}"
             source_hint += f" Visual source classification{detail}; this overrides random or generic card filenames."
+        inventory_text = str(card.get("_design_inventory_text") or "").strip()
+        inventory_hint = (
+            f" {self.DESIGN_INVENTORY_MARKER} (reproduce every item literally in every output; this is the design that must not change): {inventory_text}"
+            if inventory_text
+            else ""
+        )
         return (
             "Before creating images, carefully analyze the selected Trello reference image for "
             + "; ".join(product_bits)
             + ". Keep those design features consistent across the whole image set."
             + source_hint
+            + inventory_hint
         )
 
     def _flow_operator_missing_product_rule_detail(self, card: Dict[str, Any], signals: Dict[str, Any]) -> str:
@@ -13287,6 +13591,7 @@ exit 1
                 "Do not copy the source motif/name/design onto a different secondary product; props must remain plain and secondary. "
                 "The only valid main product is the exact visible product object in the attached source image, with the same outline, construction, and design placement."
             ),
+            self._flow_agent_design_replication_rule(),
             (
                 "HAVI product shot rule lock: "
                 f"{str(product_rule.get('display_name') or product_rule_key)} uses the fixed shot plan imported from HAVI_Shot_Types_All_Products.xlsx. "

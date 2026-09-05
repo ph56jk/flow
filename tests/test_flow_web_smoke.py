@@ -91,6 +91,14 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         )
         self._batch_pause_env.start()
         self.addCleanup(self._batch_pause_env.stop)
+        # Keep the Gemini design-inventory step offline in tests; individual tests re-patch it on the instance.
+        self._design_inventory_patch = patch.object(
+            FlowWebService,
+            "_gemini_describe_trello_source_design",
+            return_value={"inventory": ""},
+        )
+        self._design_inventory_patch.start()
+        self.addCleanup(self._design_inventory_patch.stop)
         self.store = StateStore()
         self.service = FlowWebService(self.store)
 
@@ -417,6 +425,125 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Treat the Trello description as user-supplied product guidance", prompt)
         self.assertIn("baby pillowcase or cushion shape", items[0]["design_analysis"])
         self.assertIn("Hands embroidering pillowcase", items[0]["shot_labels"])
+
+    def _design_inventory_card(self, card_id: str = "card-inventory") -> dict[str, Any]:
+        return {
+            "id": card_id,
+            "shortLink": card_id,
+            "idList": "ready",
+            "name": "advent_calendar",
+            "desc": "",
+            "url": f"https://trello.example/c/{card_id}",
+            "_image_attachments": [{"id": "att-inv", "name": "calendar.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-inv"],
+        }
+
+    def _design_inventory_patches(self, describe_payload: dict[str, Any]) -> list[Any]:
+        return [
+            patch.object(self.service, "_gemini_api_key", return_value="gemini-key"),
+            patch.object(self.service, "_trello_credentials", return_value=("trello-key", "trello-token")),
+            patch.object(self.service, "_trello_download_attachment_bytes", return_value=(b"image-bytes", "image/jpeg")),
+            patch.object(
+                self.service,
+                "_gemini_classify_trello_source_product_rule",
+                return_value={
+                    "product_rule_key": "advent_calendar",
+                    "confidence": 0.95,
+                    "visible_product": "linen advent calendar with dinosaur embroidery",
+                    "reason": "pocket grid visible",
+                },
+            ),
+            patch.object(self.service, "_trello_should_write_ai_title_description", return_value=False),
+            patch.object(self.service, "_gemini_describe_trello_source_design", return_value=describe_payload),
+        ]
+
+    def test_design_inventory_locks_prompt_and_qa_checklist(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = self._design_inventory_card()
+        describe_payload = {
+            "inventory": (
+                "Cream cotton wall advent calendar with 'Merry Rex-mas' lettering in green and red, a T-rex and a "
+                "triceratops both wearing red Santa hats above 25 numbered pockets with dark teal numbers."
+            ),
+            "base_color": "cream",
+            "text_elements": ["Merry Rex-mas"],
+            "motifs": ["T-rex with red Santa hat", "triceratops with red Santa hat"],
+            "must_not_change": ["two hatted dinosaurs", "cream fabric"],
+        }
+        patches = self._design_inventory_patches(describe_payload)
+        with contextlib.ExitStack() as stack:
+            mocks = [stack.enter_context(item) for item in patches]
+            items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+        describe = mocks[-1]
+
+        describe.assert_called_once()
+        self.assertEqual(1, len(items))
+        self.assertIn("Merry Rex-mas", card["_design_inventory_text"])
+        self.assertIn("Must not change: two hatted dinosaurs; cream fabric", card["_design_inventory_text"])
+        self.assertIn("EXACT DESIGN INVENTORY of the source product", items[0]["design_analysis"])
+        self.assertIn("Merry Rex-mas", items[0]["notes"])
+        prompt = items[0]["prompt"]
+        self.assertIn("Design replication lock", prompt)
+        self.assertIn("never describe the product generically", prompt)
+        self.assertIn("restates the exact design inventory", prompt)
+
+        child = CreateJobRequest(
+            type="image",
+            title="child",
+            prompt=prompt,
+            prompt_notes=items[0]["notes"],
+            prompt_product="advent_calendar",
+        )
+        self.assertIn("Merry Rex-mas", self.service._design_inventory_from_request(child))
+        self.assertNotIn("Flow Agent will write the final prompts", self.service._design_inventory_from_request(child))
+        qa_prompt = self.service._trello_source_qa_prompt(child)
+        self.assertIn("exact replica of the source product", qa_prompt)
+        self.assertIn("Design inventory of the source product", qa_prompt)
+        self.assertIn("Merry Rex-mas", qa_prompt)
+        self.assertIn("is a REJECT", qa_prompt)
+
+    def test_design_inventory_is_cached_per_source_attachment(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        describe_payload = {"inventory": "Cream linen calendar with two hatted dinosaurs."}
+        patches = self._design_inventory_patches(describe_payload)
+        with contextlib.ExitStack() as stack:
+            mocks = [stack.enter_context(item) for item in patches]
+            first_card = self._design_inventory_card()
+            second_card = self._design_inventory_card()
+            self.service._flow_operator_enrich_card_with_visual_product_rule(request, first_card)
+            self.service._flow_operator_enrich_card_with_visual_product_rule(request, second_card)
+        describe = mocks[-1]
+
+        describe.assert_called_once()
+        self.assertEqual(first_card["_design_inventory_text"], second_card["_design_inventory_text"])
+        self.assertIn("two hatted dinosaurs", second_card["_design_inventory_text"])
+
+    def test_design_inventory_failure_keeps_prompt_usable(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = self._design_inventory_card("card-inventory-fail")
+        patches = self._design_inventory_patches({})
+        patches[-1] = patch.object(
+            self.service,
+            "_gemini_describe_trello_source_design",
+            side_effect=RuntimeError("Gemini API returned HTTP 503."),
+        )
+        with contextlib.ExitStack() as stack:
+            for item in patches:
+                stack.enter_context(item)
+            items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+        self.assertEqual(1, len(items))
+        self.assertIn("HTTP 503", card["_design_inventory_error"])
+        self.assertNotIn("EXACT DESIGN INVENTORY", items[0]["design_analysis"])
+        self.assertIn("Design replication lock", items[0]["prompt"])
+        self.assertEqual("", self.service._design_inventory_from_request(CreateJobRequest(type="image", prompt=items[0]["prompt"])))
+
+    def test_auto_trello_design_qa_rejection_is_retried_not_stopped(self) -> None:
+        detail = "Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn (different dinosaur; ảnh lỗi: 2, 6)."
+        self.assertTrue(self.service._auto_trello_is_design_qa_rejection(detail))
+        self.assertFalse(self.service._auto_trello_should_stop_on_child_error(detail))
+        self.assertFalse(self.service._auto_trello_is_design_qa_rejection("Đã xảy ra lỗi. Hãy thử lại."))
+        self.assertEqual(2, FlowWebService.AUTO_TRELLO_DESIGN_QA_MAX_RETRIES)
 
     def test_trello_ai_title_description_block_preserves_existing_description(self) -> None:
         description = "Original buyer notes.\nKeep the flower motif exact."
@@ -5726,6 +5853,14 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         self._batch_pause_env.start()
         self.addCleanup(self._batch_pause_env.stop)
+        # Keep the Gemini design-inventory step offline in tests; individual tests re-patch it on the instance.
+        self._design_inventory_patch = patch.object(
+            FlowWebService,
+            "_gemini_describe_trello_source_design",
+            return_value={"inventory": ""},
+        )
+        self._design_inventory_patch.start()
+        self.addCleanup(self._design_inventory_patch.stop)
         self.store = StateStore()
         self.service = FlowWebService(self.store)
 
@@ -6045,7 +6180,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         saved = self.store.get_job(job.id)
         self.assertTrue(any("thử lại lần 2" in entry.message for entry in saved.logs))
 
-    async def test_trello_source_validation_warns_without_blocking_on_gemini_json_outage(self) -> None:
+    async def test_trello_source_validation_blocks_upload_on_gemini_json_outage(self) -> None:
         source = self.uploads_dir / "source.jpg"
         source.write_bytes(b"source")
         artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(self.downloads_dir / "out.jpg"), mime_type="image/jpeg")
@@ -6076,13 +6211,19 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             "_gemini_validate_trello_source_artifacts",
             side_effect=RuntimeError("Gemini không trả về JSON kiểm tra ảnh hợp lệ."),
         ) as validate:
-            await self.service._validate_trello_source_artifacts_before_upload(job.id, request, [artifact])
+            with self.assertRaises(RuntimeError) as ctx:
+                await self.service._validate_trello_source_artifacts_before_upload(job.id, request, [artifact])
 
+        # The QA outage is retried once, then the upload is held instead of shipping unverified designs.
         self.assertEqual(2, validate.call_count)
+        self.assertIn("Gemini QA không chạy được", str(ctx.exception))
+        self.assertTrue(self.service._auto_trello_is_design_qa_unavailable(str(ctx.exception)))
+        self.assertFalse(self.service._auto_trello_is_design_qa_rejection(str(ctx.exception)))
+        self.assertFalse(self.service._auto_trello_should_stop_on_child_error(str(ctx.exception)))
         saved = self.store.get_job(job.id)
         messages = [entry.message for entry in saved.logs]
-        self.assertTrue(any("vẫn upload" in message for message in messages))
-        self.assertTrue(any("cảnh báo kỹ thuật" in message for message in messages))
+        self.assertTrue(any("không upload Trello khi chưa kiểm tra được thiết kế" in message for message in messages))
+        self.assertFalse(any("vẫn upload" in message for message in messages))
 
     async def test_plan_storyboard_returns_local_scenes_when_gemini_is_not_configured(self) -> None:
         with patch.object(self.service, "ensure_media_skill_library", AsyncMock(return_value={})), patch.object(
