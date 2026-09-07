@@ -516,11 +516,11 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("different fabric base color is acceptable", qa_prompt)
         self.assertNotIn("Ornament pose rule", qa_prompt)
 
+        # Ornament poses are steered by the shot rules only; QA must not reject faithful images for pose.
         ornament = CreateJobRequest(type="image", title="child", prompt="x", prompt_product="Ornament Round")
         ornament_prompt = self.service._trello_source_qa_prompt(ornament)
-        self.assertIn("Ornament pose rule", ornament_prompt)
-        self.assertIn("stands upright or balances on its edge", ornament_prompt)
-        self.assertIn("hanging from its cord or loop, lying completely flat", ornament_prompt)
+        self.assertNotIn("Ornament pose rule", ornament_prompt)
+        self.assertNotIn("stands upright or balances on its edge", ornament_prompt)
         self.assertIn("Never show the ornament standing upright", PRODUCT_SHOT_RULES["ornament_round"]["shots"][0][2])
         self.assertEqual(12, PRODUCT_SHOT_RULES["ornament_round"]["target_count"])
         self.assertEqual(12, PRODUCT_SHOT_RULES["pn_ornament"]["target_count"])
@@ -2889,18 +2889,46 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             items[0]["shot_labels"],
         )
 
-    def test_auto_trello_eight_output_card_generates_full_twelve_image_set(self) -> None:
+    def test_auto_trello_partial_output_cards_are_finished_instead_of_regenerated(self) -> None:
+        """Cards that already hold >= FLOW_TRELLO_QA_MIN_GOOD_IMAGES outputs are never regenerated (no fill-in policy)."""
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4, trello_board_id="board-1")
+        for existing in (8, 10):
+            with self.subTest(existing=existing):
+                card = {
+                    "id": f"partial-{existing}",
+                    "shortLink": f"partial{existing}",
+                    "idList": "ready",
+                    "idBoard": "board-1",
+                    "name": "embroidered pillowcase",
+                    "url": f"https://trello.example/c/partial{existing}",
+                    "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
+                    "_selected_attachment_ids": ["source-att"],
+                    "_flow_output_count": existing,
+                }
+                with patch.object(self.service, "_trello_credentials", return_value=("trello-key", "trello-token")), patch.object(
+                    self.service, "_trello_content_review_list_id", return_value="list-review"
+                ), patch.object(self.service, "_trello_move_card_to_list", return_value={"id": card["id"]}) as move:
+                    items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
+
+                self.assertEqual([], items)
+                self.assertEqual("complete_output_set", card["_auto_trello_skip_code"])
+                self.assertIn(f"{existing}/12 anh output", card["_auto_trello_skip_reason"])
+                self.assertIn("khong tao bu", card["_auto_trello_skip_reason"])
+                self.assertTrue(card["_auto_trello_moved_to_review"])
+                move.assert_called_once_with("trello-key", "trello-token", card["id"], "list-review")
+
+    def test_auto_trello_card_below_min_outputs_generates_fresh_full_twelve_image_set(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
         cards = [
             {
-                "id": "complete-card",
-                "shortLink": "complete",
+                "id": "sparse-card",
+                "shortLink": "sparse",
                 "idList": "ready",
                 "name": "embroidered pillowcase",
-                "url": "https://trello.example/c/complete",
+                "url": "https://trello.example/c/sparse",
                 "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
                 "_selected_attachment_ids": ["source-att"],
-                "_flow_output_count": 8,
+                "_flow_output_count": 2,
             }
         ]
 
@@ -2908,10 +2936,11 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
 
         self.assertEqual(1, len(items))
         self.assertEqual(12, items[0]["flow_agent_image_count"])
-        self.assertEqual(8, items[0]["flow_agent_existing_output_count"])
-        self.assertIn("already has 8/12 Flow output", items[0]["prompt"])
+        self.assertEqual(2, items[0]["flow_agent_existing_output_count"])
+        self.assertIn("already has 2/12 Flow output", items[0]["prompt"])
         self.assertIn("fresh full 12-image set", items[0]["prompt"])
-        self.assertNotIn("Continue the same set by creating exactly 4 new missing image", items[0]["prompt"])
+        self.assertNotIn("Continue the same set by creating exactly 10 new missing image", items[0]["prompt"])
+        self.assertIn("source image is not a generated output", items[0]["prompt"])
         self.assertEqual(
             [
                 "Embroidery craft proof",
@@ -2933,34 +2962,6 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertIn("Colorway text/name rule", items[0]["prompt"])
         self.assertIn("never repeat the exact same readable name/text across all color variants", items[0]["prompt"])
         self.assertIn("otherwise all options must remain nameless", items[0]["prompt"])
-
-    def test_auto_trello_ten_output_card_generates_full_twelve_image_set(self) -> None:
-        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)
-        cards = [
-            {
-                "id": "nearly-complete-card",
-                "shortLink": "nearly",
-                "idList": "ready",
-                "name": "embroidered pillowcase",
-                "url": "https://trello.example/c/nearly",
-                "_image_attachments": [{"id": "source-att", "name": "source.jpg", "mimeType": "image/jpeg"}],
-                "_selected_attachment_ids": ["source-att"],
-                "_flow_output_count": 10,
-            }
-        ]
-
-        items = self.service._trello_ai_prompt_items_for_image_cards(cards, request, 40)
-
-        self.assertEqual(1, len(items))
-        self.assertEqual(12, items[0]["flow_agent_image_count"])
-        self.assertEqual(10, items[0]["flow_agent_existing_output_count"])
-        self.assertIn("already has 10/12 Flow output", items[0]["prompt"])
-        self.assertIn("fresh full 12-image set", items[0]["prompt"])
-        self.assertNotIn("Continue the same set by creating exactly 2 new missing image", items[0]["prompt"])
-        self.assertIn("source image is not a generated output", items[0]["prompt"])
-        self.assertEqual(12, len(items[0]["shot_labels"]))
-        self.assertEqual("Embroidery craft proof", items[0]["shot_labels"][0])
-        self.assertEqual("Color option display", items[0]["shot_labels"][-1])
 
     def test_auto_trello_hoop_uses_name_variants_instead_of_colorways(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=4)

@@ -9752,19 +9752,12 @@ exit 1
         raise RuntimeError(last_message or f"Gemini API request failed for {context}.")
 
     def _trello_source_qa_product_rules(self, request: CreateJobRequest) -> List[str]:
-        """Product-specific QA rules chosen from the card/product text."""
-        haystack = " ".join(
-            str(value or "")
-            for value in (request.prompt_product, request.title, request.prompt_notes, (request.prompt or "")[:4000])
-        ).lower()
-        rules: List[str] = []
-        if "ornament" in haystack:
-            rules.append(
-                "Ornament pose rule: the source is a hanging ornament. Reject any output where the ornament stands upright or balances on its edge "
-                "on a table, shelf, or other surface, or leans against props - a linen/hoop ornament cannot stand like that. Acceptable poses are only: "
-                "hanging from its cord or loop, lying completely flat, resting inside an open box, or held in a hand."
-            )
-        return rules
+        """Product-specific QA rules chosen from the card/product text.
+
+        Pose/scene preferences (e.g. ornaments standing on a table) are handled by the
+        shot rules only; QA must not drop otherwise faithful images for them.
+        """
+        return []
 
     def _trello_source_qa_prompt(self, request: CreateJobRequest) -> str:
         inventory = self._design_inventory_from_request(request)
