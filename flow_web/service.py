@@ -9758,10 +9758,14 @@ exit 1
                 "(1) wording, spelling, lettering style, or letter colors; "
                 "(2) motif identity - subject/species/character, pose, accessories such as hats or bows, count, colors, size, or placement; "
                 "(3) numbering or label style and colors; "
-                "(4) fabric base color or material of a single-product output (only a multi-variant colorway lineup showing several products side by side may vary the fabric color, and even then motif, lettering, and construction must stay identical); "
+                "(4) material or fabric texture of the product; "
                 "(5) trims, collar, buttons, ties, cords, dowel, clasps, or hardware; "
                 "(6) silhouette, construction, proportions, pocket/panel layout, or product category; "
                 "(7) any added, missing, simplified, restyled, or 'improved' design element, including a motif repeated onto areas that are plain on the source.",
+                "Planned exceptions that are part of the shot list - never reject an output only for these: "
+                "(a) colorway variants: the same product, single or in a lineup, in a different fabric base color is acceptable when the motif, lettering style, collar, trims, and construction stay identical; "
+                "(b) craft/process shots: the same embroidery being stitched in a hoop, cut fabric pieces, sewing or pressing steps, a mannequin, a hanger, a gift box, or a multi-panel close-up collage of the same product are acceptable presentations, not a product-category change, as long as the visible design matches the source; "
+                "(c) lineup variants carrying different personalized names in the same lettering style and placement.",
                 "A product that merely shares the theme of the source (for example a different dinosaur design on the same kind of calendar, or a different flower on the same kind of dress) is a REJECT, even if it looks high quality.",
                 "Reject if the output appears to come from another Trello card or another product.",
                 "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",

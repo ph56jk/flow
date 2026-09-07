@@ -510,6 +510,10 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         # Colorway lineup shots may carry different names per variant (matches the prompt's colorway rule).
         self.assertIn("multi-product lineup shot", qa_prompt)
         self.assertIn("is NOT a defect", qa_prompt)
+        # Planned shot-list exceptions (colorways, craft/process shots) must not be rejected as design changes.
+        self.assertIn("Planned exceptions that are part of the shot list", qa_prompt)
+        self.assertIn("stitched in a hoop", qa_prompt)
+        self.assertIn("different fabric base color is acceptable", qa_prompt)
 
     def test_design_inventory_is_cached_per_source_attachment(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
