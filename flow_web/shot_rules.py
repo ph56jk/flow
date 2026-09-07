@@ -310,6 +310,7 @@ _ORNAMENT_ROUND_LOCK = (
     "weave, natural wrinkles, proportions, and premium handmade finish. Do not redesign, redraw, simplify, move, "
     "resize, or replace the embroidery; do not change the frame, clasp, hanging construction, material, or product "
     "scale; and do not turn the ornament into a large wall hoop, bag, pillow, banner, coaster, plaque, or printed item."
+    "Never show the ornament standing upright or balanced on its edge on a table, shelf, or any surface, and never lean it against props: it must hang from its cord or loop, lie completely flat, sit inside a box, or be held in a hand. "
 )
 
 _ORNAMENT_ROUND_STYLE = (
@@ -338,6 +339,7 @@ _PN_ORNAMENT_LOCK = (
     "redesign, redraw, simplify, move, resize, recolor, replace, mirror, or cover the motif; never alter the frame, clasp, "
     "hanging construction, linen, or product scale; and never turn the ornament into a large wall hoop, pillow, bag, "
     "banner, coaster, plaque, stocking, plush, or another product."
+    "Never show the ornament standing upright or balanced on its edge on a table, shelf, or any surface, and never lean it against props: it must hang from its cord or loop, lie completely flat, sit inside a box, or be held in a hand. "
 )
 
 _PN_ORNAMENT_STYLE = (
@@ -1348,7 +1350,7 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
                                 'do treo cay thong',
                                 'do trang tri giang sinh tron',
                                 'ornament giang sinh'),
-                    'target_count': 14,
+                    'target_count': 12,
                     'allow_planned_multi_panel_shots': True,
                     'allow_planned_prop_text': True,
                     'lock': 'the main product must remain the exact same small round hand-embroidered Christmas linen ornament from the source image, with the same round wooden hoop/frame, metal clasp or fastener if visible, linen fabric and color, hanging cord or ribbon, embroidery motif, embroidery placement, embroidery scale, thread colors, raised hand-stitch texture, fabric weave, natural wrinkles, proportions, and premium handmade Christmas identity; never enlarge it into a wall hoop, redesign or simplify the embroidery, change the frame or hanging construction, make the stitches look printed or machine-flat, or turn it into a bag, pillow, banner, coaster, plaque, or generic Christmas decoration',
@@ -1360,16 +1362,16 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
                                _ornament_round_brief('hang the ornament at the center of a fresh Christmas tree branch so it stands out clearly among the pine needles. Use soft white balanced daylight and keep tree lights from becoming strongly yellow. Shoot at ornament height from a 30-45 degree angle. Add a few baubles and softly blurred fairy lights in the background while keeping the complete round frame, hanging cord, clasp, linen face, and embroidery sharply visible.')),
                               ('Open gift box',
                                'Ornament presented inside open Christmas gift box',
-                               _ornament_round_brief('present the ornament inside an open Christmas-toned gift box lined with clean tissue paper. Use bright clean luxurious white daylight and shoot from a 35-45 degree angle. Add deep red or champagne ribbon, a few small pine sprigs, dried orange slices, cinnamon sticks, and several softly blurred gift boxes in the background. Do not hide the frame, clasp, cord, linen, or embroidery beneath the packaging.')),
+                               _ornament_round_brief('lay the ornament flat inside an open Christmas-toned gift box lined with clean tissue paper. Use bright clean luxurious white daylight and shoot from a 35-45 degree angle. Add deep red or champagne ribbon, a few small pine sprigs, dried orange slices, cinnamon sticks, and several softly blurred gift boxes in the background. Do not hide the frame, clasp, cord, linen, or embroidery beneath the packaging.')),
                               ('Minimal Christmas table',
                                'Ornament in refined candle and pinecone setting',
-                               _ornament_round_brief('place the ornament lying flat or standing securely at the center of a minimal Christmas tabletop scene. Use soft even white daylight rather than candle-yellow light and shoot from a frontal 45-degree angle. Decorate with two low unlit or neutrally lit candles, a few small pinecones, several pastel matte baubles, and one evergreen sprig. Keep every prop secondary and the embroidery crisp and tactile.')),
+                               _ornament_round_brief('place the ornament lying flat at the center of a minimal Christmas tabletop scene. Use soft even white daylight rather than candle-yellow light and shoot from a frontal 45-degree angle. Decorate with two low unlit or neutrally lit candles, a few small pinecones, several pastel matte baubles, and one evergreen sprig. Keep every prop secondary and the embroidery crisp and tactile.')),
                               ('Christmas card flat lay',
                                'Ornament beside neutral Merry Christmas card',
                                _ornament_round_brief('place the ornament as the main focal point beside one neutral-toned greeting card whose only readable prop text is Merry Christmas, on a white wood-grain tabletop. Shoot top-down from 75-90 degrees with clean even white daylight. Add a thin ribbon, one small gnome, and a small evergreen branch in the upper-left corner. The greeting card is a separate prop and must not touch or cover the ornament; add no other writing, label, tag, logo, or text overlay.')),
                               ('Baby keepsake shelf',
                                'Ornament with folded baby clothes by bright window',
-                               _ornament_round_brief('place the ornament on a white wood-grain shelf or tabletop beside several neatly folded baby outfits near a bright window. Use soft clear white daylight and shoot top-down or at 45 degrees. Keep a softly blurred Christmas background and add one small gnome teddy, a Christmas stocking, and a small reindeer figure in a very tidy arrangement. Keep the ornament small and correctly scaled relative to the clothing.')),
+                               _ornament_round_brief('lay the ornament completely flat on a white wood-grain shelf or tabletop beside several neatly folded baby outfits near a bright window. Use soft clear white daylight and shoot top-down or at 45 degrees. Keep a softly blurred Christmas background and add one small gnome teddy, a Christmas stocking, and a small reindeer figure in a very tidy arrangement. Keep the ornament small and correctly scaled relative to the clothing.')),
                               ('Hand embroidery process',
                                'Woman stitching ornament motif at craft table',
                                _ornament_round_brief('show an adult woman seated at a clean handmade craft table. One anatomically natural hand holds a small embroidery hoop containing linen that matches the product color, while the other hand carefully stitches the exact source motif with a realistically threaded embroidery needle at a believable contact point. Add small scissors, thread spools, neatly folded linen, beautiful window light, and subtle Christmas decor. The finished source ornament may sit nearby as a clear reference product, but do not change its design.')),
@@ -1389,8 +1391,8 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
                                'One-year-old baby holding small ornament by tree',
                                _ornament_round_brief('show a roughly one-year-old baby wearing a Christmas outfit and Santa hat, seated beside a Christmas tree and naturally holding the ornament. Use cozy but white-balanced soft daylight with tasteful Christmas decor. The ornament must remain genuinely small relative to the baby hand and body, never enlarged, and its embroidered front should face the camera without being covered. Keep baby hands anatomically natural.')),
                               ('Bookshelf lifestyle',
-                               'Ornament resting on neutral books with pine and orange',
-                               _ornament_round_brief('rest the ornament against one or two white or pale neutral hardcover books for a warm premium Christmas lifestyle scene. Use soft clean white daylight reflecting naturally from the paper and shoot from a 30-45 degree angle. Add one frosted glass bauble, one evergreen sprig, dried orange slices, and cinnamon sticks. Keep the ornament as the dominant sharp subject and do not use beige or yellow color grading.')),
+                               'Ornament lying flat on neutral books with pine and orange',
+                               _ornament_round_brief('lay the ornament flat on top of one or two white or pale neutral hardcover books for a warm premium Christmas lifestyle scene. Use soft clean white daylight reflecting naturally from the paper and shoot from a 30-45 degree angle. Add one frosted glass bauble, one evergreen sprig, dried orange slices, and cinnamon sticks. Keep the ornament as the dominant sharp subject and do not use beige or yellow color grading.')),
                               ('Construction detail collage',
                                'Four-panel macro of embroidery frame and clasp',
                                _ornament_round_brief('create one square 1:1 collage containing exactly four macro close-up photos of the same source ornament: raised embroidery and individual thread fibers, linen weave and stitch edges, wooden hoop/frame material and edge finish, and the metal clasp or fastener plus hanging-cord attachment. Every panel must match the original product exactly and prove genuine hand embroidery rather than print or machine-flat stitching. Do not add new motifs, text, hardware, or a different ornament.')))},
@@ -7505,7 +7507,7 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
         "ornament pn",
         "do treo punch needle",
     ),
-    "target_count": 14,
+    "target_count": 12,
     "lock": (
         "the main product must remain the exact same small handmade Christmas linen Punch Needle ornament from the "
         "source, preserving its silhouette, frame, metal clasp, hanging cord, linen, motif, colors, placement, scale, "
@@ -7538,7 +7540,7 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
             "Gift box",
             "Punch Needle ornament in open Christmas gift box",
             _pn_ornament_brief(
-                "place the exact ornament inside one open Christmas-toned gift box lined with clean tissue paper. Shoot "
+                "lay the exact ornament flat inside one open Christmas-toned gift box lined with clean tissue paper. Shoot "
                 "from 35-45 degrees in bright clean luxurious white daylight. Add deep red or champagne ribbon, small pine "
                 "sprigs, dried orange slices, cinnamon, and softly blurred gift boxes behind. Keep the complete frame, "
                 "clasp, cord, linen face, and raised punch-needle motif uncovered."
@@ -7548,7 +7550,7 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
             "Minimal Christmas table",
             "Punch Needle ornament with low candles and pastel baubles",
             _pn_ornament_brief(
-                "place the exact ornament lying flat or standing securely at the center of a minimal Christmas tabletop. "
+                "place the exact ornament lying flat at the center of a minimal Christmas tabletop. "
                 "Shoot from a frontal 45-degree angle in soft even white light, never candle-yellow. Style with two low "
                 "neutral candles, a few small pinecones, pastel matte baubles, and one evergreen sprig. Keep every prop "
                 "secondary and the thick handmade punch-needle loop texture crisp."
@@ -7568,7 +7570,7 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
             "Baby clothing shelf",
             "Punch Needle ornament beside folded baby outfits near window",
             _pn_ornament_brief(
-                "place the exact ornament on a white wood-grain shelf or tabletop beside several neatly folded baby "
+                "lay the exact ornament completely flat on a white wood-grain shelf or tabletop beside several neatly folded baby "
                 "outfits near a bright window. Shoot top-down or at 45 degrees in soft clear white daylight. Use a softly "
                 "blurred Christmas background with one small gnome teddy, a Christmas stocking, and a tiny reindeer figure. "
                 "Keep the ornament small relative to the clothes and preserve its tactile punch-needle motif."
@@ -7642,9 +7644,9 @@ PRODUCT_SHOT_RULES["pn_ornament"] = {
         ),
         (
             "Books lifestyle",
-            "Punch Needle ornament resting on pale hardcover books",
+            "Punch Needle ornament lying flat on pale hardcover books",
             _pn_ornament_brief(
-                "rest the exact ornament against one or two white or pale neutral hardcover books for a refined Christmas "
+                "lay the exact ornament flat on top of one or two white or pale neutral hardcover books for a refined Christmas "
                 "lifestyle scene. Shoot from 30-45 degrees in soft clean white daylight reflecting from the paper. Add one "
                 "frosted glass bauble, one evergreen sprig, dried orange slices, and cinnamon. Keep the ornament dominant, "
                 "sharp, correctly scaled, and free of beige or yellow color grading."
@@ -8306,3 +8308,35 @@ PRODUCT_SHOT_RULES["christmas_fabric_cross"] = {
         ),
     ),
 }
+
+
+# 2026-09-07: shots removed on purpose so these products generate exactly 12 images
+# (ornaments: poses standing upright on a table / leaning on books; the others: duplicate
+# scenes chosen by the operator). Entries match a shot's label or its summary text.
+_REMOVED_SHOTS_BY_RULE = {
+    "ornament_round": {"Minimal Christmas table", "Bookshelf lifestyle"},
+    "pn_ornament": {"Minimal Christmas table", "Books lifestyle"},
+    "halloween_bag": {"Candy bar setup", "Sibling set lifestyle"},
+    "halloween_banner": {"Door hook lifestyle", "Second mantle display"},
+    "christmas_banner": {"Wardrobe or room door"},
+    "fabric_cross": {"Product display đơn"},
+    "hoops_with_photos": {"Mẹ cầm khung — linen dress"},
+    "wedding_hoop": {"Đôi uyên ương cầm #2", "Đôi từ phía sau — outdoor"},
+    "wedding_pillowcase": {"Standalone #2", "2 bé nằm trên 2 gối"},
+}
+
+
+def _shot_is_removed(shot, removed):
+    if isinstance(shot, dict):
+        label, summary = str(shot.get("label") or ""), str(shot.get("summary") or "")
+    else:
+        label = str(shot[0]) if len(shot) > 0 else ""
+        summary = str(shot[1]) if len(shot) > 1 else ""
+    return label.strip() in removed or summary.strip() in removed
+
+
+for _rule_key, _removed in _REMOVED_SHOTS_BY_RULE.items():
+    _rule = PRODUCT_SHOT_RULES.get(_rule_key)
+    if isinstance(_rule, dict):
+        _rule["shots"] = tuple(shot for shot in _rule.get("shots", ()) if not _shot_is_removed(shot, _removed))
+        _rule["target_count"] = min(int(_rule.get("target_count") or 12), len(_rule["shots"]), 12)

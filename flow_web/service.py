@@ -168,8 +168,9 @@ class FlowWebService:
     )
     VISUAL_PRODUCT_RULE_MIN_CONFIDENCE = 0.7
     VISUAL_PRODUCT_RULE_MIN_INFERRED_CONFIDENCE = 0.5
-    FLOW_AGENT_BATCH_PAUSE_MIN_S = 60
-    FLOW_AGENT_BATCH_PAUSE_MAX_S = 120
+    # Pause between Flow Agent rounds/cards; shortened from 60-120 s on 2026-09-07 for throughput.
+    FLOW_AGENT_BATCH_PAUSE_MIN_S = 15
+    FLOW_AGENT_BATCH_PAUSE_MAX_S = 30
     TELEGRAM_API_URL_TEMPLATE = "https://api.telegram.org/bot{token}/{method}"
     TELEGRAM_TIMEOUT_S = 20
     TRELLO_API_BASE_URL = "https://api.trello.com/1"
@@ -4205,7 +4206,10 @@ class FlowWebService:
                 if skipped_complete_count:
                     await self.store.append_log(
                         batch_id,
-                        f"Bo qua {skipped_complete_count} card da du anh output theo target cua rule.",
+                        (
+                            f"Bo qua {skipped_complete_count} card da co anh output (du target hoac du muc toi thieu theo chinh sach khong tao bu); "
+                            "card thieu anh da duoc chuyen sang Content Review."
+                        ),
                     )
 
                 fresh_items: List[Dict[str, Any]] = []
@@ -9747,8 +9751,24 @@ exit 1
                     raise RuntimeError(f"Could not call Gemini for {context}: {exc.reason}") from exc
         raise RuntimeError(last_message or f"Gemini API request failed for {context}.")
 
+    def _trello_source_qa_product_rules(self, request: CreateJobRequest) -> List[str]:
+        """Product-specific QA rules chosen from the card/product text."""
+        haystack = " ".join(
+            str(value or "")
+            for value in (request.prompt_product, request.title, request.prompt_notes, (request.prompt or "")[:4000])
+        ).lower()
+        rules: List[str] = []
+        if "ornament" in haystack:
+            rules.append(
+                "Ornament pose rule: the source is a hanging ornament. Reject any output where the ornament stands upright or balances on its edge "
+                "on a table, shelf, or other surface, or leans against props - a linen/hoop ornament cannot stand like that. Acceptable poses are only: "
+                "hanging from its cord or loop, lying completely flat, resting inside an open box, or held in a hand."
+            )
+        return rules
+
     def _trello_source_qa_prompt(self, request: CreateJobRequest) -> str:
         inventory = self._design_inventory_from_request(request)
+        product_rules = self._trello_source_qa_product_rules(request)
         return "\n".join(
             [
                 "You are a strict ecommerce QA checker before uploading generated images to Trello.",
@@ -9774,6 +9794,7 @@ exit 1
                 "Reject invented readable text anywhere else, and reject any lineup variant whose motif, lettering style, collar, trims, construction, or placement differs from the source.",
                 "Secondary props are allowed only when they remain visually secondary and do not carry the source design, motif, or name.",
                 "Close-up, detail, process, or partial-view outputs are acceptable only when every visible design element matches the source exactly.",
+                *product_rules,
                 "Return JSON only with this exact shape: {\"ok\": boolean, \"reason\": string, \"bad_indexes\": [number], \"confidence\": number}.",
                 "bad_indexes must contain the zero-based artifact indexes shown in the OUTPUT_IMAGE_INDEX_N labels; in reason, name the first mismatching design element for each bad index.",
                 (f"Design inventory of the source product (authoritative checklist for the comparison): {inventory}" if inventory else ""),
@@ -10378,6 +10399,35 @@ exit 1
             "content_review": review_move,
         }
 
+    def _move_partial_output_card_to_review_sync(
+        self,
+        request: CreateJobRequest,
+        card: Dict[str, Any],
+        output_count: int,
+        target_count: int,
+    ) -> bool:
+        key, token = self._trello_credentials()
+        card_id = self._normalize_trello_card_id(str(card.get("id") or card.get("shortLink") or ""))
+        board_id = self._normalize_trello_board_id(str(request.trello_board_id or card.get("idBoard") or ""))
+        if not (key and token and card_id and board_id):
+            card["_auto_trello_skip_reason"] = f"{card.get('_auto_trello_skip_reason') or ''} (thieu Trello key/board nen chua chuyen list)".strip()
+            return False
+        try:
+            review_list_name = self._default_trello_review_list_name()
+            review_list_id = self._trello_content_review_list_id(key, token, board_id, review_list_name)
+            if not review_list_id:
+                card["_auto_trello_skip_reason"] = f"{card.get('_auto_trello_skip_reason') or ''} (khong tim thay list {review_list_name})".strip()
+                return False
+            self._trello_move_card_to_list(key, token, card_id, review_list_id)
+            card["_auto_trello_moved_to_review"] = True
+            logging.info("Auto Trello moved partial card %s (%s/%s outputs) to %s.", card_id, output_count, target_count, review_list_name)
+            return True
+        except Exception as exc:
+            card["_auto_trello_skip_reason"] = (
+                f"{card.get('_auto_trello_skip_reason') or ''} (chua chuyen duoc sang Content Review: {humanize_flow_error(str(exc))[:120]})"
+            ).strip()
+            return False
+
     async def _move_trello_card_to_content_review_if_complete(
         self,
         job_id: str,
@@ -10399,13 +10449,15 @@ exit 1
                 output_count = int(card.get("_flow_output_count") or 0)
             else:
                 output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
-            # A set trimmed by the design QA counts as complete: the user chose to keep the
-            # passing images and not regenerate the rejected ones.
-            qa_trimmed_complete = qa_dropped > 0 and output_count + qa_dropped >= target_count
-            if output_count < target_count and not qa_trimmed_complete:
+            # "Upload what we have, never regenerate to fill the gap": any usable partial set
+            # (QA-trimmed or Flow returned fewer images) counts as complete once it holds at
+            # least FLOW_TRELLO_QA_MIN_GOOD_IMAGES outputs.
+            min_outputs = self._trello_source_qa_min_good_images()
+            partial_complete = 0 < output_count < target_count and output_count >= min_outputs
+            if output_count < target_count and not partial_complete:
                 await self.store.append_log(
                     job_id,
-                    f"Trello chua chuyen card sang Content Review vi moi thay {output_count}/{target_count} anh output, khong tinh 1 anh goc.",
+                    f"Trello chua chuyen card sang Content Review vi moi thay {output_count}/{target_count} anh output (duoi muc toi thieu {min_outputs}), khong tinh 1 anh goc.",
                 )
                 return {
                     "moved": False,
@@ -10413,10 +10465,11 @@ exit 1
                     "output_count": output_count,
                     "target_output_count": target_count,
                 }
-            if qa_trimmed_complete and output_count < target_count:
+            if partial_complete:
+                cause = f"{qa_dropped} anh bi QA loai" if qa_dropped > 0 else "Flow tra thieu anh"
                 await self.store.append_log(
                     job_id,
-                    f"Bo anh co {output_count}/{target_count} anh dat QA thiet ke ({qa_dropped} anh bi loai, khong tao bu); coi nhu du va chuyen card sang Content Review.",
+                    f"Bo anh co {output_count}/{target_count} anh ({cause}, khong tao bu); coi nhu du va chuyen card sang Content Review.",
                 )
 
             review_list_name = self._default_trello_review_list_name()
@@ -14124,11 +14177,22 @@ exit 1
             all_shots = self._flow_operator_shot_suite_for_trello_card(request, card)
             target_output_count = self._flow_operator_product_rule_target_count(str(signals.get("product_rule_key") or "").strip())
             raw_existing_flow_count = max(0, int(card.get("_flow_output_count") or 0))
+            min_outputs = self._trello_source_qa_min_good_images()
             if raw_existing_flow_count >= target_output_count:
                 card["_auto_trello_skip_code"] = "complete_output_set"
                 card["_auto_trello_skip_reason"] = (
                     f"Card da co {raw_existing_flow_count}/{target_output_count} anh output theo rule; Auto bo qua."
                 )
+                continue
+            if raw_existing_flow_count >= min_outputs:
+                # "Upload what we have, never regenerate to fill the gap": a card that already holds a
+                # usable partial set is finished and moved to review instead of getting a second full set.
+                card["_auto_trello_skip_code"] = "complete_output_set"
+                card["_auto_trello_skip_reason"] = (
+                    f"Card da co {raw_existing_flow_count}/{target_output_count} anh output; theo chinh sach khong tao bu, "
+                    "Auto coi nhu du va chuyen card sang Content Review."
+                )
+                self._move_partial_output_card_to_review_sync(request, card, raw_existing_flow_count, target_output_count)
                 continue
             existing_flow_count = max(0, min(target_output_count, int(card.get("_flow_output_count") or 0)))
             image_count = target_output_count
