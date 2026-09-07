@@ -9843,14 +9843,29 @@ exit 1
             parsed["_usage"] = body["_usage"]
         return parsed
 
+    TRELLO_SOURCE_QA_MIN_GOOD_IMAGES_DEFAULT = 3
+
+    def _trello_source_qa_min_good_images(self) -> int:
+        raw = os.getenv("FLOW_TRELLO_QA_MIN_GOOD_IMAGES", "").strip()
+        try:
+            return max(1, int(raw)) if raw else int(self.TRELLO_SOURCE_QA_MIN_GOOD_IMAGES_DEFAULT)
+        except ValueError:
+            return int(self.TRELLO_SOURCE_QA_MIN_GOOD_IMAGES_DEFAULT)
+
     async def _validate_trello_source_artifacts_before_upload(
         self,
         job_id: str,
         request: CreateJobRequest,
         artifacts: List[JobArtifact],
-    ) -> None:
+    ) -> List[JobArtifact]:
+        """Run the design QA and return the artifacts that may be uploaded.
+
+        Images Gemini flags as off-design are dropped (the user chose "upload what
+        passes, do not regenerate the rest"); the whole set is rejected only when fewer
+        than FLOW_TRELLO_QA_MIN_GOOD_IMAGES survive or Gemini rejects without indexes.
+        """
         if not self._trello_source_validation_required(request):
-            return
+            return list(artifacts)
         source_path = next((str(path or "").strip() for path in request.reference_image_paths or [] if str(path or "").strip()), "")
         if not source_path:
             raise RuntimeError("Trello Source thiếu ảnh nguồn local, app đã dừng trước khi upload để tránh nhầm sản phẩm.")
@@ -9926,7 +9941,7 @@ exit 1
                         f"Chi tiết: {warning[:180]}"
                     ),
                 )
-                return
+                return list(artifacts)
             await self.store.append_log(
                 job_id,
                 (
@@ -9979,10 +9994,26 @@ exit 1
         if rejected:
             display_indexes = ", ".join(str(index + 1) for index in sorted(bad_indexes)) or "không rõ"
             reason_text = "; ".join(reasons) or "Ảnh generated không khớp ảnh nguồn Trello."
+            checked_count = len(generated_items)
+            bad_set = {index for index in bad_indexes if 0 <= index < checked_count}
+            accepted = [artifact for index, artifact in enumerate(artifacts) if index >= checked_count or index not in bad_set]
+            minimum = self._trello_source_qa_min_good_images()
+            if bad_set and len(accepted) >= minimum:
+                await self.store.append_log(
+                    job_id,
+                    (
+                        f"Gemini QA loại {len(bad_set)}/{checked_count} ảnh lệch thiết kế (ảnh {display_indexes}): {reason_text[:400]}. "
+                        f"App upload {len(accepted)} ảnh đạt và không tạo bù phần thiếu."
+                    ),
+                )
+                return accepted
             raise RuntimeError(
-                f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason_text}; ảnh lỗi: {display_indexes})."
+                f"Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn ({reason_text}; ảnh lỗi: {display_indexes}"
+                + (f"; chỉ còn {len(accepted)}/{checked_count} ảnh đạt, dưới mức tối thiểu {minimum}" if bad_set else "")
+                + ")."
             )
         await self.store.append_log(job_id, "Gemini đã xác nhận ảnh generated khớp thiết kế ảnh nguồn Trello; tiếp tục upload.")
+        return list(artifacts)
 
     async def retry_trello_upload(self, job_id: str) -> Dict[str, Any]:
         """Re-run design QA + Trello upload from the images a finished job already generated.
@@ -10032,7 +10063,7 @@ exit 1
                 refreshed.append(JobArtifact(**payload))
             await self.store.replace_artifacts(job_id, refreshed)
             await self.store.append_log(job_id, f"Đã tải lại {len(refreshed)} ảnh từ Flow vào file riêng của job để kiểm tra và upload.")
-            await self._validate_trello_source_artifacts_before_upload(job_id, request, refreshed)
+            # _archive_trello_artifacts runs the design QA itself and uploads only the accepted images.
             trello_result = await self._archive_trello_artifacts(job_id, request, refreshed)
         except HTTPException:
             raise
@@ -10145,7 +10176,12 @@ exit 1
                 "error": "missing_trello_target",
             }
 
-        await self._validate_trello_source_artifacts_before_upload(job_id, request, artifacts)
+        accepted_artifacts = await self._validate_trello_source_artifacts_before_upload(job_id, request, artifacts)
+        if isinstance(accepted_artifacts, list):
+            qa_dropped = max(0, len(artifacts) - len(accepted_artifacts))
+            artifacts = accepted_artifacts
+        else:
+            qa_dropped = 0
 
         upload_mode = (trello_config.upload_mode or os.getenv("TRELLO_UPLOAD_MODE", "file")).strip().lower()
         if upload_mode not in {"file", "url"}:
@@ -10326,11 +10362,13 @@ exit 1
                 token,
                 board_id,
                 card_id,
+                qa_dropped=qa_dropped,
             )
         return {
             "configured": True,
             "sent": stored,
             "failed": failed,
+            "qa_dropped": qa_dropped,
             "card_id": card_id,
             "source_card_id": locked_source_card_id or request_card_id,
             "source_attachment_ids": selected_source_attachment_ids,
@@ -10347,8 +10385,10 @@ exit 1
         token: str,
         board_id: str,
         card_id: str,
+        qa_dropped: int = 0,
     ) -> Dict[str, Any]:
         target_count = self.FLOW_AGENT_TARGET_OUTPUT_COUNT
+        qa_dropped = max(0, int(qa_dropped or 0))
         try:
             card = await asyncio.to_thread(self._trello_image_card_by_id, key, token, card_id)
             if card:
@@ -10359,7 +10399,10 @@ exit 1
                 output_count = int(card.get("_flow_output_count") or 0)
             else:
                 output_count = await asyncio.to_thread(self._trello_card_flow_output_count, key, token, card_id)
-            if output_count < target_count:
+            # A set trimmed by the design QA counts as complete: the user chose to keep the
+            # passing images and not regenerate the rejected ones.
+            qa_trimmed_complete = qa_dropped > 0 and output_count + qa_dropped >= target_count
+            if output_count < target_count and not qa_trimmed_complete:
                 await self.store.append_log(
                     job_id,
                     f"Trello chua chuyen card sang Content Review vi moi thay {output_count}/{target_count} anh output, khong tinh 1 anh goc.",
@@ -10370,6 +10413,11 @@ exit 1
                     "output_count": output_count,
                     "target_output_count": target_count,
                 }
+            if qa_trimmed_complete and output_count < target_count:
+                await self.store.append_log(
+                    job_id,
+                    f"Bo anh co {output_count}/{target_count} anh dat QA thiet ke ({qa_dropped} anh bi loai, khong tao bu); coi nhu du va chuyen card sang Content Review.",
+                )
 
             review_list_name = self._default_trello_review_list_name()
             review_list_id = await asyncio.to_thread(
