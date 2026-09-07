@@ -6179,6 +6179,231 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(ok)
         self.assertIn("no new ready attachment visible", detail)
 
+    def _attach_fake_page(self, add_results: list, banner_results: list):
+        class FakeChooser:
+            def __init__(self) -> None:
+                self.files: list[str] = []
+
+            async def set_files(self, path: str) -> None:
+                self.files.append(path)
+
+        class FakeChooserInfo:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def __aenter__(self) -> "FakeChooserInfo":
+                return self
+
+            async def __aexit__(self, *_exc: object) -> bool:
+                return False
+
+            @property
+            def value(self):
+                async def _value() -> FakeChooser:
+                    return self._page.chooser
+
+                return _value()
+
+        class FakeMouse:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def click(self, x: float, y: float) -> None:
+                self._page.clicks.append((x, y))
+
+        class FakeKeyboard:
+            async def press(self, _key: str) -> None:
+                return None
+
+        class FakeLocator:
+            async def count(self) -> int:
+                return 0
+
+        class FakePage:
+            frames: list = []
+
+            def __init__(self) -> None:
+                self.scripts: list[str] = []
+                self.clicks: list[tuple[float, float]] = []
+                self.chooser = FakeChooser()
+                self.mouse = FakeMouse(self)
+                self.keyboard = FakeKeyboard()
+                self.banner_dismissed = False
+
+            def on(self, *_args: object) -> None:
+                return None
+
+            def locator(self, _selector: str) -> FakeLocator:
+                return FakeLocator()
+
+            def expect_file_chooser(self, timeout: float = 0) -> FakeChooserInfo:
+                return FakeChooserInfo(self)
+
+            async def screenshot(self, **_kwargs: object) -> None:
+                return None
+
+            async def evaluate(self, script: str, *_args: object):
+                self.scripts.append(script)
+                if "flow-banner-dismiss" in script:
+                    labels = banner_results.pop(0) if banner_results else []
+                    if labels:
+                        self.banner_dismissed = True
+                    return {"dismissed": labels, "count": len(labels)}
+                if "agent-add-control" in script:
+                    # The composer control only becomes reachable after the banner is gone.
+                    return add_results[-1] if (self.banner_dismissed or len(add_results) == 1) else add_results[0]
+                return {}
+
+        return FakePage()
+
+    async def test_dismiss_flow_top_banner_clicks_banner_dismiss_button(self) -> None:
+        class FakePage:
+            def __init__(self) -> None:
+                self.scripts: list[str] = []
+                self.results = [["Dismissclose Dismiss banner"], []]
+
+            async def evaluate(self, script: str, *_args: object) -> dict:
+                self.scripts.append(script)
+                labels = self.results.pop(0) if self.results else []
+                return {"dismissed": labels, "count": len(labels)}
+
+        page = FakePage()
+        first = await self.service._dismiss_flow_top_banner(page)
+        second = await self.service._dismiss_flow_top_banner(page)
+
+        self.assertEqual("dismissed top banner: Dismissclose Dismiss banner", first)
+        self.assertEqual("", second)
+        self.assertIn("flow-banner-dismiss", page.scripts[0])
+        js = self.service.FLOW_DISMISS_BANNER_JS
+        self.assertIn("high\\s+demand", js)
+        self.assertIn("dismiss|banner", js)
+        # Never confuse the Agent panel's own Close button with the notice banner.
+        self.assertIn("session|panel|dialog", js)
+
+    async def test_flow_agent_add_control_probe_handles_banner_offset_and_header_add_media(self) -> None:
+        add_js = self.service.FLOW_AGENT_ADD_CONTROL_JS
+        chip_js = self.service.FLOW_AGENT_COMPOSER_CHIP_JS
+        self.assertIn("agent-add-control", add_js)
+        self.assertIn("belowFold", add_js)
+        self.assertIn("scrollIntoView", add_js)
+        self.assertIn("fallback_candidates", add_js)
+        self.assertIn("headerish", add_js)
+        self.assertIn("offscreen", add_js)
+        # A 57K-char prompt makes every composer ancestor taller than the viewport; the container walk must survive that.
+        self.assertNotIn("innerHeight * 0.96", add_js)
+        self.assertNotIn("innerHeight * 0.96", chip_js)
+        self.assertIn("explicitChips", chip_js)
+        self.assertIn(".chip-container", chip_js)
+        self.assertIn('[role="dialog"], [role="listbox"], [role="menu"]', chip_js)
+
+    async def test_flow_agent_attach_dismisses_banner_then_uses_composer_add_ingredients(self) -> None:
+        composer = {"x": 1255, "y": 885, "label": "What do you want to create?"}
+        header = {"x": 1119, "y": 107, "label": "add Add media menu", "score": 888, "offscreen": False}
+        ingredients = {"x": 1119, "y": 881, "label": "add Add ingredients to the prompt box", "score": 3900, "offscreen": False}
+        page = self._attach_fake_page(
+            add_results=[
+                {"ok": False, "candidates": [], "fallback_candidates": [header], "composer": composer, "detail": "no agent add/upload control near What do you want"},
+                {"ok": True, "candidates": [ingredients], "fallback_candidates": [header], "composer": composer, "detail": "add control: add Add ingredients to the prompt box"},
+            ],
+            banner_results=[[], ["Dismissclose Dismiss banner"]],
+        )
+        self.service._flow_agent_add_control_lookup_s = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "trello-source.jpg"
+            source.write_bytes(b"jpg")
+            with patch.object(
+                self.service,
+                "_flow_agent_label_at_point",
+                side_effect=lambda _page, _x, y: "add Add ingredients to the prompt box" if float(y) > 400 else "add Add media menu",
+            ), patch.object(
+                self.service, "_confirm_flow_agent_ingredient_picker", return_value="picker: Add to prompt clicked"
+            ) as picker, patch.object(self.service, "_install_flow_page_file_chooser_guard"):
+                ok, detail = await self.service._attach_flow_agent_source_file(page, str(source))
+
+        self.assertTrue(ok, detail)
+        self.assertIn("file chooser via add Add ingredients to the prompt box", detail)
+        self.assertIn("dismissed top banner", detail)
+        self.assertEqual([(1119, 881)], page.clicks)
+        self.assertEqual([str(source)], page.chooser.files)
+        picker.assert_awaited_once_with(page, "trello-source.jpg", timeout_s=30.0)
+        banner_calls = [index for index, script in enumerate(page.scripts) if "flow-banner-dismiss" in script]
+        add_calls = [index for index, script in enumerate(page.scripts) if "agent-add-control" in script]
+        self.assertTrue(banner_calls and add_calls and banner_calls[0] < add_calls[0])
+
+    async def test_flow_agent_attach_uses_header_add_media_only_as_last_resort(self) -> None:
+        composer = {"x": 1255, "y": 885, "label": "What do you want to create?"}
+        header = {"x": 1119, "y": 107, "label": "add Add media menu", "score": 888, "offscreen": False}
+        page = self._attach_fake_page(
+            add_results=[
+                {"ok": False, "candidates": [], "fallback_candidates": [header], "composer": composer, "detail": "no agent add/upload control near What do you want"},
+            ],
+            banner_results=[[], []],
+        )
+        self.service._flow_agent_add_control_lookup_s = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "trello-source.jpg"
+            source.write_bytes(b"jpg")
+            with patch.object(self.service, "_flow_agent_label_at_point", return_value="add Add media menu"), patch.object(
+                self.service, "_confirm_flow_agent_ingredient_picker", return_value="no ingredient picker (no option/add-to-prompt visible)"
+            ) as picker, patch.object(self.service, "_install_flow_page_file_chooser_guard"):
+                ok, detail = await self.service._attach_flow_agent_source_file(page, str(source))
+
+        self.assertTrue(ok, detail)
+        self.assertIn("file chooser via add Add media menu", detail)
+        self.assertEqual([(1119, 107)], page.clicks)
+        picker.assert_awaited_once_with(page, "trello-source.jpg", timeout_s=10.0)
+
+    async def test_flow_agent_attach_skips_add_control_below_the_fold(self) -> None:
+        composer = {"x": 1255, "y": 885, "label": "What do you want to create?"}
+        offscreen = {"x": 1119, "y": 941, "label": "add Add ingredients to the prompt box", "score": 3900, "offscreen": True}
+        page = self._attach_fake_page(
+            add_results=[
+                {"ok": True, "candidates": [offscreen], "fallback_candidates": [], "composer": composer, "detail": "add control: add Add ingredients to the prompt box (below the fold)"},
+            ],
+            banner_results=[[], []],
+        )
+        self.service._flow_agent_add_control_lookup_s = 0.0
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "trello-source.jpg"
+            source.write_bytes(b"jpg")
+            with patch.object(self.service, "_install_flow_page_file_chooser_guard"), patch.object(
+                self.service, "_drop_file_on_flow_agent_composer", return_value=(False, "drop skipped")
+            ), patch.object(self.service, "_capture_flow_agent_debug_screenshot", return_value="screenshot=test.png"):
+                ok, detail = await self.service._attach_flow_agent_source_file(page, str(source))
+
+        self.assertFalse(ok)
+        self.assertIn("below the fold", detail)
+        self.assertEqual([], page.clicks)
+
+    async def test_flow_agent_panel_send_refuses_button_below_the_fold(self) -> None:
+        class FakeMouse:
+            def __init__(self) -> None:
+                self.clicks: list[tuple[float, float]] = []
+
+            async def click(self, x: float, y: float) -> None:
+                self.clicks.append((x, y))
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.mouse = FakeMouse()
+                self.scripts: list[str] = []
+
+            async def evaluate(self, script: str, *_args: object) -> dict:
+                self.scripts.append(script)
+                if "flow-banner-dismiss" in script:
+                    return {"dismissed": [], "count": 0}
+                if "agent-panel-send" in script:
+                    return {"ok": True, "x": 1395, "y": 941, "offscreen": True, "detail": "arrow_forward Start generation"}
+                return {}
+
+        page = FakePage()
+        ok, detail = await self.service._click_flow_agent_panel_send(page)
+
+        self.assertFalse(ok)
+        self.assertIn("below the fold", detail)
+        self.assertEqual([], page.mouse.clicks)
+        self.assertTrue(any("flow-banner-dismiss" in script for script in page.scripts))
+
     async def test_flow_agent_attachment_snapshot_scans_shadow_dom_and_file_inputs(self) -> None:
         class FakePage:
             def __init__(self) -> None:

@@ -2034,6 +2034,7 @@ class FlowWebService:
                 await asyncio.sleep(2.5)
                 app_ready, app_ready_detail = await self._wait_for_flow_app_ready(page, timeout_s=45.0)
                 payload["app_ready"] = {"ok": app_ready, "detail": str(app_ready_detail)[:200]}
+                payload["top_banner"] = str(await self._dismiss_flow_top_banner(page))[:200]
                 try:
                     await page.keyboard.press("Escape")
                     await asyncio.sleep(0.4)
@@ -18270,6 +18271,87 @@ exit 1
         path = str(parsed.path or "")
         return f"/project/{project_id}" in path or f"/project/{quote(project_id, safe='')}" in path
 
+    FLOW_DISMISS_BANNER_JS = """
+        /* flow-banner-dismiss */
+        () => {
+          const deepQuery = (selector, root = document, seen = new Set()) => {
+            const found = [];
+            const visit = (node) => {
+              if (!node || seen.has(node)) return;
+              seen.add(node);
+              try {
+                found.push(...node.querySelectorAll(selector));
+                for (const el of node.querySelectorAll('*')) {
+                  if (el.shadowRoot) visit(el.shadowRoot);
+                }
+              } catch (_) {}
+            };
+            visit(root);
+            return found;
+          };
+          const visible = (el) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 18 || rect.height < 18) return false;
+            const style = window.getComputedStyle(el);
+            return style.visibility !== 'hidden'
+              && style.display !== 'none'
+              && style.opacity !== '0'
+              && rect.bottom > 0
+              && rect.top < window.innerHeight;
+          };
+          const labelFor = (el) => [
+            el.textContent || '',
+            el.getAttribute('aria-label') || '',
+            el.getAttribute('title') || '',
+            el.getAttribute('data-testid') || '',
+            el.getAttribute('class') || '',
+          ].join(' ').replace(/\\s+/g, ' ').trim();
+          const bannerHost = (el) => el.closest('[class*="banner" i], [role="banner"], [role="alert"], [role="status"], [class*="notice" i], [class*="announcement" i], [class*="toast" i]');
+          const noticeText = /high\\s+demand|nhu\\s*cầu\\s*cao|retried|thử\\s*lại|refunded|hoàn\\s*lại|credits?|tín\\s*dụng|experiencing|đang\\s*gặp/i;
+          const topLimit = Math.max(120, window.innerHeight * 0.16);
+          const dismissed = [];
+          const buttons = deepQuery('button, [role="button"]')
+            .filter(visible)
+            .map((el) => ({ el, rect: el.getBoundingClientRect(), label: labelFor(el) }))
+            .filter((item) => item.rect.top < topLimit)
+            .filter((item) => !/session|panel|dialog|search|filter|menu|more_vert|account|history|edit_square|settings|tune|help|back/i.test(item.label))
+            .filter((item) => {
+              if (/dismiss|banner/i.test(item.label)) return true;
+              const host = bannerHost(item.el);
+              if (!host) return false;
+              const hostText = `${host.innerText || host.textContent || ''} ${host.getAttribute('class') || ''}`;
+              return /đóng|dong\\b|close|ok\\b|got\\s*it|đã\\s*hiểu/i.test(item.label) && noticeText.test(hostText);
+            })
+            .slice(0, 2);
+          for (const item of buttons) {
+            try {
+              item.el.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+              item.el.click();
+              dismissed.push(item.label.replace(/\\s+/g, ' ').slice(0, 60));
+            } catch (_) {}
+          }
+          return { dismissed, count: dismissed.length };
+        }
+    """
+
+    async def _dismiss_flow_top_banner(self, page: Any) -> str:
+        """Close Flow's top notice banner ("high demand", ...).
+
+        The banner pushes the whole app down, so the Agent composer toolbar (Add ingredients,
+        Start generation) ends up below the 900px viewport and every click on it misses.
+        """
+        try:
+            result = await page.evaluate(self.FLOW_DISMISS_BANNER_JS)
+        except Exception as exc:
+            return f"top banner check skipped: {humanize_flow_error(str(exc))[:80]}"
+        result = result if isinstance(result, dict) else {}
+        dismissed = [str(label) for label in (result.get("dismissed") or []) if label]
+        if not dismissed:
+            return ""
+        await asyncio.sleep(0.6)
+        return f"dismissed top banner: {', '.join(dismissed)[:120]}"
+
     async def _wait_for_flow_app_ready(self, page: Any, timeout_s: float = 40.0) -> tuple[bool, str]:
         deadline = asyncio.get_running_loop().time() + max(3.0, float(timeout_s or 40.0))
         last_detail = "flow app not rendered"
@@ -21610,8 +21692,11 @@ exit 1
                 await page.goto(project_url, wait_until="domcontentloaded", timeout=60_000)
         await asyncio.sleep(2.5)
         app_ready, app_ready_detail = await self._wait_for_flow_app_ready(page, timeout_s=45.0)
+        top_banner_detail = await self._dismiss_flow_top_banner(page)
         if job_id:
             await self.store.append_log(job_id, f"Fallback UI Flow: tab hiện tại {str(getattr(page, 'url', '') or '')[:160]}.")
+            if top_banner_detail:
+                await self.store.append_log(job_id, f"Fallback UI Flow: {top_banner_detail[:160]}.")
             await self.store.append_log(
                 job_id,
                 (
@@ -22797,9 +22882,11 @@ exit 1
             return False, humanize_flow_error(str(exc))
 
     async def _click_flow_agent_panel_send(self, page: Any) -> tuple[bool, str]:
+        await self._dismiss_flow_top_banner(page)
         try:
             result = await page.evaluate(
                 """
+                /* agent-panel-send */
                 () => {
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
@@ -22861,10 +22948,16 @@ exit 1
                     .sort((a, b) => b.score - a.score);
                   const target = explicitSendButtons[0] || buttons[0];
                   if (!target) return { ok: false, detail: 'no agent panel send button' };
+                  let targetRect = target.rect;
+                  if (targetRect.top + targetRect.height / 2 >= window.innerHeight - 2) {
+                    try { target.el.scrollIntoView({ block: 'end', inline: 'nearest' }); } catch (_) {}
+                    targetRect = target.el.getBoundingClientRect();
+                  }
                   return {
                     ok: true,
-                    x: target.rect.left + target.rect.width / 2,
-                    y: target.rect.top + target.rect.height / 2,
+                    x: targetRect.left + targetRect.width / 2,
+                    y: targetRect.top + targetRect.height / 2,
+                    offscreen: targetRect.top + targetRect.height / 2 >= window.innerHeight - 2 || targetRect.bottom <= 0,
                     detail: target.label || target.el.outerHTML?.slice(0, 120) || 'send',
                   };
                 }
@@ -22874,6 +22967,8 @@ exit 1
             return False, humanize_flow_error(str(exc))
         if not isinstance(result, dict) or not result.get("ok"):
             return False, str((result or {}).get("detail") or "no agent panel send button") if isinstance(result, dict) else "no agent panel send button"
+        if result.get("offscreen"):
+            return False, f"send button below the fold: {str(result.get('detail') or 'send')[:80]}"
         try:
             await page.mouse.click(float(result.get("x")), float(result.get("y")))
             await asyncio.sleep(0.8)
@@ -23546,19 +23641,38 @@ exit 1
             .filter((item) => /ingredient|nguyên\\s*liệu|nguyen\\s*lieu/i.test(item.label)
               && /cancel|close|remove|xóa|xoa|delete|bỏ|huỷ|huy/i.test(item.label)
               && !/add\\s*ingredient|thêm|them\\b/i.test(item.label));
+          // Ingredient chips sit at the top of the composer; with a long prompt they scroll far above
+          // the viewport, so count them by their markup instead of by visibility.
+          const chipLike = deepQuery('.chip-container, [class*="chip"], [class*="ingredient"]')
+            .filter((el) => el instanceof Element)
+            .map((el) => ({
+              el,
+              rect: el.getBoundingClientRect(),
+              label: `${labelFor(el)} ${[...el.querySelectorAll('img')].map((img) => img.getAttribute('alt') || '').join(' ')}`.replace(/\\s+/g, ' ').trim(),
+            }))
+            .filter((item) => item.rect.width >= 16 && item.rect.height >= 16)
+            .filter((item) => {
+              const style = window.getComputedStyle(item.el);
+              return style.display !== 'none' && style.visibility !== 'hidden';
+            })
+            .filter((item) => item.rect.left >= window.innerWidth * 0.35)
+            .filter((item) => !item.el.closest('[role="dialog"], [role="listbox"], [role="menu"], [aria-modal="true"]'))
+            .filter((item) => /ingredient|nguyên\\s*liệu|nguyen\\s*lieu/i.test(item.label))
+            .filter((item) => !/add\\s*ingredient|thêm\\s*nguyên|them\\s*nguyen|prompt\\s*box/i.test(item.label));
+          const explicitChips = chipLike.filter((item) => !chipLike.some((other) => other.el !== item.el && other.el.contains(item.el)));
           const box = textboxes[0];
           if (!box) {
             return {
-              composer_chip_count: ingredientChips.length,
-              composer_chip_labels: ingredientChips.map((item) => item.label.slice(0, 80)),
-              composer_chip_detail: `composerChips=${ingredientChips.length} (no composer textbox)`,
+              composer_chip_count: Math.max(ingredientChips.length, explicitChips.length),
+              composer_chip_labels: [...ingredientChips, ...explicitChips].map((item) => item.label.slice(0, 80)).slice(0, 8),
+              composer_chip_detail: `composerChips=${Math.max(ingredientChips.length, explicitChips.length)} explicitChips=${explicitChips.length} (no composer textbox)`,
             };
           }
           let container = box.el.parentElement;
           let found = null;
           for (let depth = 0; container && depth < 12; depth += 1, container = container.parentElement) {
             const rect = container.getBoundingClientRect();
-            if (rect.height > window.innerHeight * 0.96 || rect.width < 160 || rect.width > window.innerWidth * 0.6) break;
+            if (rect.width < 160 || rect.width > window.innerWidth * 0.6) break;
             const hasToolbar = [...container.querySelectorAll('button, [role="button"]')]
               .some((btn) => /ingredient|start\\s*generation|arrow_forward|send|gửi|tune|settings/i.test(labelFor(btn)));
             if (hasToolbar) {
@@ -23568,9 +23682,9 @@ exit 1
           }
           if (!found) {
             return {
-              composer_chip_count: ingredientChips.length,
-              composer_chip_labels: ingredientChips.map((item) => item.label.slice(0, 80)),
-              composer_chip_detail: `composerChips=${ingredientChips.length} (no composer container)`,
+              composer_chip_count: Math.max(ingredientChips.length, explicitChips.length),
+              composer_chip_labels: [...ingredientChips, ...explicitChips].map((item) => item.label.slice(0, 80)).slice(0, 8),
+              composer_chip_detail: `composerChips=${Math.max(ingredientChips.length, explicitChips.length)} explicitChips=${explicitChips.length} (no composer container)`,
             };
           }
           const containerRect = found.getBoundingClientRect();
@@ -23584,16 +23698,16 @@ exit 1
           const topLevel = nodes.filter((item) => !nodeSet.has(item.el.parentElement));
           const removeButtons = nodes.filter((item) => /close|remove|xóa|xoa|delete|clear|bỏ|huỷ|huy|cancel/i.test(item.label) && item.el.closest('button, [role="button"]'));
           const media = nodes.filter((item) => item.el.matches('img, canvas, video, [style*="background-image"]') || /(^|\\s)image(\\s|$)/i.test(item.label));
-          const labels = [...topLevel.map((item) => item.label.slice(0, 80)), ...ingredientChips.map((item) => item.label.slice(0, 80))]
+          const labels = [...topLevel.map((item) => item.label.slice(0, 80)), ...ingredientChips.map((item) => item.label.slice(0, 80)), ...explicitChips.map((item) => item.label.slice(0, 80))]
             .filter((label, index, arr) => label && arr.indexOf(label) === index)
             .slice(0, 8);
-          const chipCount = Math.max(topLevel.length, ingredientChips.length);
+          const chipCount = Math.max(topLevel.length, ingredientChips.length, explicitChips.length);
           return {
             composer_chip_count: chipCount,
             composer_chip_remove_count: removeButtons.length,
             composer_chip_media_count: media.length,
             composer_chip_labels: labels,
-            composer_chip_detail: `composerChips=${chipCount} chipRemove=${removeButtons.length} chipMedia=${media.length} ingredientChips=${ingredientChips.length}`,
+            composer_chip_detail: `composerChips=${chipCount} chipRemove=${removeButtons.length} chipMedia=${media.length} ingredientChips=${ingredientChips.length} explicitChips=${explicitChips.length}`,
           };
         }
     """
@@ -23733,6 +23847,7 @@ exit 1
         return False, f"{last_detail}; no completed uploadImage response in {int(timeout_s)}s"
 
     FLOW_AGENT_ADD_CONTROL_JS = """
+        /* agent-add-control */
         () => {
           const deepQuery = (selector, root = document, seen = new Set()) => {
             const found = [];
@@ -23795,7 +23910,7 @@ exit 1
             let node = box.el.parentElement;
             for (let depth = 0; node && depth < 12; depth += 1, node = node.parentElement) {
               const rect = node.getBoundingClientRect();
-              if (rect.height > window.innerHeight * 0.96 || rect.width < 160 || rect.width > window.innerWidth * 0.6) break;
+              if (rect.width < 160 || rect.width > window.innerWidth * 0.6) break;
               const hasToolbar = [...node.querySelectorAll('button, [role="button"]')].some((btn) => toolbarish.test(labelFor(btn)));
               if (hasToolbar) {
                 container = node;
@@ -23807,14 +23922,30 @@ exit 1
           const suggestionish = /edit\\s+an?\\s+image|create\\s+a\\s+few|versions?\\s+of|moodboard|storyboard|organi[sz]e|learn\\s+about|brainstorm|develop|show\\s+me|keyboard|shortcut|omni|collections?|generation\\s+costs?/i;
           const strong = /ingredient|add\\s*media|upload|tải\\s*lên|tai\\s*len|đính\\s*kèm|dinh\\s*kem|thêm\\s*ảnh|them\\s*anh|attach|add_photo|photo_library|hình\\s*ảnh|hinh\\s*anh|nguyên\\s*liệu|nguyen\\s*lieu/i;
           const iconAdd = /(^|\\s)(\\+|add|add_2|add_circle|add_box|attach_file|attachment|upload|upload_file|photo|image|media)(\\s|$)/i;
-          const candidates = deepQuery('button, [role="button"], label')
-            .filter((el) => visible(el, 14, 14))
+          // A top notice banner or a long prompt can push the composer toolbar just below the fold.
+          const belowFold = (el) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            if (rect.width < 14 || rect.height < 14) return false;
+            const style = window.getComputedStyle(el);
+            return style.visibility !== 'hidden'
+              && style.display !== 'none'
+              && style.opacity !== '0'
+              && rect.top >= window.innerHeight - 2
+              && rect.top < window.innerHeight + 260
+              && rect.right > 0
+              && rect.left < window.innerWidth;
+          };
+          const headerLimit = Math.min(170, window.innerHeight * 0.2);
+          const scored = deepQuery('button, [role="button"], label')
+            .filter((el) => visible(el, 14, 14) || belowFold(el))
             .map((el) => {
               const rect = el.getBoundingClientRect();
               const label = labelFor(el);
               const midY = (rect.top + rect.bottom) / 2;
               const compact = rect.width <= 96 && rect.height <= 96;
               const inContainer = container ? container.contains(el) : rect.top >= window.innerHeight * 0.3;
+              const headerish = !inContainer && rect.top < headerLimit;
               const nearBox = rect.bottom >= visTop - 140
                 && rect.top <= visBottom + 140
                 && rect.right >= boxRect.left - 200
@@ -23833,23 +23964,34 @@ exit 1
                 - (compact ? 0 : 5000)
                 - (relevant ? 0 : 5000)
                 - (label.length > 140 ? 800 : 0);
-              return { rect, label, score };
+              return { el, rect, label, score, headerish };
             })
             .filter((item) => item.score > 500)
-            .sort((a, b) => b.score - a.score)
-            .slice(0, 4)
-            .map((item) => ({
-              x: item.rect.left + item.rect.width / 2,
-              y: item.rect.top + item.rect.height / 2,
+            .sort((a, b) => b.score - a.score);
+          const toPoint = (item) => {
+            let rect = item.rect;
+            if (rect.top + rect.height / 2 >= window.innerHeight - 2) {
+              try { item.el.scrollIntoView({ block: 'end', inline: 'nearest' }); } catch (_) {}
+              rect = item.el.getBoundingClientRect();
+            }
+            return {
+              x: rect.left + rect.width / 2,
+              y: rect.top + rect.height / 2,
               label: item.label.slice(0, 120),
               score: Math.round(item.score),
-            }));
+              offscreen: rect.top + rect.height / 2 >= window.innerHeight - 2 || rect.bottom <= 0,
+            };
+          };
+          const candidates = scored.filter((item) => !item.headerish).slice(0, 4).map(toPoint);
+          // The page-header "Add media" menu uploads into the project library, not the prompt: last resort only.
+          const fallbackCandidates = scored.filter((item) => item.headerish).slice(0, 2).map(toPoint);
           return {
             ok: candidates.length > 0,
             candidates,
+            fallback_candidates: fallbackCandidates,
             composer: box ? { x: boxRect.left + boxRect.width / 2, y: boxMidY, label: box.label.slice(0, 80) } : null,
             detail: candidates.length
-              ? `add control: ${candidates[0].label}`
+              ? `add control: ${candidates[0].label}${candidates[0].offscreen ? ' (below the fold)' : ''}`
               : (box ? `no agent add/upload control near ${box.label.slice(0, 60)}` : 'no agent add/upload control (no composer)'),
           };
         }
@@ -24388,6 +24530,9 @@ exit 1
         self._flow_agent_chooser_file = str(source)
         self._flow_agent_chooser_expecting = False
         self._install_flow_page_file_chooser_guard(page)
+        top_banner_detail = await self._dismiss_flow_top_banner(page)
+        if top_banner_detail:
+            attempts.append(top_banner_detail)
 
         async def _set_any_file_input() -> tuple[bool, str]:
             try:
@@ -24445,15 +24590,15 @@ exit 1
             finally:
                 self._flow_agent_chooser_expecting = False
 
-        async def _finish(detail: str) -> tuple[bool, str]:
+        async def _finish(detail: str, picker_timeout_s: float = 30.0) -> tuple[bool, str]:
             step_detail = await self._flow_agent_debug_step(page, "after-upload")
-            picker_detail = await self._confirm_flow_agent_ingredient_picker(page, source.name)
+            picker_detail = await self._confirm_flow_agent_ingredient_picker(page, source.name, timeout_s=picker_timeout_s)
             tried = f" (earlier clicks: {' | '.join(item for item in attempts[:8] if item)})" if attempts else ""
             return True, f"{detail}; {step_detail} {picker_detail}{tried}"[:1600]
 
         # The composer toolbar re-renders for a moment after a long prompt is inserted,
         # so poll for the add control instead of trusting a single snapshot.
-        lookup_deadline = asyncio.get_running_loop().time() + 10.0
+        lookup_deadline = asyncio.get_running_loop().time() + float(getattr(self, "_flow_agent_add_control_lookup_s", 10.0) or 0.0)
         result: Dict[str, Any] = {}
         while True:
             try:
@@ -24465,32 +24610,63 @@ exit 1
                 break
             await asyncio.sleep(0.75)
         candidates = [item for item in (result.get("candidates") or []) if isinstance(item, dict)]
+        fallback_candidates = [item for item in (result.get("fallback_candidates") or []) if isinstance(item, dict)]
         composer = result.get("composer") if isinstance(result.get("composer"), dict) else None
+        if not candidates or all(item.get("offscreen") for item in candidates):
+            # Flow's top notice banner pushes the composer toolbar below the fold: close it and look again.
+            top_banner_detail = await self._dismiss_flow_top_banner(page)
+            if top_banner_detail:
+                attempts.append(top_banner_detail)
+                await asyncio.sleep(0.6)
+            try:
+                retry = await page.evaluate(self.FLOW_AGENT_ADD_CONTROL_JS)
+            except Exception:
+                retry = {}
+            retry = retry if isinstance(retry, dict) else {}
+            retry_candidates = [item for item in (retry.get("candidates") or []) if isinstance(item, dict)]
+            if retry_candidates:
+                result = retry
+                candidates = retry_candidates
+                fallback_candidates = [item for item in (retry.get("fallback_candidates") or []) if isinstance(item, dict)]
+                composer = retry.get("composer") if isinstance(retry.get("composer"), dict) else composer
 
-        for candidate in candidates[:3]:
-            label = str(candidate.get("label") or "add control")[:80]
-            if await _click_for_file_chooser(candidate.get("x"), candidate.get("y"), label):
-                return await _finish(f"file chooser via {label}")
-            attempts.append(f"{label}: no chooser")
-            await asyncio.sleep(0.6)
-            try:
-                menu = await page.evaluate(self.FLOW_AGENT_UPLOAD_MENU_JS)
-            except Exception:
-                menu = {}
-            menu_items = [item for item in ((menu or {}).get("items") or []) if isinstance(item, dict)] if isinstance(menu, dict) else []
-            for item in menu_items[:3]:
-                item_label = str(item.get("label") or "menu item")[:80]
-                if await _click_for_file_chooser(item.get("x"), item.get("y"), item_label):
-                    return await _finish(f"file chooser via {label} > {item_label}")
-                attempts.append(f"menu {item_label}: no chooser")
-            input_ok, input_detail = await _set_any_file_input()
-            if input_ok:
-                return await _finish(f"{input_detail} after {label}")
-            try:
-                await page.keyboard.press("Escape")
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
+        async def _try_add_controls(items: List[Dict[str, Any]], limit: int, picker_timeout_s: float) -> tuple[bool, str] | None:
+            for candidate in items[:limit]:
+                label = str(candidate.get("label") or "add control")[:80]
+                if candidate.get("offscreen"):
+                    attempts.append(f"{label[:40]}: below the fold")
+                    continue
+                if await _click_for_file_chooser(candidate.get("x"), candidate.get("y"), label):
+                    return await _finish(f"file chooser via {label}", picker_timeout_s)
+                attempts.append(f"{label}: no chooser")
+                await asyncio.sleep(0.6)
+                try:
+                    menu = await page.evaluate(self.FLOW_AGENT_UPLOAD_MENU_JS)
+                except Exception:
+                    menu = {}
+                menu_items = [item for item in ((menu or {}).get("items") or []) if isinstance(item, dict)] if isinstance(menu, dict) else []
+                for item in menu_items[:3]:
+                    item_label = str(item.get("label") or "menu item")[:80]
+                    if await _click_for_file_chooser(item.get("x"), item.get("y"), item_label):
+                        return await _finish(f"file chooser via {label} > {item_label}", picker_timeout_s)
+                    attempts.append(f"menu {item_label}: no chooser")
+                input_ok, input_detail = await _set_any_file_input()
+                if input_ok:
+                    return await _finish(f"{input_detail} after {label}", picker_timeout_s)
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.3)
+                except Exception:
+                    pass
+            return None
+
+        outcome = await _try_add_controls(candidates, 3, 30.0)
+        if outcome is not None:
+            return outcome
+        # The page-header "Add media" menu (project library upload) is used only when the composer offers no control.
+        outcome = await _try_add_controls(fallback_candidates, 2, 10.0)
+        if outcome is not None:
+            return outcome
 
         input_ok, input_detail = await _set_any_file_input()
         if input_ok:
