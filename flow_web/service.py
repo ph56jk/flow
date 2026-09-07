@@ -2023,6 +2023,7 @@ class FlowWebService:
         async def _go(client: Any) -> Dict[str, Any]:
             project_url = self._project_url(client.project_id)
             page, page_detail = await self._acquire_isolated_flow_agent_page(client, project_url)
+            self._install_flow_page_file_chooser_guard(page)
             payload: Dict[str, Any] = {"page_detail": str(page_detail)[:200]}
             try:
                 try:
@@ -16619,6 +16620,8 @@ exit 1
             selected_profile.path.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
+        if self._mark_chrome_profile_clean_exit(selected_profile.path):
+            logging.info("Cleared Chrome crash flag for profile %s before launch.", selected_profile.label)
         browser = BrowserManager(headless=False, profile_dir=selected_profile.path)
         await browser.start()
         config = self.store.snapshot().config
@@ -20339,6 +20342,9 @@ exit 1
 
     async def _upload_project_image_robust(self, client: Any, image_path: str) -> str:
         image_file = Path(str(image_path or "")).expanduser().resolve()
+        # Any file dialog opened by the upload triggers below must receive this file, never the OS dialog.
+        self._flow_agent_chooser_file = str(image_file)
+        self._flow_agent_chooser_expecting = False
         if not image_file.exists():
             raise RuntimeError(f"Khong tim thay anh de tai len: {image_file}")
 
@@ -20403,6 +20409,7 @@ exit 1
                     continue
 
         if not uploaded:
+            self._install_flow_page_file_chooser_guard(page)
             trigger_locators = [
                 page.locator('[aria-label*="Upload" i]').first,
                 page.locator('[aria-label*="Tải" i]').first,
@@ -20421,9 +20428,13 @@ exit 1
                         await trigger.scroll_into_view_if_needed(timeout=1200)
                     except Exception:
                         pass
-                    async with page.expect_file_chooser(timeout=3500) as chooser_info:
-                        await trigger.click(force=True, timeout=2500)
-                    chooser = await chooser_info.value
+                    self._flow_agent_chooser_expecting = True
+                    try:
+                        async with page.expect_file_chooser(timeout=3500) as chooser_info:
+                            await trigger.click(force=True, timeout=2500)
+                        chooser = await chooser_info.value
+                    finally:
+                        self._flow_agent_chooser_expecting = False
                     await chooser.set_files(str(image_file))
                     uploaded = True
                     break
@@ -21465,6 +21476,7 @@ exit 1
         project_url = self._project_url(client.project_id)
         if flow_agent_enabled:
             page, page_detail = await self._acquire_isolated_flow_agent_page(client, project_url)
+            self._install_flow_page_file_chooser_guard(page)
             if job_id:
                 await self.store.append_log(job_id, f"Fallback UI Flow: dung tab Flow Agent moi ({page_detail[:120]}).")
         else:
@@ -24187,6 +24199,72 @@ exit 1
         detail = str(result.get("detail") if isinstance(result, dict) else result or "")
         return False, f"drop failed: {detail[:100]}"
 
+    def _install_flow_page_file_chooser_guard(self, page: Any) -> None:
+        """Keep Chromium from ever showing the native Windows "Open" dialog.
+
+        While a 'filechooser' listener is registered Playwright intercepts every file
+        dialog on the page. The guard feeds the source image that the current attach
+        step is waiting for (or closes the chooser empty when nothing is pending), so a
+        chooser that opens after an expect_file_chooser window has timed out can no
+        longer leave an orphaned OS dialog on screen.
+        """
+        if page is None or getattr(page, "_havi_chooser_guard", False):
+            return
+
+        def _on_chooser(chooser: Any) -> None:
+            async def _apply() -> None:
+                if getattr(self, "_flow_agent_chooser_expecting", False):
+                    return
+                pending = str(getattr(self, "_flow_agent_chooser_file", "") or "")
+                try:
+                    if pending and Path(pending).is_file():
+                        await chooser.set_files(pending)
+                        self._flow_agent_chooser_handled = int(getattr(self, "_flow_agent_chooser_handled", 0) or 0) + 1
+                        logging.info("Flow file chooser handled by guard with %s", Path(pending).name)
+                    else:
+                        await chooser.set_files([])
+                        logging.info("Flow file chooser closed by guard (no pending source file)")
+                except Exception as exc:
+                    logging.debug("Flow file chooser guard could not handle the dialog: %s", exc)
+
+            try:
+                asyncio.get_running_loop().create_task(_apply())
+            except RuntimeError:
+                asyncio.ensure_future(_apply())
+
+        try:
+            page.on("filechooser", _on_chooser)
+            page._havi_chooser_guard = True
+        except Exception as exc:
+            logging.debug("could not install file chooser guard: %s", exc)
+
+    def _mark_chrome_profile_clean_exit(self, profile_dir: Path) -> bool:
+        """Clear the crash flag so Chrome does not show the "Restore pages?" bubble.
+
+        Workers are sometimes stopped hard (watchdog restarts, deploys); Chrome then
+        records the profile as crashed and covers the Flow Agent panel with the
+        restore bubble on the next launch.
+        """
+        preferences = Path(profile_dir) / "Default" / "Preferences"
+        try:
+            if not preferences.is_file():
+                return False
+            data = json.loads(preferences.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return False
+            profile = data.setdefault("profile", {})
+            if not isinstance(profile, dict):
+                return False
+            if profile.get("exit_type") == "Normal" and profile.get("exited_cleanly") is True:
+                return False
+            profile["exit_type"] = "Normal"
+            profile["exited_cleanly"] = True
+            preferences.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            return True
+        except Exception as exc:
+            logging.debug("could not mark Chrome profile clean exit: %s", exc)
+            return False
+
     async def _attach_flow_agent_source_file(
         self,
         page: Any,
@@ -24197,6 +24275,10 @@ exit 1
         if not source.is_file():
             return False, f"source file missing: {source}"
         attempts: List[str] = []
+        # Any file dialog that opens from here on receives this file (or gets closed).
+        self._flow_agent_chooser_file = str(source)
+        self._flow_agent_chooser_expecting = False
+        self._install_flow_page_file_chooser_guard(page)
 
         async def _set_any_file_input() -> tuple[bool, str]:
             try:
@@ -24230,17 +24312,29 @@ exit 1
                 if not re.search(probe_token, actual or "", flags=re.IGNORECASE):
                     attempts.append(f"{expected[:40]} moved (found '{actual[:40]}')")
                     return False
+            handled_before = int(getattr(self, "_flow_agent_chooser_handled", 0) or 0)
+            self._flow_agent_chooser_expecting = True
             try:
                 async with page.expect_file_chooser(timeout=3500) as chooser_info:
                     await page.mouse.click(float(x), float(y))
                 chooser = await chooser_info.value
+                self._flow_agent_chooser_expecting = False
                 await chooser.set_files(str(source))
                 await asyncio.sleep(2.0)
                 attempts.append(await self._flow_agent_debug_step(page, f"chooser-{re.sub(r'[^a-z0-9]+', '-', expected[:16].lower())}"))
                 return True
             except Exception:
+                self._flow_agent_chooser_expecting = False
+                # A slow UI can open the dialog after the wait above gave up; the page guard
+                # feeds it the source file, so give it a moment before declaring "no chooser".
+                await asyncio.sleep(2.0)
+                if int(getattr(self, "_flow_agent_chooser_handled", 0) or 0) > handled_before:
+                    attempts.append(f"late chooser handled by guard after {expected[:40]}")
+                    return True
                 attempts.append(await self._flow_agent_debug_step(page, f"nochooser-{re.sub(r'[^a-z0-9]+', '-', expected[:16].lower())}"))
                 return False
+            finally:
+                self._flow_agent_chooser_expecting = False
 
         async def _finish(detail: str) -> tuple[bool, str]:
             step_detail = await self._flow_agent_debug_step(page, "after-upload")

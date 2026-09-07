@@ -609,6 +609,60 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("advent_calendar", second_card["_visual_product_rule_key"])
         self.assertIn("two hatted dinosaurs", second_card["_design_inventory_text"])
 
+    def test_file_chooser_guard_feeds_pending_source_and_installs_once(self) -> None:
+        handlers: list[Any] = []
+
+        class _FakePage:
+            def on(self, event: str, handler: Any) -> None:
+                handlers.append((event, handler))
+
+        class _FakeChooser:
+            def __init__(self) -> None:
+                self.files: list[Any] = []
+
+            async def set_files(self, files: Any) -> None:
+                self.files.append(files)
+
+        page = _FakePage()
+        self.service._install_flow_page_file_chooser_guard(page)
+        self.service._install_flow_page_file_chooser_guard(page)
+        self.assertEqual(1, len(handlers))
+        self.assertEqual("filechooser", handlers[0][0])
+
+        source = self.uploads_dir / "guard-source.jpg"
+        source.write_bytes(b"source")
+
+        async def _run() -> tuple[_FakeChooser, _FakeChooser]:
+            self.service._flow_agent_chooser_file = str(source)
+            self.service._flow_agent_chooser_expecting = False
+            pending = _FakeChooser()
+            handlers[0][1](pending)
+            await asyncio.sleep(0.05)
+            self.service._flow_agent_chooser_file = ""
+            idle = _FakeChooser()
+            handlers[0][1](idle)
+            await asyncio.sleep(0.05)
+            return pending, idle
+
+        pending, idle = asyncio.run(_run())
+        self.assertEqual([str(source)], pending.files)
+        self.assertEqual([[]], idle.files)
+        self.assertEqual(1, self.service._flow_agent_chooser_handled)
+
+    def test_mark_chrome_profile_clean_exit_clears_crash_flag(self) -> None:
+        profile_dir = self.temp_root / "profile-clean-exit"
+        preferences = profile_dir / "Default" / "Preferences"
+        preferences.parent.mkdir(parents=True, exist_ok=True)
+        preferences.write_text(json.dumps({"profile": {"exit_type": "Crashed", "exited_cleanly": False, "name": "x"}}), encoding="utf-8")
+
+        self.assertTrue(self.service._mark_chrome_profile_clean_exit(profile_dir))
+        saved = json.loads(preferences.read_text(encoding="utf-8"))
+        self.assertEqual("Normal", saved["profile"]["exit_type"])
+        self.assertTrue(saved["profile"]["exited_cleanly"])
+        self.assertEqual("x", saved["profile"]["name"])
+        self.assertFalse(self.service._mark_chrome_profile_clean_exit(profile_dir))
+        self.assertFalse(self.service._mark_chrome_profile_clean_exit(self.temp_root / "missing-profile"))
+
     def test_auto_trello_design_qa_rejection_is_retried_not_stopped(self) -> None:
         detail = "Gemini chặn upload Trello vì ảnh generated không khớp ảnh nguồn/card nguồn (different dinosaur; ảnh lỗi: 2, 6)."
         self.assertTrue(self.service._auto_trello_is_design_qa_rejection(detail))
