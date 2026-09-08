@@ -22289,13 +22289,15 @@ exit 1
                                     job_id,
                                     f"Fallback UI Flow: đã tự phê duyệt Tác nhân Flow sau timeout ({approve_detail[:120]}).",
                                 )
+                        # Under load the Agent needs 4-6 minutes for 12 images; re-submitting earlier
+                        # generates a second set for the same card (double Flow credits).
                         images = await self._wait_for_flow_agent_images_after_submit(
                             client,
                             page,
                             known_media_before_submit,
                             prompt=prompt,
                             target_count=target_count,
-                            timeout_s=min(ui_timeout_s, max(120.0, ui_timeout_s * 0.8)),
+                            timeout_s=max(float(ui_timeout_s), 420.0),
                             fallback_workflow_id=resolved_workflow_id,
                             job_id=job_id,
                             visible_before=visible_before_submit,
