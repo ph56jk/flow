@@ -9791,7 +9791,8 @@ exit 1
                 "Planned exceptions that are part of the shot list - never reject an output only for these: "
                 "(a) colorway variants: the same product, single or in a lineup, in a different fabric base color is acceptable when the motif, lettering style, collar, trims, and construction stay identical; "
                 "(b) craft/process shots: the same embroidery being stitched in a hoop, cut fabric pieces, sewing or pressing steps, a mannequin, a hanger, a gift box, or a multi-panel close-up collage of the same product are acceptable presentations, not a product-category change, as long as the visible design matches the source; "
-                "(c) lineup variants carrying different personalized names in the same lettering style and placement.",
+                "(c) lineup variants carrying different personalized names in the same lettering style and placement; "
+                "(d) an intentional interior or inside view of the product (for example looking down into a filled stocking or bag) where the embroidery is only partly visible or hidden by the angle, as long as the visible fabric, cuff, and construction match the source.",
                 "A product that merely shares the theme of the source (for example a different dinosaur design on the same kind of calendar, or a different flower on the same kind of dress) is a REJECT, even if it looks high quality.",
                 "Reject if the output appears to come from another Trello card or another product.",
                 "Reject if the source motif, design, or personalized name is copied onto a different product type inside the output, such as a pillow, cushion, blanket, shirt, tote, hoop, or framed print, unless the SOURCE_IMAGE itself is exactly that product type.",
@@ -12160,7 +12161,6 @@ exit 1
                     "punch needle christmas stocking",
                     "christmas punch needle stocking",
                     "punch needle stocking",
-                    "embroidered christmas stocking",
                     "christmas stocking",
                     "holiday stocking",
                     "mini christmas stocking",
@@ -12186,6 +12186,9 @@ exit 1
                 "exclude": (
                     "round ornament",
                     "embroidery hoop ornament",
+                    "hand embroidered",
+                    "hand embroidery",
+                    "embroidery thread",
                     "sock worn on foot",
                     "wearing socks",
                     "pair of socks",
@@ -12401,6 +12404,22 @@ exit 1
                 "main": ("cross", "religious cross", "crucifix", "soft cross", "cross keepsake"),
                 "context": ("fabric", "linen", "stitched edge", "embroidered name", "baby keepsake", "soft sewn"),
                 "exclude": ("pillow", "cushion", "book", "banner", "hoop", "crown", "pom-pom", "pompom"),
+            },
+            "embroidered_socks": {
+                "main": (
+                    "embroidered socks",
+                    "embroidered sock",
+                    "christmas socks",
+                    "christmas sock",
+                    "hand embroidered stocking",
+                    "hand-embroidered stocking",
+                    "embroidered linen stocking",
+                    "linen christmas stocking",
+                    "fillable stocking",
+                    "stocking",
+                ),
+                "context": ("hand embroidery", "hand embroidered", "embroidery thread", "thread", "satin stitch", "linen", "cotton", "christmas", "cuff", "toe", "heel", "hanging loop", "filled", "fillable", "candy", "gifts"),
+                "exclude": ("punch needle", "wool yarn", "yarn loops", "loop pile", "raised wool", "flat panel", "one-sided", "sock worn on foot", "wearing socks", "pair of socks"),
             },
             "dress_baby": {
                 "main": ("dress", "dresses", "frock", "sundress", "pinafore", "garment"),

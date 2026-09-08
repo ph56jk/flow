@@ -1101,6 +1101,32 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual("Banner image 1 Mẹ và bé chạm vào cờ thêu tên", item["shot_labels"][0])
         self.assertEqual("Banner image 12 Cờ trong hộp quà mở", item["shot_labels"][-1])
 
+    def test_embroidered_socks_rule_has_twelve_operator_shots(self) -> None:
+        rule = PRODUCT_SHOT_RULES["embroidered_socks"]
+        self.assertEqual("Embroidered Socks", rule["display_name"])
+        self.assertEqual(12, rule["target_count"])
+        self.assertEqual(12, len(rule["shots"]))
+        self.assertEqual("embroidered_socks", self.service._flow_operator_product_rule_key_from_text("Embroidered Socks"))
+        self.assertEqual("embroidered_socks", self.service._flow_operator_product_rule_key_from_text("tất thêu giáng sinh"))
+        # Punch-needle stocking cards keep their own rule.
+        self.assertEqual("pc_stocks", self.service._flow_operator_product_rule_key_from_text("Punch Needle Christmas Stocking"))
+        labels = [shot[0] for shot in rule["shots"]]
+        self.assertEqual("Christmas tree branch", labels[0])
+        self.assertEqual("Three colorways on wall hooks", labels[9])
+        self.assertEqual("Inside view from above", labels[-1])
+        briefs = " ".join(shot[2] for shot in rule["shots"])
+        self.assertIn("bulge naturally", briefs)
+        self.assertIn("no yellow cast", briefs)
+        self.assertIn("the thread through the needle's eye", briefs)
+        self.assertIn("rather than hanging on the tree", briefs)
+        self.assertIn("plain unembroidered cotton linen", briefs)
+        self.assertNotIn("collage", rule["shots"][1][2].split("Overall style")[0])
+        shots = self.service._flow_operator_product_rule_shot_suite("embroidered_socks")
+        self.assertEqual(12, len(shots))
+        self.assertIn("Product/category lock", shots[0]["brief"])
+        qa_prompt = self.service._trello_source_qa_prompt(CreateJobRequest(type="image", title="child", prompt="x", prompt_product="Embroidered Socks"))
+        self.assertIn("(d) an intentional interior or inside view", qa_prompt)
+
     def test_havi_product_shot_rules_supply_twelve_safe_shots_for_each_product(self) -> None:
         for product_key, rule in PRODUCT_SHOT_RULES.items():
             with self.subTest(product_key=product_key):
@@ -2849,6 +2875,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "birthday_hat": "hand embroidered linen birthday hat with tie strings, pom-pom details, ruffle trim, and birthday party styling",
             "crown": "soft fabric birthday crown made of linen with pom-pom tips and embroidered details for a baby party",
             "christmas_fabric_cross": "soft sewn Christmas fabric cross keepsake made of linen with raised hand embroidery, a hanging loop, and pine decor",
+            "embroidered_socks": "hand embroidered linen Christmas stocking with a folded cuff, hanging loop, and a small embroidered motif in colored thread, filled with candy and gifts",
             "fabric_cross": "soft sewn religious cross keepsake made of linen with embroidered name",
             "christmas_dress_baby": "Christmas baby linen dress with a white collar, ruffled shoulders, hand embroidery, and two wooden back buttons",
             "halloween_dress_baby": "Halloween baby linen dress with ruffled shoulders, hand embroidery, and two wooden back buttons",

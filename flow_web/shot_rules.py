@@ -47,6 +47,7 @@ PRODUCT_SHOT_RULE_PRIORITY: Tuple[str, ...] = ('ring_bearer_pillow',
  'birthday_hat',
  'crown',
  'christmas_fabric_cross',
+ 'embroidered_socks',
  'fabric_cross',
  'christmas_dress_baby',
  'halloween_dress_baby',
@@ -1219,8 +1220,6 @@ PRODUCT_SHOT_RULES: Dict[str, Dict[str, Any]] = {'tooth_fairy_pillow': {'display
          'Punch Needle Christmas Stocking',
          'punch needle christmas stocking',
          'Christmas Punch Needle Stocking',
-         'embroidered Christmas stocking',
-         'Christmas embroidered stocking',
          'Christmas stocking punch needle',
          'tat noel punch needle',
          'tat giang sinh punch needle',
@@ -8308,6 +8307,193 @@ PRODUCT_SHOT_RULES["christmas_fabric_cross"] = {
         ),
     ),
 }
+
+# 2026-09-08: Embroidered Socks (fillable hand-embroidered Christmas stocking), 12 shots specified by the operator.
+_EMBROIDERED_SOCKS_LOCK = (
+    "Keep the original hand-embroidered Christmas stocking from the reference image 100% unchanged: same stocking "
+    "silhouette, toe and heel shape, proportions, cuff shape and cuff fabric, body fabric material and base color, "
+    "linen or cotton weave, seams, hanging loop material and position, embroidery motif, personalized text if present, "
+    "thread colors, stitch style, raised hand-stitch texture, and embroidery placement and scale. Never redraw, "
+    "simplify, mirror, recolor, move, enlarge, hide, print, or machine-embroider the source design, and never turn the "
+    "stocking into a flat decorative panel, a wearable sock on a foot, a bag, pillow, ornament, banner, or another "
+    "product. Whenever the stocking holds items it must bulge naturally and softly, the way real fabric does when "
+    "filled, without distorting the embroidery. Only the surrounding scene and explicitly requested fabric-color "
+    "variants may change."
+)
+
+_EMBROIDERED_SOCKS_STYLE = (
+    "Overall style for every output: one separate true square 1:1 premium Etsy handmade Christmas product photograph, "
+    "professional editorial composition, clear airy bright white-balanced natural daylight, clean whites, soft natural "
+    "shadows, accurate fabric and thread colors, visible fabric weave, crisp seams, and tack-sharp raised hand "
+    "embroidery matching the reference. Christmas props stay vivid but secondary and never cover the embroidery. "
+    "No yellow, amber, orange, golden-hour, tungsten, sepia, beige, or warm color cast; no harsh studio glare, dark "
+    "scene, clutter, plastic-looking fabric, altered embroidery, mass-produced appearance, malformed hands or bodies, "
+    "extra fingers, random text, logo, watermark, UI, blur, or AI artifacts. Every image must remain one standalone "
+    "photograph; no collage, grid, or multi-panel layout."
+)
+
+
+def _embroidered_socks_brief(scene: str) -> str:
+    return (
+        "Use the uploaded Embroidered Socks reference image as the exact and only product reference. Create one "
+        f"separate square 1:1 high-end handmade Etsy Christmas product photo: {scene} "
+        f"{_EMBROIDERED_SOCKS_LOCK} {_EMBROIDERED_SOCKS_STYLE}"
+    )
+
+
+PRODUCT_SHOT_RULES["embroidered_socks"] = {
+    "display_name": "Embroidered Socks",
+    "aliases": (
+        "Embroidered Socks",
+        "Embroidered Sock",
+        "embroidered_socks",
+        "Embroidered Christmas Socks",
+        "Embroidered Christmas Sock",
+        "Christmas Socks",
+        "Christmas Sock",
+        "Hand Embroidered Socks",
+        "Hand Embroidered Stocking",
+        "Embroidered Stocking",
+        "Fillable Embroidered Stocking",
+        "Linen Christmas Socks",
+        "tat theu",
+        "tất thêu",
+        "tat theu giang sinh",
+        "tất thêu giáng sinh",
+        "vo theu",
+        "vớ thêu",
+    ),
+    "target_count": 12,
+    "allow_planned_multi_panel_shots": False,
+    "lock": (
+        "the main product must remain the exact same hand-embroidered fillable Christmas stocking from the source, "
+        "preserving its exact silhouette, cuff, fabric colors, embroidery motif or personalized wording, thread colors, "
+        "raised hand stitches, hanging loop, and handmade identity; a filled stocking bulges naturally"
+    ),
+    "shots": (
+        (
+            "Christmas tree branch",
+            "Stocking hanging on real tree branch beside silver baubles and red bows",
+            _embroidered_socks_brief(
+                "hang the exact hand-embroidered stocking from its loop on a branch of a real Christmas tree, with "
+                "silver baubles and red bows hanging on the tree beside it. Light the scene with natural window daylight "
+                "that is clear and airy with no yellow cast, and keep the mood vividly festive. The embroidery on the "
+                "stocking is taken exactly from the reference image and stays fully visible and sharp."
+            ),
+        ),
+        (
+            "Hand embroidery process",
+            "Woman embroidering the same motif in a hoop at a light wood table",
+            _embroidered_socks_brief(
+                "show an Etsy-style craft-process scene: a woman seated at a light-colored wooden table carefully hand "
+                "embroidering the exact same motif as the stocking in the reference on fabric stretched in an embroidery "
+                "hoop. The needle sits at the precise spot that is being stitched, and the thread through the needle's eye "
+                "is the same color as the thread at that spot in the reference. Show anatomically natural hands, the "
+                "partly finished motif, matching floss, and clear white daylight; crop or turn her face so it is not "
+                "clearly identifiable."
+            ),
+        ),
+        (
+            "Hanging on wall hook",
+            "Hand hanging the filled stocking on an elegant wooden wall hook",
+            _embroidered_socks_brief(
+                "show one anatomically natural hand hanging the exact stocking by its loop onto an elegant wooden wall "
+                "hook; the stocking already holds Christmas goodies and bulges naturally. Surround the hook with vivid "
+                "Christmas accessories such as greenery, baubles, and ribbon. Use clear airy natural daylight with no "
+                "yellow cast and keep the embroidery as sharp and legible as in the reference."
+            ),
+        ),
+        (
+            "Staircase banister",
+            "Stocking on a small hook of a white wooden staircase banister with garland",
+            _embroidered_socks_brief(
+                "hang the exact stocking from a small hook on the banister of a white wooden staircase; the stocking is "
+                "filled with items and a pine sprig and bulges naturally. Wrap the banister in a lush evergreen garland "
+                "with large red velvet bows and twinkling cool-white lights. Use clear bright light with no yellow cast, "
+                "a luxurious lifestyle mood, and the embroidery exactly as in the reference."
+            ),
+        ),
+        (
+            "White gift box",
+            "Stocking lying inside a premium white Christmas gift box",
+            _embroidered_socks_brief(
+                "lay the exact stocking neatly inside a premium white Christmas gift box, embroidery facing up and fully "
+                "visible, with vivid Christmas decorations arranged around the box. Use crystal-clear airy daylight with "
+                "no yellow tint and keep the embroidery exactly as in the reference."
+            ),
+        ),
+        (
+            "Fireplace mantel",
+            "Filled stocking hanging naturally from a decorated Christmas fireplace",
+            _embroidered_socks_brief(
+                "hang the exact raised-embroidery stocking naturally from a Christmas fireplace mantel; the stocking holds "
+                "Christmas goodies so it puffs out gently. Decorate vividly with pine branches on the mantel, red and gold "
+                "baubles, sparkling white LED lights, and a few wrapped decorative gift boxes. Use crystal-clear airy "
+                "light with no yellow cast."
+            ),
+        ),
+        (
+            "Basket flat lay",
+            "Top-down stocking among a basket of Christmas accessories",
+            _embroidered_socks_brief(
+                "photograph from directly above (flat lay) the exact stocking placed among a basket of vivid Christmas "
+                "accessories: gold pinecones, green pine sprigs, red ribbon, and candy canes. Use clear airy daylight with "
+                "no yellow tint and show the raised embroidery texture as distinctly as in the reference."
+            ),
+        ),
+        (
+            "Toddlers filling stocking",
+            "Two three-year-olds on a rug putting candy into the stocking",
+            _embroidered_socks_brief(
+                "set a modern, vivid Christmas living room where two three-year-old children sit on the rug putting candy "
+                "into the exact stocking, which bulges naturally as it fills. Keep the stocking and its embroidery clearly "
+                "visible and sharp, crop or turn the children's faces so they are not clearly identifiable, and use clear "
+                "white daylight."
+            ),
+        ),
+        (
+            "Leaning on gifts under tree",
+            "Filled stocking resting against gift boxes under the tree, not hanging",
+            _embroidered_socks_brief(
+                "show the exact stocking, filled and bulging naturally, resting and leaning naturally against wrapped gift "
+                "boxes under the Christmas tree rather than hanging on the tree. Use clear airy natural daylight with no "
+                "yellow cast and gentle, restrained Christmas decor."
+            ),
+        ),
+        (
+            "Three colorways on wall hooks",
+            "Three stockings in three fabric colors with identical embroidery on a wooden hook rack",
+            _embroidered_socks_brief(
+                "display three Christmas stockings in three different fabric colors (the body and the cuff of each may "
+                "match or differ), all carrying exactly the same embroidery as the reference in the same placement, size, "
+                "thread colors, and stitch style. Hang them side by side from an elegant wooden wall hook rack with "
+                "Christmas decoration, each stocking holding Christmas items and bulging naturally. Use a cream-white "
+                "wall and crystal-clear light from one side that casts soft shadows; absolutely no yellow cast; a minimal, "
+                "premium Christmas setting."
+            ),
+        ),
+        (
+            "Embroidery macro",
+            "Close-up of the hand embroidery on the stocking",
+            _embroidered_socks_brief(
+                "take one close-up photograph of the embroidery on the exact stocking so the hand stitches, thread fibers, "
+                "stitch direction, and raised texture are clearly visible, keeping enough of the fabric around the motif "
+                "to show it belongs to the stocking. Use soft clear white daylight and shallow background blur."
+            ),
+        ),
+        (
+            "Inside view from above",
+            "Top-down look into the stocking full of small gifts, candy canes, and pinecones",
+            _embroidered_socks_brief(
+                "take a close-up photograph from above looking down into the opening of the exact stocking. Inside it is "
+                "full of small gifts wrapped in tissue paper, candy canes, and a few small pinecones; the inside fabric is "
+                "plain unembroidered cotton linen. Keep the outer embroidery partly visible on the visible part of the "
+                "stocking, use clear airy natural daylight, a vividly festive mood, and absolutely no yellow cast."
+            ),
+        ),
+    ),
+}
+
 
 
 # 2026-09-07: shots removed on purpose so these products generate exactly 12 images
