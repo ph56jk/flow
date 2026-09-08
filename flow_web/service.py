@@ -20881,6 +20881,7 @@ exit 1
         prompt: str,
         target_count: int,
         fallback_workflow_id: str = "",
+        exclude_srcs: set[str] | None = None,
     ) -> List[Any]:
         from flow._api import GeneratedImage
 
@@ -20889,6 +20890,7 @@ exit 1
             page = await client._bm.page()
             items = await page.evaluate(
                 """
+                /* visible-grid-images */
                 (limit) => {
                   const visible = (el) => {
                     if (!el || !(el instanceof Element)) return false;
@@ -20967,6 +20969,8 @@ exit 1
             url = str(item.get("src") or "").strip()
             if not url or url in seen_urls:
                 continue
+            if exclude_srcs and url in exclude_srcs:
+                continue  # was already on the grid before this submit: the previous card's image
             seen_urls.add(url)
             image = GeneratedImage.__new__(GeneratedImage)
             image._raw = {"visible_ui_fallback": True, **item}
@@ -21051,6 +21055,30 @@ exit 1
             return str(result.get("label") or "Try again")
         return ""
 
+    FLOW_VISIBLE_GRID_KEYS_JS = """
+        /* visible-grid-keys */
+        () => {
+          const srcFor = (img) => {
+            const current = img.currentSrc || img.src || '';
+            if (current) return current;
+            const srcset = img.getAttribute('srcset') || '';
+            return srcset.split(',').map((part) => part.trim().split(/\\s+/)[0]).filter(Boolean).pop() || '';
+          };
+          return Array.from(document.querySelectorAll('img[src], img[srcset]'))
+            .map(srcFor)
+            .filter((src) => src && !src.startsWith('data:') && !src.startsWith('blob:'));
+        }
+    """
+
+    async def _visible_flow_grid_image_keys(self, client: Any) -> set[str]:
+        """Every image src currently rendered on the Flow page (taken right before a submit)."""
+        try:
+            page = await client._bm.page()
+            items = await page.evaluate(self.FLOW_VISIBLE_GRID_KEYS_JS)
+        except Exception:
+            return set()
+        return {str(item).strip() for item in (items if isinstance(items, list) else []) if str(item or "").strip()}
+
     async def _wait_for_flow_agent_images_after_submit(
         self,
         client: Any,
@@ -21062,20 +21090,26 @@ exit 1
         timeout_s: float,
         fallback_workflow_id: str = "",
         job_id: str = "",
+        visible_before: set[str] | None = None,
+        settle_s: float = 45.0,
     ) -> List[Any]:
         """Wait for images the Agent actually generated for THIS submit.
 
-        Only media unknown before the submit count. When the panel shows "The agent failed"
-        the app presses Try again once; a second failure with no new images raises
-        FlowAgentFailedError so the caller retries on a fresh session. The visible grid is
-        used only when the project API gave no baseline at all: with a baseline, an empty API
-        result means nothing was generated, and the grid would only hand back the previous
-        card's images (the 2026-09-07/08 stale-grid incident).
+        Two sources, both filtered for newness: project-API media not in ``known_media``, and
+        grid images whose src was not on the page before the submit (``visible_before``). The
+        API is unreliable on large projects (3170's project routinely fails to load), which is
+        why the old unfiltered grid fallback existed and why it handed back the previous
+        card's images when the Agent failed (2026-09-07/08 incident). When the panel shows
+        "The agent failed" the app presses Try again once; a second failure with no new images
+        raises FlowAgentFailedError so the caller retries on a fresh session.
         """
         target = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(target_count or 1)))
         deadline = time.monotonic() + max(10.0, float(timeout_s or 60.0))
         best: List[Any] = []
+        best_changed_at = time.monotonic()
         try_again_clicked = False
+        api_failures = 0
+        api_failure_logged = False
         while True:
             # Check the panel first: a failed agent never produces images, so do not burn the budget waiting.
             message = await self._visible_flow_agent_failed_message(page)
@@ -21093,29 +21127,59 @@ exit 1
                 if best:
                     return best[:target]
                 raise FlowAgentFailedError(f"Flow Agent failed twice, no new images: {message[:160]}")
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            now = time.monotonic()
+            if now >= deadline:
                 break
+            api_images: List[Any] = []
             try:
-                images = await self._wait_for_new_project_images(
+                project_data = await client._api.get_project_data()
+            except Exception as exc:
+                project_data = None
+                api_failures += 1
+                if api_failures >= 3 and job_id and not api_failure_logged:
+                    api_failure_logged = True
+                    await self.store.append_log(
+                        job_id,
+                        f"Fallback UI Flow: API project khong doc duoc ({humanize_flow_error(str(exc))[:80]}); app theo doi grid Flow de nhan anh moi cua card nay.",
+                    )
+            if isinstance(project_data, dict):
+                api_images = self._project_generated_images(
+                    project_data,
+                    known_media=known_media,
+                    prompt=prompt,
+                    limit=target,
+                    fallback_workflow_id=fallback_workflow_id,
+                )
+                if api_images and any(not str(getattr(image, "fife_url", "") or "").strip() for image in api_images):
+                    try:
+                        urls_by_workflow = await self._flow_project_image_urls_by_workflow(client)
+                    except Exception:
+                        urls_by_workflow = {}
+                    for image in api_images:
+                        if not str(getattr(image, "fife_url", "") or "").strip():
+                            image.fife_url = urls_by_workflow.get(str(getattr(image, "workflow_id", "") or "").strip(), "")
+                    api_images = [image for image in api_images if str(getattr(image, "fife_url", "") or "").strip()]
+            grid_images: List[Any] = []
+            if visible_before is not None:
+                grid_images = await self._visible_flow_project_images_from_page(
                     client,
-                    known_media,
                     prompt=prompt,
                     target_count=target,
-                    timeout_s=min(15.0, remaining),
                     fallback_workflow_id=fallback_workflow_id,
-                    allow_visible_fallback=False,
+                    exclude_srcs=visible_before,
                 )
-            except RuntimeError:
-                images = []
-            if len(images) > len(best):
-                best = images
+            candidate = api_images if len(api_images) >= len(grid_images) else grid_images
+            if len(candidate) > len(best):
+                best = candidate
+                best_changed_at = time.monotonic()
             if len(best) >= target:
                 return best[:target]
-            await asyncio.sleep(1.0)
+            if best and time.monotonic() - best_changed_at >= max(5.0, float(settle_s or 45.0)):
+                return best[:target]
+            await asyncio.sleep(3.0)
         if best:
             return best[:target]
-        if not known_media:
+        if not known_media and visible_before is None:
             visible_images = await self._visible_flow_project_images_from_page(
                 client,
                 prompt=prompt,
@@ -22116,6 +22180,8 @@ exit 1
                     "App đã dừng để tránh lấy nhầm ảnh cũ trong project rồi upload sai card."
                 ) from exc
             known_media_before_submit = set()
+        # Grid srcs already on the page: anything else that appears after the submit is this card's output.
+        visible_before_submit: set[str] | None = (await self._visible_flow_grid_image_keys(client)) if flow_agent_enabled else None
 
         pre_submit_quota_message = ""
         pre_submit_try_again_message = ""
@@ -22232,12 +22298,13 @@ exit 1
                             timeout_s=min(ui_timeout_s, max(120.0, ui_timeout_s * 0.8)),
                             fallback_workflow_id=resolved_workflow_id,
                             job_id=job_id,
+                            visible_before=visible_before_submit,
                         )
                         if images:
                             if job_id and getattr(images[0], "_raw", {}).get("visible_ui_fallback"):
                                 await self.store.append_log(
                                     job_id,
-                                    f"Fallback UI Flow: API project khong doc duoc nen app lay {len(images)} anh dang hien thi trong grid Flow.",
+                                    f"Fallback UI Flow: nhan {len(images)} anh moi tu grid Flow (khong co trong grid truoc khi gui).",
                                 )
                             if job_id:
                                 await self.store.append_log(

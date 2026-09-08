@@ -6554,14 +6554,11 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 self.calls += 1
                 return project_data_sequence[index]
 
-        class FakeClient:
-            def __init__(self) -> None:
-                self._api = FakeApi()
-
         class FakePage:
             def __init__(self) -> None:
                 self.clicks = 0
                 self.text_reads = 0
+                self.grid_items: list = []
 
             async def evaluate(self, script: str, *_args: object):
                 if "flow-visible-text" in script:
@@ -6570,21 +6567,36 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
                 if "agent-try-again-click" in script:
                     self.clicks += 1
                     return {"ok": True, "label": "Try again"}
+                if "visible-grid-keys" in script:
+                    return [item["src"] for item in self.grid_items]
+                if "visible-grid-images" in script:
+                    return list(self.grid_items)
                 return {}
 
-        return FakeClient(), FakePage()
+        page = FakePage()
+
+        class FakeBrowserManager:
+            async def page(self) -> FakePage:
+                return page
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self._api = FakeApi()
+                self._bm = FakeBrowserManager()
+
+        return FakeClient(), page
 
     async def test_wait_after_submit_presses_try_again_once_then_fails_without_grid_images(self) -> None:
         empty = {"projectContents": {"media": [], "workflows": []}}
         client, page = self._agent_wait_fakes([empty], "Twelve Part Creative Series\nThe agent failed. Please try again.\nTry again")
-        with patch.object(self.service, "_visible_flow_project_images_from_page") as visible_grid:
-            with self.assertRaises(FlowAgentFailedError) as raised:
-                await self.service._wait_for_flow_agent_images_after_submit(
-                    client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=12.0, fallback_workflow_id="wf"
-                )
+        page.grid_items = [{"src": "https://flow.google.com/asb/old-1", "workflow_id": "", "width": 256, "height": 256}]
+        with self.assertRaises(FlowAgentFailedError) as raised:
+            await self.service._wait_for_flow_agent_images_after_submit(
+                client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=12.0, fallback_workflow_id="wf",
+                visible_before={"https://flow.google.com/asb/old-1"},
+            )
         self.assertEqual(1, page.clicks)
         self.assertIn("agent failed", str(raised.exception).lower())
-        visible_grid.assert_not_called()
 
     async def test_wait_after_submit_returns_only_media_unknown_before_submit(self) -> None:
         new_media = {
@@ -6597,32 +6609,45 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             }
         }
         client, page = self._agent_wait_fakes([new_media], "What do you want to create?")
-        with patch.object(self.service, "_visible_flow_project_images_from_page") as visible_grid:
-            images = await self.service._wait_for_flow_agent_images_after_submit(
-                client, page, {"old-media"}, prompt="p", target_count=1, timeout_s=12.0, fallback_workflow_id="wf"
-            )
+        images = await self.service._wait_for_flow_agent_images_after_submit(
+            client, page, {"old-media"}, prompt="p", target_count=1, timeout_s=12.0, fallback_workflow_id="wf", visible_before=set()
+        )
         self.assertEqual(["new-1"], [image.media_name for image in images])
         self.assertEqual(0, page.clicks)
-        visible_grid.assert_not_called()
 
-    async def test_wait_after_submit_never_uses_visible_grid_when_api_baseline_exists(self) -> None:
+    async def test_wait_after_submit_ignores_grid_images_that_were_there_before_submit(self) -> None:
         empty = {"projectContents": {"media": [], "workflows": []}}
         client, page = self._agent_wait_fakes([empty], "What do you want to create?")
-        with patch.object(self.service, "_visible_flow_project_images_from_page") as visible_grid:
-            with self.assertRaises(RuntimeError) as raised:
-                await self.service._wait_for_flow_agent_images_after_submit(
-                    client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=10.0, fallback_workflow_id="wf"
-                )
-        self.assertNotIsInstance(raised.exception, FlowAgentFailedError)
-        visible_grid.assert_not_called()
-        # Without any API baseline the grid is the only source and may still be used.
-        client2, page2 = self._agent_wait_fakes([empty], "What do you want to create?")
-        with patch.object(self.service, "_visible_flow_project_images_from_page", return_value=["grid-image"]) as visible_grid_2:
-            images = await self.service._wait_for_flow_agent_images_after_submit(
-                client2, page2, set(), prompt="p", target_count=12, timeout_s=10.0, fallback_workflow_id="wf"
+        old_src = "https://flow.google.com/asb/previous-card"
+        page.grid_items = [{"src": old_src, "workflow_id": "", "width": 256, "height": 256}]
+        with self.assertRaises(RuntimeError) as raised:
+            await self.service._wait_for_flow_agent_images_after_submit(
+                client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=10.0, fallback_workflow_id="wf",
+                visible_before={old_src},
             )
-        self.assertEqual(["grid-image"], images)
-        visible_grid_2.assert_called_once()
+        self.assertNotIsInstance(raised.exception, FlowAgentFailedError)
+
+    async def test_wait_after_submit_accepts_grid_images_that_appear_after_submit_when_api_is_down(self) -> None:
+        class BrokenApi:
+            async def get_project_data(self) -> dict:
+                raise RuntimeError("502 project too large")
+
+        client, page = self._agent_wait_fakes([{}], "What do you want to create?")
+        client._api = BrokenApi()
+        old_src = "https://flow.google.com/asb/previous-card"
+        page.grid_items = [
+            {"src": "https://flow.google.com/asb/new-1", "workflow_id": "", "width": 256, "height": 256},
+            {"src": "https://flow.google.com/asb/new-2", "workflow_id": "", "width": 256, "height": 256},
+            {"src": old_src, "workflow_id": "", "width": 256, "height": 256},
+        ]
+        images = await self.service._wait_for_flow_agent_images_after_submit(
+            client, page, {"old-media"}, prompt="p", target_count=2, timeout_s=20.0, fallback_workflow_id="wf",
+            visible_before={old_src},
+        )
+        self.assertEqual(["https://flow.google.com/asb/new-1", "https://flow.google.com/asb/new-2"], [image.fife_url for image in images])
+        self.assertTrue(all(image._raw.get("visible_ui_fallback") for image in images))
+        keys = await self.service._visible_flow_grid_image_keys(client)
+        self.assertEqual({"https://flow.google.com/asb/new-1", "https://flow.google.com/asb/new-2", old_src}, keys)
 
     async def test_flow_agent_attachment_snapshot_scans_shadow_dom_and_file_inputs(self) -> None:
         class FakePage:
