@@ -111,10 +111,40 @@ class StateStore:
     def get_job(self, job_id: str) -> Optional[JobRecord]:
         return next((job for job in self._state.jobs if job.id == job_id), None)
 
+    JOB_HISTORY_LIMIT = 50
+    LIVE_JOB_STATUSES = ("running", "queued")
+
+    def _trim_job_history(self) -> None:
+        """Keep the newest JOB_HISTORY_LIMIT records without ever dropping live work.
+
+        A continuous Auto AI batch adds one child record per card. After ~50 cards the
+        batch record itself was the oldest entry and got evicted, which silently killed
+        the loop (get_job(batch_id) returned None) and left the last child queued forever
+        while /api/health still answered ok. Running/queued jobs and the batches that own
+        a live child always survive; the limit only applies to finished history.
+        """
+        jobs = self._state.jobs
+        if len(jobs) <= self.JOB_HISTORY_LIMIT:
+            return
+        live_ids = {job.id for job in jobs if job.status in self.LIVE_JOB_STATUSES}
+        for job in jobs:
+            result = job.result if isinstance(job.result, dict) else {}
+            owned = {str(child_id) for child_id in (result.get("child_job_ids") or []) if child_id}
+            current_child = str(result.get("current_child_job_id") or "")
+            if current_child:
+                owned.add(current_child)
+            if owned & live_ids:
+                live_ids.add(job.id)
+        protected = [job for job in jobs if job.id in live_ids]
+        slots = max(0, self.JOB_HISTORY_LIMIT - len(protected))
+        history = [job for job in jobs if job.id not in live_ids][:slots]
+        keep_ids = {job.id for job in protected} | {job.id for job in history}
+        self._state.jobs = [job for job in jobs if job.id in keep_ids]
+
     async def add_job(self, job: JobRecord) -> JobRecord:
         async with self._lock:
             self._state.jobs.insert(0, job)
-            self._state.jobs = self._state.jobs[:50]
+            self._trim_job_history()
             self._sync_job_error_snapshot(job)
             self._sync_job_retry_snapshot(job)
             self._sync_job_replay_snapshot(job)

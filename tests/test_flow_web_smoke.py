@@ -5963,6 +5963,53 @@ class StateStoreRegressionTests(TempAppPathsMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.start_temp_paths()
 
+    def test_store_history_trim_never_drops_running_batch_or_queued_child(self) -> None:
+        store = StateStore()
+        batch = JobRecord(type="batch_image", status="running", title="Auto AI Trello: cho san pham moi lien tuc")
+        asyncio.run(store.add_job(batch))
+        for index in range(60):
+            asyncio.run(store.add_job(JobRecord(type="image", status="completed", title=f"Flow Agent {index + 1}/{index + 1} · card")))
+        queued = JobRecord(type="image", status="queued", title="Flow Agent 61/61 · card")
+        asyncio.run(store.add_job(queued))
+
+        jobs = asyncio.run(store.list_jobs())
+        self.assertEqual(StateStore.JOB_HISTORY_LIMIT, len(jobs))
+        self.assertEqual(queued.id, jobs[0].id)
+        self.assertIsNotNone(store.get_job(batch.id), "running batch must survive the history trim")
+        self.assertIsNotNone(store.get_job(queued.id))
+        completed_titles = [job.title for job in jobs if job.status == "completed"]
+        self.assertEqual(48, len(completed_titles))
+        self.assertEqual("Flow Agent 60/60 · card", completed_titles[0])
+
+    def test_store_history_trim_keeps_batch_that_owns_a_live_child(self) -> None:
+        store = StateStore()
+        child = JobRecord(type="image", status="queued", title="Flow Agent 1/1 · card")
+        batch = JobRecord(
+            type="batch_image",
+            status="completed",
+            title="Auto AI Trello: cho san pham moi lien tuc",
+            result={"child_job_ids": [child.id], "current_child_job_id": child.id},
+        )
+        asyncio.run(store.add_job(batch))
+        asyncio.run(store.add_job(child))
+        for index in range(60):
+            asyncio.run(store.add_job(JobRecord(type="image", status="failed", title=f"old {index}")))
+
+        jobs = asyncio.run(store.list_jobs())
+        self.assertEqual(StateStore.JOB_HISTORY_LIMIT, len(jobs))
+        self.assertIsNotNone(store.get_job(batch.id), "batch owning a queued child must survive")
+        self.assertIsNotNone(store.get_job(child.id))
+
+    def test_store_history_trim_applies_plain_limit_when_nothing_is_live(self) -> None:
+        store = StateStore()
+        for index in range(60):
+            asyncio.run(store.add_job(JobRecord(type="image", status="completed", title=f"done {index}")))
+
+        jobs = asyncio.run(store.list_jobs())
+        self.assertEqual(50, len(jobs))
+        self.assertEqual("done 59", jobs[0].title)
+        self.assertEqual("done 10", jobs[-1].title)
+
     def test_store_repairs_incomplete_jobs_after_restart(self) -> None:
         snapshot = StateSnapshot(
             config=AppConfig(project_id="pid"),
