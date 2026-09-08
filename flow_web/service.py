@@ -5,6 +5,7 @@ import base64
 import csv
 import ctypes
 import io
+import hashlib
 import json
 import logging
 import mimetypes
@@ -109,6 +110,10 @@ class ImageUpscaleResult:
     target_size: tuple[int, int] = (0, 0)
     used_flow: bool = False
     failure_reason: str = ""
+
+
+class FlowAgentFailedError(RuntimeError):
+    """Flow's Agent panel showed "The agent failed. Please try again." and produced no images."""
 
 
 class FlowAgentQuotaError(RuntimeError):
@@ -8896,8 +8901,15 @@ exit 1
                 return True
         return False
 
+    def _ai_title_enabled(self) -> bool:
+        """AI product titles are OFF unless FLOW_AI_TITLE_ENABLED is truthy (user decision 2026-09-08: Gemini cost)."""
+        raw = os.getenv("FLOW_AI_TITLE_ENABLED", "").strip().lower()
+        return raw in {"1", "true", "on", "yes"}
+
     def _trello_should_write_ai_title_description(self, card: Dict[str, Any]) -> bool:
         if not isinstance(card, dict):
+            return False
+        if not self._ai_title_enabled():
             return False
         if self._trello_description_has_ai_title_block(str(card.get("desc") or "")):
             return False
@@ -12529,7 +12541,25 @@ exit 1
             "inferred_from_visual_text": inferred_from_visual_text,
         }
 
-    def _gemini_classify_trello_source_product_rule(
+    def _flow_operator_visual_product_rule_options_compact(self) -> str:
+        """Rule list for the classifier: key, display name, aliases and a short lock excerpt.
+
+        The full lock texts made the classification prompt ~29K chars (~6K tokens per card);
+        the excerpt keeps the disambiguating product-form words at a fraction of the cost.
+        """
+        lines: List[str] = []
+        for key in PRODUCT_SHOT_RULE_PRIORITY:
+            suite = PRODUCT_SHOT_RULES.get(key) or {}
+            display = str(suite.get("display_name") or key).strip()
+            aliases = ", ".join(str(alias) for alias in (suite.get("aliases") or ())[:5])
+            lock = re.sub(r"\s+", " ", str(suite.get("lock") or "")).strip()
+            excerpt = lock[:110].rsplit(" ", 1)[0] if len(lock) > 110 else lock
+            lines.append(f"- {key}: {display}. Aliases: {aliases}. Form: {excerpt}")
+        return "\n".join(lines)
+
+    GEMINI_SOURCE_ANALYSIS_MEMO_LIMIT = 64
+
+    def _gemini_analyze_trello_source(
         self,
         *,
         image_bytes: bytes,
@@ -12538,92 +12568,40 @@ exit 1
         attachment_name: str,
         card_description: str,
     ) -> Dict[str, Any]:
+        """One Gemini call that returns both the product-rule classification and the design inventory.
+
+        Classification and design inventory used to be two calls that each re-sent the same source
+        image (2026-09-07: 214 + 214 calls, 58% of Gemini spend). The result is memoised per image so
+        the classify/describe wrappers below share a single request per card.
+        """
         api_key = self._gemini_api_key()
         if not api_key:
             raise RuntimeError("Gemini is not configured for visual product classification.")
+        memo: Dict[str, Dict[str, Any]] = getattr(self, "_gemini_source_analysis_memo", None) or {}
+        self._gemini_source_analysis_memo = memo
+        memo_key = f"{hashlib.sha1(image_bytes or b'').hexdigest()}|{str(card_name or '')[:80]}"
+        cached = memo.get(memo_key)
+        if isinstance(cached, dict):
+            return cached
         prompt = "\n".join(
             [
-                "Classify the SOURCE_IMAGE into one HAVI ecommerce product shot rule.",
+                "You are analysing one handmade product photo (SOURCE_IMAGE) for an ecommerce image pipeline. Do two things in ONE answer.",
+                "TASK 1 - classification: classify the main physical product into one HAVI product shot rule.",
                 "Use the image as the authority. Treat card names and attachment filenames as weak clues only; they are often random or wrong.",
                 "Return an empty product_rule_key when the product is not clearly one of the allowed rules.",
                 "Do not guess from motif text, filename, or background props. Classify only the main physical product form visible in the image.",
                 "In visible_product, describe both the physical product form and the visible embroidery motif/design on the product, for example 'linen drawstring bag with lavender daisy embroidery'.",
                 "Allowed product_rule_key values:",
-                self._flow_operator_visual_product_rule_options(),
-                'Return JSON only with this exact shape: {"product_rule_key": string, "confidence": number, "visible_product": string, "reason": string}.',
+                self._flow_operator_visual_product_rule_options_compact(),
+                "TASK 2 - design inventory: catalogue the product so an image generator can reproduce the SAME design exactly in new scenes.",
+                "Describe only what is visible on the main product. Never invent details, never generalize, never suggest alternatives or improvements.",
+                "Be literal and specific: the exact wording and spelling of any text with its letter colors and lettering style; every motif with its subject/species/character, pose, accessories (hats, bows, scarves), colors, count, size, and position on the product; number/label style and colors; fabric base color and material; trims, collar, buttons, ties, cords, dowel, clasps, and hardware; layout and proportions.",
+                f"inventory is one compact English paragraph under {self.DESIGN_INVENTORY_MAX_CHARS} characters that restates all of that in reproduction order; keep the other design fields short.",
+                'Return JSON only with this exact shape: {"classification": {"product_rule_key": string, "confidence": number, "visible_product": string, "reason": string}, '
+                '"design": {"inventory": string, "text_elements": [string], "motifs": [string], "must_not_change": [string]}}.',
                 "confidence must be 0.0 to 1.0.",
                 f"Card name: {card_name}",
                 f"Attachment name: {attachment_name}",
-                f"Card description: {card_description[:1200]}",
-            ]
-        )
-        payload = {
-            "contents": [
-                {
-                    "parts": [
-                        {"text": prompt},
-                        {"text": "SOURCE_IMAGE"},
-                        self._inline_gemini_image_part(image_bytes, mime_type or "image/jpeg"),
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.0,
-                "maxOutputTokens": 2048,
-                "responseMimeType": "application/json",
-                **self._gemini_thinking_config("light"),
-            },
-        }
-        url = self.GEMINI_API_URL_TEMPLATE.format(model=quote(self._gemini_model(), safe="._-"))
-        request_obj = Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "x-goog-api-key": api_key,
-            },
-            method="POST",
-        )
-        body = self._gemini_post_json(request_obj, context="visual product classification")
-
-        text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="visual product classification")
-        if not isinstance(parsed, dict):
-            raise RuntimeError("Gemini did not return a valid visual classification object.")
-        return parsed
-
-    DESIGN_INVENTORY_MAX_CHARS = 1400
-    DESIGN_INVENTORY_MARKER = "EXACT DESIGN INVENTORY of the source product"
-
-    def _design_inventory_enabled(self) -> bool:
-        raw = os.getenv("FLOW_DESIGN_INVENTORY_ENABLED", "").strip().lower()
-        return raw not in {"0", "false", "off", "no"}
-
-    def _gemini_describe_trello_source_design(
-        self,
-        *,
-        image_bytes: bytes,
-        mime_type: str,
-        card_name: str,
-        attachment_name: str,
-        card_description: str,
-        product_rule_key: str = "",
-        visible_product: str = "",
-    ) -> Dict[str, Any]:
-        api_key = self._gemini_api_key()
-        if not api_key:
-            raise RuntimeError("Gemini is not configured for the source design inventory.")
-        prompt = "\n".join(
-            [
-                "You are cataloguing a handmade product photo so an image generator can reproduce the SAME design exactly in new scenes.",
-                "Describe only what is visible on the main product in SOURCE_IMAGE. Never invent details, never generalize, never suggest alternatives or improvements.",
-                "Be literal and specific: the exact wording and spelling of any text with its letter colors and lettering style; every motif with its subject/species/character, pose, accessories (hats, bows, scarves), colors, count, size, and position on the product; number/label style and colors; fabric base color and material; trims, collar, buttons, ties, cords, dowel, clasps, and hardware; layout and proportions.",
-                "Return JSON only with this exact shape: {\"inventory\": string, \"base_color\": string, \"material\": string, \"text_elements\": [string], \"motifs\": [string], \"numbers_or_labels\": string, \"trims_hardware\": string, \"layout\": string, \"must_not_change\": [string]}.",
-                f"inventory is one compact English paragraph under {self.DESIGN_INVENTORY_MAX_CHARS} characters that restates all of the above in reproduction order.",
-                f"Card name: {card_name}",
-                f"Attachment name: {attachment_name}",
-                f"Product rule: {product_rule_key or 'unknown'}",
-                f"Visible product: {visible_product or 'unknown'}",
                 f"Card description: {card_description[:800]}",
             ]
         )
@@ -12656,13 +12634,77 @@ exit 1
         )
         body = self._gemini_post_json(
             request_obj,
-            context="the source design inventory",
+            context="visual classification + design inventory",
             timeout_s=max(90.0, float(self.GEMINI_TIMEOUT_S)),
         )
-
         text = self._extract_gemini_text(body)
-        parsed = self._parse_json_candidate(text, context="design inventory")
+        parsed = self._parse_json_candidate(text, context="visual classification + design inventory")
         if not isinstance(parsed, dict):
+            raise RuntimeError("Gemini did not return a valid source analysis object.")
+        classification = parsed.get("classification")
+        design = parsed.get("design")
+        if not isinstance(classification, dict) and any(key in parsed for key in ("product_rule_key", "visible_product")):
+            classification = parsed  # model flattened the object
+        if not isinstance(design, dict) and "inventory" in parsed:
+            design = parsed
+        analysis = {
+            "classification": classification if isinstance(classification, dict) else {},
+            "design": design if isinstance(design, dict) else {},
+        }
+        if len(memo) >= self.GEMINI_SOURCE_ANALYSIS_MEMO_LIMIT:
+            memo.pop(next(iter(memo)))
+        memo[memo_key] = analysis
+        return analysis
+
+    def _gemini_classify_trello_source_product_rule(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        card_name: str,
+        attachment_name: str,
+        card_description: str,
+    ) -> Dict[str, Any]:
+        analysis = self._gemini_analyze_trello_source(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            card_name=card_name,
+            attachment_name=attachment_name,
+            card_description=card_description,
+        )
+        parsed = analysis.get("classification")
+        if not isinstance(parsed, dict) or not parsed:
+            raise RuntimeError("Gemini did not return a valid visual classification object.")
+        return parsed
+
+    DESIGN_INVENTORY_MAX_CHARS = 1400
+    DESIGN_INVENTORY_MARKER = "EXACT DESIGN INVENTORY of the source product"
+
+    def _design_inventory_enabled(self) -> bool:
+        raw = os.getenv("FLOW_DESIGN_INVENTORY_ENABLED", "").strip().lower()
+        return raw not in {"0", "false", "off", "no"}
+
+    def _gemini_describe_trello_source_design(
+        self,
+        *,
+        image_bytes: bytes,
+        mime_type: str,
+        card_name: str,
+        attachment_name: str,
+        card_description: str,
+        product_rule_key: str = "",
+        visible_product: str = "",
+    ) -> Dict[str, Any]:
+        # Served from the same memoised analysis as the classification: no second Gemini call per card.
+        analysis = self._gemini_analyze_trello_source(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            card_name=card_name,
+            attachment_name=attachment_name,
+            card_description=card_description,
+        )
+        parsed = analysis.get("design")
+        if not isinstance(parsed, dict) or not parsed:
             raise RuntimeError("Gemini did not return a valid design inventory object.")
         return parsed
 
@@ -16510,6 +16552,14 @@ exit 1
             or ("da xay ra loi" in compact and "hay thu lai" in compact)
             or ("an error occurred" in compact and "try again" in compact)
             or ("something went wrong" in compact and "try again" in compact)
+        )
+
+    def _is_flow_agent_failed_message(self, value: Exception | str) -> bool:
+        """Flow's "The agent failed. Please try again." (capacity), distinct from the try-again quota counter."""
+        compact = self._flow_agent_error_match_text(value)
+        return (
+            ("agent failed" in compact and "try again" in compact)
+            or ("tac nhan" in compact and ("that bai" in compact or "khong thanh cong" in compact) and "thu lai" in compact)
         )
 
     async def _mark_flow_profile_quota_limited(self, profile: FlowBrowserProfile, exc: Exception) -> None:
@@ -20932,6 +20982,150 @@ exit 1
             images.append(image)
         return images[:target]
 
+    FLOW_VISIBLE_PANEL_TEXT_JS = """
+        /* flow-visible-text */
+        () => {
+          const visible = (node) => {
+            if (!node || !(node instanceof Element)) return false;
+            const style = window.getComputedStyle(node);
+            const rect = node.getBoundingClientRect();
+            return style.display !== 'none'
+              && style.visibility !== 'hidden'
+              && style.opacity !== '0'
+              && rect.width > 0
+              && rect.height > 0
+              && rect.bottom > 0
+              && rect.top < window.innerHeight;
+          };
+          return [...document.querySelectorAll('[role="alert"], [role="status"], button, div, span, p')]
+            .filter(visible)
+            .map((node) => node.innerText || node.textContent || '')
+            .filter(Boolean)
+            .join('\\n');
+        }
+    """
+
+    FLOW_AGENT_TRY_AGAIN_CLICK_JS = """
+        /* agent-try-again-click */
+        () => {
+          const visible = (el) => {
+            if (!el || !(el instanceof Element)) return false;
+            const rect = el.getBoundingClientRect();
+            const style = window.getComputedStyle(el);
+            return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0'
+              && rect.width >= 40 && rect.height >= 20 && rect.bottom > 0 && rect.top < window.innerHeight
+              && rect.left >= window.innerWidth * 0.35;
+          };
+          const labelFor = (el) => [el.textContent || '', el.getAttribute('aria-label') || ''].join(' ').replace(/\\s+/g, ' ').trim();
+          const buttons = [...document.querySelectorAll('button, [role="button"]')]
+            .filter(visible)
+            .map((el) => ({ el, label: labelFor(el), rect: el.getBoundingClientRect() }))
+            .filter((item) => /^(try\\s*again|thử\\s*lại|thu\\s*lai)$/i.test(item.label) || /^try\\s*again/i.test(item.label))
+            .sort((a, b) => b.rect.bottom - a.rect.bottom);
+          const target = buttons[0];
+          if (!target) return { ok: false, label: '' };
+          try { target.el.scrollIntoView({ block: 'nearest' }); target.el.click(); } catch (_) { return { ok: false, label: target.label }; }
+          return { ok: true, label: target.label.slice(0, 40) };
+        }
+    """
+
+    async def _visible_flow_agent_failed_message(self, page: Any) -> str:
+        try:
+            text = await page.evaluate(self.FLOW_VISIBLE_PANEL_TEXT_JS)
+        except Exception:
+            return ""
+        raw = str(text or "").strip()
+        if not raw or not self._is_flow_agent_failed_message(raw):
+            return ""
+        for line in raw.splitlines():
+            if self._is_flow_agent_failed_message(line):
+                return line.strip()[:200]
+        return "Flow Agent: The agent failed. Please try again."
+
+    async def _click_flow_agent_try_again_button(self, page: Any) -> str:
+        try:
+            result = await page.evaluate(self.FLOW_AGENT_TRY_AGAIN_CLICK_JS)
+        except Exception:
+            return ""
+        if isinstance(result, dict) and result.get("ok"):
+            return str(result.get("label") or "Try again")
+        return ""
+
+    async def _wait_for_flow_agent_images_after_submit(
+        self,
+        client: Any,
+        page: Any,
+        known_media: set[str],
+        *,
+        prompt: str,
+        target_count: int,
+        timeout_s: float,
+        fallback_workflow_id: str = "",
+        job_id: str = "",
+    ) -> List[Any]:
+        """Wait for images the Agent actually generated for THIS submit.
+
+        Only media unknown before the submit count. When the panel shows "The agent failed"
+        the app presses Try again once; a second failure with no new images raises
+        FlowAgentFailedError so the caller retries on a fresh session. The visible grid is
+        used only when the project API gave no baseline at all: with a baseline, an empty API
+        result means nothing was generated, and the grid would only hand back the previous
+        card's images (the 2026-09-07/08 stale-grid incident).
+        """
+        target = max(1, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, int(target_count or 1)))
+        deadline = time.monotonic() + max(10.0, float(timeout_s or 60.0))
+        best: List[Any] = []
+        try_again_clicked = False
+        while True:
+            # Check the panel first: a failed agent never produces images, so do not burn the budget waiting.
+            message = await self._visible_flow_agent_failed_message(page)
+            if message:
+                if not try_again_clicked:
+                    try_again_clicked = True
+                    label = await self._click_flow_agent_try_again_button(page)
+                    if job_id:
+                        await self.store.append_log(
+                            job_id,
+                            f"Flow Agent báo lỗi ({message[:80]}); app bấm '{label or 'Try again'}' một lần rồi chờ tiếp, không lấy ảnh cũ trong grid.",
+                        )
+                    await asyncio.sleep(3.0)
+                    continue
+                if best:
+                    return best[:target]
+                raise FlowAgentFailedError(f"Flow Agent failed twice, no new images: {message[:160]}")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                images = await self._wait_for_new_project_images(
+                    client,
+                    known_media,
+                    prompt=prompt,
+                    target_count=target,
+                    timeout_s=min(15.0, remaining),
+                    fallback_workflow_id=fallback_workflow_id,
+                    allow_visible_fallback=False,
+                )
+            except RuntimeError:
+                images = []
+            if len(images) > len(best):
+                best = images
+            if len(best) >= target:
+                return best[:target]
+            await asyncio.sleep(1.0)
+        if best:
+            return best[:target]
+        if not known_media:
+            visible_images = await self._visible_flow_project_images_from_page(
+                client,
+                prompt=prompt,
+                target_count=target,
+                fallback_workflow_id=fallback_workflow_id,
+            )
+            if visible_images:
+                return visible_images[:target]
+        raise RuntimeError("Google Flow không trả ảnh mới trong project sau khi bấm tạo ảnh.")
+
     async def _wait_for_new_project_images(
         self,
         client: Any,
@@ -21360,6 +21554,8 @@ exit 1
                     "timed out",
                     "thoi gian cho",
                     "chua tra ve anh",
+                    "agent failed",
+                    "tac nhan flow that bai",
                 )
             )
         )
@@ -21370,6 +21566,8 @@ exit 1
             return 4.0
         if self._is_flow_agent_try_again_error(normalized):
             return 8.0
+        if "agent failed" in normalized or "tac nhan flow that bai" in normalized:
+            return 20.0
         return 45.0 if ("recaptcha" in normalized or "403" in normalized) else 25.0
 
     def _flow_agent_shot_specs(self) -> List[Dict[str, str]]:
@@ -22025,20 +22223,21 @@ exit 1
                                     job_id,
                                     f"Fallback UI Flow: đã tự phê duyệt Tác nhân Flow sau timeout ({approve_detail[:120]}).",
                                 )
-                        images = await self._wait_for_new_project_images(
+                        images = await self._wait_for_flow_agent_images_after_submit(
                             client,
+                            page,
                             known_media_before_submit,
                             prompt=prompt,
                             target_count=target_count,
                             timeout_s=min(ui_timeout_s, max(120.0, ui_timeout_s * 0.8)),
                             fallback_workflow_id=resolved_workflow_id,
-                            allow_visible_fallback=True,
+                            job_id=job_id,
                         )
                         if images:
                             if job_id and getattr(images[0], "_raw", {}).get("visible_ui_fallback"):
                                 await self.store.append_log(
                                     job_id,
-                                    f"Fallback UI Flow: panel bao loi nhung app thay {len(images)} anh lon trong grid Flow; tiep tuc lay anh dang hien thi.",
+                                    f"Fallback UI Flow: API project khong doc duoc nen app lay {len(images)} anh dang hien thi trong grid Flow.",
                                 )
                             if job_id:
                                 await self.store.append_log(
@@ -22046,6 +22245,8 @@ exit 1
                                     f"Fallback UI Flow: Flow Agent đã tạo {len(images)} ảnh mới trong project.",
                                 )
                             return images[:target_count]
+                    except FlowAgentFailedError:
+                        raise
                     except Exception as project_exc:
                         if job_id:
                             await self.store.append_log(
@@ -22083,7 +22284,7 @@ exit 1
                 target_count=target_count,
                 timeout_s=ui_timeout_s,
                 fallback_workflow_id=resolved_workflow_id,
-                allow_visible_fallback=flow_agent_enabled,
+                allow_visible_fallback=flow_agent_enabled and not known_media_before_submit,
             )
         elif flow_agent_enabled and len(images) < target_count:
             if job_id:
@@ -22100,7 +22301,7 @@ exit 1
                     timeout_s=min(ui_timeout_s, 150.0),
                     fallback_workflow_id=resolved_workflow_id,
                     settle_s=min(90.0, max(25.0, ui_timeout_s / 5)),
-                    allow_visible_fallback=flow_agent_enabled,
+                    allow_visible_fallback=flow_agent_enabled and not known_media_before_submit,
                 )
                 merged: List[Any] = []
                 seen_keys: set[str] = set()

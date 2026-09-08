@@ -37,6 +37,7 @@ from flow_web.schemas import (
 )
 from flow_web.service import FlowAgentQuotaError, FlowBrowserProfile, FlowWebService, ImageUpscaleResult
 from flow_web.shot_rules import PRODUCT_SHOT_RULES
+from flow_web.service import FlowAgentFailedError
 from flow_web.store import StateStore
 
 
@@ -814,6 +815,88 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertNotIn("Emma", title)
         self.assertIn("Hand Embroidered Linen Drawstring Bag", title)
 
+    def test_ai_title_is_disabled_by_default(self) -> None:
+        request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
+        card = {
+            "id": "card-no-title",
+            "shortLink": "no-title",
+            "idList": "ready",
+            "name": "Sage_green_linen_drawstring_bag.jpeg",
+            "desc": "",
+            "url": "https://trello.example/c/no-title",
+            "_image_attachments": [{"id": "att-title", "name": "drawstring_bag.jpeg", "mimeType": "image/jpeg"}],
+            "_selected_attachment_ids": ["att-title"],
+        }
+        with patch.dict(os.environ, {"FLOW_AI_TITLE_ENABLED": ""}), patch.object(
+            self.service, "_gemini_api_key", return_value="gemini-key"
+        ), patch.object(self.service, "_trello_credentials", return_value=("trello-key", "trello-token")), patch.object(
+            self.service, "_trello_download_attachment_bytes", return_value=(b"image-bytes", "image/jpeg")
+        ), patch.object(
+            self.service,
+            "_gemini_classify_trello_source_product_rule",
+            return_value={"product_rule_key": "drawstring_bag", "confidence": 0.9, "visible_product": "linen bag", "reason": "pouch"},
+        ), patch.object(self.service, "_gemini_suggest_trello_product_title") as suggest, patch.object(
+            self.service, "_trello_put_json"
+        ) as put_json:
+            self.service._flow_operator_enrich_card_with_visual_product_rule(request, card)
+
+        self.assertFalse(self.service._trello_should_write_ai_title_description(card))
+        suggest.assert_not_called()
+        put_json.assert_not_called()
+        self.assertNotIn("_ai_title_error", card)
+        self.assertNotIn("_ai_suggested_title", card)
+        self.assertEqual("drawstring_bag", card["_visual_product_rule_key"])
+
+    def test_source_analysis_uses_one_gemini_call_for_classification_and_inventory(self) -> None:
+        # setUp stubs the describe wrapper at class level; this test needs the real merged path.
+        self._design_inventory_patch.stop()
+        self.addCleanup(self._design_inventory_patch.start)
+        analysis = {
+            "classification": {
+                "product_rule_key": "advent_calendar",
+                "confidence": 0.93,
+                "visible_product": "linen advent calendar with dinosaur embroidery",
+                "reason": "pocket grid",
+            },
+            "design": {
+                "inventory": "Cream linen calendar with two hatted dinosaurs above 25 numbered pockets.",
+                "text_elements": ["Merry Rex-mas"],
+                "motifs": ["T-rex in red Santa hat"],
+                "must_not_change": ["two dinosaurs"],
+            },
+        }
+        body = {"candidates": [{"content": {"parts": [{"text": json.dumps(analysis)}]}}]}
+        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+            self.service, "_gemini_post_json", return_value=body
+        ) as post_json:
+            classification = self.service._gemini_classify_trello_source_product_rule(
+                image_bytes=b"image-bytes", mime_type="image/jpeg", card_name="advent", attachment_name="a.jpg", card_description=""
+            )
+            design = self.service._gemini_describe_trello_source_design(
+                image_bytes=b"image-bytes", mime_type="image/jpeg", card_name="advent", attachment_name="a.jpg", card_description=""
+            )
+
+        self.assertEqual(1, post_json.call_count)
+        self.assertEqual("advent_calendar", classification["product_rule_key"])
+        self.assertIn("two hatted dinosaurs", design["inventory"])
+        self.assertIn("visual classification + design inventory", post_json.call_args.kwargs.get("context", ""))
+        sent = json.loads(post_json.call_args.args[0].data.decode("utf-8"))
+        prompt_text = sent["contents"][0]["parts"][0]["text"]
+        self.assertIn("TASK 1 - classification", prompt_text)
+        self.assertIn("TASK 2 - design inventory", prompt_text)
+        self.assertIn("- advent_calendar:", prompt_text)
+        # Compact rule list: the full lock texts (~29K chars) are no longer sent with every card.
+        self.assertLess(len(prompt_text), 15000)
+        self.assertEqual(4096, sent["generationConfig"]["maxOutputTokens"])
+        # A different image is a different analysis (memo is keyed by image bytes).
+        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+            self.service, "_gemini_post_json", return_value=body
+        ) as post_json_2:
+            self.service._gemini_classify_trello_source_product_rule(
+                image_bytes=b"other-image", mime_type="image/jpeg", card_name="advent", attachment_name="a.jpg", card_description=""
+            )
+        self.assertEqual(1, post_json_2.call_count)
+
     def test_auto_trello_ai_title_missing_gemini_records_error_on_item(self) -> None:
         request = CreateJobRequest(type="image", title="Auto image from Trello card", count=12)
         card = {
@@ -827,7 +910,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "_selected_attachment_ids": ["att-title"],
         }
 
-        with patch.object(self.service, "_gemini_api_key", return_value=""):
+        with patch.dict(os.environ, {"FLOW_AI_TITLE_ENABLED": "1"}), patch.object(self.service, "_gemini_api_key", return_value=""):
             items = self.service._trello_ai_prompt_items_for_image_cards([card], request, 40)
 
         self.assertEqual(1, len(items))
@@ -849,7 +932,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "_selected_attachment_ids": ["att-title"],
         }
 
-        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+        with patch.dict(os.environ, {"FLOW_AI_TITLE_ENABLED": "1"}), patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
             self.service,
             "_trello_credentials",
             return_value=("trello-key", "trello-token"),
@@ -902,7 +985,7 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             "_selected_attachment_ids": ["att-title"],
         }
 
-        with patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
+        with patch.dict(os.environ, {"FLOW_AI_TITLE_ENABLED": "1"}), patch.object(self.service, "_gemini_api_key", return_value="gemini-key"), patch.object(
             self.service,
             "_trello_credentials",
             return_value=("trello-key", "trello-token"),
@@ -6450,6 +6533,96 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertIn("below the fold", detail)
         self.assertEqual([], page.mouse.clicks)
         self.assertTrue(any("flow-banner-dismiss" in script for script in page.scripts))
+
+    def test_flow_agent_failed_message_is_retryable_but_not_a_try_again_strike(self) -> None:
+        message = "The agent failed. Please try again."
+        self.assertTrue(self.service._is_flow_agent_failed_message(message))
+        self.assertTrue(self.service._is_flow_agent_failed_message("Tác nhân thất bại. Hãy thử lại."))
+        self.assertFalse(self.service._is_flow_agent_failed_message("Something else happened"))
+        # Must not feed the 10-strike counter that quota-blocks a profile for 24h.
+        self.assertFalse(self.service._is_flow_agent_try_again_error(message))
+        self.assertTrue(self.service._is_retryable_flow_agent_ui_error(f"flow agent failed twice, no new images: {message}"))
+        self.assertEqual(20.0, self.service._flow_agent_ui_retry_delay_s(f"flow agent failed twice: {message}"))
+
+    def _agent_wait_fakes(self, project_data_sequence: list, panel_text: str):
+        class FakeApi:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def get_project_data(self) -> dict:
+                index = min(self.calls, len(project_data_sequence) - 1)
+                self.calls += 1
+                return project_data_sequence[index]
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self._api = FakeApi()
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.clicks = 0
+                self.text_reads = 0
+
+            async def evaluate(self, script: str, *_args: object):
+                if "flow-visible-text" in script:
+                    self.text_reads += 1
+                    return panel_text
+                if "agent-try-again-click" in script:
+                    self.clicks += 1
+                    return {"ok": True, "label": "Try again"}
+                return {}
+
+        return FakeClient(), FakePage()
+
+    async def test_wait_after_submit_presses_try_again_once_then_fails_without_grid_images(self) -> None:
+        empty = {"projectContents": {"media": [], "workflows": []}}
+        client, page = self._agent_wait_fakes([empty], "Twelve Part Creative Series\nThe agent failed. Please try again.\nTry again")
+        with patch.object(self.service, "_visible_flow_project_images_from_page") as visible_grid:
+            with self.assertRaises(FlowAgentFailedError) as raised:
+                await self.service._wait_for_flow_agent_images_after_submit(
+                    client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=12.0, fallback_workflow_id="wf"
+                )
+        self.assertEqual(1, page.clicks)
+        self.assertIn("agent failed", str(raised.exception).lower())
+        visible_grid.assert_not_called()
+
+    async def test_wait_after_submit_returns_only_media_unknown_before_submit(self) -> None:
+        new_media = {
+            "projectContents": {
+                "media": [
+                    {"name": "old-media", "workflowId": "wf-old", "image": {"generatedImage": {"fifeUrl": "https://img/old", "prompt": "old"}}},
+                    {"name": "new-1", "workflowId": "wf", "image": {"generatedImage": {"fifeUrl": "https://img/new1", "prompt": "p"}}},
+                ],
+                "workflows": [],
+            }
+        }
+        client, page = self._agent_wait_fakes([new_media], "What do you want to create?")
+        with patch.object(self.service, "_visible_flow_project_images_from_page") as visible_grid:
+            images = await self.service._wait_for_flow_agent_images_after_submit(
+                client, page, {"old-media"}, prompt="p", target_count=1, timeout_s=12.0, fallback_workflow_id="wf"
+            )
+        self.assertEqual(["new-1"], [image.media_name for image in images])
+        self.assertEqual(0, page.clicks)
+        visible_grid.assert_not_called()
+
+    async def test_wait_after_submit_never_uses_visible_grid_when_api_baseline_exists(self) -> None:
+        empty = {"projectContents": {"media": [], "workflows": []}}
+        client, page = self._agent_wait_fakes([empty], "What do you want to create?")
+        with patch.object(self.service, "_visible_flow_project_images_from_page") as visible_grid:
+            with self.assertRaises(RuntimeError) as raised:
+                await self.service._wait_for_flow_agent_images_after_submit(
+                    client, page, {"old-media"}, prompt="p", target_count=12, timeout_s=10.0, fallback_workflow_id="wf"
+                )
+        self.assertNotIsInstance(raised.exception, FlowAgentFailedError)
+        visible_grid.assert_not_called()
+        # Without any API baseline the grid is the only source and may still be used.
+        client2, page2 = self._agent_wait_fakes([empty], "What do you want to create?")
+        with patch.object(self.service, "_visible_flow_project_images_from_page", return_value=["grid-image"]) as visible_grid_2:
+            images = await self.service._wait_for_flow_agent_images_after_submit(
+                client2, page2, set(), prompt="p", target_count=12, timeout_s=10.0, fallback_workflow_id="wf"
+            )
+        self.assertEqual(["grid-image"], images)
+        visible_grid_2.assert_called_once()
 
     async def test_flow_agent_attachment_snapshot_scans_shadow_dom_and_file_inputs(self) -> None:
         class FakePage:
