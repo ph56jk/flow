@@ -14891,10 +14891,10 @@ exit 1
 
         image = Image.new("RGB", (side, side), ((seed * 53) % 255, (seed * 97) % 255, (seed * 151) % 255))
         draw = ImageDraw.Draw(image)
-        step = max(8, side // (4 + (seed % 5)))
-        for offset in range(0, side, step):
-            shade = (offset * (seed + 3)) % 255
-            draw.rectangle((offset, 0, offset + step // 2, side), fill=(shade, 255 - shade, (shade * 2) % 255))
+        band = side // 3
+        for index in range(3):
+            shade = (index * 70 + seed * 37) % 255
+            draw.rectangle((index * band, 0, (index + 1) * band, side // 2), fill=(shade, 255 - shade, (shade * 2) % 255))
         cx, cy = side * (1 + seed % 4) // 6, side * (1 + (seed // 2) % 4) // 6
         radius = side // (3 + seed % 3)
         draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=((seed * 31) % 255, 40, 200))
@@ -14932,7 +14932,7 @@ exit 1
         }
     """
     UI_2K_THUMB_SIZE = 24
-    UI_2K_MATCH_MAX_DISTANCE = 0.15
+    UI_2K_MATCH_MAX_DISTANCE = 0.04
     UI_2K_MATCH_MIN_MARGIN = 0.03
 
     def _image_thumb_signature(self, image_bytes: bytes) -> List[float]:
@@ -14986,9 +14986,11 @@ exit 1
         wanted = max(1, min(int(count or 1), self.FLOW_AGENT_MAX_OUTPUT_COUNT + 2))
         page = await client._bm.page()
         project_id = str(getattr(client, "project_id", "") or "").strip()
-        if project_id and project_id not in str(getattr(page, "url", "") or ""):
+        if project_id:
+            # Always reload: the shared tab can hold a stale grid (an older card's set on top), and the
+            # freshly loaded project lists media newest-first.
             await page.goto(self._project_url(project_id), wait_until="domcontentloaded", timeout=60_000)
-            await asyncio.sleep(4.0)
+            await asyncio.sleep(5.0)
         await self._wait_for_flow_app_ready(page, timeout_s=30.0)
         await self._dismiss_flow_top_banner(page)
         try:
@@ -15021,6 +15023,15 @@ exit 1
                 controls = await page.evaluate(self.FLOW_UI_CONTROLS_JS)
                 controls = controls if isinstance(controls, list) else []
                 download_btn = next((it for it in controls if re.search(r"download media|^download\b", str(it.get("label") or ""), re.I)), None)
+                if not download_btn:
+                    # The first click right after a generation often only focuses the tile: click once more.
+                    await asyncio.sleep(1.5)
+                    center = await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, tile_index) or center
+                    await page.mouse.click(float(center["x"]), float(center["y"]))
+                    await asyncio.sleep(3.0)
+                    controls = await page.evaluate(self.FLOW_UI_CONTROLS_JS)
+                    controls = controls if isinstance(controls, list) else []
+                    download_btn = next((it for it in controls if re.search(r"download media|^download\b", str(it.get("label") or ""), re.I)), None)
                 if not download_btn:
                     raise RuntimeError("no Download control in the image editor")
                 await page.mouse.click(float(download_btn["x"]), float(download_btn["y"]))
