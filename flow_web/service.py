@@ -328,6 +328,8 @@ class FlowWebService:
         self._flow_profile_agent_retry_error_counts: Dict[str, int] = self._valid_flow_profile_agent_retry_counts(
             self.store.snapshot().flow_profile_agent_retry_error_counts
         )
+        # Consecutive jobs that ended in "The agent failed" per profile (in-memory; a restart starts over).
+        self._flow_profile_agent_failed_job_counts: Dict[str, int] = {}
 
     async def close(self) -> None:
         async with self._browser_session_lock:
@@ -8752,6 +8754,7 @@ exit 1
                 _execute,
                 workflow_id=request.workflow_id,
                 timeout_s=request.timeout_s,
+                job_id=job_id,
             )
             if request.type == "image":
                 images = payload["images"]
@@ -16432,6 +16435,7 @@ exit 1
         fn: Callable[[Any], Any],
         workflow_id: str = "",
         timeout_s: int = 0,
+        job_id: str = "",
     ) -> Any:
         FlowClient, _, _, _, _ = self._flow_modules(client_only=True)
         config = self._normalized_config(self.store.snapshot().config)
@@ -16464,6 +16468,7 @@ exit 1
                         )
                         result = await fn(client)
                         await self._reset_flow_profile_agent_try_again_errors(profile)
+                        self._flow_profile_agent_failed_job_counts.pop(profile.key, None)
                         return result
                     except HTTPException:
                         raise
@@ -16485,6 +16490,36 @@ exit 1
                                 self._active_flow_profile_index = next_profile.index
                                 continue
                             raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail()) from exc
+                        if self._is_flow_agent_failed_message(exc):
+                            # "The agent failed. Please try again." on every submit is the daily Agent limit
+                            # (no quota text, credits untouched; seen on Acc13/14/15 2026-09-05..09).
+                            count = self._record_flow_profile_agent_failed_job(profile)
+                            threshold = self._flow_agent_failed_switch_threshold()
+                            if count >= threshold:
+                                last_quota_error = exc
+                                await self._mark_flow_profile_quota_limited(profile, exc)
+                                next_profile = self._next_available_flow_profile(profile)
+                                await self._log_flow_profile_agent_failed_switch(job_id, profile, next_profile, count)
+                                if next_profile is not None:
+                                    self._active_flow_profile_index = next_profile.index
+                                    continue
+                                raise HTTPException(status_code=429, detail=self._flow_profiles_all_quota_blocked_detail()) from exc
+                            if job_id:
+                                await self.store.append_log(
+                                    job_id,
+                                    (
+                                        f"Flow Agent failed trên {profile.label} ({count}/{threshold} card liên tiếp); "
+                                        f"đủ {threshold} card app sẽ chặn acc này đến "
+                                        f"{self._flow_profile_block_until_label(self._flow_profile_block_until())} giờ VN và đổi acc."
+                                    ),
+                                )
+                            raise HTTPException(
+                                status_code=self._flow_error_status(exc),
+                                detail=(
+                                    f"{self._flow_error_detail(exc)} "
+                                    f"(Flow Agent failed {count}/{threshold} card liên tiếp trên {profile.label}; đủ {threshold} card sẽ đổi acc.)"
+                                ),
+                            ) from exc
                         if self._is_flow_agent_try_again_error(exc):
                             count = await self._record_flow_profile_agent_try_again_error(profile, exc)
                             threshold = self._flow_agent_try_again_threshold()
@@ -16676,14 +16711,46 @@ exit 1
     def _flow_profile_project_id(self, profile: FlowBrowserProfile, fallback_project_id: str = "") -> str:
         return self._normalize_project_id(profile.project_id or fallback_project_id)
 
-    def _flow_profile_block_seconds(self) -> float:
-        raw = os.getenv("FLOW_CHROME_PROFILE_QUOTA_BLOCK_S", "").strip()
-        if not raw:
-            raw = os.getenv("FLOW_PROFILE_QUOTA_BLOCK_S", "").strip()
+    FLOW_PROFILE_BLOCK_MIN_SECONDS = 60.0
+
+    def _flow_profile_block_until(self, now: float | None = None) -> float:
+        """Epoch when a quota-blocked profile may be used again.
+
+        Flow's daily Agent limit resets at 00:00 UTC (07:00 Vietnam; observed 2026-09-09), so the block ends
+        at the next 00:00 UTC instead of a fixed 24 h that over-blocked the account for most of the next day.
+        FLOW_CHROME_PROFILE_QUOTA_BLOCK_S / FLOW_PROFILE_QUOTA_BLOCK_S still force a fixed duration.
+        """
+        current = float(now if now is not None else time.time())
+        raw = os.getenv("FLOW_CHROME_PROFILE_QUOTA_BLOCK_S", "").strip() or os.getenv("FLOW_PROFILE_QUOTA_BLOCK_S", "").strip()
+        if raw:
+            try:
+                return current + max(self.FLOW_PROFILE_BLOCK_MIN_SECONDS, float(raw))
+            except ValueError:
+                pass
+        day = 24.0 * 60.0 * 60.0
+        next_reset = (int(current // day) + 1) * day
+        return max(next_reset, current + self.FLOW_PROFILE_BLOCK_MIN_SECONDS)
+
+    def _flow_profile_block_until_label(self, blocked_until: float) -> str:
+        """Human label in Vietnam time, e.g. '07:00 10/09'."""
         try:
-            return max(60.0, float(raw)) if raw else 24.0 * 60.0 * 60.0
+            moment = datetime.fromtimestamp(float(blocked_until), tz=timezone(timedelta(hours=7)))
+        except (TypeError, ValueError, OverflowError, OSError):
+            return ""
+        return moment.strftime("%H:%M %d/%m")
+
+    def _flow_agent_failed_switch_threshold(self) -> int:
+        """Consecutive jobs ending in "The agent failed" on one profile before the app blocks it and rotates."""
+        raw = os.getenv("FLOW_AGENT_FAILED_SWITCH_THRESHOLD", "").strip()
+        try:
+            return max(1, min(20, int(raw))) if raw else 2
         except ValueError:
-            return 24.0 * 60.0 * 60.0
+            return 2
+
+    def _record_flow_profile_agent_failed_job(self, profile: FlowBrowserProfile) -> int:
+        next_count = int(self._flow_profile_agent_failed_job_counts.get(profile.key, 0) or 0) + 1
+        self._flow_profile_agent_failed_job_counts[profile.key] = next_count
+        return next_count
 
     def _flow_agent_try_again_threshold(self) -> int:
         raw = (
@@ -16732,10 +16799,42 @@ exit 1
             if self._flow_profile_is_quota_blocked(profile)
         ]
         label_text = ", ".join(blocked_labels) if blocked_labels else "tat ca profile"
+        expiries = [
+            float(self._flow_profile_quota_blocked_until.get(profile.key, 0.0) or 0.0)
+            for profile in profiles
+            if self._flow_profile_is_quota_blocked(profile)
+        ]
+        reset_text = ""
+        if expiries:
+            reset_label = self._flow_profile_block_until_label(min(expiries))
+            if reset_label:
+                reset_text = f" (som nhat {reset_label} gio VN)"
         return (
             f"Tat ca Chrome profile Flow da het quota Agent ({label_text}). "
-            "App da dung thay vi quay lai profile da het quota. Hay dang nhap them profile khac hoac cho quota reset."
+            f"App da dung thay vi quay lai profile da het quota. Hay dang nhap them profile khac hoac cho quota reset{reset_text}."
         )
+
+    async def _log_flow_profile_agent_failed_switch(
+        self,
+        job_id: str,
+        profile: FlowBrowserProfile,
+        next_profile: FlowBrowserProfile | None,
+        count: int,
+    ) -> None:
+        if not job_id:
+            return
+        until_label = self._flow_profile_block_until_label(
+            float(self._flow_profile_quota_blocked_until.get(profile.key, 0.0) or 0.0)
+        )
+        head = (
+            f"Flow Agent failed {count} card liên tiếp trên {profile.label} (hết hạn mức Agent trong ngày). "
+            f"App chặn {profile.label} đến {until_label} giờ VN"
+        )
+        if next_profile is not None:
+            message = f"{head} và chuyển sang {next_profile.label} cho card này."
+        else:
+            message = f"{head}; không còn acc nào khác nên Auto AI sẽ dừng tới lúc đó."
+        await self.store.append_log(job_id, message)
 
     def _flow_profile_is_quota_blocked(self, profile: FlowBrowserProfile) -> bool:
         blocked_until = float(self._flow_profile_quota_blocked_until.get(profile.key, 0.0) or 0.0)
@@ -16838,9 +16937,10 @@ exit 1
 
     async def _mark_flow_profile_quota_limited(self, profile: FlowBrowserProfile, exc: Exception) -> None:
         self._flow_profile_quota_blocked_until = self._valid_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
-        self._flow_profile_quota_blocked_until[profile.key] = time.time() + self._flow_profile_block_seconds()
+        self._flow_profile_quota_blocked_until[profile.key] = self._flow_profile_block_until()
         await self.store.replace_flow_profile_quota_blocks(self._flow_profile_quota_blocked_until)
         self._flow_profile_agent_retry_error_counts.pop(profile.key, None)
+        self._flow_profile_agent_failed_job_counts.pop(profile.key, None)
         await self.store.replace_flow_profile_agent_retry_error_counts(self._flow_profile_agent_retry_error_counts)
         if self._shared_browser_profile_key == profile.key:
             await self._close_shared_browser()

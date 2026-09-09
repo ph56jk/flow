@@ -7,6 +7,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -7510,6 +7511,123 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
         self.assertEqual(1, self.store.snapshot().flow_profile_agent_retry_error_counts[profiles[0].key])
 
+    def test_flow_profile_block_until_is_next_midnight_utc(self) -> None:
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False):
+            # 2026-09-09 05:30 UTC -> 2026-09-10 00:00 UTC (07:00 Vietnam)
+            self.assertEqual(1788998400.0, self.service._flow_profile_block_until(now=1788931800.0))
+            # 30 s before midnight still respects the 60 s minimum block
+            self.assertEqual(1788998430.0, self.service._flow_profile_block_until(now=1788998370.0))
+            self.assertEqual("07:00 10/09", self.service._flow_profile_block_until_label(1788998400.0))
+            self.assertEqual(2, self.service._flow_agent_failed_switch_threshold())
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "3600"}, clear=False):
+            self.assertEqual(1788931800.0 + 3600.0, self.service._flow_profile_block_until(now=1788931800.0))
+
+    async def test_with_client_switches_profile_after_two_consecutive_flow_agent_failed_jobs(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Acc14", path=self.temp_root / "acc14"),
+            FlowBrowserProfile(index=1, label="Acc18", path=self.temp_root / "acc18"),
+        ]
+        job = JobRecord(type="image", status="running", title="card")
+        await self.store.add_job(job)
+        calls: list[str] = []
+
+        async def use_client(client: Any) -> str:
+            calls.append(client.name)
+            if client.name == "client-1":
+                raise FlowAgentFailedError("Flow Agent failed twice, no new images: The agent failed. Please try again.")
+            return client.name
+
+        started = time.time()
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False), patch.object(
+            self.service, "_flow_profile_specs", return_value=profiles
+        ), patch.object(
+            self.service,
+            "_ensure_shared_browser",
+            AsyncMock(side_effect=[SimpleNamespace(name="b1"), SimpleNamespace(name="b1"), SimpleNamespace(name="b2")]),
+        ), patch.object(
+            self.service,
+            "_build_client_from_shared_browser",
+            AsyncMock(side_effect=[SimpleNamespace(name="client-1"), SimpleNamespace(name="client-1"), SimpleNamespace(name="client-2")]),
+        ):
+            # First failed job: counted, not blocked, error surfaced to the job.
+            with self.assertRaises(HTTPException) as first:
+                await self.service._with_client(use_client, job_id=job.id)
+            self.assertIn("1/2", first.exception.detail)
+            self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
+            # Second consecutive failed job: Acc14 blocked until 07:00 VN, same job continues on Acc18.
+            result = await self.service._with_client(use_client, job_id=job.id)
+
+        self.assertEqual("client-2", result)
+        self.assertEqual(["client-1", "client-1", "client-2"], calls)
+        self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
+        blocked_until = self.store.snapshot().flow_profile_quota_blocked_until[profiles[0].key]
+        day = 86400.0
+        self.assertEqual((int(started // day) + 1) * day, blocked_until)
+        self.assertLess(blocked_until - started, day)
+        self.assertEqual(0, self.service._flow_profile_agent_failed_job_counts.get(profiles[0].key, 0))
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("1/2 card liên tiếp", logs)
+        self.assertIn("chuyển sang Acc18", logs)
+        self.assertIn("07:00", logs)
+
+    async def test_with_client_single_profile_stops_after_two_flow_agent_failed_jobs(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [FlowBrowserProfile(index=0, label="Acc15", path=self.temp_root / "acc15")]
+
+        async def use_client(client: Any) -> str:
+            raise FlowAgentFailedError("Flow Agent failed twice, no new images: The agent failed. Please try again.")
+
+        with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False), patch.object(
+            self.service, "_flow_profile_specs", return_value=profiles
+        ), patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace(name="b1"))
+        ), patch.object(
+            self.service, "_build_client_from_shared_browser", AsyncMock(return_value=SimpleNamespace(name="client-1"))
+        ):
+            with self.assertRaises(HTTPException) as first:
+                await self.service._with_client(use_client)
+            self.assertNotEqual(429, first.exception.status_code)
+            with self.assertRaises(HTTPException) as second:
+                await self.service._with_client(use_client)
+            self.assertEqual(429, second.exception.status_code)
+            self.assertIn("het quota Agent (Acc15)", second.exception.detail)
+            self.assertIn("gio VN", second.exception.detail)
+            # Every later job fails fast without touching Flow, so the Auto AI batch stops cleanly.
+            with self.assertRaises(HTTPException) as third:
+                await self.service._with_client(use_client)
+            self.assertEqual(429, third.exception.status_code)
+        self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
+        self.assertTrue(self.service._auto_trello_should_stop_on_child_error(second.exception.detail))
+
+    async def test_with_client_success_resets_flow_agent_failed_job_counter(self) -> None:
+        await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
+        profiles = [
+            FlowBrowserProfile(index=0, label="Acc14", path=self.temp_root / "acc14"),
+            FlowBrowserProfile(index=1, label="Acc18", path=self.temp_root / "acc18"),
+        ]
+        outcomes = iter(["fail", "ok", "fail"])
+
+        async def use_client(client: Any) -> str:
+            if next(outcomes) == "fail":
+                raise FlowAgentFailedError("Flow Agent failed twice, no new images: The agent failed. Please try again.")
+            return client.name
+
+        with patch.object(self.service, "_flow_profile_specs", return_value=profiles), patch.object(
+            self.service, "_ensure_shared_browser", AsyncMock(return_value=SimpleNamespace(name="b1"))
+        ), patch.object(
+            self.service, "_build_client_from_shared_browser", AsyncMock(return_value=SimpleNamespace(name="client-1"))
+        ):
+            with self.assertRaises(HTTPException):
+                await self.service._with_client(use_client)
+            self.assertEqual("client-1", await self.service._with_client(use_client))
+            with self.assertRaises(HTTPException) as again:
+                await self.service._with_client(use_client)
+
+        self.assertIn("1/2", again.exception.detail)
+        self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[0]))
+
     async def test_with_client_resets_flow_agent_try_again_counter_after_success(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))
         profile = FlowBrowserProfile(index=0, label="Main", path=self.temp_root / "main-profile")
@@ -7948,7 +8066,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[video_job]))
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
@@ -8013,7 +8131,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         only_one_job = SimpleNamespace(media_name="media-123", workflow_id="wf-123")
         fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[only_one_job]))
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client):
@@ -8041,7 +8159,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
         fake_client = SimpleNamespace(generate_video=fake_generate_video)
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         async def fake_wait_for(awaitable, timeout=None):
@@ -8094,7 +8212,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         fake_client = SimpleNamespace(generate_video=AsyncMock(return_value=[video_job]))
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
@@ -8234,7 +8352,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             generate_image=AsyncMock(return_value=[fake_image]),
         )
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client), patch.object(
@@ -8369,7 +8487,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             generate_image=AsyncMock(side_effect=AssertionError("UI image generation should not be used")),
         )
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client):
@@ -8429,7 +8547,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             _api=SimpleNamespace(generate_image=AsyncMock(return_value=fake_images)),
         )
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(fake_client)
 
         with patch.object(self.service, "_with_client", side_effect=fake_with_client):
@@ -8478,7 +8596,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ]
         calls: list[str] = []
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_archive(job_id, module_request, artifacts):
@@ -8572,7 +8690,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_generate_images(client, job_id, module_request, reference_media_names):
@@ -8684,7 +8802,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_generate_images(client, job_id, module_request, reference_media_names):
@@ -8842,7 +8960,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         )
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_generate_images(client, job_id, module_request, reference_media_names):
@@ -8987,7 +9105,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ]
         calls: list[str] = []
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         async def fake_archive(job_id, module_request, artifacts):
@@ -9155,7 +9273,7 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         ]
         captured: dict[str, object] = {}
 
-        async def fake_with_client(fn, workflow_id="", timeout_s=0):
+        async def fake_with_client(fn, workflow_id="", timeout_s=0, job_id=""):
             return await fn(SimpleNamespace())
 
         def fake_webhook(method, url, headers, body, timeout_s):
