@@ -10232,9 +10232,16 @@ exit 1
         ui_2k_candidates: List[Dict[str, Any]] = []
         if upscale_2k and self._flow_ui_upscale_enabled():
             first_workflow_id = str(getattr(artifacts[0], "workflow_id", "") or "").strip()
+            # Scan the whole generated set (not only the QA-approved count): the newest tiles include
+            # the rejected images too, so stopping after N downloads left approved images without a 2K.
+            try:
+                generated_count = int(getattr(request, "count", 0) or 0)
+            except (TypeError, ValueError):
+                generated_count = 0
+            ui_2k_wanted = max(total_uploads, min(self.FLOW_AGENT_MAX_OUTPUT_COUNT, generated_count))
             try:
                 ui_2k_candidates = await self._with_client(
-                    lambda client: self._download_flow_ui_upscaled_set(client, total_uploads, job_id=job_id),
+                    lambda client: self._download_flow_ui_upscaled_set(client, ui_2k_wanted, job_id=job_id),
                     workflow_id=first_workflow_id,
                 )
             except Exception as ui_exc:
