@@ -6676,6 +6676,172 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         keys = await self.service._visible_flow_grid_image_keys(client)
         self.assertEqual({"https://flow.google.com/asb/new-1", "https://flow.google.com/asb/new-2", old_src}, keys)
 
+    def _ui2k_fakes(self, generated: int, total_tiles: int):
+        service = self.service
+
+        class FakeDownload:
+            def __init__(self, name: str, payload: bytes) -> None:
+                self.suggested_filename = name
+                self._payload = payload
+
+            async def save_as(self, path: str) -> None:
+                Path(path).write_bytes(self._payload)
+
+        class FakeDownloadInfo:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def __aenter__(self) -> "FakeDownloadInfo":
+                return self
+
+            async def __aexit__(self, *_exc: object) -> bool:
+                return False
+
+            @property
+            def value(self):
+                async def _value() -> FakeDownload:
+                    return self._page.pending_download
+
+                return _value()
+
+        class FakeTile:
+            def __init__(self, page: "FakePage", index: int) -> None:
+                self._page, self._index = page, index
+
+            async def click(self, timeout: float = 0) -> None:
+                self._page.opened = self._index
+                self._page.menu_open = False
+
+        class FakeLocator:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def count(self) -> int:
+                return total_tiles
+
+            def nth(self, index: int) -> FakeTile:
+                return FakeTile(self._page, index)
+
+        class FakeMouse:
+            def __init__(self, page: "FakePage") -> None:
+                self._page = page
+
+            async def click(self, x: float, y: float) -> None:
+                page = self._page
+                if (x, y) == (1192, 38):
+                    page.menu_open = True
+                elif (x, y) == (1231, 130) and page.menu_open:
+                    index = page.opened
+                    if index < generated:
+                        page.pending_download = FakeDownload(f"Gen_image_{index}_2K_2026.jpeg", service._test_jpeg_bytes(2048, seed=index))
+                    else:
+                        page.pending_download = FakeDownload("trello-source-1.jpg", service._test_jpeg_bytes(2048, seed=99))
+                    page.downloads.append(index)
+                    page.menu_open = False
+                elif (x, y) == (20, 87):
+                    page.opened = None
+
+        class FakeKeyboard:
+            async def press(self, _key: str) -> None:
+                return None
+
+        class FakePage:
+            url = "https://flow.google.com/project/proj-1"
+
+            def __init__(self) -> None:
+                self.opened = None
+                self.menu_open = False
+                self.downloads: list[int] = []
+                self.pending_download = None
+                self.mouse = FakeMouse(self)
+                self.keyboard = FakeKeyboard()
+
+            async def goto(self, *_a: object, **_k: object) -> None:
+                return None
+
+            def locator(self, _selector: str) -> FakeLocator:
+                return FakeLocator(self)
+
+            def expect_download(self, timeout: float = 0) -> FakeDownloadInfo:
+                return FakeDownloadInfo(self)
+
+            async def evaluate(self, script: str, *_args: object):
+                if "textboxes" in script and "buttons" in script:
+                    return {"buttons": 6, "textboxes": 1, "url": self.url}
+                if "flow-banner-dismiss" in script:
+                    return {"dismissed": [], "count": 0}
+                if "flow-ui-controls" in script:
+                    if self.opened is None:
+                        return [{"label": "add | Add media menu |", "x": 1119, "y": 38}]
+                    controls = [
+                        {"label": "download | Download media |", "x": 1192, "y": 38},
+                        {"label": "arrow_back | Back button to go to previous page |", "x": 20, "y": 87},
+                        {"label": "Done | Done editing |", "x": 1380, "y": 38},
+                    ]
+                    if self.menu_open:
+                        controls.append({"label": "1K Original size | |", "x": 1231, "y": 89})
+                        if self.opened < generated:
+                            controls.append({"label": "2K Upscaled | |", "x": 1231, "y": 130})
+                            controls.append({"label": "4K Upscaled | |", "x": 1231, "y": 171})
+                    return controls
+                return {}
+
+        page = FakePage()
+
+        class FakeBrowserManager:
+            async def page(self) -> FakePage:
+                return page
+
+        class FakeClient:
+            project_id = "proj-1"
+
+            def __init__(self) -> None:
+                self._bm = FakeBrowserManager()
+
+        return FakeClient(), page
+
+    async def test_flow_ui_2k_download_collects_generated_images_then_stops_at_source_upload(self) -> None:
+        client, page = self._ui2k_fakes(generated=3, total_tiles=10)
+        job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))
+        with patch.object(self.service, "_download_root", return_value=self.data_dir / "downloads"):
+            results = await self.service._download_flow_ui_upscaled_set(client, 5, job_id=job.id)
+
+        self.assertEqual(3, len(results))
+        # The 4th tile is the source upload: its menu only offers the original size, so nothing is downloaded and the loop stops.
+        self.assertEqual([0, 1, 2], page.downloads)
+        self.assertTrue(all(item["size"] == (2048, 2048) for item in results))
+        self.assertTrue(all(item["name"].startswith("Gen_image_") for item in results))
+        self.assertIsNone(page.opened)
+
+    async def test_flow_ui_2k_download_stops_when_enough_images_are_collected(self) -> None:
+        client, page = self._ui2k_fakes(generated=12, total_tiles=40)
+        job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))
+        with patch.object(self.service, "_download_root", return_value=self.data_dir / "downloads"):
+            results = await self.service._download_flow_ui_upscaled_set(client, 4, job_id=job.id)
+        self.assertEqual(4, len(results))
+        self.assertEqual([0, 1, 2, 3], page.downloads)
+
+    async def test_match_ui_upscaled_candidate_pairs_by_thumbnail_not_position(self) -> None:
+        candidates = [{"bytes": self.service._test_jpeg_bytes(2048, seed=seed)} for seed in (2, 0, 1)]
+        for seed in (0, 1, 2):
+            matched = self.service._match_ui_upscaled_candidate(self.service._test_jpeg_bytes(1024, seed=seed), candidates)
+            self.assertIsNotNone(matched, f"seed {seed} should match")
+            self.assertEqual(self.service._test_jpeg_bytes(2048, seed=seed), matched["bytes"])
+        self.assertIsNone(self.service._match_ui_upscaled_candidate(self.service._test_jpeg_bytes(1024, seed=7), candidates))
+
+    async def test_upsample_artifact_bytes_prefers_flow_ui_2k_candidate(self) -> None:
+        source_path = self.data_dir / "ui2k-source.jpg"
+        source_path.write_bytes(self.service._test_jpeg_bytes(1024, seed=3))
+        artifact = JobArtifact(label="1", url="", local_path=str(source_path), mime_type="image/jpeg")
+        candidates = [{"bytes": self.service._test_jpeg_bytes(2048, seed=5)}, {"bytes": self.service._test_jpeg_bytes(2048, seed=3)}]
+        with patch.object(self.service, "_flow_upsample_api_enabled", return_value=False):
+            result = await self.service._upsample_artifact_bytes(artifact, "", ui_candidates=candidates)
+        self.assertEqual("flow_2k", result.source)
+        self.assertEqual((2048, 2048), result.target_size)
+        self.assertTrue(result.used_flow)
+        self.assertTrue(candidates[1]["used"])
+        self.assertNotIn("used", candidates[0])
+
     async def test_flow_agent_attachment_snapshot_scans_shadow_dom_and_file_inputs(self) -> None:
         class FakePage:
             def __init__(self) -> None:

@@ -10229,6 +10229,19 @@ exit 1
             detail=f"Đang chuẩn bị upload {total_uploads} ảnh kết quả lên Trello.",
         )
         await self.store.append_log(job_id, f"Đang upload {total_uploads} ảnh kết quả lên Trello.")
+        ui_2k_candidates: List[Dict[str, Any]] = []
+        if upscale_2k and self._flow_ui_upscale_enabled():
+            first_workflow_id = str(getattr(artifacts[0], "workflow_id", "") or "").strip()
+            try:
+                ui_2k_candidates = await self._with_client(
+                    lambda client: self._download_flow_ui_upscaled_set(client, total_uploads, job_id=job_id),
+                    workflow_id=first_workflow_id,
+                )
+            except Exception as ui_exc:
+                await self.store.append_log(
+                    job_id,
+                    f"Khong tai duoc ban 2K tu giao dien Flow, giu ban 1K: {humanize_flow_error(str(ui_exc))[:160]}",
+                )
         for index, artifact in enumerate(artifacts):
             artifact_url = str(artifact.url or artifact.public_url or "").strip()
             artifact_local_path = str(artifact.local_path or "").strip()
@@ -10267,6 +10280,7 @@ exit 1
                             upscale_result = await self._upsample_artifact_bytes(
                                 artifact,
                                 artifact_url,
+                                ui_candidates=ui_2k_candidates,
                             )
                         except Exception as up_exc:
                             await self.store.append_log(
@@ -14871,6 +14885,193 @@ exit 1
     # Match Flow's current 2K image upsample request first. Local resize is
     # opt-in only because it increases pixel count without adding real detail.
 
+    def _test_jpeg_bytes(self, side: int, *, seed: int = 0) -> bytes:
+        """Deterministic synthetic JPEG (gradient + stripes keyed by seed) for tests and probes."""
+        from PIL import Image, ImageDraw
+
+        image = Image.new("RGB", (side, side), ((seed * 53) % 255, (seed * 97) % 255, (seed * 151) % 255))
+        draw = ImageDraw.Draw(image)
+        step = max(8, side // (4 + (seed % 5)))
+        for offset in range(0, side, step):
+            shade = (offset * (seed + 3)) % 255
+            draw.rectangle((offset, 0, offset + step // 2, side), fill=(shade, 255 - shade, (shade * 2) % 255))
+        cx, cy = side * (1 + seed % 4) // 6, side * (1 + (seed // 2) % 4) // 6
+        radius = side // (3 + seed % 3)
+        draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=((seed * 31) % 255, 40, 200))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=90)
+        return buffer.getvalue()
+
+    def _flow_ui_upscale_enabled(self) -> bool:
+        """Download "2K Upscaled" from Flow's image editor for each generated image (user-approved 2026-09-09)."""
+        value = os.getenv("FLOW_UI_UPSCALE_2K_ENABLED", "").strip().lower()
+        if not value:
+            return True
+        return value not in {"0", "false", "no", "off"}
+
+    FLOW_UI_CONTROLS_JS = """
+        /* flow-ui-controls */
+        () => [...document.querySelectorAll('button, [role="button"], [role="menuitem"], [role="menuitemradio"], [role="option"], mat-option, li')]
+          .filter((el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+            return r.width >= 14 && r.height >= 14 && s.display !== 'none' && s.visibility !== 'hidden' && r.bottom > 0 && r.top < innerHeight; })
+          .map((el) => { const r = el.getBoundingClientRect();
+            return { label: [el.textContent || '', el.getAttribute('aria-label') || '', el.getAttribute('title') || ''].join(' | ').replace(/\\s+/g, ' ').trim().slice(0, 100),
+                     x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })
+          .filter((it) => it.label)
+    """
+    FLOW_UI_TILE_SELECTOR = 'img[alt*="Tile displaying"]'
+    UI_2K_THUMB_SIZE = 24
+    UI_2K_MATCH_MAX_DISTANCE = 0.15
+    UI_2K_MATCH_MIN_MARGIN = 0.03
+
+    def _image_thumb_signature(self, image_bytes: bytes) -> List[float]:
+        """Tiny grayscale thumbnail used to pair a 1K artifact with its 2K download."""
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image_bytes)) as image:
+            thumb = image.convert("RGB").resize((self.UI_2K_THUMB_SIZE, self.UI_2K_THUMB_SIZE), Image.BILINEAR)
+            return [channel / 255.0 for pixel in thumb.getdata() for channel in pixel]
+
+    def _match_ui_upscaled_candidate(self, source_bytes: bytes, candidates: List[Dict[str, Any]]) -> Dict[str, Any] | None:
+        """Return the unused candidate whose thumbnail is closest to the source, or None when nothing is close."""
+        try:
+            source_sig = self._image_thumb_signature(source_bytes)
+        except Exception:
+            return None
+        best: Dict[str, Any] | None = None
+        best_distance = 1.0
+        second_distance = 1.0
+        for candidate in candidates:
+            if not isinstance(candidate, dict) or candidate.get("used"):
+                continue
+            sig = candidate.get("sig")
+            if not sig:
+                try:
+                    sig = self._image_thumb_signature(bytes(candidate.get("bytes") or b""))
+                    candidate["sig"] = sig
+                except Exception:
+                    continue
+            if len(sig) != len(source_sig):
+                continue
+            distance = sum(abs(a - b) for a, b in zip(source_sig, sig)) / len(source_sig)
+            if distance < best_distance:
+                second_distance = best_distance
+                best_distance = distance
+                best = candidate
+            elif distance < second_distance:
+                second_distance = distance
+        if best is None or best_distance > self.UI_2K_MATCH_MAX_DISTANCE:
+            return None
+        if second_distance - best_distance < self.UI_2K_MATCH_MIN_MARGIN:
+            return None  # two candidates look alike: refuse rather than risk uploading the wrong one
+        return best
+
+    async def _download_flow_ui_upscaled_set(self, client: Any, count: int, *, job_id: str = "") -> List[Dict[str, Any]]:
+        """Open the newest grid images in Flow's editor and download their "2K Upscaled" versions.
+
+        Returns [{"bytes", "name", "sig"}]; the loop stops after ``count`` downloads or at the first
+        source upload (Trello attachments are named trello-*). Any per-image failure is logged and skipped.
+        """
+        wanted = max(1, min(int(count or 1), self.FLOW_AGENT_MAX_OUTPUT_COUNT + 2))
+        page = await client._bm.page()
+        project_id = str(getattr(client, "project_id", "") or "").strip()
+        if project_id and project_id not in str(getattr(page, "url", "") or ""):
+            await page.goto(self._project_url(project_id), wait_until="domcontentloaded", timeout=60_000)
+            await asyncio.sleep(4.0)
+        await self._wait_for_flow_app_ready(page, timeout_s=30.0)
+        await self._dismiss_flow_top_banner(page)
+        try:
+            await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await asyncio.sleep(1.0)
+        results: List[Dict[str, Any]] = []
+        failures = 0
+        tiles = page.locator(self.FLOW_UI_TILE_SELECTOR)
+        try:
+            available = int(await tiles.count())
+        except Exception:
+            available = 0
+        if job_id:
+            await self.store.append_log(job_id, f"Dang tai ban 2K tu giao dien Flow cho {wanted} anh (grid co {available} anh).")
+        download_root = self._download_root()
+        download_root.mkdir(parents=True, exist_ok=True)
+        for tile_index in range(min(max(available, 0), wanted + 4)):
+            if len(results) >= wanted or failures >= 3:
+                break
+            try:
+                await tiles.nth(tile_index).click(timeout=8000)
+                await asyncio.sleep(3.0)
+                controls = await page.evaluate(self.FLOW_UI_CONTROLS_JS)
+                controls = controls if isinstance(controls, list) else []
+                download_btn = next((it for it in controls if re.search(r"download media|^download\b", str(it.get("label") or ""), re.I)), None)
+                if not download_btn:
+                    raise RuntimeError("no Download control in the image editor")
+                await page.mouse.click(float(download_btn["x"]), float(download_btn["y"]))
+                await asyncio.sleep(2.0)
+                menu = await page.evaluate(self.FLOW_UI_CONTROLS_JS)
+                menu = menu if isinstance(menu, list) else []
+                option = next((it for it in menu if re.search(r"\b2k\b", str(it.get("label") or ""), re.I) and re.search(r"upscal", str(it.get("label") or ""), re.I)), None)
+                if not option:
+                    # uploads and non-generated media only offer the original size: we are past this card's outputs
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.5)
+                    await self._flow_ui_leave_image_editor(page)
+                    if any(re.search(r"original size", str(it.get("label") or ""), re.I) for it in menu):
+                        break
+                    failures += 1
+                    continue
+                async with page.expect_download(timeout=120_000) as download_info:
+                    await page.mouse.click(float(option["x"]), float(option["y"]))
+                download = await download_info.value
+                file_name = str(getattr(download, "suggested_filename", "") or "")
+                if file_name.lower().startswith("trello-"):
+                    await self._flow_ui_leave_image_editor(page)
+                    break
+                destination = download_root / f"ui2k-{(job_id or 'job')[:8]}-{len(results) + 1}.jpeg"
+                await download.save_as(str(destination))
+                data = await asyncio.to_thread(destination.read_bytes)
+                size = await asyncio.to_thread(self._image_size_from_bytes, data)
+                if data and size and max(size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+                    results.append({"bytes": data, "name": file_name, "path": str(destination), "size": size})
+                else:
+                    failures += 1
+                await self._flow_ui_leave_image_editor(page)
+            except Exception as exc:
+                failures += 1
+                if job_id:
+                    await self.store.append_log(
+                        job_id,
+                        f"Ban 2K tu Flow cho anh thu {tile_index + 1} khong lay duoc: {humanize_flow_error(str(exc))[:120]}",
+                    )
+                try:
+                    await page.keyboard.press("Escape")
+                    await asyncio.sleep(0.5)
+                    await self._flow_ui_leave_image_editor(page)
+                except Exception:
+                    pass
+        if job_id:
+            await self.store.append_log(job_id, f"Da tai {len(results)}/{wanted} ban 2K tu giao dien Flow.")
+        return results
+
+    async def _flow_ui_leave_image_editor(self, page: Any) -> None:
+        try:
+            controls = await page.evaluate(self.FLOW_UI_CONTROLS_JS)
+        except Exception:
+            controls = []
+        back = next(
+            (it for it in (controls if isinstance(controls, list) else []) if re.search(r"arrow_back|back button|^done\b", str(it.get("label") or ""), re.I)),
+            None,
+        )
+        try:
+            if back:
+                await page.mouse.click(float(back["x"]), float(back["y"]))
+            else:
+                await page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+
     def _flow_upsample_api_enabled(self) -> bool:
         value = os.getenv("FLOW_UPSAMPLE_API_ENABLED", "").strip().lower()
         if not value:
@@ -15351,6 +15552,7 @@ exit 1
         self,
         artifact: JobArtifact,
         artifact_url: str,
+        ui_candidates: List[Dict[str, Any]] | None = None,
     ) -> ImageUpscaleResult:
         """Fetch an artifact and prepare 2K bytes for Trello upload.
 
@@ -15380,6 +15582,24 @@ exit 1
         source_size = await asyncio.to_thread(self._image_size_from_bytes, source_bytes)
         if source_size and max(source_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
             return ImageUpscaleResult()
+
+        # Flow's own editor offers "2K Upscaled" per generated image (free); the set is fetched once
+        # per card and paired with this artifact by thumbnail similarity, never by position.
+        if ui_candidates:
+            matched = await asyncio.to_thread(self._match_ui_upscaled_candidate, source_bytes, ui_candidates)
+            if matched is not None:
+                matched_bytes = bytes(matched.get("bytes") or b"")
+                matched_size = await asyncio.to_thread(self._image_size_from_bytes, matched_bytes)
+                if matched_bytes and matched_size and max(matched_size) >= self.TRELLO_UPSCALE_LONG_EDGE_PX:
+                    matched["used"] = True
+                    return ImageUpscaleResult(
+                        bytes=matched_bytes,
+                        mime_type="image/jpeg",
+                        source="flow_2k",
+                        source_size=source_size,
+                        target_size=matched_size,
+                        used_flow=True,
+                    )
 
         async def _go(client: Any) -> bytes:
             return await self._upsample_image_via_flow(
