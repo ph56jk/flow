@@ -14920,6 +14920,17 @@ exit 1
           .filter((it) => it.label)
     """
     FLOW_UI_TILE_SELECTOR = 'img[alt*="Tile displaying"]'
+    FLOW_UI_TILE_CENTER_JS = """
+        /* flow-ui-tile-center */
+        (index) => {
+          const tiles = [...document.querySelectorAll('img[alt*="Tile displaying"]')];
+          const img = tiles[index];
+          if (!img) return null;
+          img.scrollIntoView({ block: 'center', inline: 'nearest' });
+          const r = img.getBoundingClientRect();
+          return { x: r.left + r.width / 2, y: r.top + r.height / 2, w: r.width, h: r.height, total: tiles.length };
+        }
+    """
     UI_2K_THUMB_SIZE = 24
     UI_2K_MATCH_MAX_DISTANCE = 0.15
     UI_2K_MATCH_MIN_MARGIN = 0.03
@@ -15000,7 +15011,12 @@ exit 1
             if len(results) >= wanted or failures >= 3:
                 break
             try:
-                await tiles.nth(tile_index).click(timeout=8000)
+                center = await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, tile_index)
+                if not isinstance(center, dict) or float(center.get("w") or 0) < 40 or float(center.get("h") or 0) < 40:
+                    raise RuntimeError(f"grid tile {tile_index + 1} is not rendered ({center})")
+                await asyncio.sleep(0.6)
+                center = await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, tile_index) or center
+                await page.mouse.click(float(center["x"]), float(center["y"]))
                 await asyncio.sleep(3.0)
                 controls = await page.evaluate(self.FLOW_UI_CONTROLS_JS)
                 controls = controls if isinstance(controls, list) else []
@@ -15040,9 +15056,10 @@ exit 1
             except Exception as exc:
                 failures += 1
                 if job_id:
+                    shot = await self._capture_flow_agent_debug_screenshot(page, "ui2k-fail") if failures == 1 else ""
                     await self.store.append_log(
                         job_id,
-                        f"Ban 2K tu Flow cho anh thu {tile_index + 1} khong lay duoc: {humanize_flow_error(str(exc))[:120]}",
+                        f"Ban 2K tu Flow cho anh thu {tile_index + 1} khong lay duoc: {' '.join(str(exc).split())[:300]} {shot}",
                     )
                 try:
                     await page.keyboard.press("Escape")

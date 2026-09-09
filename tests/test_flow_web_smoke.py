@@ -6728,7 +6728,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
 
             async def click(self, x: float, y: float) -> None:
                 page = self._page
-                if (x, y) == (1192, 38):
+                if y == 300 and 400 <= x < 400 + total_tiles:
+                    page.opened = int(x - 400)
+                    page.menu_open = False
+                elif (x, y) == (1192, 38):
                     page.menu_open = True
                 elif (x, y) == (1231, 130) and page.menu_open:
                     index = page.opened
@@ -6765,11 +6768,16 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             def expect_download(self, timeout: float = 0) -> FakeDownloadInfo:
                 return FakeDownloadInfo(self)
 
-            async def evaluate(self, script: str, *_args: object):
+            async def evaluate(self, script: str, *args: object):
                 if "textboxes" in script and "buttons" in script:
                     return {"buttons": 6, "textboxes": 1, "url": self.url}
                 if "flow-banner-dismiss" in script:
                     return {"dismissed": [], "count": 0}
+                if "flow-ui-tile-center" in script:
+                    index = int(args[0]) if args else 0
+                    if index >= total_tiles:
+                        return None
+                    return {"x": 400 + index, "y": 300, "w": 256, "h": 256, "total": total_tiles}
                 if "flow-ui-controls" in script:
                     if self.opened is None:
                         return [{"label": "add | Add media menu |", "x": 1119, "y": 38}]
