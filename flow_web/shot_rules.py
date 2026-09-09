@@ -8152,7 +8152,6 @@ PRODUCT_SHOT_RULES["christmas_fabric_cross"] = {
         "Christmas Cross Keepsake",
         "Christmas Soft Cross",
         "Christmas Hanging Fabric Cross",
-        "Christmas Cross Ornament",
         "Noel Fabric Cross",
         "Xmas Fabric Cross",
         "Holiday Fabric Cross",
