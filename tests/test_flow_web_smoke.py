@@ -38,7 +38,7 @@ from flow_web.schemas import (
 )
 from flow_web.service import FlowAgentQuotaError, FlowBrowserProfile, FlowWebService, ImageUpscaleResult
 from flow_web.shot_rules import PRODUCT_SHOT_RULES
-from flow_web.service import FlowAgentFailedError
+from flow_web.service import FlowAgentFailedError, FlowUiUpscaleUnavailableError
 from flow_web.store import StateStore
 
 
@@ -94,6 +94,9 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
             {
                 "FLOW_AGENT_BATCH_PAUSE_MIN_S": "0",
                 "FLOW_AGENT_BATCH_PAUSE_MAX_S": "0",
+                # Legacy archive tests exercise the API-upscale/keep-original paths; the Flow-UI 2K hold
+                # (user rule 2026-09-10) is enabled explicitly by the tests that cover it.
+                "FLOW_UI_UPSCALE_2K_ENABLED": "0",
             },
             clear=False,
         )
@@ -3819,7 +3822,8 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         self.assertEqual(1, result["sent"])
         self.assertEqual(0, result["failed"])
 
-    def test_trello_archive_keeps_original_after_flow_upsample_failure(self) -> None:
+    def test_trello_archive_holds_card_when_flow_ui_2k_is_unavailable(self) -> None:
+        """User rule 2026-09-10: no 1K images on Trello. A failed UI-2K download holds the card untouched."""
         from PIL import Image
 
         source_file = self.downloads_dir / "flow-small.jpg"
@@ -3840,7 +3844,93 @@ class FlowWebServiceSyncTests(TempAppPathsMixin, unittest.TestCase):
         job = JobRecord(type="image", status="running", title="test")
         asyncio.run(self.store.add_job(job))
 
-        with patch.object(
+        with patch.dict(os.environ, {"FLOW_UI_UPSCALE_2K_ENABLED": ""}, clear=False), patch.object(
+            self.service,
+            "_with_client",
+            new=AsyncMock(side_effect=FlowUiUpscaleUnavailableError("Flow khong tra ban 2K (3 anh khong tai duoc, moi 0/1 anh co 2K)")),
+        ), patch.object(
+            self.service,
+            "_upsample_artifact_bytes",
+            new=AsyncMock(side_effect=RuntimeError("No session found")),
+        ) as upsample, patch.object(
+            self.service,
+            "_trello_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_bytes:
+            with self.assertRaises(FlowUiUpscaleUnavailableError) as raised:
+                asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        attach_bytes.assert_not_called()
+        upsample.assert_not_called()
+        self.assertIn("khong upload anh 1K", str(raised.exception))
+        self.assertTrue(self.service._auto_trello_should_stop_on_child_error(str(raised.exception)))
+        held = self.downloads_dir / "held-2k" / f"{job.id[:8]}-1.jpg"
+        self.assertTrue(held.is_file(), "the 1K file must be kept for the later 2K recovery")
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("giu card Trello nguyen trang", logs)
+
+    def test_trello_archive_holds_rest_of_card_when_one_image_has_no_real_2k(self) -> None:
+        from PIL import Image
+
+        source_file = self.downloads_dir / "flow-small.jpg"
+        Image.new("RGB", (640, 480), (120, 170, 210)).save(source_file, format="JPEG", quality=90)
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=True,
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(source_file), mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.dict(os.environ, {"FLOW_UI_UPSCALE_2K_ENABLED": ""}, clear=False), patch.object(
+            self.service, "_with_client", new=AsyncMock(return_value=[])
+        ), patch.object(
+            self.service,
+            "_upsample_artifact_bytes",
+            new=AsyncMock(return_value=ImageUpscaleResult(source="flow_unavailable", failure_reason="Flow returned original bytes")),
+        ), patch.object(
+            self.service,
+            "_trello_attach_file_bytes",
+            return_value={"id": "att-1", "name": "flow-cat.jpg", "url": "https://trello.example/att-1"},
+        ) as attach_bytes:
+            with self.assertRaises(FlowUiUpscaleUnavailableError) as raised:
+                asyncio.run(self.service._archive_trello_artifacts(job.id, request, [artifact]))
+
+        attach_bytes.assert_not_called()
+        self.assertIn("khong co ban 2K that", str(raised.exception))
+        self.assertTrue(self.service._auto_trello_should_stop_on_child_error(str(raised.exception)))
+
+    def test_trello_archive_keeps_original_after_flow_upsample_failure(self) -> None:
+        """With the UI-2K download switched off (FLOW_UI_UPSCALE_2K_ENABLED=0) the old fallback still applies."""
+        from PIL import Image
+
+        source_file = self.downloads_dir / "flow-small.jpg"
+        Image.new("RGB", (640, 480), (120, 170, 210)).save(source_file, format="JPEG", quality=90)
+        asyncio.run(
+            self.service.update_trello_config(
+                TrelloConfigUpdateRequest(
+                    api_key="key",
+                    token="token",
+                    card_id="https://trello.com/c/abc123/demo-card",
+                    upload_mode="file",
+                    upscale_to_2k=True,
+                )
+            )
+        )
+        request = CreateJobRequest(type="image", prompt="cat")
+        artifact = JobArtifact(label="Ảnh 1", media_name="media", local_path=str(source_file), mime_type="image/jpeg")
+        job = JobRecord(type="image", status="running", title="test")
+        asyncio.run(self.store.add_job(job))
+
+        with patch.dict(os.environ, {"FLOW_UI_UPSCALE_2K_ENABLED": "0"}, clear=False), patch.object(
             self.service,
             "_upsample_artifact_bytes",
             new=AsyncMock(side_effect=RuntimeError("No session found")),
@@ -6149,6 +6239,9 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             {
                 "FLOW_AGENT_BATCH_PAUSE_MIN_S": "0",
                 "FLOW_AGENT_BATCH_PAUSE_MAX_S": "0",
+                # Legacy archive tests exercise the API-upscale/keep-original paths; the Flow-UI 2K hold
+                # (user rule 2026-09-10) is enabled explicitly by the tests that cover it.
+                "FLOW_UI_UPSCALE_2K_ENABLED": "0",
             },
             clear=False,
         )
@@ -6829,6 +6922,38 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
             results = await self.service._download_flow_ui_upscaled_set(client, 4, job_id=job.id)
         self.assertEqual(4, len(results))
         self.assertEqual([0, 1, 2, 3], page.downloads)
+
+    async def test_flow_ui_2k_download_raises_after_three_failed_images(self) -> None:
+        client, page = self._ui2k_fakes(generated=12, total_tiles=40)
+        job = await self.store.add_job(JobRecord(type="image", status="running", title="ui2k"))
+
+        class TimingOutDownloadInfo:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            @property
+            def value(self):
+                async def _value():
+                    raise TimeoutError('Timeout 120000ms exceeded while waiting for event "download"')
+
+                return _value()
+
+        page.expect_download = lambda timeout=0: TimingOutDownloadInfo()
+        with patch.object(self.service, "_download_root", return_value=self.data_dir / "downloads"), patch.object(
+            self.service, "_capture_flow_agent_debug_screenshot", AsyncMock(return_value="")
+        ):
+            with self.assertRaises(FlowUiUpscaleUnavailableError) as raised:
+                await self.service._download_flow_ui_upscaled_set(client, 12, job_id=job.id)
+
+        self.assertIn("khong tra ban 2K", str(raised.exception))
+        self.assertEqual([0, 1, 2], page.downloads)
+        logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
+        self.assertIn("Da tai 0/12 ban 2K", logs)
+        self.assertTrue(self.service._auto_trello_should_stop_on_child_error(str(raised.exception)))
+        self.assertTrue(self.service._auto_trello_should_stop_on_child_error("Anh 3/12 khong co ban 2K that; app giu phan con lai"))
 
     async def test_match_ui_upscaled_candidate_pairs_by_thumbnail_not_position(self) -> None:
         candidates = [{"bytes": self.service._test_jpeg_bytes(2048, seed=seed)} for seed in (2, 0, 1)]
@@ -7511,12 +7636,10 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
         self.assertEqual(1, self.store.snapshot().flow_profile_agent_retry_error_counts[profiles[0].key])
 
-    def test_flow_profile_block_until_is_next_midnight_utc(self) -> None:
+    def test_flow_profile_block_until_is_24h_after_the_strike(self) -> None:
         with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "", "FLOW_PROFILE_QUOTA_BLOCK_S": ""}, clear=False):
-            # 2026-09-09 05:30 UTC -> 2026-09-10 00:00 UTC (07:00 Vietnam)
-            self.assertEqual(1788998400.0, self.service._flow_profile_block_until(now=1788931800.0))
-            # 30 s before midnight still respects the 60 s minimum block
-            self.assertEqual(1788998430.0, self.service._flow_profile_block_until(now=1788998370.0))
+            # Rolling window: 2026-09-09 05:30 UTC -> 2026-09-10 05:30 UTC, not the next midnight UTC.
+            self.assertEqual(1788931800.0 + 86400.0, self.service._flow_profile_block_until(now=1788931800.0))
             self.assertEqual("07:00 10/09", self.service._flow_profile_block_until_label(1788998400.0))
             self.assertEqual(2, self.service._flow_agent_failed_switch_threshold())
         with patch.dict(os.environ, {"FLOW_CHROME_PROFILE_QUOTA_BLOCK_S": "3600"}, clear=False):
@@ -7563,14 +7686,12 @@ class FlowWebServiceAsyncTests(TempAppPathsMixin, unittest.IsolatedAsyncioTestCa
         self.assertTrue(self.service._flow_profile_is_quota_blocked(profiles[0]))
         self.assertFalse(self.service._flow_profile_is_quota_blocked(profiles[1]))
         blocked_until = self.store.snapshot().flow_profile_quota_blocked_until[profiles[0].key]
-        day = 86400.0
-        self.assertEqual((int(started // day) + 1) * day, blocked_until)
-        self.assertLess(blocked_until - started, day)
+        self.assertAlmostEqual(started + 86400.0, blocked_until, delta=30.0)
         self.assertEqual(0, self.service._flow_profile_agent_failed_job_counts.get(profiles[0].key, 0))
         logs = " ".join(entry.message for entry in self.store.get_job(job.id).logs)
         self.assertIn("1/2 card liên tiếp", logs)
         self.assertIn("chuyển sang Acc18", logs)
-        self.assertIn("07:00", logs)
+        self.assertIn("giờ VN", logs)
 
     async def test_with_client_single_profile_stops_after_two_flow_agent_failed_jobs(self) -> None:
         await self.store.replace_config(AppConfig(project_id="pid", headless=False, generation_timeout_s=300))

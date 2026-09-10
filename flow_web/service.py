@@ -120,6 +120,14 @@ class FlowAgentQuotaError(RuntimeError):
     """Raised when the current Google Flow Agent browser profile hits its quota."""
 
 
+class FlowUiUpscaleUnavailableError(RuntimeError):
+    """Flow's editor stopped handing out "2K Upscaled" downloads (per-account daily limit, 2026-09-09).
+
+    The card is held untouched instead of being filled with 1K images; the generated images stay in the
+    account's Flow project so their 2K versions can be fetched later without regenerating.
+    """
+
+
 def _model_dump(model: Any) -> Dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump(mode="json")
@@ -3672,6 +3680,8 @@ class FlowWebService:
             "request khong co anh goc",
             "dung truoc khi bam tao",
             "tat ca chrome profile flow da het quota",
+            "khong tra ban 2k",
+            "khong co ban 2k that",
         )
         return any(signal in normalized for signal in stop_signals)
 
@@ -10248,10 +10258,18 @@ exit 1
                     workflow_id=first_workflow_id,
                 )
             except Exception as ui_exc:
+                # The user does not want 1K images on Trello: hold the card untouched and let the Auto AI
+                # batch stop (see _auto_trello_should_stop_on_child_error). The generated images stay in the
+                # Flow project, so their 2K versions can be fetched later without spending credits again.
+                detail = " ".join(str(getattr(ui_exc, "detail", "") or ui_exc).split())[:220]
                 await self.store.append_log(
                     job_id,
-                    f"Khong tai duoc ban 2K tu giao dien Flow, giu ban 1K: {humanize_flow_error(str(ui_exc))[:160]}",
+                    f"Flow khong tra ban 2K; app giu card Trello nguyen trang, khong upload anh 1K: {detail}",
                 )
+                await self._persist_held_artifact_files(job_id, artifacts)
+                raise FlowUiUpscaleUnavailableError(
+                    f"Flow khong tra ban 2K; app giu card, khong upload anh 1K. Chi tiet: {detail}"
+                ) from ui_exc
         for index, artifact in enumerate(artifacts):
             artifact_url = str(artifact.url or artifact.public_url or "").strip()
             artifact_local_path = str(artifact.local_path or "").strip()
@@ -10329,6 +10347,14 @@ exit 1
                                         f"giu anh goc va khong resize gia 2K{detail}."
                                     ),
                                 )
+                        if self._flow_ui_upscale_enabled() and not (
+                            upscale_result.bytes and upscale_result.source in ("flow_2k", "local_resize")
+                        ):
+                            await self._persist_held_artifact_files(job_id, artifacts)
+                            raise FlowUiUpscaleUnavailableError(
+                                f"Anh {index + 1}/{total_uploads} khong co ban 2K that; app giu phan con lai cua card, "
+                                "khong upload anh 1K (cac anh truoc do da len Trello o 2K). Lay 2K tu project Flow sau."
+                            )
                     try:
                         if upscale_result.bytes:
                             source_bytes = upscale_result.bytes
@@ -10391,6 +10417,9 @@ exit 1
                     detail=f"Đã upload {stored}/{total_uploads} ảnh lên Trello.",
                 )
                 await self.store.append_log(job_id, f"Đã upload ảnh {index + 1}/{total_uploads} lên Trello.")
+            except FlowUiUpscaleUnavailableError:
+                # Holding the card is deliberate: let it fail the job so the Auto AI batch stops.
+                raise
             except Exception as exc:
                 failed += 1
                 await self.store.append_log(
@@ -14930,6 +14959,7 @@ exit 1
           .filter((it) => it.label)
     """
     FLOW_UI_TILE_SELECTOR = 'img[alt*="Tile displaying"]'
+    FLOW_UI_2K_GIVE_UP_FAILURES = 3
     FLOW_UI_TILE_CENTER_JS = """
         /* flow-ui-tile-center */
         (index) => {
@@ -15020,7 +15050,7 @@ exit 1
         download_root = self._download_root()
         download_root.mkdir(parents=True, exist_ok=True)
         for tile_index in range(min(max(available, 0), wanted + 4)):
-            if len(results) >= wanted or failures >= 3:
+            if len(results) >= wanted or failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES:
                 break
             try:
                 center = await page.evaluate(self.FLOW_UI_TILE_CENTER_JS, tile_index)
@@ -15090,6 +15120,11 @@ exit 1
                     pass
         if job_id:
             await self.store.append_log(job_id, f"Da tai {len(results)}/{wanted} ban 2K tu giao dien Flow.")
+        if failures >= self.FLOW_UI_2K_GIVE_UP_FAILURES and len(results) < wanted:
+            raise FlowUiUpscaleUnavailableError(
+                f"Flow khong tra ban 2K ({failures} anh khong tai duoc, moi {len(results)}/{wanted} anh co 2K); "
+                "app giu card, khong upload anh 1K. Anh da tao van nam trong project Flow de lay 2K sau."
+            )
         return results
 
     async def _flow_ui_leave_image_editor(self, page: Any) -> None:
@@ -15701,6 +15736,31 @@ exit 1
             used_flow=flow_changed,
             failure_reason=reason,
         )
+
+    async def _persist_held_artifact_files(self, job_id: str, artifacts: List[JobArtifact]) -> str:
+        """Copy a held card's 1K files to downloads/held-2k/<job8>-N.<ext> so the 2K recovery can pair them later.
+
+        The per-card files (visible-flow-N.jpg.jpg) are shared between jobs and overwritten by the next card.
+        """
+        folder = self._download_root() / "held-2k"
+        copied = 0
+        try:
+            await asyncio.to_thread(folder.mkdir, parents=True, exist_ok=True)
+            for index, artifact in enumerate(artifacts):
+                local_path = str(getattr(artifact, "local_path", "") or "").strip()
+                source = Path(local_path).expanduser() if local_path else None
+                if source is None or not source.is_file():
+                    continue
+                suffix = source.suffix.lower() if source.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp") else ".jpg"
+                destination = folder / f"{(job_id or 'job')[:8]}-{index + 1}{suffix}"
+                await asyncio.to_thread(shutil.copyfile, str(source), str(destination))
+                copied += 1
+        except Exception as exc:  # noqa: BLE001 - best effort, the hold itself must not fail
+            await self.store.append_log(job_id, f"Khong sao luu duoc anh 1K cua card giu lai: {str(exc)[:120]}")
+            return ""
+        if copied and job_id:
+            await self.store.append_log(job_id, f"Da sao luu {copied} anh 1K cua card vao {folder} de lay 2K sau.")
+        return str(folder) if copied else ""
 
     async def _persist_flow_2k_artifact_file(
         self,
@@ -16712,13 +16772,16 @@ exit 1
         return self._normalize_project_id(profile.project_id or fallback_project_id)
 
     FLOW_PROFILE_BLOCK_MIN_SECONDS = 60.0
+    FLOW_PROFILE_BLOCK_SECONDS = 24.0 * 60.0 * 60.0
 
     def _flow_profile_block_until(self, now: float | None = None) -> float:
-        """Epoch when a quota-blocked profile may be used again.
+        """Epoch when a quota-blocked profile may be used again: 24 h after the strike.
 
-        Flow's daily Agent limit resets at 00:00 UTC (07:00 Vietnam; observed 2026-09-09), so the block ends
-        at the next 00:00 UTC instead of a fixed 24 h that over-blocked the account for most of the next day.
-        FLOW_CHROME_PROFILE_QUOTA_BLOCK_S / FLOW_PROFILE_QUOTA_BLOCK_S still force a fixed duration.
+        Flow's Agent limit (and the editor's 2K download limit) behave as rolling ~24 h windows from the
+        moment they were hit: accounts blocked at 12:19 / 15:42 VN on 2026-09-09 still failed at 08:08 VN
+        the next day, i.e. after 00:00 UTC, so a release at midnight UTC under-blocked them. The earlier
+        "reset at 07:00 VN" reading came from the 2026-09-08 "high demand" outage, not from the quota.
+        FLOW_CHROME_PROFILE_QUOTA_BLOCK_S / FLOW_PROFILE_QUOTA_BLOCK_S override the duration.
         """
         current = float(now if now is not None else time.time())
         raw = os.getenv("FLOW_CHROME_PROFILE_QUOTA_BLOCK_S", "").strip() or os.getenv("FLOW_PROFILE_QUOTA_BLOCK_S", "").strip()
@@ -16727,9 +16790,7 @@ exit 1
                 return current + max(self.FLOW_PROFILE_BLOCK_MIN_SECONDS, float(raw))
             except ValueError:
                 pass
-        day = 24.0 * 60.0 * 60.0
-        next_reset = (int(current // day) + 1) * day
-        return max(next_reset, current + self.FLOW_PROFILE_BLOCK_MIN_SECONDS)
+        return current + self.FLOW_PROFILE_BLOCK_SECONDS
 
     def _flow_profile_block_until_label(self, blocked_until: float) -> str:
         """Human label in Vietnam time, e.g. '07:00 10/09'."""
